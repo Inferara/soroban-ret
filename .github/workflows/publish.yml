@@ -45,32 +45,40 @@ jobs:
       # but CLI failed). Re-running the same tag will only publish what is
       # missing.
 
+      # Helper: query the sparse index (the surface cargo actually uses for
+      # dependency resolution) for a specific version. The path layout for the
+      # crates.io sparse index is `<aa>/<bb>/<crate>` where `<aa>` is the first
+      # two letters of the crate name and `<bb>` is the next two. For both
+      # `soroban-ret` and `soroban-ret-cli` that is `so/ro/<crate>`.
+
       - name: Publish soroban-ret (library)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_KEY }}
           V: ${{ steps.ver.outputs.version }}
         run: |
-          if curl -sfI "https://crates.io/api/v1/crates/soroban-ret/$V" -o /dev/null; then
-            echo "soroban-ret $V already on crates.io — skipping publish"
+          if curl -s "https://index.crates.io/so/ro/soroban-ret" | grep -q "\"vers\":\"$V\""; then
+            echo "soroban-ret $V already in sparse index — skipping publish"
           else
             cargo publish -p soroban-ret --dry-run --locked
             cargo publish -p soroban-ret --locked
           fi
 
-      - name: Wait for crates.io to index soroban-ret
+      - name: Wait for crates.io sparse index to publish soroban-ret
         env:
           V: ${{ steps.ver.outputs.version }}
         run: |
-          # Poll up to 5 minutes for the index to catch up. The CLI cannot
-          # publish until the library version is resolvable from the registry.
-          for i in $(seq 1 30); do
-            if curl -sfI "https://crates.io/api/v1/crates/soroban-ret/$V" -o /dev/null; then
-              echo "soroban-ret $V indexed"
+          # Poll the sparse index — that is the surface cargo reads when
+          # resolving the CLI's path-and-version dependency on the library.
+          # Up to 10 minutes (60 * 10s) to absorb crates.io edge propagation
+          # delays observed in the wild.
+          for i in $(seq 1 60); do
+            if curl -s "https://index.crates.io/so/ro/soroban-ret" | grep -q "\"vers\":\"$V\""; then
+              echo "soroban-ret $V is in sparse index"
               exit 0
             fi
             sleep 10
           done
-          echo "timed out waiting for soroban-ret $V to index" >&2
+          echo "timed out waiting for soroban-ret $V to appear in sparse index" >&2
           exit 1
 
       - name: Publish soroban-ret-cli (binary)
@@ -78,8 +86,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_KEY }}
           V: ${{ steps.ver.outputs.version }}
         run: |
-          if curl -sfI "https://crates.io/api/v1/crates/soroban-ret-cli/$V" -o /dev/null; then
-            echo "soroban-ret-cli $V already on crates.io — skipping publish"
+          if curl -s "https://index.crates.io/so/ro/soroban-ret-cli" | grep -q "\"vers\":\"$V\""; then
+            echo "soroban-ret-cli $V already in sparse index — skipping publish"
           else
             cargo publish -p soroban-ret-cli --dry-run --locked
             cargo publish -p soroban-ret-cli --locked

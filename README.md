@@ -1,5 +1,7 @@
 [![Build](https://github.com/Inferara/soroban-ret/actions/workflows/build.yml/badge.svg)](https://github.com/Inferara/soroban-ret/actions/workflows/build.yml)
 [![codecov](https://codecov.io/gh/Inferara/soroban-ret/branch/main/graph/badge.svg?token=U1F2477BLC)](https://codecov.io/gh/Inferara/soroban-ret)
+[![soroban-ret on crates.io](https://img.shields.io/crates/v/soroban-ret.svg?label=soroban-ret)](https://crates.io/crates/soroban-ret)
+[![soroban-ret-cli on crates.io](https://img.shields.io/crates/v/soroban-ret-cli.svg?label=soroban-ret-cli)](https://crates.io/crates/soroban-ret-cli)
 
 # Reverse-engineering tool for Stellar Soroban smart contracts
 
