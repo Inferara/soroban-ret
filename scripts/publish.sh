@@ -36,6 +36,30 @@ esac
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$script_dir/.."
 
+# --- rollback trap -----------------------------------------------------------
+# Snapshot HEAD before any mutations. The trap restores both git state and
+# working-tree files (Cargo.toml, Cargo.lock) to the pre-script state if
+# anything fails between arming and disarming.
+
+original_head="$(git rev-parse HEAD)"
+rollback_armed=0
+tag=""
+
+rollback() {
+    local rc=$?
+    trap - EXIT
+    if [[ $rollback_armed -eq 1 && $rc -ne 0 ]]; then
+        echo "" >&2
+        echo "error: aborting; rolling back local changes" >&2
+        if [[ -n "$tag" ]]; then
+            git tag -d "$tag" >/dev/null 2>&1 || true
+        fi
+        git reset --hard "$original_head" >/dev/null 2>&1 || true
+    fi
+    exit $rc
+}
+trap rollback EXIT
+
 # --- safety checks -----------------------------------------------------------
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -86,13 +110,15 @@ read -r -p "proceed? [y/N] " ans
 # --- bump version in Cargo.toml ----------------------------------------------
 # The literal `version = "${current}"` appears in [workspace.package] and in
 # the soroban-ret path dependency under [workspace.dependencies]. Replace both.
+# From here on, the trap will roll back on any failure.
+
+rollback_armed=1
 
 sed -i.bak "s|version = \"${current}\"|version = \"${new}\"|g" Cargo.toml
 rm -f Cargo.toml.bak
 
 if grep -q "version = \"${current}\"" Cargo.toml; then
     echo "error: stale version still present in Cargo.toml after substitution" >&2
-    git checkout -- Cargo.toml
     exit 1
 fi
 
@@ -106,8 +132,13 @@ git add Cargo.toml Cargo.lock
 git commit -m "chore: release ${tag}"
 git tag -a "${tag}" -m "Release ${tag}"
 
-git push origin main
-git push origin "${tag}"
+# Atomic push: the remote either accepts both the bump commit on `main` and
+# the new tag, or rejects both. Prevents a half-pushed state where the tag
+# lands without the commit (or vice versa).
+git push --atomic origin "main:main" "refs/tags/${tag}"
+
+# Success — disarm rollback so the trap doesn't undo our committed work.
+rollback_armed=0
 
 cat <<EOF
 
