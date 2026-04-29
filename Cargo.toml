@@ -22,8 +22,6 @@ soroban-spec = "26.0.0-rc.1"
 soroban-meta = "26.0.0-rc.1"
 stellar-xdr = { version = "26.0.0", default-features = false, features = ["curr", "std", "base64"] }
 thiserror = "2.0.18"
-log = "0.4"
 clap = { version = "4.6.1", features = ["derive"] }
-env_logger = "0.11.10"
 wasmparser = "0.248.0"
 wasmprinter = "0.248.0"

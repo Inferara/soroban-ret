@@ -31,13 +31,7 @@ Output is a one-line summary of the parsed module, e.g.:
 Functions: 13, Types: 4, Imports: 27
 ```
 
-Flags:
-
-| Flag | Effect |
-|---|---|
-| `-o, --output <path>` | (reserved for source output once codegen lands) |
-| `--spec-only` | (reserved for spec-only emission once codegen lands) |
-| `-v, --verbose` | enable `debug`-level logging |
+The CLI currently takes only the input WASM path. Flags for source-file output, spec-only emission, and verbose logging will be added once the corresponding pipeline stages land.
 
 ## Library usage
 
@@ -81,6 +75,18 @@ cargo run -p soroban-ret-cli -- path/to/contract.wasm
 | 4 | IR optimizer + post-optimization passes | planned |
 | 5 | Rust source emitter | planned |
 
+## Acknowledgements
+
+This project is funded by the [Stellar Community Fund](https://communityfund.stellar.org/).
+
+`soroban-ret` reverse-engineers Soroban contracts back into readable Rust source, giving developers and auditors on [Stellar](https://stellar.org/) the ability to inspect, review, and verify on-chain code that ships only as compiled WASM.
+
+![SCF banner](assets/scf_banner.png)
+
+## Contributing
+
+Contributions are welcome!
+
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+This project is licensed under the Apache License 2.0. See [LICENSE](./LICENSE) for details.
