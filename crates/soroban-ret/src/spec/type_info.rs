@@ -1,5 +1,5 @@
-use stellar_xdr::curr as stellar_xdr;
 use stellar_xdr::ScSpecTypeDef;
+use stellar_xdr::curr as stellar_xdr;
 
 /// Returns true if this type requires the Env to be passed
 pub fn type_needs_env(type_def: &ScSpecTypeDef) -> bool {

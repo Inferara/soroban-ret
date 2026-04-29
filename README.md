@@ -1,3 +1,6 @@
+[![Build](https://github.com/Inferara/soroban-ret/actions/workflows/build.yml/badge.svg)](https://github.com/Inferara/soroban-ret/actions/workflows/build.yml)
+[![codecov](https://codecov.io/gh/Inferara/soroban-ret/branch/main/graph/badge.svg?token=U1F2477BLC)](https://codecov.io/gh/Inferara/soroban-ret)
+
 # Reverse-engineering tool for Stellar Soroban smart contracts
 
 ## Status
