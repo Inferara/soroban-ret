@@ -1,0 +1,29 @@
+[package]
+name = "soroban-ret"
+description = "Stellar Soroban Smart Contracts Reverse Engineering Tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+soroban-spec = { workspace = true }
+soroban-meta = { workspace = true }
+stellar-xdr = { workspace = true }
+wasmparser = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+wasmprinter = { workspace = true, optional = true }
+
+[dev-dependencies]
+pretty_assertions = "1.2.1"
+insta = "1.40"
+proptest = "1.4"
+glob = "0.3"
+wat = "1"
+regex = "1"

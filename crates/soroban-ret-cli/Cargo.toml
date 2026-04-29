@@ -1,0 +1,22 @@
+[package]
+name = "soroban-ret-cli"
+description = "CLI for the Stellar Soroban Smart Contracts Reverse Engineering Tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "soroban-ret"
+path = "src/main.rs"
+
+[dependencies]
+soroban-ret = { workspace = true, features = ["wasmprinter"] }
+clap = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }

@@ -1,2 +1,1 @@
-# soroban-ret
-Soroban Reverse Engineering Tool
+# Stellar Soroban Smart Contracts Reverse Engineering Tool
