@@ -391,4 +391,277 @@ mod tests {
         assert_eq!(table.get_by_index(1).unwrap().name, "get_contract_data");
         assert_eq!(table.get_by_index(2).unwrap().name, "require_auth");
     }
+
+    #[test]
+    fn empty_table_helpers() {
+        let table = ImportTable::new();
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+        assert!(table.resolve(0).is_none());
+        assert!(table.get_by_index(0).is_none());
+
+        let default_table = ImportTable::default();
+        assert!(default_table.is_empty());
+    }
+
+    #[test]
+    fn unknown_module_letter_falls_back_to_unknown_module() {
+        let mut t = ImportTable::new();
+        t.add("z", "9", 7);
+        let entry = t.get_by_index(0).unwrap();
+        assert_eq!(entry.module, HostModule::Unknown);
+        assert_eq!(entry.name, "9"); // raw fn_code preserved
+        assert_eq!(entry.type_index, 7);
+        assert_eq!(entry.import_index, 0);
+    }
+
+    #[test]
+    fn resolve_host_function_returns_none_for_unknown_module_letter() {
+        assert!(resolve_host_function("Z", "_").is_none());
+        assert!(resolve_host_function("", "_").is_none());
+        assert!(resolve_host_function("foo", "_").is_none());
+    }
+
+    fn module_codes() -> &'static [(&'static str, HostModule)] {
+        &[
+            ("x", HostModule::Context),
+            ("i", HostModule::Int),
+            ("m", HostModule::Map),
+            ("v", HostModule::Vec),
+            ("l", HostModule::Ledger),
+            ("d", HostModule::Call),
+            ("b", HostModule::Buf),
+            ("c", HostModule::Crypto),
+            ("a", HostModule::Address),
+            ("p", HostModule::Prng),
+            ("t", HostModule::Test),
+        ]
+    }
+
+    #[test]
+    fn unknown_fn_code_within_known_module_returns_none() {
+        // "~" is not a valid fn_code in any host module — every module should
+        // refuse to resolve it.
+        for (letter, _) in module_codes() {
+            assert!(
+                resolve_host_function(letter, "~").is_none(),
+                "expected None for module {letter} fn ~"
+            );
+        }
+    }
+
+    /// Exhaustive table of every (module, fn_code, expected_name) pair Soroban
+    /// emits. This drives every match arm in `resolve_*` to be hit at least
+    /// once for coverage.
+    fn full_dispatch_table() -> Vec<(&'static str, &'static str, HostModule, &'static str)> {
+        use HostModule::*;
+        vec![
+            // Context
+            ("x", "_", Context, "log_from_linear_memory"),
+            ("x", "0", Context, "obj_cmp"),
+            ("x", "1", Context, "contract_event"),
+            ("x", "2", Context, "get_ledger_version"),
+            ("x", "3", Context, "get_ledger_sequence"),
+            ("x", "4", Context, "get_ledger_timestamp"),
+            ("x", "5", Context, "fail_with_error"),
+            ("x", "6", Context, "get_ledger_network_id"),
+            ("x", "7", Context, "get_current_contract_address"),
+            ("x", "8", Context, "get_max_live_until_ledger"),
+            // Int
+            ("i", "_", Int, "obj_from_u64"),
+            ("i", "0", Int, "obj_to_u64"),
+            ("i", "1", Int, "obj_from_i64"),
+            ("i", "2", Int, "obj_to_i64"),
+            ("i", "3", Int, "obj_from_u128_pieces"),
+            ("i", "4", Int, "obj_to_u128_lo64"),
+            ("i", "5", Int, "obj_to_u128_hi64"),
+            ("i", "6", Int, "obj_from_i128_pieces"),
+            ("i", "7", Int, "obj_to_i128_lo64"),
+            ("i", "8", Int, "obj_to_i128_hi64"),
+            ("i", "9", Int, "obj_from_u256_pieces"),
+            ("i", "a", Int, "u256_val_from_be_bytes"),
+            ("i", "b", Int, "u256_val_to_be_bytes"),
+            ("i", "c", Int, "obj_to_u256_hi_hi"),
+            ("i", "d", Int, "obj_to_u256_hi_lo"),
+            ("i", "e", Int, "obj_to_u256_lo_hi"),
+            ("i", "f", Int, "obj_to_u256_lo_lo"),
+            ("i", "g", Int, "obj_from_i256_pieces"),
+            ("i", "h", Int, "i256_val_from_be_bytes"),
+            ("i", "i", Int, "i256_val_to_be_bytes"),
+            ("i", "j", Int, "obj_to_i256_hi_hi"),
+            ("i", "k", Int, "obj_to_i256_hi_lo"),
+            ("i", "l", Int, "obj_to_i256_lo_hi"),
+            ("i", "m", Int, "obj_to_i256_lo_lo"),
+            ("i", "n", Int, "u256_add"),
+            ("i", "o", Int, "u256_sub"),
+            ("i", "p", Int, "u256_mul"),
+            ("i", "q", Int, "u256_div"),
+            ("i", "r", Int, "u256_rem_euclid"),
+            ("i", "s", Int, "u256_pow"),
+            ("i", "t", Int, "u256_shl"),
+            ("i", "u", Int, "u256_shr"),
+            ("i", "v", Int, "i256_add"),
+            ("i", "w", Int, "i256_sub"),
+            ("i", "x", Int, "i256_mul"),
+            ("i", "y", Int, "i256_div"),
+            ("i", "z", Int, "i256_rem_euclid"),
+            ("i", "A", Int, "i256_pow"),
+            ("i", "B", Int, "i256_shl"),
+            ("i", "C", Int, "i256_shr"),
+            ("i", "D", Int, "timepoint_obj_from_u64"),
+            ("i", "E", Int, "timepoint_obj_to_u64"),
+            ("i", "F", Int, "duration_obj_from_u64"),
+            ("i", "G", Int, "duration_obj_to_u64"),
+            // Map
+            ("m", "_", Map, "map_new"),
+            ("m", "0", Map, "map_put"),
+            ("m", "1", Map, "map_get"),
+            ("m", "2", Map, "map_del"),
+            ("m", "3", Map, "map_len"),
+            ("m", "4", Map, "map_has"),
+            ("m", "5", Map, "map_key_by_pos"),
+            ("m", "6", Map, "map_val_by_pos"),
+            ("m", "7", Map, "map_keys"),
+            ("m", "8", Map, "map_values"),
+            ("m", "9", Map, "map_new_from_linear_memory"),
+            ("m", "a", Map, "map_unpack_to_linear_memory"),
+            // Vec
+            ("v", "_", Vec, "vec_new"),
+            ("v", "0", Vec, "vec_put"),
+            ("v", "1", Vec, "vec_get"),
+            ("v", "2", Vec, "vec_del"),
+            ("v", "3", Vec, "vec_len"),
+            ("v", "4", Vec, "vec_push_front"),
+            ("v", "5", Vec, "vec_pop_front"),
+            ("v", "6", Vec, "vec_push_back"),
+            ("v", "7", Vec, "vec_pop_back"),
+            ("v", "8", Vec, "vec_front"),
+            ("v", "9", Vec, "vec_back"),
+            ("v", "a", Vec, "vec_insert"),
+            ("v", "b", Vec, "vec_append"),
+            ("v", "c", Vec, "vec_slice"),
+            ("v", "d", Vec, "vec_first_index_of"),
+            ("v", "e", Vec, "vec_last_index_of"),
+            ("v", "f", Vec, "vec_binary_search"),
+            ("v", "g", Vec, "vec_new_from_linear_memory"),
+            ("v", "h", Vec, "vec_unpack_to_linear_memory"),
+            // Ledger
+            ("l", "_", Ledger, "put_contract_data"),
+            ("l", "0", Ledger, "has_contract_data"),
+            ("l", "1", Ledger, "get_contract_data"),
+            ("l", "2", Ledger, "del_contract_data"),
+            ("l", "3", Ledger, "create_contract"),
+            ("l", "4", Ledger, "create_asset_contract"),
+            ("l", "5", Ledger, "upload_wasm"),
+            ("l", "6", Ledger, "update_current_contract_wasm"),
+            ("l", "7", Ledger, "extend_contract_data_ttl"),
+            (
+                "l",
+                "8",
+                Ledger,
+                "extend_current_contract_instance_and_code_ttl",
+            ),
+            ("l", "9", Ledger, "extend_contract_instance_and_code_ttl"),
+            ("l", "a", Ledger, "get_contract_id"),
+            ("l", "b", Ledger, "get_asset_contract_id"),
+            ("l", "c", Ledger, "extend_contract_instance_ttl"),
+            ("l", "d", Ledger, "extend_contract_code_ttl"),
+            ("l", "e", Ledger, "create_contract_with_constructor"),
+            // Call
+            ("d", "_", Call, "call"),
+            ("d", "0", Call, "try_call"),
+            // Buf
+            ("b", "_", Buf, "serialize_to_bytes"),
+            ("b", "0", Buf, "deserialize_from_bytes"),
+            ("b", "1", Buf, "bytes_copy_to_linear_memory"),
+            ("b", "2", Buf, "bytes_copy_from_linear_memory"),
+            ("b", "3", Buf, "bytes_new_from_linear_memory"),
+            ("b", "4", Buf, "bytes_new"),
+            ("b", "5", Buf, "bytes_put"),
+            ("b", "6", Buf, "bytes_get"),
+            ("b", "7", Buf, "bytes_del"),
+            ("b", "8", Buf, "bytes_len"),
+            ("b", "9", Buf, "bytes_push"),
+            ("b", "a", Buf, "bytes_pop"),
+            ("b", "b", Buf, "bytes_front"),
+            ("b", "c", Buf, "bytes_back"),
+            ("b", "d", Buf, "bytes_insert"),
+            ("b", "e", Buf, "bytes_append"),
+            ("b", "f", Buf, "bytes_slice"),
+            ("b", "g", Buf, "string_copy_to_linear_memory"),
+            ("b", "h", Buf, "symbol_copy_to_linear_memory"),
+            ("b", "i", Buf, "string_new_from_linear_memory"),
+            ("b", "j", Buf, "symbol_new_from_linear_memory"),
+            ("b", "k", Buf, "string_len"),
+            ("b", "l", Buf, "symbol_len"),
+            ("b", "m", Buf, "symbol_index_in_linear_memory"),
+            ("b", "n", Buf, "string_to_bytes"),
+            ("b", "o", Buf, "bytes_to_string"),
+            // Crypto
+            ("c", "_", Crypto, "compute_hash_sha256"),
+            ("c", "0", Crypto, "verify_sig_ed25519"),
+            ("c", "1", Crypto, "compute_hash_keccak256"),
+            ("c", "2", Crypto, "recover_key_ecdsa_secp256k1"),
+            ("c", "3", Crypto, "verify_sig_ecdsa_secp256r1"),
+            ("c", "4", Crypto, "bls12_381_check_g1_is_in_subgroup"),
+            ("c", "5", Crypto, "bls12_381_g1_add"),
+            ("c", "6", Crypto, "bls12_381_g1_mul"),
+            ("c", "7", Crypto, "bls12_381_g1_msm"),
+            ("c", "8", Crypto, "bls12_381_map_fp_to_g1"),
+            ("c", "9", Crypto, "bls12_381_hash_to_g1"),
+            ("c", "a", Crypto, "bls12_381_check_g2_is_in_subgroup"),
+            ("c", "b", Crypto, "bls12_381_g2_add"),
+            ("c", "c", Crypto, "bls12_381_g2_mul"),
+            ("c", "d", Crypto, "bls12_381_g2_msm"),
+            ("c", "e", Crypto, "bls12_381_map_fp2_to_g2"),
+            ("c", "f", Crypto, "bls12_381_hash_to_g2"),
+            ("c", "g", Crypto, "bls12_381_multi_pairing_check"),
+            ("c", "h", Crypto, "bls12_381_fr_add"),
+            ("c", "i", Crypto, "bls12_381_fr_sub"),
+            ("c", "j", Crypto, "bls12_381_fr_mul"),
+            ("c", "k", Crypto, "bls12_381_fr_pow"),
+            ("c", "l", Crypto, "bls12_381_fr_inv"),
+            ("c", "m", Crypto, "bn254_g1_add"),
+            ("c", "n", Crypto, "bn254_g1_mul"),
+            ("c", "o", Crypto, "bn254_multi_pairing_check"),
+            // Address
+            ("a", "_", Address, "require_auth_for_args"),
+            ("a", "0", Address, "require_auth"),
+            ("a", "1", Address, "strkey_to_address"),
+            ("a", "2", Address, "address_to_strkey"),
+            ("a", "3", Address, "authorize_as_curr_contract"),
+            ("a", "4", Address, "get_address_from_muxed_address"),
+            ("a", "5", Address, "get_id_from_muxed_address"),
+            ("a", "6", Address, "get_address_executable"),
+            // Prng
+            ("p", "_", Prng, "prng_reseed"),
+            ("p", "0", Prng, "prng_bytes_new"),
+            ("p", "1", Prng, "prng_u64_in_inclusive_range"),
+            ("p", "2", Prng, "prng_vec_shuffle"),
+            // Test
+            ("t", "_", Test, "dummy0"),
+            ("t", "0", Test, "protocol_gated_dummy"),
+        ]
+    }
+
+    #[test]
+    fn full_dispatch_table_resolves_every_known_pair() {
+        for (letter, code, expected_module, expected_name) in full_dispatch_table() {
+            let resolved = resolve_host_function(letter, code)
+                .unwrap_or_else(|| panic!("no resolution for ({letter}, {code})"));
+            assert_eq!(resolved.0, expected_module, "module for ({letter}, {code})");
+            assert_eq!(resolved.1, expected_name, "name for ({letter}, {code})");
+        }
+    }
+
+    #[test]
+    fn import_table_resolve_finds_entry_by_index() {
+        let mut t = ImportTable::new();
+        t.add("c", "_", 5);
+        t.add("c", "0", 6);
+        let entry = t.resolve(1).expect("entry at import_index 1");
+        assert_eq!(entry.name, "verify_sig_ed25519");
+        assert_eq!(entry.type_index, 6);
+        assert!(t.resolve(99).is_none());
+    }
 }

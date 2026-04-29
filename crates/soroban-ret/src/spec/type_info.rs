@@ -64,3 +64,111 @@ pub fn storage_type_name(discriminant: u64) -> &'static str {
         _ => "unknown",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ScSpecTypeDef, function_takes_env, is_primitive, is_udt, storage_type_name, type_needs_env,
+        udt_name,
+    };
+    use ::stellar_xdr::curr::{
+        ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeBytesN, ScSpecTypeMap, ScSpecTypeUdt,
+        ScSpecTypeVec,
+    };
+
+    fn udt(name: &str) -> ScSpecTypeDef {
+        ScSpecTypeDef::Udt(ScSpecTypeUdt {
+            name: name.try_into().unwrap(),
+        })
+    }
+
+    #[test]
+    fn type_needs_env_compound_types() {
+        let elem = ScSpecTypeDef::U32;
+        assert!(type_needs_env(&ScSpecTypeDef::Vec(Box::new(
+            ScSpecTypeVec {
+                element_type: Box::new(elem.clone()),
+            }
+        ))));
+        assert!(type_needs_env(&ScSpecTypeDef::Map(Box::new(
+            ScSpecTypeMap {
+                key_type: Box::new(elem.clone()),
+                value_type: Box::new(elem.clone()),
+            }
+        ))));
+        assert!(type_needs_env(&ScSpecTypeDef::Bytes));
+        assert!(type_needs_env(&ScSpecTypeDef::BytesN(ScSpecTypeBytesN {
+            n: 32
+        })));
+        assert!(type_needs_env(&ScSpecTypeDef::String));
+        assert!(type_needs_env(&ScSpecTypeDef::Symbol));
+        assert!(type_needs_env(&ScSpecTypeDef::Address));
+        assert!(type_needs_env(&ScSpecTypeDef::MuxedAddress));
+    }
+
+    #[test]
+    fn type_needs_env_primitives_do_not() {
+        for t in [
+            ScSpecTypeDef::U32,
+            ScSpecTypeDef::I32,
+            ScSpecTypeDef::U64,
+            ScSpecTypeDef::I64,
+            ScSpecTypeDef::U128,
+            ScSpecTypeDef::I128,
+            ScSpecTypeDef::Bool,
+            ScSpecTypeDef::Void,
+        ] {
+            assert!(!type_needs_env(&t), "primitive should not need env: {t:?}");
+        }
+    }
+
+    #[test]
+    fn primitives_classified_correctly() {
+        for t in [
+            ScSpecTypeDef::U32,
+            ScSpecTypeDef::I32,
+            ScSpecTypeDef::U64,
+            ScSpecTypeDef::I64,
+            ScSpecTypeDef::U128,
+            ScSpecTypeDef::I128,
+            ScSpecTypeDef::Bool,
+            ScSpecTypeDef::Void,
+        ] {
+            assert!(is_primitive(&t), "should be primitive: {t:?}");
+        }
+        assert!(!is_primitive(&ScSpecTypeDef::Bytes));
+        assert!(!is_primitive(&ScSpecTypeDef::Address));
+        assert!(!is_primitive(&udt("Foo")));
+    }
+
+    #[test]
+    fn udt_detection_and_name() {
+        let foo = udt("Foo");
+        assert!(is_udt(&foo));
+        assert_eq!(udt_name(&foo).as_deref(), Some("Foo"));
+
+        assert!(!is_udt(&ScSpecTypeDef::U32));
+        assert_eq!(udt_name(&ScSpecTypeDef::U32), None);
+        assert_eq!(udt_name(&ScSpecTypeDef::Bytes), None);
+    }
+
+    #[test]
+    fn function_takes_env_is_always_true() {
+        let f = ScSpecFunctionV0 {
+            doc: "".try_into().unwrap(),
+            name: "any".try_into().unwrap(),
+            inputs: Vec::<ScSpecFunctionInputV0>::new().try_into().unwrap(),
+            outputs: Vec::<ScSpecTypeDef>::new().try_into().unwrap(),
+        };
+        assert!(function_takes_env(&f));
+    }
+
+    #[test]
+    fn storage_type_name_maps_all_known_discriminants() {
+        assert_eq!(storage_type_name(0), "temporary");
+        assert_eq!(storage_type_name(1), "persistent");
+        assert_eq!(storage_type_name(2), "instance");
+        assert_eq!(storage_type_name(3), "unknown");
+        assert_eq!(storage_type_name(99), "unknown");
+    }
+}
