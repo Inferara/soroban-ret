@@ -35,6 +35,15 @@ Output is a one-line summary of the parsed module, e.g.:
 ```
 Functions: 13, Types: 4, Imports: 27
 ```
+> [!NOTE]
+> The output is organized in the following manner
+> - Functions: 13 = Soroban contract spec functions from contractspecv0
+> - Types: 4 = Soroban user-defined spec types: structs + unions + enums
+> - Imports: 27 = actual WASM function imports
+>## 
+> ### It does not mean:
+> - raw WASM function-section count
+> - raw WASM type-section count
 
 The CLI currently takes only the input WASM path. Flags for source-file output, spec-only emission, and verbose logging will be added once the corresponding pipeline stages land.
 
