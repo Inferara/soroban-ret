@@ -37,9 +37,9 @@ Functions: 13, Types: 4, Imports: 27
 ```
 > [!NOTE]
 > The output is organized in the following manner
-> - Functions: 13 = Soroban contract spec functions from contractspecv0
-> - Types: 4 = Soroban user-defined spec types: structs + unions + enums
-> - Imports: 27 = actual WASM function imports
+> - Functions: $N$ = Soroban contract spec functions from contractspecv0
+> - Types: $N$ = Soroban user-defined spec types: structs + unions + enums
+> - Imports: $N$ = actual WASM function imports
 >## 
 > ### It does not mean:
 > - raw WASM function-section count
