@@ -16,5 +16,6 @@ name = "soroban-ret"
 path = "src/main.rs"
 
 [dependencies]
-soroban-ret = { workspace = true, features = ["wasmprinter"] }
+soroban-ret = { workspace = true }
 clap = { workspace = true }
+env_logger = { workspace = true }
