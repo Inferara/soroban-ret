@@ -4,7 +4,7 @@ use stellar_xdr::curr::ScSpecTypeDef;
 
 use super::functions::{
     generate_stmt, generate_stmt_result_wrapped, generate_stmts_with_tail,
-    generate_stmts_with_tail_result_wrapped,
+    generate_stmts_with_tail_result_wrapped, safe_ident,
 };
 use super::imports::{compute_extra_imports, compute_imports};
 use crate::ir::high_level_ir::{ContractFn, ContractModule, CryptoUsage};
@@ -39,7 +39,7 @@ pub fn assemble_module(module: &ContractModule, registry: &TypeRegistry) -> Toke
         .collect();
 
     // Contract struct
-    let contract_name = format_ident!("{}", module.contract_struct);
+    let contract_name = safe_ident(&module.contract_struct);
 
     // Determine contract's error enum name for Result return types
     let error_enum_name: Option<String> = if module.error_enums.len() == 1 {
@@ -108,14 +108,14 @@ fn generic_wasm_return_type(results: &[WasmType]) -> Option<TokenStream> {
 }
 
 fn generate_generic_fn(func: &ContractFn) -> TokenStream {
-    let fn_name = format_ident!("{}", func.name);
+    let fn_name = safe_ident(&func.name);
 
     // Build parameter list from wasm_signature if available
     let mut params = Vec::new();
     if let Some(ref sig) = func.wasm_signature {
         for (i, wt) in sig.params.iter().enumerate() {
             let p_name = if let Some(p) = func.params.get(i) {
-                format_ident!("{}", p.name)
+                safe_ident(&p.name)
             } else {
                 format_ident!("arg{}", i)
             };
@@ -124,7 +124,7 @@ fn generate_generic_fn(func: &ContractFn) -> TokenStream {
         }
     } else {
         for param in &func.params {
-            let p_name = format_ident!("{}", param.name);
+            let p_name = safe_ident(&param.name);
             let p_type = super::types::generate_type_ident(&param.type_def);
             params.push(quote! { #p_name: #p_type });
         }
@@ -174,7 +174,7 @@ fn generate_contract_fn(
     } else if func.is_check_auth {
         format_ident!("__check_auth")
     } else {
-        format_ident!("{}", func.name)
+        safe_ident(&func.name)
     };
 
     // Build parameter list
@@ -183,7 +183,16 @@ fn generate_contract_fn(
         params.push(quote! { env: Env });
     }
     for param in &func.params {
-        let p_name = format_ident!("{}", param.name);
+        // If a user param is literally named `env` and we also inject the
+        // `env: Env` host parameter, the user param shadows the injected one
+        // and breaks hard-coded `&env` / `env.storage()` call sites in the
+        // body. Rename the colliding user param to `env_`.
+        let resolved_name: &str = if func.takes_env && param.name == "env" {
+            "env_"
+        } else {
+            &param.name
+        };
+        let p_name = safe_ident(resolved_name);
         let p_type = if crypto.has_any() {
             super::types::generate_type_ident_crypto(&param.type_def, crypto, Some(&param.name))
         } else {
@@ -210,7 +219,7 @@ fn generate_contract_fn(
             if matches!(&*r.error_type, ScSpecTypeDef::Error)
                 && let Some(ename) = error_enum_name
             {
-                let err = format_ident!("{}", ename);
+                let err = safe_ident(ename);
                 return Some(quote! { -> Result<#ok, #err> });
             }
             let err = gen_type(&r.error_type);
@@ -291,14 +300,17 @@ pub fn format_source(tokens: &TokenStream) -> Result<String, syn::Error> {
     // expressions in parens for safety, but prettyplease will re-add parens
     // only where truly needed for precedence/associativity.
     strip_unnecessary_parens(&mut file);
+    // Strip `(topics = [...])` from `#[contractevent(...)]` attributes —
+    // the Soroban SDK derives the event name from the struct name. Done at
+    // the AST level so the rewrite cannot mangle string literals or comments.
+    strip_contractevent_topics_ast(&mut file);
     let source = prettyplease::unparse(&file);
-    // prettyplease inserts a space between `&` and `env` inside macro invocations
-    // (e.g. `panic_with_error!(& env, ...)`) because they are separate tokens.
-    // Fix this by collapsing `& env` back to `&env`.
-    let source = source.replace("& env,", "&env,").replace("& env)", "&env)");
-    // Strip contractevent topics parameter — Soroban SDK derives event name from struct name,
-    // so `#[contractevent(topics = ["transfer"])]` is redundant; emit `#[contractevent]`.
-    let source = strip_contractevent_topics(&source);
+    // prettyplease inserts a space between `&` and `env` inside macro
+    // invocations (e.g. `panic_with_error!(& env, ...)`) because they are
+    // separate tokens. Collapse `& env` back to `&env`, but only outside
+    // string literals so contents like `"& env, foo"` are preserved.
+    let source = replace_outside_strings(&source, "& env,", "&env,");
+    let source = replace_outside_strings(&source, "& env)", "&env)");
     // Collapse single-type turbofish that prettyplease splits across lines, e.g.:
     //   invoke_contract::<\n            u64,\n        >(  →  invoke_contract::<u64>(
     let mut source = collapse_single_turbofish(&source);
@@ -310,6 +322,206 @@ pub fn format_source(tokens: &TokenStream) -> Result<String, syn::Error> {
     // prettyplease output if rustfmt is unavailable or fails.
     source = try_rustfmt(&source).unwrap_or(source);
     Ok(source)
+}
+
+/// Walk an `&str` and apply a `find → replace` substitution, but only when
+/// the match site lies outside a Rust string or character literal. Used by
+/// post-format passes that would otherwise risk corrupting contract code
+/// containing the same substring inside a literal.
+fn replace_outside_strings(source: &str, find: &str, replace_with: &str) -> String {
+    if find.is_empty() {
+        return source.to_string();
+    }
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    // States: Normal, InString, InChar, InRawString { hashes }, LineComment, BlockComment { depth }
+    enum St {
+        Normal,
+        String,
+        Char,
+        Raw(usize),
+        LineComment,
+        BlockComment(u32),
+    }
+    let mut st = St::Normal;
+    while i < bytes.len() {
+        match st {
+            St::Normal => {
+                // Detect start of literal/comment context.
+                let b = bytes[i];
+                // Raw string: r"...", r#"..."#, r##"..."##
+                if b == b'r'
+                    && (i + 1 < bytes.len() && (bytes[i + 1] == b'"' || bytes[i + 1] == b'#'))
+                {
+                    let mut j = i + 1;
+                    let mut hashes = 0;
+                    while j < bytes.len() && bytes[j] == b'#' {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b'"' {
+                        out.push_str(&source[i..=j]);
+                        i = j + 1;
+                        st = St::Raw(hashes);
+                        continue;
+                    }
+                }
+                if b == b'"' {
+                    out.push('"');
+                    i += 1;
+                    st = St::String;
+                    continue;
+                }
+                if b == b'\'' {
+                    out.push('\'');
+                    i += 1;
+                    st = St::Char;
+                    continue;
+                }
+                if b == b'/' && i + 1 < bytes.len() {
+                    if bytes[i + 1] == b'/' {
+                        out.push_str("//");
+                        i += 2;
+                        st = St::LineComment;
+                        continue;
+                    }
+                    if bytes[i + 1] == b'*' {
+                        out.push_str("/*");
+                        i += 2;
+                        st = St::BlockComment(1);
+                        continue;
+                    }
+                }
+                if source[i..].starts_with(find) {
+                    out.push_str(replace_with);
+                    i += find.len();
+                    continue;
+                }
+                out.push(b as char);
+                i += 1;
+            }
+            St::String => {
+                let b = bytes[i];
+                out.push(b as char);
+                i += 1;
+                if b == b'\\' && i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                } else if b == b'"' {
+                    st = St::Normal;
+                }
+            }
+            St::Char => {
+                let b = bytes[i];
+                out.push(b as char);
+                i += 1;
+                if b == b'\\' && i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                } else if b == b'\'' {
+                    st = St::Normal;
+                }
+            }
+            St::Raw(hashes) => {
+                if bytes[i] == b'"' {
+                    let needed = hashes;
+                    let mut ok = true;
+                    for k in 1..=needed {
+                        if i + k >= bytes.len() || bytes[i + k] != b'#' {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        out.push_str(&source[i..=i + needed]);
+                        i += needed + 1;
+                        st = St::Normal;
+                        continue;
+                    }
+                }
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            St::LineComment => {
+                let b = bytes[i];
+                out.push(b as char);
+                i += 1;
+                if b == b'\n' {
+                    st = St::Normal;
+                }
+            }
+            St::BlockComment(depth) => {
+                if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    out.push_str("*/");
+                    i += 2;
+                    st = if depth == 1 {
+                        St::Normal
+                    } else {
+                        St::BlockComment(depth - 1)
+                    };
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    out.push_str("/*");
+                    i += 2;
+                    st = St::BlockComment(depth + 1);
+                    continue;
+                }
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Strip the `topics = [...]` parameter from `#[contractevent(...)]`
+/// attributes at the AST level — the Soroban SDK derives the event name
+/// from the struct name, so the explicit topics list emitted by
+/// `soroban-spec-rust` is redundant. Operating on the parsed `syn::File`
+/// avoids any risk of corrupting string literals or comments that happen
+/// to contain the same substring.
+fn strip_contractevent_topics_ast(file: &mut syn::File) {
+    use syn::visit_mut::VisitMut;
+    struct V;
+    impl VisitMut for V {
+        fn visit_attribute_mut(&mut self, attr: &mut syn::Attribute) {
+            if attr.path().is_ident("contractevent")
+                && let syn::Meta::List(list) = &attr.meta
+            {
+                // Collapse `#[contractevent(topics = [...])]` to bare
+                // `#[contractevent]`. We do this only when the attribute
+                // contains *only* a `topics = ...` clause; if other future
+                // parameters appear we preserve them.
+                let only_has_topics = syn::parse2::<TopicsOnly>(list.tokens.clone()).is_ok();
+                if only_has_topics {
+                    let path = list.path.clone();
+                    attr.meta = syn::Meta::Path(path);
+                }
+            }
+            syn::visit_mut::visit_attribute_mut(self, attr);
+        }
+    }
+
+    // Helper parse target: matches `topics = [...]` exactly.
+    struct TopicsOnly;
+    impl syn::parse::Parse for TopicsOnly {
+        fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+            let ident: syn::Ident = input.parse()?;
+            if ident != "topics" {
+                return Err(input.error("expected `topics`"));
+            }
+            let _: syn::Token![=] = input.parse()?;
+            let _: syn::ExprArray = input.parse()?;
+            if !input.is_empty() {
+                return Err(input.error("unexpected trailing tokens"));
+            }
+            Ok(TopicsOnly)
+        }
+    }
+
+    V.visit_file_mut(file);
 }
 
 /// Try to format source code with rustfmt. Returns None if rustfmt is
@@ -452,24 +664,6 @@ fn strip_parens_expr(expr: &mut syn::Expr) {
     if let syn::Expr::Paren(paren) = expr {
         *expr = *paren.expr.clone();
     }
-}
-
-/// Strip `(topics = [...])` from `#[contractevent(...)]` attributes.
-/// The Soroban SDK derives the event name from the struct name, so the
-/// explicit topics parameter from soroban-spec-rust is redundant.
-fn strip_contractevent_topics(source: &str) -> String {
-    let pattern = "contractevent(topics = [";
-    let mut result = source.to_string();
-    while let Some(start) = result.find(pattern) {
-        let search_from = start + pattern.len();
-        if let Some(close_rel) = result[search_from..].find("])") {
-            let end = search_from + close_rel + 2; // skip past `])`
-            result = format!("{}contractevent{}", &result[..start], &result[end..]);
-        } else {
-            break;
-        }
-    }
-    result
 }
 
 /// Collapse single-type turbofish that `prettyplease` splits across 3 lines:
@@ -655,6 +849,57 @@ mod tests {
         let bad: proc_macro2::TokenStream = quote! { : ; };
         let result = format_source(&bad);
         assert!(result.is_err(), "expected error from format_source");
+    }
+
+    #[test]
+    fn replace_outside_strings_skips_string_literal_contents() {
+        // The naive replace would corrupt this string literal; the literal-aware
+        // version must leave it untouched.
+        let src = r#"fn x() { let _ = "& env, foo"; let y = &env, bar; }"#;
+        let out = super::replace_outside_strings(src, "& env,", "&env,");
+        // The literal must contain `& env,` verbatim still.
+        assert!(out.contains(r#""& env, foo""#), "got: {out}");
+        // The non-string occurrence (`= &env, bar`) was already &env-spaced
+        // in the source; no replacement was needed there. Verify the literal
+        // wasn't merged, by checking the count of the literal-text substring.
+        assert_eq!(out.matches("& env,").count(), 1, "got: {out}");
+    }
+
+    #[test]
+    fn replace_outside_strings_handles_raw_strings_and_comments() {
+        let src = r##"// comment with & env,
+        fn x() {
+            let _ = r#"raw & env, raw"#;
+            let _ = r"plain & env, plain";
+            // & env, in line comment
+            /* & env, in block comment */
+        }
+        macro_invocation!(& env, body);
+        "##;
+        let out = super::replace_outside_strings(src, "& env,", "&env,");
+        // Line + block comments and raw strings preserve `& env,`.
+        assert!(out.contains("// comment with & env,"), "got: {out}");
+        assert!(out.contains(r#""raw & env, raw""#), "got: {out}");
+        assert!(out.contains(r#""plain & env, plain""#), "got: {out}");
+        assert!(out.contains("// & env, in line comment"), "got: {out}");
+        assert!(out.contains("/* & env, in block comment */"), "got: {out}");
+        // The macro_invocation match is in normal code, so it gets replaced.
+        assert!(out.contains("macro_invocation!(&env, body)"), "got: {out}");
+    }
+
+    #[test]
+    fn strip_contractevent_topics_ast_collapses_to_bare_attr() {
+        // Synthesize a minimal file with a #[contractevent(topics = ["transfer"])]
+        // attribute and verify the AST pass collapses it to #[contractevent].
+        let src: proc_macro2::TokenStream = quote! {
+            #[contractevent(topics = ["transfer"])]
+            pub struct Transfer { pub amount: i128 }
+        };
+        let mut file: syn::File = syn::parse2(quote! { #src }).unwrap();
+        super::strip_contractevent_topics_ast(&mut file);
+        let out = prettyplease::unparse(&file);
+        assert!(out.contains("#[contractevent]"), "got: {out}");
+        assert!(!out.contains("topics"), "got: {out}");
     }
 
     #[test]

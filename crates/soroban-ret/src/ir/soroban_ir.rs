@@ -11,6 +11,7 @@ pub enum SorobanExpr {
     BoolLiteral(bool),
     SymbolLiteral(String),
     StringLiteral(String),
+    BytesLiteral(Vec<u8>),
     Void,
     /// Rust `None` for Option-typed fields where the decompiled value is Void/unknown.
     None,

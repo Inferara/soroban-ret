@@ -14,8 +14,9 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Only output type definitions and function signatures (no bodies)
-    #[arg(long)]
+    /// Only output type definitions and function signatures (no bodies).
+    /// Incompatible with --info (which short-circuits before this would apply).
+    #[arg(long, conflicts_with = "info")]
     spec_only: bool,
 
     /// Pre-optimize WASM with wasm-opt (binaryen) before decompiling.
@@ -27,8 +28,9 @@ struct Cli {
     #[arg(long)]
     info: bool,
 
-    /// Force generic WASM decompilation mode (no Soroban assumptions)
-    #[arg(long)]
+    /// Force generic WASM decompilation mode (no Soroban assumptions).
+    /// Incompatible with --info (which always runs in Auto mode).
+    #[arg(long, conflicts_with = "info")]
     generic: bool,
 
     /// Enable verbose logging

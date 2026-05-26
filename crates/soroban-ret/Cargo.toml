@@ -27,9 +27,5 @@ cov-mark = { workspace = true }
 wasmprinter = { workspace = true, optional = true }
 
 [dev-dependencies]
-pretty_assertions = "1.2.1"
 insta = "1.40"
-proptest = "1.4"
-glob = "0.3"
 wat = "1"
-regex = "1"

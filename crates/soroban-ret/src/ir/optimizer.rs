@@ -4,12 +4,46 @@ use super::soroban_ir::{MatchArm, MatchPattern, SorobanExpr, SorobanStmt, Storag
 /// Used as a fallback when the standard optimization empties a function body
 /// that originally had host calls — produces visible output instead of todo!().
 pub fn optimize_stmts_preserve_host_calls(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
-    optimize_stmts_inner(stmts, true)
+    optimize_stmts_to_fixpoint(stmts, true)
 }
 
 /// Optimize a list of statements
 pub fn optimize_stmts(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
-    optimize_stmts_inner(stmts, false)
+    optimize_stmts_to_fixpoint(stmts, false)
+}
+
+/// Defensive fixed-point wrapper around `optimize_stmts_inner`.
+///
+/// The inner pipeline contains intentional manual unrolling of several passes
+/// (`fold_has_get_pattern` ×2, `collapse_trivial_loops` ×3, `remove_empty_matches`
+/// ×2) tuned for the common case. This wrapper re-runs the pipeline if a full
+/// pass produced new output, catching cases where adding a future pass exposes
+/// fresh work for an earlier pass that the manual unrolling didn't anticipate.
+///
+/// Cap at 4 iterations: in practice convergence is reached in 1 (the manual
+/// unrolling already handles the common case). A debug_assert fires if the
+/// cap is hit, surfacing a regression to anyone touching the pass order.
+fn optimize_stmts_to_fixpoint(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<SorobanStmt> {
+    const MAX_ITERATIONS: usize = 4;
+    let mut current = optimize_stmts_inner(stmts, preserve_orphans);
+    for iteration in 1..MAX_ITERATIONS {
+        let prev_repr = format!("{:?}", &current);
+        let next = optimize_stmts_inner(current.clone(), preserve_orphans);
+        let next_repr = format!("{:?}", &next);
+        if prev_repr == next_repr {
+            log::trace!(
+                "Optimizer reached fixpoint after {} extra iteration(s)",
+                iteration - 1
+            );
+            return next;
+        }
+        current = next;
+    }
+    debug_assert!(
+        false,
+        "optimizer did not converge in {MAX_ITERATIONS} iterations — pass ordering may need review",
+    );
+    current
 }
 
 fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<SorobanStmt> {
@@ -654,20 +688,24 @@ fn collapse_trivial_loops(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                     cov_mark::hit!(trivial_loop_collapsed);
                     continue;
                 }
-                // `loop { if cond { break; } }` → remove entirely.
-                // The condition depends on runtime values that can't change
-                // inside the loop (no assignments), so it either always
-                // breaks (no-op) or never breaks (infinite). This is a
-                // decompiler artifact from losing the loop's real body.
-                if matches!(
-                    body.as_slice(),
-                    [SorobanStmt::If {
+                // `loop { if cond { break; } }` → remove entirely, but only
+                // when the condition has no side effects. If the condition
+                // triggers a host call (storage read, invoke_contract, etc.)
+                // the call itself is observable, and even though Soroban is
+                // single-threaded and the condition's *value* can't change
+                // between iterations, dropping the loop drops the call. Keep
+                // the loop in that case.
+                if let [
+                    SorobanStmt::If {
+                        condition,
                         then_body,
                         else_body,
-                        ..
-                    }] if matches!(then_body.as_slice(), [SorobanStmt::Break])
-                         && else_body.is_empty()
-                ) {
+                    },
+                ] = body.as_slice()
+                    && matches!(then_body.as_slice(), [SorobanStmt::Break])
+                    && else_body.is_empty()
+                    && !expr_has_side_effects(condition)
+                {
                     cov_mark::hit!(trivial_loop_collapsed);
                     continue;
                 }
@@ -908,15 +946,20 @@ fn remove_empty_matches(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
 // Remove orphan host calls / unknown values
 // ---------------------------------------------------------------------------
 
-/// Remove standalone `RawHostCall` and `UnknownVal` statements.
+/// Remove standalone `UnknownVal` and discarded-accessor statements.
+///
 /// These are intermediate computation results whose return values were lost
 /// during lifting. As standalone statements they are artifacts, not real code.
+///
+/// `RawHostCall` is intentionally **kept** here: the sibling predicate
+/// `expr_has_side_effects` classifies raw host calls as side-effectful, and
+/// silently dropping them would delete real semantically-meaningful calls the
+/// lifter failed to recognise. The two predicates must agree.
 fn remove_orphan_host_calls(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     let mut result = Vec::new();
     for stmt in stmts {
         match stmt {
-            SorobanStmt::Expr(SorobanExpr::RawHostCall { .. })
-            | SorobanStmt::Expr(SorobanExpr::UnknownVal)
+            SorobanStmt::Expr(SorobanExpr::UnknownVal)
             // Standalone has() is a pure existence check with result discarded
             // — artifact from lost if-guard whose structure was removed.
             | SorobanStmt::Expr(SorobanExpr::StorageHas { .. }) => {
@@ -1069,6 +1112,7 @@ fn expr_contains(haystack: &SorobanExpr, needle: &SorobanExpr) -> bool {
         | SorobanExpr::BoolLiteral(_)
         | SorobanExpr::SymbolLiteral(_)
         | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::Void
         | SorobanExpr::None
         | SorobanExpr::Param(_)
@@ -1291,6 +1335,31 @@ fn fold_constant_matches(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     for stmt in stmts {
         match stmt {
             SorobanStmt::Match { scrutinee, arms } => {
+                // Guard against the lifter's `I32Literal(0)` sentinel for
+                // untracked stack values. If the scrutinee is exactly that
+                // sentinel and the match arms include any enum-variant
+                // pattern, this is almost certainly an enum dispatch whose
+                // scrutinee the lifter failed to compute — folding to a
+                // wildcard arm would silently delete the real variant code.
+                // Mirror the guard `try_fold_literal_cmp` uses for the same
+                // sentinel.
+                let scrut_is_sentinel = matches!(&scrutinee, SorobanExpr::I32Literal(0));
+                let has_enum_arm = arms
+                    .iter()
+                    .any(|arm| matches!(arm.pattern, MatchPattern::EnumVariant { .. }));
+                if scrut_is_sentinel && has_enum_arm {
+                    result.push(SorobanStmt::Match {
+                        scrutinee,
+                        arms: arms
+                            .into_iter()
+                            .map(|arm| MatchArm {
+                                pattern: arm.pattern,
+                                body: fold_constant_matches(arm.body),
+                            })
+                            .collect(),
+                    });
+                    continue;
+                }
                 if let Some(scrutinee_val) = as_literal_i128(&scrutinee) {
                     // Find the arm whose literal pattern matches the scrutinee
                     let matching_arm = arms.iter().position(|arm| {
@@ -2907,6 +2976,186 @@ pub fn remove_redundant_lets_public(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt>
     remove_redundant_lets(stmts)
 }
 
+/// Invalidate StorageGet CSE entries when a statement may have mutated
+/// observable storage. Conservative: a StorageSet/StorageRemove matching the
+/// exact `(storage_type, key)` of an entry invalidates only that entry; any
+/// other potential mutation (storage write with non-comparable key,
+/// RawHostCall, nested control flow) clears the entire table.
+fn invalidate_seen_gets_for_stmt(
+    stmt: &SorobanStmt,
+    seen_gets: &mut Vec<(StorageType, SorobanExpr, bool, u32, String)>,
+) {
+    let exprs: Vec<&SorobanExpr> = match stmt {
+        SorobanStmt::Expr(e) => vec![e],
+        SorobanStmt::Let { value, .. } => vec![value],
+        SorobanStmt::Assign { value, .. } => vec![value],
+        SorobanStmt::Return(Some(e)) => vec![e],
+        // Control flow: we don't track CSE across branches/loops. Just clear.
+        SorobanStmt::If { .. }
+        | SorobanStmt::Match { .. }
+        | SorobanStmt::Loop { .. }
+        | SorobanStmt::Block(_) => {
+            seen_gets.clear();
+            return;
+        }
+        SorobanStmt::Return(None)
+        | SorobanStmt::Break
+        | SorobanStmt::Continue
+        | SorobanStmt::Comment(_) => return,
+    };
+
+    for e in exprs {
+        invalidate_seen_gets_for_expr(e, seen_gets);
+        if seen_gets.is_empty() {
+            return;
+        }
+    }
+}
+
+fn invalidate_seen_gets_for_expr(
+    expr: &SorobanExpr,
+    seen_gets: &mut Vec<(StorageType, SorobanExpr, bool, u32, String)>,
+) {
+    match expr {
+        SorobanExpr::StorageSet {
+            storage_type, key, ..
+        }
+        | SorobanExpr::StorageRemove { storage_type, key } => {
+            seen_gets.retain(|(st, k, _, _, _)| !(st == storage_type && k == key.as_ref()));
+        }
+        SorobanExpr::StorageExtendTtl { .. } | SorobanExpr::ExtendInstanceAndCodeTtl { .. } => {
+            // TTL extensions do not change observed values; no invalidation.
+        }
+        SorobanExpr::RawHostCall { .. }
+        | SorobanExpr::InvokeContract { .. }
+        | SorobanExpr::TryInvokeContract { .. } => {
+            // Unknown effects — flush conservatively.
+            seen_gets.clear();
+        }
+        // Recurse into composite expressions to find nested mutations.
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => {
+            invalidate_seen_gets_for_expr(a, seen_gets);
+            invalidate_seen_gets_for_expr(b, seen_gets);
+        }
+        SorobanExpr::Not(inner)
+        | SorobanExpr::RequireAuth(inner)
+        | SorobanExpr::AuthorizeAsCurrContract(inner)
+        | SorobanExpr::PanicWithError(inner)
+        | SorobanExpr::CryptoSha256(inner)
+        | SorobanExpr::CryptoKeccak256(inner)
+        | SorobanExpr::PrngReseed(inner)
+        | SorobanExpr::PrngBytesNew(inner)
+        | SorobanExpr::PrngVecShuffle(inner)
+        | SorobanExpr::StrkeyToAddress(inner)
+        | SorobanExpr::AddressToStrkey(inner)
+        | SorobanExpr::FieldAccess { object: inner, .. }
+        | SorobanExpr::ValConvert { value: inner, .. }
+        | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::ErrorFromCode(inner) => {
+            invalidate_seen_gets_for_expr(inner, seen_gets);
+        }
+        SorobanExpr::MethodCall { object, args, .. } => {
+            invalidate_seen_gets_for_expr(object, seen_gets);
+            for a in args {
+                invalidate_seen_gets_for_expr(a, seen_gets);
+            }
+        }
+        SorobanExpr::PublishEvent { topics, data, .. } => {
+            for t in topics {
+                invalidate_seen_gets_for_expr(t, seen_gets);
+            }
+            invalidate_seen_gets_for_expr(data, seen_gets);
+        }
+        SorobanExpr::StructConstruct { fields, .. } => {
+            for (_, v) in fields {
+                invalidate_seen_gets_for_expr(v, seen_gets);
+            }
+        }
+        SorobanExpr::EnumConstruct { fields, .. }
+        | SorobanExpr::TupleConstruct(fields)
+        | SorobanExpr::VecConstruct(fields)
+        | SorobanExpr::Log(fields) => {
+            for v in fields {
+                invalidate_seen_gets_for_expr(v, seen_gets);
+            }
+        }
+        SorobanExpr::MapConstruct(entries) => {
+            for (k, v) in entries {
+                invalidate_seen_gets_for_expr(k, seen_gets);
+                invalidate_seen_gets_for_expr(v, seen_gets);
+            }
+        }
+        SorobanExpr::RequireAuthForArgs { address, args } => {
+            invalidate_seen_gets_for_expr(address, seen_gets);
+            invalidate_seen_gets_for_expr(args, seen_gets);
+        }
+        SorobanExpr::CryptoEd25519Verify {
+            public_key,
+            message,
+            signature,
+        } => {
+            invalidate_seen_gets_for_expr(public_key, seen_gets);
+            invalidate_seen_gets_for_expr(message, seen_gets);
+            invalidate_seen_gets_for_expr(signature, seen_gets);
+        }
+        SorobanExpr::CryptoSecp256k1Recover {
+            msg_digest,
+            signature,
+            recovery_id,
+        } => {
+            invalidate_seen_gets_for_expr(msg_digest, seen_gets);
+            invalidate_seen_gets_for_expr(signature, seen_gets);
+            invalidate_seen_gets_for_expr(recovery_id, seen_gets);
+        }
+        SorobanExpr::PrngU64InRange { low, high } => {
+            invalidate_seen_gets_for_expr(low, seen_gets);
+            invalidate_seen_gets_for_expr(high, seen_gets);
+        }
+        // Pure StorageGet and StorageHas are read-only; do not invalidate.
+        SorobanExpr::StorageGet { key, .. } | SorobanExpr::StorageHas { key, .. } => {
+            invalidate_seen_gets_for_expr(key, seen_gets);
+        }
+        // Leaves with no side effects.
+        SorobanExpr::U32Literal(_)
+        | SorobanExpr::I32Literal(_)
+        | SorobanExpr::U64Literal(_)
+        | SorobanExpr::I64Literal(_)
+        | SorobanExpr::U128Literal(_)
+        | SorobanExpr::I128Literal(_)
+        | SorobanExpr::BoolLiteral(_)
+        | SorobanExpr::SymbolLiteral(_)
+        | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
+        | SorobanExpr::Void
+        | SorobanExpr::None
+        | SorobanExpr::Param(_)
+        | SorobanExpr::Local(_)
+        | SorobanExpr::NamedLocal(_)
+        | SorobanExpr::Env
+        | SorobanExpr::Panic
+        | SorobanExpr::LedgerSequence
+        | SorobanExpr::LedgerTimestamp
+        | SorobanExpr::LedgerNetworkId
+        | SorobanExpr::CurrentContractAddress
+        | SorobanExpr::MaxLiveUntilLedger
+        | SorobanExpr::CollectionNew(_)
+        | SorobanExpr::UnknownVal
+        | SorobanExpr::ContractError { .. } => {}
+    }
+}
+
 fn remove_redundant_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     // Recurse into nested scopes first so inner lets are cleaned up.
     let mut stmts: Vec<SorobanStmt> = stmts.into_iter().map(recurse_nested).collect();
@@ -2915,6 +3164,12 @@ fn remove_redundant_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     // converts unused `let var_N = StorageGet` to `Expr(StorageGet)` which the
     // CSE can't match. Running CSE first eliminates duplicates while both
     // bindings are still Let statements.
+    //
+    // Invalidation: a StorageSet of the same (storage_type, key) between two
+    // gets makes the second get observe a different value, so we must drop
+    // the seen entry. Conservatively, any statement that might mutate storage
+    // (a write of an unknown key, or a RawHostCall whose effects we cannot
+    // model) flushes the whole table.
     let mut i = 0;
     let mut seen_gets: Vec<(StorageType, SorobanExpr, bool, u32, String)> = Vec::new();
     while i < stmts.len() {
@@ -2950,6 +3205,10 @@ fn remove_redundant_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                 continue;
             }
             seen_gets.push((*storage_type, (**key).clone(), *unwrap, idx, name.clone()));
+        } else {
+            // For any non-StorageGet-let statement, check whether it might
+            // mutate storage and invalidate seen_gets accordingly.
+            invalidate_seen_gets_for_stmt(&stmts[i], &mut seen_gets);
         }
         i += 1;
     }
@@ -3924,11 +4183,25 @@ fn recover_keys_in_stmt(stmt: SorobanStmt) -> SorobanStmt {
 
             if has_enum_arms && let SorobanExpr::Param(ref param_name) = scrutinee {
                 let replacement = SorobanExpr::Param(param_name.clone());
+                // Narrow the rewrite: only replace UnknownVal storage keys in
+                // arms that have no references to other params. If an arm
+                // mentions another param, the lifter most likely lost a key
+                // computed from that other param — substituting the scrutinee
+                // would silently attribute storage to the wrong key.
                 let arms = arms
                     .into_iter()
-                    .map(|arm| MatchArm {
-                        pattern: arm.pattern,
-                        body: replace_unknown_storage_keys(arm.body, &replacement),
+                    .map(|arm| {
+                        let mentions_other_params =
+                            arm_mentions_other_params(&arm.body, param_name);
+                        let body = if mentions_other_params {
+                            arm.body
+                        } else {
+                            replace_unknown_storage_keys(arm.body, &replacement)
+                        };
+                        MatchArm {
+                            pattern: arm.pattern,
+                            body,
+                        }
                     })
                     .collect();
                 return SorobanStmt::Match { scrutinee, arms };
@@ -4020,6 +4293,193 @@ fn replace_unknown_keys_in_stmt(stmt: SorobanStmt, replacement: &SorobanExpr) ->
             value: replace_unknown_keys_in_expr(value, replacement),
         },
         other => other,
+    }
+}
+
+/// Return true if any expression in the body references a `SorobanExpr::Param`
+/// whose name differs from `excluded`. Used to detect arms whose unknown
+/// storage key was likely composed from a different parameter than the
+/// matched scrutinee — those arms must NOT have their key rewritten.
+fn arm_mentions_other_params(body: &[SorobanStmt], excluded: &str) -> bool {
+    body.iter().any(|s| stmt_mentions_other_params(s, excluded))
+}
+
+fn stmt_mentions_other_params(stmt: &SorobanStmt, excluded: &str) -> bool {
+    match stmt {
+        SorobanStmt::Expr(e)
+        | SorobanStmt::Let { value: e, .. }
+        | SorobanStmt::Assign { value: e, .. } => expr_mentions_other_params(e, excluded),
+        SorobanStmt::Return(Some(e)) => expr_mentions_other_params(e, excluded),
+        SorobanStmt::Return(None)
+        | SorobanStmt::Break
+        | SorobanStmt::Continue
+        | SorobanStmt::Comment(_) => false,
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            expr_mentions_other_params(condition, excluded)
+                || arm_mentions_other_params(then_body, excluded)
+                || arm_mentions_other_params(else_body, excluded)
+        }
+        SorobanStmt::Match { scrutinee, arms } => {
+            expr_mentions_other_params(scrutinee, excluded)
+                || arms
+                    .iter()
+                    .any(|a| arm_mentions_other_params(&a.body, excluded))
+        }
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+            arm_mentions_other_params(body, excluded)
+        }
+    }
+}
+
+fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
+    match expr {
+        SorobanExpr::Param(name) => name != excluded,
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => {
+            expr_mentions_other_params(a, excluded) || expr_mentions_other_params(b, excluded)
+        }
+        SorobanExpr::Not(inner)
+        | SorobanExpr::RequireAuth(inner)
+        | SorobanExpr::AuthorizeAsCurrContract(inner)
+        | SorobanExpr::PanicWithError(inner)
+        | SorobanExpr::CryptoSha256(inner)
+        | SorobanExpr::CryptoKeccak256(inner)
+        | SorobanExpr::PrngReseed(inner)
+        | SorobanExpr::PrngBytesNew(inner)
+        | SorobanExpr::PrngVecShuffle(inner)
+        | SorobanExpr::StrkeyToAddress(inner)
+        | SorobanExpr::AddressToStrkey(inner)
+        | SorobanExpr::FieldAccess { object: inner, .. }
+        | SorobanExpr::ValConvert { value: inner, .. }
+        | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::ErrorFromCode(inner) => expr_mentions_other_params(inner, excluded),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            expr_mentions_other_params(object, excluded)
+                || args.iter().any(|a| expr_mentions_other_params(a, excluded))
+        }
+        SorobanExpr::StorageGet { key, .. }
+        | SorobanExpr::StorageHas { key, .. }
+        | SorobanExpr::StorageRemove { key, .. } => expr_mentions_other_params(key, excluded),
+        SorobanExpr::StorageSet { key, value, .. } => {
+            expr_mentions_other_params(key, excluded) || expr_mentions_other_params(value, excluded)
+        }
+        SorobanExpr::StorageExtendTtl {
+            key,
+            threshold,
+            extend_to,
+            ..
+        } => {
+            expr_mentions_other_params(key, excluded)
+                || expr_mentions_other_params(threshold, excluded)
+                || expr_mentions_other_params(extend_to, excluded)
+        }
+        SorobanExpr::ExtendInstanceAndCodeTtl {
+            threshold,
+            extend_to,
+        } => {
+            expr_mentions_other_params(threshold, excluded)
+                || expr_mentions_other_params(extend_to, excluded)
+        }
+        SorobanExpr::RequireAuthForArgs { address, args } => {
+            expr_mentions_other_params(address, excluded)
+                || expr_mentions_other_params(args, excluded)
+        }
+        SorobanExpr::PublishEvent { topics, data, .. } => {
+            topics
+                .iter()
+                .any(|t| expr_mentions_other_params(t, excluded))
+                || expr_mentions_other_params(data, excluded)
+        }
+        SorobanExpr::InvokeContract {
+            address,
+            function,
+            args,
+            ..
+        }
+        | SorobanExpr::TryInvokeContract {
+            address,
+            function,
+            args,
+            ..
+        } => {
+            expr_mentions_other_params(address, excluded)
+                || expr_mentions_other_params(function, excluded)
+                || args.iter().any(|a| expr_mentions_other_params(a, excluded))
+        }
+        SorobanExpr::StructConstruct { fields, .. } => fields
+            .iter()
+            .any(|(_, v)| expr_mentions_other_params(v, excluded)),
+        SorobanExpr::EnumConstruct { fields, .. }
+        | SorobanExpr::TupleConstruct(fields)
+        | SorobanExpr::VecConstruct(fields)
+        | SorobanExpr::Log(fields)
+        | SorobanExpr::RawHostCall { args: fields, .. } => fields
+            .iter()
+            .any(|v| expr_mentions_other_params(v, excluded)),
+        SorobanExpr::MapConstruct(entries) => entries.iter().any(|(k, v)| {
+            expr_mentions_other_params(k, excluded) || expr_mentions_other_params(v, excluded)
+        }),
+        SorobanExpr::CryptoEd25519Verify {
+            public_key,
+            message,
+            signature,
+        } => {
+            expr_mentions_other_params(public_key, excluded)
+                || expr_mentions_other_params(message, excluded)
+                || expr_mentions_other_params(signature, excluded)
+        }
+        SorobanExpr::CryptoSecp256k1Recover {
+            msg_digest,
+            signature,
+            recovery_id,
+        } => {
+            expr_mentions_other_params(msg_digest, excluded)
+                || expr_mentions_other_params(signature, excluded)
+                || expr_mentions_other_params(recovery_id, excluded)
+        }
+        SorobanExpr::PrngU64InRange { low, high } => {
+            expr_mentions_other_params(low, excluded) || expr_mentions_other_params(high, excluded)
+        }
+        // Leaves with no Param children.
+        SorobanExpr::U32Literal(_)
+        | SorobanExpr::I32Literal(_)
+        | SorobanExpr::U64Literal(_)
+        | SorobanExpr::I64Literal(_)
+        | SorobanExpr::U128Literal(_)
+        | SorobanExpr::I128Literal(_)
+        | SorobanExpr::BoolLiteral(_)
+        | SorobanExpr::SymbolLiteral(_)
+        | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
+        | SorobanExpr::Void
+        | SorobanExpr::None
+        | SorobanExpr::Local(_)
+        | SorobanExpr::NamedLocal(_)
+        | SorobanExpr::Env
+        | SorobanExpr::Panic
+        | SorobanExpr::LedgerSequence
+        | SorobanExpr::LedgerTimestamp
+        | SorobanExpr::LedgerNetworkId
+        | SorobanExpr::CurrentContractAddress
+        | SorobanExpr::MaxLiveUntilLedger
+        | SorobanExpr::CollectionNew(_)
+        | SorobanExpr::UnknownVal
+        | SorobanExpr::ContractError { .. } => false,
     }
 }
 
@@ -5668,5 +6128,243 @@ mod tests {
             }
             other => panic!("expected Expr(MethodCall), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn collapse_trivial_loops_keeps_loop_if_cond_has_side_effects() {
+        // `loop { if storage_get { break } }` must NOT be collapsed — the
+        // storage read is observable and the collapse would drop it.
+        let stmts = vec![SorobanStmt::Loop {
+            body: vec![SorobanStmt::If {
+                condition: SorobanExpr::StorageHas {
+                    storage_type: StorageType::Persistent,
+                    key: Box::new(SorobanExpr::SymbolLiteral("k".into())),
+                },
+                then_body: vec![SorobanStmt::Break],
+                else_body: Vec::new(),
+            }],
+        }];
+        let out = optimize_stmts(stmts);
+        assert!(
+            matches!(&out[0], SorobanStmt::Loop { .. }),
+            "expected loop to survive; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn collapse_trivial_loops_still_collapses_pure_cond() {
+        // Regression-protect happy path: pure condition still gets collapsed.
+        let stmts = vec![SorobanStmt::Loop {
+            body: vec![SorobanStmt::If {
+                condition: SorobanExpr::BoolLiteral(true),
+                then_body: vec![SorobanStmt::Break],
+                else_body: Vec::new(),
+            }],
+        }];
+        let out = optimize_stmts(stmts);
+        assert!(
+            out.is_empty(),
+            "expected pure-condition trivial loop to collapse; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fold_constant_matches_preserves_enum_dispatch_with_sentinel_scrutinee() {
+        // The lifter emits `I32Literal(0)` as a placeholder for untracked
+        // stack values. If a match scrutinee comes through as that sentinel
+        // and the arms are enum dispatch, the old folder would pick the
+        // wildcard arm and silently delete the variant code.
+        let arms = vec![
+            MatchArm {
+                pattern: MatchPattern::EnumVariant {
+                    type_name: "DataKey".into(),
+                    variant: "Persistent".into(),
+                    bindings: vec!["_".into()],
+                },
+                body: vec![ret(SorobanExpr::U32Literal(1))],
+            },
+            MatchArm {
+                pattern: MatchPattern::EnumVariant {
+                    type_name: "DataKey".into(),
+                    variant: "Temp".into(),
+                    bindings: vec!["_".into()],
+                },
+                body: vec![ret(SorobanExpr::U32Literal(2))],
+            },
+            MatchArm {
+                pattern: MatchPattern::Wildcard,
+                body: vec![ret(SorobanExpr::U32Literal(99))],
+            },
+        ];
+        let stmts = vec![SorobanStmt::Match {
+            scrutinee: SorobanExpr::I32Literal(0),
+            arms,
+        }];
+        let out = optimize_stmts(stmts);
+        // Match must survive with all three arms intact.
+        match &out[0] {
+            SorobanStmt::Match { arms, .. } => {
+                assert_eq!(
+                    arms.len(),
+                    3,
+                    "expected match to survive intact; got: {arms:?}"
+                );
+            }
+            other => panic!("expected match to survive; got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_constant_matches_still_folds_real_literal_dispatch() {
+        // Regression-protect the happy path: `match 1 { 0 => .., 1 => ok, _ => .. }`
+        // should still fold to `ok`. Use literal patterns only (no enum arms)
+        // so the sentinel guard doesn't trigger.
+        let arms = vec![
+            MatchArm {
+                pattern: MatchPattern::Literal(SorobanExpr::I32Literal(0)),
+                body: vec![ret(SorobanExpr::U32Literal(999))],
+            },
+            MatchArm {
+                pattern: MatchPattern::Literal(SorobanExpr::I32Literal(1)),
+                body: vec![ret(SorobanExpr::U32Literal(7))],
+            },
+        ];
+        let stmts = vec![SorobanStmt::Match {
+            scrutinee: SorobanExpr::I32Literal(1),
+            arms,
+        }];
+        let out = optimize_stmts(stmts);
+        // The match should have been inlined to just the return-7 body.
+        assert!(
+            matches!(
+                &out[0],
+                SorobanStmt::Return(Some(SorobanExpr::U32Literal(7)))
+            ),
+            "expected literal-1 arm to fold; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cse_storage_get_invalidates_after_storage_set_same_key() {
+        // `let a = get(k); set(k, v); let b = get(k);` must NOT fold the
+        // second get to `a` — the StorageSet between them invalidates the
+        // cached value.
+        let key = || SorobanExpr::SymbolLiteral("k".into());
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_0".into(),
+                mutable: false,
+                value: SorobanExpr::StorageGet {
+                    storage_type: StorageType::Persistent,
+                    key: Box::new(key()),
+                    unwrap: true,
+                },
+            },
+            SorobanStmt::Expr(SorobanExpr::StorageSet {
+                storage_type: StorageType::Persistent,
+                key: Box::new(key()),
+                value: Box::new(SorobanExpr::U64Literal(42)),
+            }),
+            SorobanStmt::Let {
+                name: "var_1".into(),
+                mutable: false,
+                value: SorobanExpr::StorageGet {
+                    storage_type: StorageType::Persistent,
+                    key: Box::new(key()),
+                    unwrap: true,
+                },
+            },
+        ];
+        let out = optimize_stmts(stmts);
+        // Both gets must survive (CSE must not collapse them).
+        let get_count = out
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    SorobanStmt::Let {
+                        value: SorobanExpr::StorageGet { .. },
+                        ..
+                    } | SorobanStmt::Expr(SorobanExpr::StorageGet { .. })
+                )
+            })
+            .count();
+        assert_eq!(
+            get_count, 2,
+            "expected both gets to survive CSE around an intervening set; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cse_storage_get_still_folds_without_intervening_set() {
+        // Regression-protect the happy path: two reads of the same key with
+        // no intervening write should still be CSE'd.
+        let key = || SorobanExpr::SymbolLiteral("k".into());
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_0".into(),
+                mutable: false,
+                value: SorobanExpr::StorageGet {
+                    storage_type: StorageType::Persistent,
+                    key: Box::new(key()),
+                    unwrap: true,
+                },
+            },
+            SorobanStmt::Let {
+                name: "var_1".into(),
+                mutable: false,
+                value: SorobanExpr::StorageGet {
+                    storage_type: StorageType::Persistent,
+                    key: Box::new(key()),
+                    unwrap: true,
+                },
+            },
+            // Use both so dead-store removal doesn't strip them.
+            SorobanStmt::Return(Some(SorobanExpr::Add(
+                Box::new(SorobanExpr::Local(0)),
+                Box::new(SorobanExpr::Local(1)),
+            ))),
+        ];
+        let out = optimize_stmts(stmts);
+        let get_count = out
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    SorobanStmt::Let {
+                        value: SorobanExpr::StorageGet { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            get_count, 1,
+            "expected CSE to fold duplicate gets; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_orphan_host_calls_keeps_raw_host_call() {
+        // RawHostCall has side effects per `expr_has_side_effects`; the orphan
+        // remover must agree and keep it, otherwise host calls the lifter
+        // failed to recognize would be silently deleted.
+        let stmts = vec![SorobanStmt::Expr(SorobanExpr::RawHostCall {
+            module: "x".to_string(),
+            function: "unknown_op".to_string(),
+            args: Vec::new(),
+        })];
+        let out = optimize_stmts(stmts);
+        let kept_a_raw_host_call = out.iter().any(|s| {
+            matches!(
+                s,
+                SorobanStmt::Expr(SorobanExpr::RawHostCall { function, .. })
+                    if function == "unknown_op"
+            )
+        });
+        assert!(
+            kept_a_raw_host_call,
+            "orphan RawHostCall must survive DCE; got: {out:?}"
+        );
     }
 }

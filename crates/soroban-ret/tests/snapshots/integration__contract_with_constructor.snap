@@ -1,0 +1,36 @@
+---
+source: crates/soroban-ret/tests/integration.rs
+expression: source
+---
+#![no_std]
+use soroban_sdk::{contract, contractimpl, contracttype, Env};
+#[contracttype]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub enum DataKey {
+    Persistent(u32),
+    Temp(u32),
+    Instance(u32),
+}
+#[contract]
+pub struct Contract;
+#[contractimpl]
+impl Contract {
+    pub fn __constructor(env: Env, init_key: u32, init_value: i64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Persistent(init_key), &init_value);
+        env.storage()
+            .temporary()
+            .set(&DataKey::Temp(init_key * 2), &init_value);
+        env.storage()
+            .instance()
+            .set(&DataKey::Instance(init_key * 3), &init_value);
+    }
+    pub fn get_data(env: Env, key: DataKey) -> Option<i64> {
+        match key {
+            DataKey::Persistent(_) => env.storage().persistent().get(&key),
+            DataKey::Temp(_) => env.storage().temporary().get(&key),
+            DataKey::Instance(_) => env.storage().instance().get(&key),
+        }
+    }
+}

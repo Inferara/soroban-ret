@@ -7,6 +7,8 @@
 /// 3. Pattern Matcher -> Soroban-Aware IR
 /// 4. IR Optimizer -> High-Level IR
 /// 5. Rust Emitter -> Formatted source code
+use std::collections::HashMap;
+
 use crate::codegen::module::{assemble_generic_module, assemble_module, format_source};
 use crate::ir::optimizer::{
     optimize_stmts, optimize_stmts_preserve_host_calls, propagate_variable_names,
@@ -22,7 +24,7 @@ use crate::wasm::imports::HostModule;
 use crate::wasm::validate::validate_soroban;
 use crate::{
     DecompileError, DecompileHints, DecompileIR, DecompileMode, DecompileOptions, DecompileResult,
-    HintValue, ValidationReport,
+    FunctionHints, HintValue, ValidationReport,
 };
 use stellar_xdr::curr::ScSpecTypeDef;
 
@@ -335,47 +337,36 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         }
         log::trace!("Pipeline pass: stage_4c3 merge_orphan_ledger_sequence");
 
-        // Stage 4c4: Repair weak storage keys from optional function-scoped hints.
+        // Stages 4c4-4c7: Repair weak operands from optional function-scoped
+        // hints. The index is built once and shared across all four passes so
+        // each function lookup is O(1) instead of the previous O(F_hints)
+        // linear scan per pass per function.
         if let Some(hints) = &options.hints {
+            let hints_index = build_hints_index(hints);
             for func in &mut contract_module.functions {
-                if let Some(key) = unique_storage_hint_key_for_function(hints, &func.name) {
+                let empty: Vec<&FunctionHints> = Vec::new();
+                let func_hints = hints_index
+                    .get(func.name.as_str())
+                    .unwrap_or(&empty)
+                    .as_slice();
+                if func_hints.is_empty() {
+                    continue;
+                }
+                if let Some(key) = unique_storage_hint_key_for_function(func_hints) {
                     repair_unknown_storage_keys_from_hint(&mut func.body, &key);
                 }
-            }
-        }
-        log::trace!("Pipeline pass: stage_4c4 repair_storage_keys_from_hints");
-
-        // Stage 4c5: Repair weak event topics/data from optional function-scoped hints.
-        if let Some(hints) = &options.hints {
-            for func in &mut contract_module.functions {
-                if let Some(event_hint) = unique_event_hint_for_function(hints, &func.name) {
+                if let Some(event_hint) = unique_event_hint_for_function(func_hints) {
                     repair_unknown_event_values_from_hint(&mut func.body, &event_hint);
                 }
-            }
-        }
-        log::trace!("Pipeline pass: stage_4c5 repair_events_from_hints");
-
-        // Stage 4c6: Repair weak cross-contract function names from optional
-        // function-scoped invoke hints.
-        if let Some(hints) = &options.hints {
-            for func in &mut contract_module.functions {
-                if let Some(function) = unique_invoke_hint_function_for_function(hints, &func.name)
-                {
+                if let Some(function) = unique_invoke_hint_function_for_function(func_hints) {
                     repair_unknown_invoke_functions_from_hint(&mut func.body, &function);
                 }
-            }
-        }
-        log::trace!("Pipeline pass: stage_4c6 repair_invoke_functions_from_hints");
-
-        // Stage 4c7: Repair weak auth operands from optional function-scoped hints.
-        if let Some(hints) = &options.hints {
-            for func in &mut contract_module.functions {
-                if let Some(auth_hint) = unique_auth_hint_for_function(hints, &func.name) {
+                if let Some(auth_hint) = unique_auth_hint_for_function(func_hints) {
                     repair_weak_auth_from_hint(&mut func.body, &auth_hint);
                 }
             }
         }
-        log::trace!("Pipeline pass: stage_4c7 repair_auth_from_hints");
+        log::trace!("Pipeline pass: stage_4c4_4c7 hint-driven repairs");
 
         // Stage 4d: Remove trailing orphan .len() from Result<(), E> functions.
         for func in &mut contract_module.functions {
@@ -690,17 +681,20 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
     })
 }
 
-fn unique_storage_hint_key_for_function(
-    hints: &DecompileHints,
-    function_name: &str,
-) -> Option<SorobanExpr> {
+/// Build a lookup index keyed by `function_name` so the four hint passes can
+/// share an O(1) per-function lookup instead of doing four linear scans.
+fn build_hints_index(hints: &DecompileHints) -> HashMap<&str, Vec<&FunctionHints>> {
+    let mut idx: HashMap<&str, Vec<&FunctionHints>> = HashMap::new();
+    for fh in &hints.functions {
+        idx.entry(fh.function_name.as_str()).or_default().push(fh);
+    }
+    idx
+}
+
+fn unique_storage_hint_key_for_function(function_hints: &[&FunctionHints]) -> Option<SorobanExpr> {
     let mut unique_key = None;
 
-    for function_hints in hints
-        .functions
-        .iter()
-        .filter(|hints| hints.function_name == function_name)
-    {
+    for function_hints in function_hints {
         for storage_hint in &function_hints.storage {
             let key = hint_value_to_soroban_expr(&storage_hint.key)?;
 
@@ -721,17 +715,10 @@ struct EventRepairHint {
     data: Vec<SorobanExpr>,
 }
 
-fn unique_event_hint_for_function(
-    hints: &DecompileHints,
-    function_name: &str,
-) -> Option<EventRepairHint> {
+fn unique_event_hint_for_function(function_hints: &[&FunctionHints]) -> Option<EventRepairHint> {
     let mut unique_event = None;
 
-    for function_hints in hints
-        .functions
-        .iter()
-        .filter(|hints| hints.function_name == function_name)
-    {
+    for function_hints in function_hints {
         for event_hint in &function_hints.events {
             let event = EventRepairHint {
                 topics: event_hint
@@ -758,16 +745,11 @@ fn unique_event_hint_for_function(
 }
 
 fn unique_invoke_hint_function_for_function(
-    hints: &DecompileHints,
-    function_name: &str,
+    function_hints: &[&FunctionHints],
 ) -> Option<SorobanExpr> {
     let mut unique_function = None;
 
-    for function_hints in hints
-        .functions
-        .iter()
-        .filter(|hints| hints.function_name == function_name)
-    {
+    for function_hints in function_hints {
         for invoke_hint in &function_hints.invokes {
             let Some(function) = &invoke_hint.function else {
                 continue;
@@ -799,17 +781,10 @@ struct AuthRepairHint {
     args: SorobanExpr,
 }
 
-fn unique_auth_hint_for_function(
-    hints: &DecompileHints,
-    function_name: &str,
-) -> Option<AuthRepairHint> {
+fn unique_auth_hint_for_function(function_hints: &[&FunctionHints]) -> Option<AuthRepairHint> {
     let mut unique_auth = None;
 
-    for function_hints in hints
-        .functions
-        .iter()
-        .filter(|hints| hints.function_name == function_name)
-    {
+    for function_hints in function_hints {
         for auth_hint in &function_hints.auth {
             let address = match &auth_hint.address {
                 Some(address) => Some(hint_value_to_soroban_expr(address)?),
@@ -848,7 +823,7 @@ fn hint_value_to_soroban_expr(value: &HintValue) -> Option<SorobanExpr> {
         HintValue::U128(value) => Some(SorobanExpr::U128Literal(*value)),
         HintValue::I128(value) => Some(SorobanExpr::I128Literal(*value)),
         HintValue::String(value) => Some(SorobanExpr::StringLiteral(value.clone())),
-        HintValue::Bytes(_) => None,
+        HintValue::Bytes(value) => Some(SorobanExpr::BytesLiteral(value.clone())),
     }
 }
 
@@ -1041,6 +1016,7 @@ fn repair_unknown_invoke_functions_in_expr(expr: &mut SorobanExpr, replacement: 
         | SorobanExpr::BoolLiteral(_)
         | SorobanExpr::SymbolLiteral(_)
         | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::Void
         | SorobanExpr::None
         | SorobanExpr::Param(_)
@@ -1270,6 +1246,7 @@ fn repair_unknown_event_values_in_expr(expr: &mut SorobanExpr, hint: &EventRepai
         | SorobanExpr::BoolLiteral(_)
         | SorobanExpr::SymbolLiteral(_)
         | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::Void
         | SorobanExpr::None
         | SorobanExpr::Param(_)
@@ -1515,6 +1492,7 @@ fn repair_weak_auth_in_expr(expr: &mut SorobanExpr, hint: &AuthRepairHint) {
         | SorobanExpr::BoolLiteral(_)
         | SorobanExpr::SymbolLiteral(_)
         | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::Void
         | SorobanExpr::None
         | SorobanExpr::Param(_)
@@ -1744,6 +1722,7 @@ fn repair_unknown_storage_keys_in_expr(expr: &mut SorobanExpr, replacement: &Sor
         | SorobanExpr::BoolLiteral(_)
         | SorobanExpr::SymbolLiteral(_)
         | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::Void
         | SorobanExpr::None
         | SorobanExpr::Param(_)
@@ -1951,7 +1930,7 @@ fn run_wasm_opt(wasm: &[u8]) -> Result<Vec<u8>, DecompileError> {
 
     std::fs::File::create(&input_path)
         .and_then(|mut f| f.write_all(wasm))
-        .map_err(|e| DecompileError::WasmParse(format!("wasm-opt temp file: {e}")))?;
+        .map_err(|e| DecompileError::PreOptimize(format!("wasm-opt temp file: {e}")))?;
 
     let result = Command::new("wasm-opt")
         .arg("-O2")
@@ -1971,21 +1950,22 @@ fn run_wasm_opt(wasm: &[u8]) -> Result<Vec<u8>, DecompileError> {
 
     match result {
         Ok(output) if output.status.success() => {
-            let optimized = std::fs::read(&output_path)
-                .map_err(|e| DecompileError::WasmParse(format!("reading wasm-opt output: {e}")))?;
+            let optimized = std::fs::read(&output_path).map_err(|e| {
+                DecompileError::PreOptimize(format!("reading wasm-opt output: {e}"))
+            })?;
             Ok(optimized)
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(DecompileError::WasmParse(format!(
+            Err(DecompileError::PreOptimize(format!(
                 "wasm-opt failed: {stderr}"
             )))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(DecompileError::WasmParse(
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(DecompileError::PreOptimize(
             "wasm-opt not found. Install binaryen: https://github.com/WebAssembly/binaryen"
                 .to_string(),
         )),
-        Err(e) => Err(DecompileError::WasmParse(format!(
+        Err(e) => Err(DecompileError::PreOptimize(format!(
             "wasm-opt execution error: {e}"
         ))),
     }
@@ -1999,7 +1979,7 @@ impl WasmOptTempDir {
     fn new() -> Result<Self, DecompileError> {
         let path = unique_wasm_opt_temp_dir_path();
         std::fs::create_dir(&path)
-            .map_err(|e| DecompileError::WasmParse(format!("wasm-opt temp dir: {e}")))?;
+            .map_err(|e| DecompileError::PreOptimize(format!("wasm-opt temp dir: {e}")))?;
         Ok(Self { path })
     }
 
@@ -2628,6 +2608,7 @@ fn score_param_local_base_in_expr(
         | SorobanExpr::I128Literal(_)
         | SorobanExpr::SymbolLiteral(_)
         | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::Param(_) => ParamBaseScore {
             total_hits: 0,
             distinct_slots: std::collections::BTreeSet::new(),
@@ -2860,6 +2841,7 @@ fn expr_uses_env(expr: &SorobanExpr) -> bool {
         | SorobanExpr::PrngU64InRange { .. }
         | SorobanExpr::PrngVecShuffle(_)
         | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::CurrentContractAddress
         | SorobanExpr::LedgerSequence
         | SorobanExpr::LedgerTimestamp
@@ -6510,6 +6492,18 @@ mod tests {
         DecompileHints::with_functions(vec![function_hints])
     }
 
+    /// Test convenience: filter `hints.functions` by name to a Vec the four
+    /// `unique_*_for_function` helpers can consume. In the pipeline this is
+    /// done via a HashMap built once per run; in tests we filter per call
+    /// for clarity.
+    fn matching<'a>(hints: &'a DecompileHints, function_name: &str) -> Vec<&'a FunctionHints> {
+        hints
+            .functions
+            .iter()
+            .filter(|fh| fh.function_name == function_name)
+            .collect()
+    }
+
     fn invoke_contract_with_function(function: SorobanExpr) -> SorobanExpr {
         SorobanExpr::InvokeContract {
             address: Box::new(SorobanExpr::Param("contract".to_string())),
@@ -6553,7 +6547,7 @@ mod tests {
                 Some(HintValue::Symbol("approve".to_string())),
             ],
         );
-        let replacement = unique_invoke_hint_function_for_function(&hints, "transfer")
+        let replacement = unique_invoke_hint_function_for_function(&matching(&hints, "transfer"))
             .expect("hint should be unique");
         let mut body = vec![
             SorobanStmt::Expr(invoke_contract_with_function(SorobanExpr::UnknownVal)),
@@ -6588,7 +6582,9 @@ mod tests {
             SorobanExpr::UnknownVal,
         ))];
 
-        if let Some(replacement) = unique_invoke_hint_function_for_function(&hints, "transfer") {
+        if let Some(replacement) =
+            unique_invoke_hint_function_for_function(&matching(&hints, "transfer"))
+        {
             repair_unknown_invoke_functions_from_hint(&mut body, &replacement);
         }
 
@@ -6607,7 +6603,9 @@ mod tests {
             SorobanExpr::UnknownVal,
         ))];
 
-        if let Some(replacement) = unique_invoke_hint_function_for_function(&hints, "transfer") {
+        if let Some(replacement) =
+            unique_invoke_hint_function_for_function(&matching(&hints, "transfer"))
+        {
             repair_unknown_invoke_functions_from_hint(&mut body, &replacement);
         }
 
@@ -6625,7 +6623,7 @@ mod tests {
             "transfer",
             vec![Some(HintValue::Symbol("approve".to_string()))],
         );
-        let replacement = unique_invoke_hint_function_for_function(&hints, "transfer")
+        let replacement = unique_invoke_hint_function_for_function(&matching(&hints, "transfer"))
             .expect("hint should be unique");
         let mut body = vec![SorobanStmt::Expr(invoke_contract_with_function(
             SorobanExpr::SymbolLiteral("existing".to_string()),
@@ -6647,8 +6645,8 @@ mod tests {
     #[test]
     fn storage_hints_repair_unknown_storage_keys_when_unambiguous() {
         let hints = storage_hints("read", vec![HintValue::Symbol("Balance".to_string())]);
-        let replacement =
-            unique_storage_hint_key_for_function(&hints, "read").expect("hint should be unique");
+        let replacement = unique_storage_hint_key_for_function(&matching(&hints, "read"))
+            .expect("hint should be unique");
         let mut body = vec![
             SorobanStmt::Expr(SorobanExpr::StorageGet {
                 storage_type: StorageType::Persistent,
@@ -6709,7 +6707,7 @@ mod tests {
             unwrap: true,
         })];
 
-        if let Some(replacement) = unique_storage_hint_key_for_function(&hints, "read") {
+        if let Some(replacement) = unique_storage_hint_key_for_function(&matching(&hints, "read")) {
             repair_unknown_storage_keys_from_hint(&mut body, &replacement);
         }
 
@@ -6724,8 +6722,8 @@ mod tests {
     #[test]
     fn storage_hints_repair_string_storage_keys_when_unambiguous() {
         let hints = storage_hints("read", vec![HintValue::String("account".to_string())]);
-        let replacement =
-            unique_storage_hint_key_for_function(&hints, "read").expect("hint should be unique");
+        let replacement = unique_storage_hint_key_for_function(&matching(&hints, "read"))
+            .expect("hint should be unique");
         let mut body = vec![SorobanStmt::Expr(SorobanExpr::StorageGet {
             storage_type: StorageType::Persistent,
             key: Box::new(SorobanExpr::UnknownVal),
@@ -6749,40 +6747,45 @@ mod tests {
     fn storage_hints_support_wide_integer_keys() {
         let u128_hints = storage_hints("read", vec![HintValue::U128(42)]);
         assert!(matches!(
-            unique_storage_hint_key_for_function(&u128_hints, "read"),
+            unique_storage_hint_key_for_function(&matching(&u128_hints, "read")),
             Some(SorobanExpr::U128Literal(42))
         ));
 
         let i128_hints = storage_hints("read", vec![HintValue::I128(-42)]);
         assert!(matches!(
-            unique_storage_hint_key_for_function(&i128_hints, "read"),
+            unique_storage_hint_key_for_function(&matching(&i128_hints, "read")),
             Some(SorobanExpr::I128Literal(-42))
         ));
     }
 
     #[test]
-    fn storage_hints_do_not_repair_when_key_is_unsupported() {
+    fn storage_hints_repair_bytes_storage_keys_when_unambiguous() {
         let hints = storage_hints("read", vec![HintValue::Bytes(vec![1, 2, 3])]);
+        let replacement = unique_storage_hint_key_for_function(&matching(&hints, "read"))
+            .expect("Bytes hint should now repair");
         let mut body = vec![SorobanStmt::Expr(SorobanExpr::StorageGet {
             storage_type: StorageType::Persistent,
             key: Box::new(SorobanExpr::UnknownVal),
             unwrap: true,
         })];
 
-        if let Some(replacement) = unique_storage_hint_key_for_function(&hints, "read") {
-            repair_unknown_storage_keys_from_hint(&mut body, &replacement);
-        }
+        repair_unknown_storage_keys_from_hint(&mut body, &replacement);
 
         match &body[0] {
             SorobanStmt::Expr(SorobanExpr::StorageGet { key, .. }) => {
-                assert!(matches!(key.as_ref(), SorobanExpr::UnknownVal));
+                assert!(matches!(
+                    key.as_ref(),
+                    SorobanExpr::BytesLiteral(b) if b == &[1u8, 2, 3]
+                ));
             }
             other => panic!("unexpected stmt shape: {other:?}"),
         }
     }
 
     #[test]
-    fn storage_hints_do_not_repair_when_supported_key_has_unsupported_peer() {
+    fn storage_hints_do_not_repair_when_keys_are_ambiguous() {
+        // Distinct keys (Symbol vs Bytes) — both individually supported,
+        // but ambiguous together, so hint repair must abstain.
         let hints = storage_hints(
             "read",
             vec![
@@ -6791,7 +6794,7 @@ mod tests {
             ],
         );
 
-        assert!(unique_storage_hint_key_for_function(&hints, "read").is_none());
+        assert!(unique_storage_hint_key_for_function(&matching(&hints, "read")).is_none());
     }
 
     #[test]
@@ -6825,8 +6828,8 @@ mod tests {
                 vec![HintValue::U64(10)],
             )],
         );
-        let replacement =
-            unique_event_hint_for_function(&hints, "transfer").expect("hint should be unique");
+        let replacement = unique_event_hint_for_function(&matching(&hints, "transfer"))
+            .expect("hint should be unique");
         let mut body = vec![SorobanStmt::Expr(SorobanExpr::PublishEvent {
             event_name: None,
             topics: vec![SorobanExpr::UnknownVal],
@@ -6859,8 +6862,8 @@ mod tests {
                 vec![HintValue::U64(10), HintValue::Bool(true)],
             )],
         );
-        let replacement =
-            unique_event_hint_for_function(&hints, "transfer").expect("hint should be unique");
+        let replacement = unique_event_hint_for_function(&matching(&hints, "transfer"))
+            .expect("hint should be unique");
         let mut body = vec![SorobanStmt::Expr(SorobanExpr::PublishEvent {
             event_name: None,
             topics: vec![weak_buf_symbol_call(), weak_buf_string_call()],
@@ -6913,7 +6916,7 @@ mod tests {
             data: Box::new(SorobanExpr::UnknownVal),
         })];
 
-        if let Some(replacement) = unique_event_hint_for_function(&hints, "transfer") {
+        if let Some(replacement) = unique_event_hint_for_function(&matching(&hints, "transfer")) {
             repair_unknown_event_values_from_hint(&mut body, &replacement);
         }
 
@@ -6927,7 +6930,10 @@ mod tests {
     }
 
     #[test]
-    fn event_hints_do_not_repair_when_event_contains_unsupported_values() {
+    fn event_hints_repair_when_event_contains_bytes_values() {
+        // Previously Bytes was unsupported and short-circuited the entire
+        // hint-repair path. Now BytesLiteral exists in the IR; verify a
+        // bytes data hint surfaces as a BytesLiteral in the repaired event.
         let hints = event_hints(
             "transfer",
             vec![(
@@ -6936,7 +6942,12 @@ mod tests {
             )],
         );
 
-        assert!(unique_event_hint_for_function(&hints, "transfer").is_none());
+        let hint = unique_event_hint_for_function(&matching(&hints, "transfer"))
+            .expect("Bytes-valued event hint should now repair");
+        assert!(matches!(
+            &hint.data[0],
+            SorobanExpr::BytesLiteral(b) if b == &[1u8, 2, 3]
+        ));
     }
 
     #[test]
@@ -6948,8 +6959,8 @@ mod tests {
                 vec![HintValue::U64(10)],
             )],
         );
-        let replacement =
-            unique_event_hint_for_function(&hints, "transfer").expect("hint should be unique");
+        let replacement = unique_event_hint_for_function(&matching(&hints, "transfer"))
+            .expect("hint should be unique");
         let mut body = vec![SorobanStmt::Expr(SorobanExpr::PublishEvent {
             event_name: None,
             topics: vec![SorobanExpr::SymbolLiteral("existing".to_string())],
@@ -6979,8 +6990,8 @@ mod tests {
                 vec![HintValue::Symbol("spend".to_string()), HintValue::U64(7)],
             )],
         );
-        let hint =
-            unique_auth_hint_for_function(&hints, "transfer").expect("auth hint should be unique");
+        let hint = unique_auth_hint_for_function(&matching(&hints, "transfer"))
+            .expect("auth hint should be unique");
         let mut body = vec![
             SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(SorobanExpr::UnknownVal))),
             SorobanStmt::Expr(SorobanExpr::RequireAuthForArgs {
@@ -7028,8 +7039,8 @@ mod tests {
                 vec![HintValue::U32(7)],
             )],
         );
-        let hint =
-            unique_auth_hint_for_function(&hints, "transfer").expect("auth hint should be unique");
+        let hint = unique_auth_hint_for_function(&matching(&hints, "transfer"))
+            .expect("auth hint should be unique");
         let mut body = vec![SorobanStmt::Expr(SorobanExpr::RequireAuthForArgs {
             address: Box::new(SorobanExpr::UnknownVal),
             args: Box::new(SorobanExpr::MethodCall {
@@ -7077,7 +7088,7 @@ mod tests {
             args: Box::new(SorobanExpr::UnknownVal),
         })];
 
-        if let Some(hint) = unique_auth_hint_for_function(&hints, "transfer") {
+        if let Some(hint) = unique_auth_hint_for_function(&matching(&hints, "transfer")) {
             repair_weak_auth_from_hint(&mut body, &hint);
         }
 
@@ -7091,7 +7102,9 @@ mod tests {
     }
 
     #[test]
-    fn auth_hints_do_not_repair_when_unsupported() {
+    fn auth_hints_repair_when_args_contain_bytes_values() {
+        // Bytes args used to short-circuit hint repair. With BytesLiteral in
+        // the IR they now flow through; verify a Bytes arg surfaces correctly.
         let hints = auth_hints(
             "transfer",
             vec![(
@@ -7099,31 +7112,34 @@ mod tests {
                 vec![HintValue::Bytes(vec![1, 2, 3])],
             )],
         );
-        let mut body = vec![SorobanStmt::Expr(SorobanExpr::RequireAuthForArgs {
-            address: Box::new(SorobanExpr::UnknownVal),
-            args: Box::new(SorobanExpr::UnknownVal),
-        })];
 
-        if let Some(hint) = unique_auth_hint_for_function(&hints, "transfer") {
-            repair_weak_auth_from_hint(&mut body, &hint);
-        }
-
-        match &body[0] {
-            SorobanStmt::Expr(SorobanExpr::RequireAuthForArgs { address, args }) => {
-                assert!(matches!(address.as_ref(), SorobanExpr::UnknownVal));
-                assert!(matches!(args.as_ref(), SorobanExpr::UnknownVal));
+        let hint = unique_auth_hint_for_function(&matching(&hints, "transfer"))
+            .expect("Bytes-valued auth args hint should now repair");
+        match &hint.args {
+            SorobanExpr::VecConstruct(items) => {
+                assert!(matches!(
+                    &items[0],
+                    SorobanExpr::BytesLiteral(b) if b == &[1u8, 2, 3]
+                ));
             }
-            other => panic!("unexpected stmt shape: {other:?}"),
+            other => panic!("expected VecConstruct, got: {other:?}"),
         }
 
-        let unsupported_address_hints = auth_hints(
+        // Bytes is also valid as an address hint value now.
+        let bytes_address_hints = auth_hints(
             "transfer",
             vec![(
-                Some(HintValue::Bytes(vec![1, 2, 3])),
+                Some(HintValue::Bytes(vec![9, 9, 9])),
                 vec![HintValue::U64(1)],
             )],
         );
-        assert!(unique_auth_hint_for_function(&unsupported_address_hints, "transfer").is_none());
+        let bytes_addr_hint =
+            unique_auth_hint_for_function(&matching(&bytes_address_hints, "transfer"))
+                .expect("Bytes-valued auth address hint should now repair");
+        assert!(matches!(
+            &bytes_addr_hint.address,
+            Some(SorobanExpr::BytesLiteral(b)) if b == &[9u8, 9, 9]
+        ));
     }
 
     #[test]
@@ -7135,8 +7151,8 @@ mod tests {
                 vec![HintValue::Symbol("hinted".to_string())],
             )],
         );
-        let hint =
-            unique_auth_hint_for_function(&hints, "transfer").expect("auth hint should be unique");
+        let hint = unique_auth_hint_for_function(&matching(&hints, "transfer"))
+            .expect("auth hint should be unique");
         let mut body = vec![
             SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(SorobanExpr::Param(
                 "user".to_string(),

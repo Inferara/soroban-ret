@@ -139,3 +139,51 @@ fn info_includes_constructor_marker_for_contract_with_ctor() {
         .success()
         .stderr(predicate::str::contains("Constructor:"));
 }
+
+#[test]
+fn info_conflicts_with_generic_flag() {
+    // --info short-circuits before mode selection; --generic with --info has
+    // no effect, so clap is configured to surface the conflict explicitly.
+    bin()
+        .arg("--info")
+        .arg("--generic")
+        .arg(fixture("test_add_u64.wasm"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn info_conflicts_with_spec_only_flag() {
+    bin()
+        .arg("--info")
+        .arg("--spec-only")
+        .arg(fixture("test_add_u64.wasm"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn pre_optimize_flag_either_succeeds_or_reports_missing_tool() {
+    // wasm-opt is optional. When present, the flag should succeed; when
+    // absent, the CLI must fail cleanly with a discoverable message (the
+    // exact text depends on whether the binary is installed locally).
+    let wasm_opt_present = std::process::Command::new("wasm-opt")
+        .arg("--version")
+        .output()
+        .is_ok();
+    let assertion = bin()
+        .arg("--pre-optimize")
+        .arg(fixture("test_add_u64.wasm"))
+        .assert();
+    if wasm_opt_present {
+        assertion
+            .success()
+            .stdout(predicate::str::contains("pub fn add"));
+    } else {
+        assertion
+            .failure()
+            .stderr(predicate::str::contains("wasm-opt"));
+    }
+}

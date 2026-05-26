@@ -58,6 +58,23 @@ fn wasm_type_to_spec(wt: &WasmType) -> ScSpecTypeDef {
     }
 }
 
+/// Combine a frame-slot base with a WASM memory offset, widening through i64
+/// so that adversarially large `offset` values (WASM permits up to u32::MAX)
+/// cannot panic in debug builds or silently wrap in release. Returns `None`
+/// when the result does not fit in the i32 used as the slot-tracker key; the
+/// frame-slot tracker is best-effort recovery so out-of-range slots are safely
+/// ignored.
+fn frame_slot_key(base: i32, offset: u32) -> Option<i32> {
+    let combined = i64::from(base).checked_add(i64::from(offset))?;
+    i32::try_from(combined).ok()
+}
+
+/// Maximum recursion depth for inlining callee bodies into the caller's stmts.
+/// Bounds stack usage and prevents pathological mutual-recursion lifting.
+/// Single source of truth — both `lift_instruction` (entry) and
+/// `lift_inline_call` (recursive callee) check against this.
+const MAX_INLINE_CALL_DEPTH: u32 = 5;
+
 /// Lift all contract functions from WASM module into a ContractModule.
 pub fn lift_functions(
     wasm_module: &WasmModule,
@@ -1625,7 +1642,7 @@ impl<'a> LiftContext<'a> {
                             self.stmts.push(SorobanStmt::Expr(set_expr));
                             self.found_host_calls = true;
                             true
-                        } else if self.inline_depth < 5 {
+                        } else if self.inline_depth < MAX_INLINE_CALL_DEPTH {
                             // Check if this is a load-struct wrapper BEFORE inlining.
                             // Save the output pointer info for post-inline gap filling.
                             let output_frame_slot = match args.first() {
@@ -2182,11 +2199,15 @@ impl<'a> LiftContext<'a> {
             | WasmInstr::I64Load32U(off) => {
                 let addr = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let loaded = if let StackVal::FrameSlot(id, base) = addr {
-                    self.frame_slots
-                        .borrow()
-                        .get(&(id, base + *off as i32))
-                        .cloned()
-                        .unwrap_or(StackVal::Unknown)
+                    match frame_slot_key(base, *off) {
+                        Some(slot) => self
+                            .frame_slots
+                            .borrow()
+                            .get(&(id, slot))
+                            .cloned()
+                            .unwrap_or(StackVal::Unknown),
+                        None => StackVal::Unknown,
+                    }
                 } else if let Some(const_addr) = to_u64(&addr) {
                     // Try reading from WASM data segments for constant addresses
                     let byte_addr = const_addr as u32 + *off;
@@ -2245,10 +2266,10 @@ impl<'a> LiftContext<'a> {
                     offset: *offset,
                     value: value.clone(),
                 });
-                if let StackVal::FrameSlot(id, base) = addr {
-                    self.frame_slots
-                        .borrow_mut()
-                        .insert((id, base + *offset as i32), value);
+                if let StackVal::FrameSlot(id, base) = addr
+                    && let Some(slot) = frame_slot_key(base, *offset)
+                {
+                    self.frame_slots.borrow_mut().insert((id, slot), value);
                 }
             }
             WasmInstr::I32Store(offset) => {
@@ -2257,10 +2278,10 @@ impl<'a> LiftContext<'a> {
                 // Note: I32Store is NOT recorded in memory_stores because it's typically
                 // used for bookkeeping (lengths, offsets), not Val-encoded fields.
                 // Val-encoded fields are stored via I64Store (Soroban Vals are 64-bit).
-                if let StackVal::FrameSlot(id, base) = addr {
-                    self.frame_slots
-                        .borrow_mut()
-                        .insert((id, base + *offset as i32), value);
+                if let StackVal::FrameSlot(id, base) = addr
+                    && let Some(slot) = frame_slot_key(base, *offset)
+                {
+                    self.frame_slots.borrow_mut().insert((id, slot), value);
                 }
             }
             WasmInstr::I32Store8(offset)
@@ -2274,10 +2295,10 @@ impl<'a> LiftContext<'a> {
                 // (e.g., I64Load8U) can resolve discriminant bytes written by
                 // struct/enum decoders. Not added to memory_stores (these are
                 // bookkeeping values, not Val-encoded fields).
-                if let StackVal::FrameSlot(id, base) = addr {
-                    self.frame_slots
-                        .borrow_mut()
-                        .insert((id, base + *offset as i32), value);
+                if let StackVal::FrameSlot(id, base) = addr
+                    && let Some(slot) = frame_slot_key(base, *offset)
+                {
+                    self.frame_slots.borrow_mut().insert((id, slot), value);
                 }
             }
 
@@ -4932,6 +4953,16 @@ fn lift_inline_call(
         locals,
         num_wasm_params,
     );
+    // Defence in depth: the only current call-site already gates on the
+    // depth, but a future caller could forget. Bail out cleanly rather than
+    // recursing past the bound.
+    if inline_depth >= MAX_INLINE_CALL_DEPTH {
+        return InlineResult {
+            content: None,
+            memory_stores: Vec::new(),
+            stack_result: None,
+        };
+    }
     ctx.inline_depth = inline_depth + 1;
     ctx.frame_slots = frame_slots;
     ctx.next_frame_id = next_frame_id;
@@ -7329,7 +7360,14 @@ fn detect_memory_copy_loop(
         return None;
     }
 
-    // Find the limit: look for `local.get COUNTER; i32.const LIMIT; i32.eq`
+    // Find the limit: look for `local.get COUNTER; i32.const LIMIT; i32.eq`.
+    // The consumer iterates `(step..limit).step_by(step)` over the recovered
+    // limit; an unbounded limit from crafted WASM (up to u32::MAX) would let
+    // an attacker drive the lifter into a multi-million-iteration HashMap
+    // loop. Real Rust struct copies don't exceed a few hundred bytes, so cap
+    // at 1024 — anything larger is either pathological or out of scope for
+    // this recognizer.
+    const MAX_MEMORY_COPY_BYTES: u32 = 1024;
     let mut counter_local = None;
     let mut limit = None;
     for w in all_instrs.windows(3) {
@@ -7337,7 +7375,7 @@ fn detect_memory_copy_loop(
             (w[0], w[1], w[2])
         {
             counter_local = Some(*cnt);
-            limit = Some(*lim as u32);
+            limit = Some((*lim as u32).min(MAX_MEMORY_COPY_BYTES));
             break;
         }
     }
@@ -8473,4 +8511,107 @@ fn generate_arithmetic_body(
     } else {
         Vec::new()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Scaffold-level tests for lifter helpers. The full lifter is exercised
+    //! end-to-end by the integration suite; this module establishes a place
+    //! for narrow unit tests of attacker-surface helpers so future regressions
+    //! land here first.
+    use super::*;
+
+    // ----- frame_slot_key (Phase 4.1) ----------------------------------
+
+    #[test]
+    fn frame_slot_key_handles_zero_offset() {
+        assert_eq!(frame_slot_key(100, 0), Some(100));
+        assert_eq!(frame_slot_key(0, 0), Some(0));
+    }
+
+    #[test]
+    fn frame_slot_key_handles_small_positive_offset() {
+        assert_eq!(frame_slot_key(0, 16), Some(16));
+        assert_eq!(frame_slot_key(-16, 16), Some(0));
+        assert_eq!(frame_slot_key(100, 200), Some(300));
+    }
+
+    #[test]
+    fn frame_slot_key_returns_none_for_max_u32_offset() {
+        // u32::MAX is a valid WASM memory offset but cannot fit in i32 alongside
+        // any non-negative base — the slot tracker must return None instead of
+        // panicking or wrapping.
+        assert_eq!(frame_slot_key(0, u32::MAX), None);
+        assert_eq!(frame_slot_key(1, u32::MAX), None);
+        assert_eq!(frame_slot_key(i32::MAX, 1), None);
+    }
+
+    #[test]
+    fn frame_slot_key_returns_none_for_high_bit_offset() {
+        // Offsets ≥ 0x8000_0000 previously cast to negative i32 and wrapped;
+        // verify the widened arithmetic refuses them cleanly.
+        assert_eq!(frame_slot_key(0, 0x8000_0000), None);
+        assert_eq!(frame_slot_key(0, 0x8000_0001), None);
+    }
+
+    #[test]
+    fn frame_slot_key_with_negative_base_can_recover_in_range() {
+        // A negative base plus a large positive offset can land back in range —
+        // verify the helper accepts it. i32::MIN + u32::MAX = 0x7FFF_FFFF (i32::MAX).
+        assert_eq!(frame_slot_key(-1, 1), Some(0));
+        assert_eq!(frame_slot_key(i32::MIN, u32::MAX), Some(i32::MAX));
+    }
+
+    // ----- MAX_INLINE_CALL_DEPTH constant (Phase 4.3) ------------------
+
+    #[test]
+    fn inline_call_depth_const_is_within_safe_bounds() {
+        // Sanity check on the depth bound: not 0 (which would disable inlining),
+        // not absurdly large (which would risk recursion blowup).
+        const _: () = assert!(MAX_INLINE_CALL_DEPTH >= 1);
+        const _: () = assert!(MAX_INLINE_CALL_DEPTH <= 32);
+    }
+
+    #[test]
+    fn lift_inline_call_short_circuits_at_max_depth() {
+        // Defence-in-depth: even if the caller forgets to check, the callee
+        // bails out cleanly rather than recursing past the limit. Verify by
+        // calling with target_idx=0 on an empty-WASM module — content is None,
+        // no memory stores, no stack result.
+        use crate::wasm::WasmModule;
+        // Minimal valid WASM: 4-byte magic + 4-byte version, no sections.
+        let empty_wasm = WasmModule::parse(b"\0asm\x01\x00\x00\x00").expect("empty WASM parses");
+        let registry = crate::spec::registry::TypeRegistry {
+            functions: std::collections::BTreeMap::new(),
+            structs: std::collections::BTreeMap::new(),
+            unions: std::collections::BTreeMap::new(),
+            enums: std::collections::BTreeMap::new(),
+            error_enums: std::collections::BTreeMap::new(),
+            events: std::collections::BTreeMap::new(),
+            meta: Vec::new(),
+            spec_entries: Vec::new(),
+        };
+        let result = lift_inline_call(
+            &empty_wasm,
+            &registry,
+            0,
+            Vec::new(),
+            MAX_INLINE_CALL_DEPTH,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+        );
+        assert!(result.content.is_none());
+        assert!(result.memory_stores.is_empty());
+        assert!(result.stack_result.is_none());
+    }
+
+    // ----- detect_memory_copy_loop bound -------------------
+    //
+    // The internal `MAX_MEMORY_COPY_BYTES` constant is exercised indirectly
+    // by the integration suite (no fixture currently triggers the loop
+    // detector). A future regression that removed the cap would still be
+    // surfaced by build-time inspection of the source; the bound is small
+    // (1024) and obvious. Direct testing requires constructing a synthetic
+    // WASM function body, which is heavy enough to belong in its own
+    // follow-up rather than this PR.
 }

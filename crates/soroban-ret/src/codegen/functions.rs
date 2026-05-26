@@ -1,17 +1,27 @@
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 
 use crate::ir::soroban_ir::{MatchArm, MatchPattern, SorobanExpr, SorobanStmt, StorageType};
 
-/// Build a `proc_macro2::Ident` from a possibly-untrusted name without panicking.
+/// Names that cannot be escaped via `r#` (Rust 2024).
+/// `proc_macro2::Ident::new_raw` panics on these.
+const RAW_FORBIDDEN: &[&str] = &["self", "Self", "crate", "super"];
+
+/// Build a `proc_macro2::Ident` from a possibly-untrusted name without panicking
+/// and without colliding with Rust keywords.
 ///
-/// Lifter-recovered names occasionally come from data-section bytes, frame-slot
-/// derivation, or symbol decoding. These paths can yield strings that are not
-/// valid Rust identifiers (empty, leading digit, embedded punctuation), and
-/// `format_ident!` panics inside `proc_macro2` on such input. This helper
-/// sanitises the input: any non-`[A-Za-z0-9_]` character becomes `_`, a leading
-/// digit gains a `_` prefix, and an empty string falls back to `_unknown`.
-fn safe_ident(name: &str) -> proc_macro2::Ident {
+/// Lifter-recovered names come from data-section bytes, frame-slot derivation,
+/// or symbol decoding. These paths can yield strings that are not valid Rust
+/// identifiers (empty, leading digit, embedded punctuation), and `format_ident!`
+/// panics inside `proc_macro2` on such input. Furthermore, a spec param literally
+/// named `type`, `match`, `move`, `fn`, etc. would emit unparseable Rust.
+///
+/// Sanitisation: any non-`[A-Za-z0-9_]` character becomes `_`, a leading digit
+/// gains a `_` prefix, empty falls back to `_unknown`. After sanitisation, if
+/// the result is a Rust keyword, it is raw-escaped (`r#name`); for the four
+/// keywords (`self`, `Self`, `crate`, `super`) that cannot be raw-escaped, a
+/// trailing underscore is appended.
+pub(crate) fn safe_ident(name: &str) -> proc_macro2::Ident {
     let mut sanitised: String = name
         .chars()
         .map(|c| {
@@ -27,7 +37,25 @@ fn safe_ident(name: &str) -> proc_macro2::Ident {
     } else if sanitised.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         sanitised.insert(0, '_');
     }
-    format_ident!("{}", sanitised)
+
+    // `_` is the wildcard token. `syn::parse_str::<Ident>("_")` rejects it
+    // and `Ident::new_raw("_")` panics, but `format_ident!("_")` works and
+    // is exactly the right output in pattern-binding contexts (the only
+    // callers that pass a bare `_`).
+    if sanitised == "_" {
+        return format_ident!("_");
+    }
+
+    // `syn::parse_str::<syn::Ident>` rejects all Rust keywords; if parsing
+    // fails the sanitised string is a keyword and must be escaped.
+    if syn::parse_str::<syn::Ident>(&sanitised).is_ok() {
+        format_ident!("{}", sanitised)
+    } else if RAW_FORBIDDEN.contains(&sanitised.as_str()) {
+        sanitised.push('_');
+        format_ident!("{}", sanitised)
+    } else {
+        proc_macro2::Ident::new_raw(&sanitised, Span::call_site())
+    }
 }
 
 // Operator precedence levels (Rust standard, higher = tighter binding).
@@ -222,6 +250,12 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
         SorobanExpr::StringLiteral(s) => {
             let lit = proc_macro2::Literal::string(s);
             quote! { String::from_str(&env, #lit) }
+        }
+        SorobanExpr::BytesLiteral(bytes) => {
+            let byte_lits = bytes
+                .iter()
+                .map(|b| proc_macro2::Literal::u8_unsuffixed(*b));
+            quote! { Bytes::from_slice(&env, &[#(#byte_lits),*]) }
         }
         SorobanExpr::Void => quote! { () },
         SorobanExpr::None => quote! { None },
@@ -641,13 +675,17 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
         SorobanExpr::CastAs { value, target_type } => {
             let val = generate_expr(value);
             // `target_type` originates from spec/IR strings and is not guaranteed
-            // to parse as a Rust type. Fall back to an identifier so codegen never
-            // panics on an unexpected type name.
+            // to parse as a Rust type. Earlier code silently coerced it to a
+            // sanitised ident (e.g. `Vec_u32_`), producing valid syntax with
+            // the wrong type. Instead, emit a `compile_error!` so the failure
+            // surfaces at compile time of the decompiled code rather than as a
+            // silent miscast.
             match syn::parse_str::<syn::Type>(target_type) {
                 Ok(ty) => quote! { #val as #ty },
                 Err(_) => {
-                    let ty_ident = safe_ident(target_type);
-                    quote! { #val as #ty_ident }
+                    let msg = format!("decompiler: unsupported cast target `{target_type}`");
+                    let msg_lit = proc_macro2::Literal::string(&msg);
+                    quote! { { compile_error!(#msg_lit); #val } }
                 }
             }
         }
@@ -1437,6 +1475,52 @@ mod safe_ident_tests {
         assert_eq!(safe_ident("_x").to_string(), "_x");
         assert_eq!(safe_ident("snake_case_42").to_string(), "snake_case_42");
     }
+
+    #[test]
+    fn raw_escapes_strict_and_reserved_keywords() {
+        // Strict keywords get the r# prefix and parse cleanly. The exact set
+        // depends on the syn version's keyword recognition; we test only
+        // keywords syn already treats as non-Ident, so the test tracks the
+        // implementation precisely.
+        for kw in [
+            "fn", "if", "else", "let", "match", "move", "type", "loop", "while", "for", "return",
+            "break", "continue", "mut", "ref", "use", "where", "impl", "trait", "pub", "mod",
+            "struct", "enum", "true", "false", "as", "in", "const", "static", "async", "await",
+            "dyn", "unsafe", "extern", "yield", "abstract", "become", "box", "do", "final",
+            "macro", "override", "priv", "typeof", "unsized", "virtual", "try",
+        ] {
+            if syn::parse_str::<syn::Ident>(kw).is_ok() {
+                // This syn version does not classify `kw` as a keyword — skip.
+                continue;
+            }
+            let id = safe_ident(kw);
+            assert_eq!(
+                id.to_string(),
+                format!("r#{kw}"),
+                "keyword {kw} did not round-trip to r#{kw}"
+            );
+            // Round-trips through syn — the produced ident is parseable.
+            let parsed = syn::parse_str::<syn::Ident>(&id.to_string());
+            assert!(parsed.is_ok(), "r#{kw} did not parse as syn::Ident");
+        }
+    }
+
+    #[test]
+    fn appends_underscore_to_forbidden_raw_keywords() {
+        // self/Self/crate/super cannot be raw-escaped: panic in Ident::new_raw.
+        // Fall back to underscore suffix.
+        assert_eq!(safe_ident("self").to_string(), "self_");
+        assert_eq!(safe_ident("Self").to_string(), "Self_");
+        assert_eq!(safe_ident("crate").to_string(), "crate_");
+        assert_eq!(safe_ident("super").to_string(), "super_");
+    }
+
+    #[test]
+    fn underscore_passes_through_as_wildcard() {
+        // `_` is the wildcard token and is the right output in match-arm
+        // binding positions (the only place a bare `_` reaches safe_ident).
+        assert_eq!(safe_ident("_").to_string(), "_");
+    }
 }
 
 #[cfg(test)]
@@ -2146,13 +2230,23 @@ mod generate_expr_tests {
     }
 
     #[test]
-    fn cast_as_invalid_type_falls_back_to_ident() {
+    fn cast_as_invalid_type_emits_compile_error() {
         let e = SorobanExpr::CastAs {
             value: boxed(SorobanExpr::Param("n".into())),
             target_type: "not a type".into(),
         };
         let out = collapse(&s(generate_expr(&e)));
-        assert!(out.starts_with("n as "), "got: {out}");
+        // The emitted Rust must contain a compile_error! so the failure is
+        // visible at compile time of the decompiled output rather than as a
+        // silent miscast to a sanitised identifier.
+        assert!(
+            out.contains("compile_error !"),
+            "expected compile_error fallback, got: {out}"
+        );
+        assert!(
+            out.contains("not a type"),
+            "expected target_type in error message, got: {out}"
+        );
     }
 }
 

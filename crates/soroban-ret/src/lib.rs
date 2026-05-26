@@ -2,7 +2,7 @@ pub mod codegen;
 pub mod dynamic_hints;
 pub mod ir;
 pub mod pattern;
-pub mod pipeline;
+pub(crate) mod pipeline;
 pub mod spec;
 pub mod wasm;
 
@@ -47,6 +47,11 @@ pub enum DecompileMode {
 pub enum DecompileError {
     #[error("WASM parsing error: {0}")]
     WasmParse(String),
+    /// External `wasm-opt` (binaryen) pre-optimization failed. Distinct from
+    /// `WasmParse` so embedders can distinguish "binaryen is missing" from
+    /// "the input WASM is malformed."
+    #[error("wasm-opt pre-optimization failed: {0}")]
+    PreOptimize(String),
     #[error("spec extraction error: {0}")]
     SpecExtraction(#[from] crate::spec::registry::RegistryError),
     #[error("pattern matching error: {0}")]

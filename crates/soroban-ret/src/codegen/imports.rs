@@ -464,6 +464,9 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
         SorobanExpr::StringLiteral(_) => {
             needs.string_type = true;
         }
+        SorobanExpr::BytesLiteral(_) => {
+            needs.bytes = true;
+        }
         _ => {}
     }
 }

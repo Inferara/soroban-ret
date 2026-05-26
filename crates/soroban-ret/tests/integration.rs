@@ -217,9 +217,11 @@ fn test_decompile_mutability_expression() {
     let wasm = include_bytes!("../../../tests/fixtures/test_mutability.wasm");
     let source = decompile(wasm).expect("decompilation failed");
     // Body has `b * 2 + a` — exercises operator precedence (binary `*` inside `+`).
+    // Require the canonical form: a loose fallback (any "b * 2" plus any "+ a")
+    // accepted wrong operand orders like `c + a + b * 2`.
     assert!(
-        source.contains("b * 2 + a") || source.contains("b * 2") && source.contains("+ a"),
-        "missing precedence-sensitive expression `b * 2 + a`: {source}"
+        source.contains("b * 2 + a"),
+        "missing canonical precedence-sensitive expression `b * 2 + a`: {source}"
     );
 }
 
@@ -777,4 +779,36 @@ fn test_all_fixtures_no_artifacts() {
             );
         }
     }
+}
+
+// -------------------------------------------------------------------------
+// Snapshot tests
+//
+// Substring assertions (`assert_ordered` / `assert_in_fn`) catch missing
+// content but accept any whitespace, attribute order, or trailing junk.
+// Snapshot the three most attribute-heavy fixtures so the full decompiled
+// shape (line breaks, attribute order, trailing newlines) is regression-
+// protected end-to-end. Run `cargo insta review` to accept intentional
+// changes.
+// -------------------------------------------------------------------------
+
+#[test]
+fn snapshot_test_errors() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_errors.wasm");
+    let source = decompile(wasm).expect("decompile test_errors");
+    insta::assert_snapshot!("test_errors", source);
+}
+
+#[test]
+fn snapshot_test_events() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_events.wasm");
+    let source = decompile(wasm).expect("decompile test_events");
+    insta::assert_snapshot!("test_events", source);
+}
+
+#[test]
+fn snapshot_contract_with_constructor() {
+    let wasm = include_bytes!("../../../tests/fixtures/contract_with_constructor.wasm");
+    let source = decompile(wasm).expect("decompile contract_with_constructor");
+    insta::assert_snapshot!("contract_with_constructor", source);
 }
