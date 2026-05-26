@@ -230,6 +230,73 @@ fn test_decompile_invoke_contract() {
 }
 
 // -------------------------------------------------------------------------
+// Extended scope: token-adjacent + multi-impl patterns
+//
+// These fixtures exercise wrapper detectors that are not reached by the
+// Levels 1-4 fixtures (keyed-storage dispatch, multi-impl merging, panic
+// bodies, alternate cross-contract param naming). They give us a smoke
+// signal that the ported lifter still handles the broader pattern space.
+// -------------------------------------------------------------------------
+
+#[test]
+fn test_decompile_liquidity_pool_keys() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_liquidity_pool.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    // Constructor must produce distinct DataKey variants for each storage set;
+    // this exercises the keyed-storage wrapper detector + enum key construction.
+    assert!(
+        source.contains("DataKey::TokenA"),
+        "missing DataKey::TokenA"
+    );
+    assert!(
+        source.contains("DataKey::TokenB"),
+        "missing DataKey::TokenB"
+    );
+    assert!(
+        source.contains("DataKey::TotalShares"),
+        "missing DataKey::TotalShares"
+    );
+}
+
+#[test]
+fn test_decompile_import_contract() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_import_contract.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    assert!(
+        source.contains("pub fn add_with"),
+        "missing add_with function"
+    );
+    assert!(
+        source.contains("invoke_contract"),
+        "missing invoke_contract call"
+    );
+    assert!(
+        source.contains("contract_id: Address"),
+        "missing contract_id parameter"
+    );
+    assert!(source.contains("x: u64"), "missing x parameter");
+    assert!(source.contains("y: u64"), "missing y parameter");
+}
+
+#[test]
+fn test_decompile_modular() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_modular.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    assert!(source.contains("pub fn one"), "missing one function");
+    assert!(source.contains("pub fn two"), "missing two function");
+    assert!(source.contains("pub fn zero"), "missing zero function");
+}
+
+#[test]
+fn test_decompile_fuzz() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_fuzz.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    assert!(source.contains("pub fn run"), "missing run function");
+    assert!(source.contains("if"), "missing conditional in run function");
+    assert!(source.contains("panic!()"), "missing panic in run function");
+}
+
+// -------------------------------------------------------------------------
 // Option / api surface
 // -------------------------------------------------------------------------
 
@@ -246,7 +313,7 @@ fn test_decompile_spec_only() {
 }
 
 // -------------------------------------------------------------------------
-// Smoke tests covering all 18 deliverable fixtures
+// Smoke tests covering all 28 fixtures (18 deliverable + 10 extended)
 // -------------------------------------------------------------------------
 
 const ALL_FIXTURES: &[(&str, &[u8])] = &[
@@ -321,6 +388,47 @@ const ALL_FIXTURES: &[(&str, &[u8])] = &[
     (
         "test_invoke_contract",
         include_bytes!("../../../tests/fixtures/test_invoke_contract.wasm"),
+    ),
+    // Extended scope (Tranche 2 fixture broadening)
+    (
+        "contract",
+        include_bytes!("../../../tests/fixtures/contract.wasm"),
+    ),
+    (
+        "contract_with_constructor",
+        include_bytes!("../../../tests/fixtures/contract_with_constructor.wasm"),
+    ),
+    (
+        "test_alloc",
+        include_bytes!("../../../tests/fixtures/test_alloc.wasm"),
+    ),
+    (
+        "test_events_ref",
+        include_bytes!("../../../tests/fixtures/test_events_ref.wasm"),
+    ),
+    (
+        "test_fuzz",
+        include_bytes!("../../../tests/fixtures/test_fuzz.wasm"),
+    ),
+    (
+        "test_import_contract",
+        include_bytes!("../../../tests/fixtures/test_import_contract.wasm"),
+    ),
+    (
+        "test_liquidity_pool",
+        include_bytes!("../../../tests/fixtures/test_liquidity_pool.wasm"),
+    ),
+    (
+        "test_macros",
+        include_bytes!("../../../tests/fixtures/test_macros.wasm"),
+    ),
+    (
+        "test_modular",
+        include_bytes!("../../../tests/fixtures/test_modular.wasm"),
+    ),
+    (
+        "test_multiimpl",
+        include_bytes!("../../../tests/fixtures/test_multiimpl.wasm"),
     ),
 ];
 
