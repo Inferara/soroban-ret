@@ -10,31 +10,31 @@ use crate::ir::high_level_ir::CryptoUsage;
 
 /// Generate a struct type definition, stripping `export = false` from soroban-spec-rust output
 pub fn generate_struct(spec: &ScSpecUdtStructV0) -> TokenStream {
-    let tokens = soroban_spec_rust::types::generate_struct(spec);
+    let tokens = soroban_spec_rust::types::generate_struct(spec).unwrap_or_default();
     strip_export_false(tokens)
 }
 
 /// Generate a union (complex enum) type definition
 pub fn generate_union(spec: &ScSpecUdtUnionV0) -> TokenStream {
-    let tokens = soroban_spec_rust::types::generate_union(spec);
+    let tokens = soroban_spec_rust::types::generate_union(spec).unwrap_or_default();
     strip_export_false(tokens)
 }
 
 /// Generate an integer enum type definition
 pub fn generate_enum(spec: &ScSpecUdtEnumV0) -> TokenStream {
-    let tokens = soroban_spec_rust::types::generate_enum(spec);
+    let tokens = soroban_spec_rust::types::generate_enum(spec).unwrap_or_default();
     strip_export_false(tokens)
 }
 
 /// Generate an error enum type definition
 pub fn generate_error_enum(spec: &ScSpecUdtErrorEnumV0) -> TokenStream {
-    let tokens = soroban_spec_rust::types::generate_error_enum(spec);
+    let tokens = soroban_spec_rust::types::generate_error_enum(spec).unwrap_or_default();
     strip_export_false(tokens)
 }
 
 /// Generate an event type definition
 pub fn generate_event(spec: &ScSpecEventV0) -> TokenStream {
-    let tokens = soroban_spec_rust::types::generate_event(spec);
+    let tokens = soroban_spec_rust::types::generate_event(spec).unwrap_or_default();
     strip_export_false(tokens)
 }
 
@@ -85,7 +85,7 @@ pub fn generate_type_ident(spec: &ScSpecTypeDef) -> TokenStream {
             }
         }
         // Primitives, Void, Udt — delegate to upstream
-        other => soroban_spec_rust::types::generate_type_ident(other),
+        other => soroban_spec_rust::types::generate_type_ident(other).unwrap_or_default(),
     }
 }
 
