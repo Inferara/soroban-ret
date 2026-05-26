@@ -1438,3 +1438,927 @@ mod safe_ident_tests {
         assert_eq!(safe_ident("snake_case_42").to_string(), "snake_case_42");
     }
 }
+
+#[cfg(test)]
+mod generate_expr_tests {
+    use super::*;
+
+    fn s(t: TokenStream) -> String {
+        t.to_string()
+    }
+    fn collapse(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    fn boxed(e: SorobanExpr) -> Box<SorobanExpr> {
+        Box::new(e)
+    }
+
+    // ----- Literals & basic atoms -----
+
+    #[test]
+    fn literals_emit_unsuffixed() {
+        assert_eq!(s(generate_expr(&SorobanExpr::U32Literal(7))), "7");
+        assert_eq!(s(generate_expr(&SorobanExpr::I32Literal(-3))), "- 3");
+        assert_eq!(s(generate_expr(&SorobanExpr::U64Literal(42))), "42");
+        assert_eq!(s(generate_expr(&SorobanExpr::I64Literal(-1))), "- 1");
+        assert_eq!(s(generate_expr(&SorobanExpr::U128Literal(1))), "1");
+        assert_eq!(s(generate_expr(&SorobanExpr::I128Literal(-1))), "- 1");
+        assert_eq!(s(generate_expr(&SorobanExpr::BoolLiteral(true))), "true");
+        assert_eq!(s(generate_expr(&SorobanExpr::BoolLiteral(false))), "false");
+        assert_eq!(s(generate_expr(&SorobanExpr::Void)), "()");
+        assert_eq!(s(generate_expr(&SorobanExpr::None)), "None");
+    }
+
+    #[test]
+    fn short_symbol_uses_symbol_short_macro() {
+        let out = collapse(&s(generate_expr(&SorobanExpr::SymbolLiteral("foo".into()))));
+        assert_eq!(out, "symbol_short ! (\"foo\")");
+    }
+
+    #[test]
+    fn long_symbol_uses_symbol_new() {
+        // 10+ chars uses Symbol::new(&env, ...)
+        let out = collapse(&s(generate_expr(&SorobanExpr::SymbolLiteral(
+            "very_long_symbol".into(),
+        ))));
+        assert!(out.contains("Symbol :: new (& env"), "got: {out}");
+        assert!(out.contains("\"very_long_symbol\""), "got: {out}");
+    }
+
+    #[test]
+    fn string_literal_emits_from_str() {
+        let out = collapse(&s(generate_expr(&SorobanExpr::StringLiteral(
+            "hello".into(),
+        ))));
+        assert_eq!(out, "String :: from_str (& env , \"hello\")");
+    }
+
+    #[test]
+    fn variables_emit_safe_idents() {
+        assert_eq!(s(generate_expr(&SorobanExpr::Param("a".into()))), "a");
+        assert_eq!(s(generate_expr(&SorobanExpr::Local(3))), "var_3");
+        assert_eq!(
+            s(generate_expr(&SorobanExpr::NamedLocal("foo_bar".into()))),
+            "foo_bar"
+        );
+        assert_eq!(s(generate_expr(&SorobanExpr::Env)), "env");
+        // Untrusted name gets sanitised.
+        assert_eq!(
+            s(generate_expr(&SorobanExpr::Param("123-bad".into()))),
+            "_123_bad"
+        );
+    }
+
+    // ----- Arithmetic & precedence -----
+
+    #[test]
+    fn add_two_literals() {
+        // Top-level operators always get outer parens for safety in any context.
+        let e = SorobanExpr::Add(
+            boxed(SorobanExpr::U32Literal(1)),
+            boxed(SorobanExpr::U32Literal(2)),
+        );
+        assert_eq!(collapse(&s(generate_expr(&e))), "(1 + 2)");
+    }
+
+    #[test]
+    fn precedence_mul_binds_tighter_than_add() {
+        // `a + b * c` — inner mul does NOT get parens (higher precedence).
+        let mul = SorobanExpr::Mul(
+            boxed(SorobanExpr::Param("b".into())),
+            boxed(SorobanExpr::Param("c".into())),
+        );
+        let add = SorobanExpr::Add(boxed(SorobanExpr::Param("a".into())), boxed(mul));
+        assert_eq!(collapse(&s(generate_expr(&add))), "(a + b * c)");
+    }
+
+    #[test]
+    fn precedence_add_inside_mul_gets_parens() {
+        // (a + b) * c — inner lower-precedence add requires explicit parens.
+        let add = SorobanExpr::Add(
+            boxed(SorobanExpr::Param("a".into())),
+            boxed(SorobanExpr::Param("b".into())),
+        );
+        let mul = SorobanExpr::Mul(boxed(add), boxed(SorobanExpr::Param("c".into())));
+        let out = collapse(&s(generate_expr(&mul)));
+        assert!(out.contains("(a + b) * c"), "got: {out}");
+    }
+
+    #[test]
+    fn left_associative_add_no_inner_parens() {
+        // (a + b) + c — left associative same precedence, inner no parens.
+        let inner = SorobanExpr::Add(
+            boxed(SorobanExpr::Param("a".into())),
+            boxed(SorobanExpr::Param("b".into())),
+        );
+        let outer = SorobanExpr::Add(boxed(inner), boxed(SorobanExpr::Param("c".into())));
+        // Outer wrap is unconditional; inner pair is on the left so no parens needed.
+        assert_eq!(collapse(&s(generate_expr(&outer))), "(a + b + c)");
+    }
+
+    #[test]
+    fn right_associative_sub_gets_parens() {
+        // a - (b - c) — right side of same-precedence binop needs parens.
+        let inner = SorobanExpr::Sub(
+            boxed(SorobanExpr::Param("b".into())),
+            boxed(SorobanExpr::Param("c".into())),
+        );
+        let outer = SorobanExpr::Sub(boxed(SorobanExpr::Param("a".into())), boxed(inner));
+        let out = collapse(&s(generate_expr(&outer)));
+        assert!(out.contains("a - (b - c)"), "got: {out}");
+    }
+
+    #[test]
+    fn sub_div_rem_codegen() {
+        for (op, sym) in [
+            (
+                SorobanExpr::Sub(
+                    boxed(SorobanExpr::Param("a".into())),
+                    boxed(SorobanExpr::Param("b".into())),
+                ),
+                "-",
+            ),
+            (
+                SorobanExpr::Div(
+                    boxed(SorobanExpr::Param("a".into())),
+                    boxed(SorobanExpr::Param("b".into())),
+                ),
+                "/",
+            ),
+            (
+                SorobanExpr::Rem(
+                    boxed(SorobanExpr::Param("a".into())),
+                    boxed(SorobanExpr::Param("b".into())),
+                ),
+                "%",
+            ),
+        ] {
+            assert_eq!(collapse(&s(generate_expr(&op))), format!("(a {sym} b)"));
+        }
+    }
+
+    #[test]
+    fn comparison_operators() {
+        for (op, sym) in [
+            (
+                SorobanExpr::Eq(
+                    boxed(SorobanExpr::Param("a".into())),
+                    boxed(SorobanExpr::Param("b".into())),
+                ),
+                "==",
+            ),
+            (
+                SorobanExpr::Ne(
+                    boxed(SorobanExpr::Param("a".into())),
+                    boxed(SorobanExpr::Param("b".into())),
+                ),
+                "!=",
+            ),
+            (
+                SorobanExpr::Lt(
+                    boxed(SorobanExpr::Param("a".into())),
+                    boxed(SorobanExpr::Param("b".into())),
+                ),
+                "<",
+            ),
+            (
+                SorobanExpr::Le(
+                    boxed(SorobanExpr::Param("a".into())),
+                    boxed(SorobanExpr::Param("b".into())),
+                ),
+                "<=",
+            ),
+            (
+                SorobanExpr::Gt(
+                    boxed(SorobanExpr::Param("a".into())),
+                    boxed(SorobanExpr::Param("b".into())),
+                ),
+                ">",
+            ),
+            (
+                SorobanExpr::Ge(
+                    boxed(SorobanExpr::Param("a".into())),
+                    boxed(SorobanExpr::Param("b".into())),
+                ),
+                ">=",
+            ),
+        ] {
+            assert_eq!(collapse(&s(generate_expr(&op))), format!("(a {sym} b)"));
+        }
+    }
+
+    #[test]
+    fn logical_and_or_not() {
+        let a = SorobanExpr::Param("a".into());
+        let b = SorobanExpr::Param("b".into());
+        let and = SorobanExpr::And(boxed(a.clone()), boxed(b.clone()));
+        let or = SorobanExpr::Or(boxed(a.clone()), boxed(b));
+        let not = SorobanExpr::Not(boxed(a));
+        assert_eq!(collapse(&s(generate_expr(&and))), "(a && b)");
+        assert_eq!(collapse(&s(generate_expr(&or))), "(a || b)");
+        // Unary `!` is highest precedence; codegen emits it without outer parens.
+        assert_eq!(collapse(&s(generate_expr(&not))), "! a");
+    }
+
+    // ----- Storage operations -----
+
+    #[test]
+    fn storage_get_with_and_without_unwrap() {
+        let key = SorobanExpr::SymbolLiteral("k".into());
+        let g = SorobanExpr::StorageGet {
+            storage_type: StorageType::Persistent,
+            key: boxed(key.clone()),
+            unwrap: true,
+        };
+        let out = collapse(&s(generate_expr(&g)));
+        assert!(out.contains(". persistent ()"), "got: {out}");
+        assert!(out.contains(". get (&"), "got: {out}");
+        assert!(out.ends_with(". unwrap ()"), "got: {out}");
+
+        let g = SorobanExpr::StorageGet {
+            storage_type: StorageType::Temporary,
+            key: boxed(key),
+            unwrap: false,
+        };
+        let out = collapse(&s(generate_expr(&g)));
+        assert!(out.contains(". temporary ()"), "got: {out}");
+        assert!(!out.contains("unwrap"), "got: {out}");
+    }
+
+    #[test]
+    fn storage_set_has_remove() {
+        let k = SorobanExpr::SymbolLiteral("k".into());
+        let v = SorobanExpr::U64Literal(7);
+        let set = SorobanExpr::StorageSet {
+            storage_type: StorageType::Instance,
+            key: boxed(k.clone()),
+            value: boxed(v),
+        };
+        let out = collapse(&s(generate_expr(&set)));
+        assert!(out.contains(". instance ()"), "got: {out}");
+        assert!(out.contains(". set (&"), "got: {out}");
+
+        let has = SorobanExpr::StorageHas {
+            storage_type: StorageType::Persistent,
+            key: boxed(k.clone()),
+        };
+        assert!(collapse(&s(generate_expr(&has))).contains(". has (&"));
+
+        let rm = SorobanExpr::StorageRemove {
+            storage_type: StorageType::Persistent,
+            key: boxed(k),
+        };
+        assert!(collapse(&s(generate_expr(&rm))).contains(". remove (&"));
+    }
+
+    #[test]
+    fn storage_extend_ttl() {
+        let e = SorobanExpr::StorageExtendTtl {
+            storage_type: StorageType::Persistent,
+            key: boxed(SorobanExpr::SymbolLiteral("k".into())),
+            threshold: boxed(SorobanExpr::U32Literal(100)),
+            extend_to: boxed(SorobanExpr::U32Literal(1000)),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains(". extend_ttl (&"), "got: {out}");
+        assert!(out.contains("100"));
+        assert!(out.contains("1000"));
+    }
+
+    #[test]
+    fn extend_instance_and_code_ttl() {
+        let e = SorobanExpr::ExtendInstanceAndCodeTtl {
+            threshold: boxed(SorobanExpr::U32Literal(50)),
+            extend_to: boxed(SorobanExpr::U32Literal(500)),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . storage () . instance () . extend_ttl"));
+        assert!(out.contains("50") && out.contains("500"));
+    }
+
+    // ----- Auth -----
+
+    #[test]
+    fn auth_require_and_for_args() {
+        let r = SorobanExpr::RequireAuth(boxed(SorobanExpr::Param("a".into())));
+        assert_eq!(collapse(&s(generate_expr(&r))), "a . require_auth ()");
+
+        let f = SorobanExpr::RequireAuthForArgs {
+            address: boxed(SorobanExpr::Param("a".into())),
+            args: boxed(SorobanExpr::TupleConstruct(vec![
+                SorobanExpr::U32Literal(1),
+                SorobanExpr::U32Literal(2),
+            ])),
+        };
+        let out = collapse(&s(generate_expr(&f)));
+        assert!(out.contains("require_auth_for_args"));
+        assert!(out.contains("(1 , 2) . into_val (& env)"));
+    }
+
+    #[test]
+    fn authorize_as_curr_contract() {
+        let e = SorobanExpr::AuthorizeAsCurrContract(boxed(SorobanExpr::VecConstruct(vec![])));
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . authorize_as_current_contract"));
+    }
+
+    // ----- Events -----
+
+    #[test]
+    fn publish_event_high_level_uses_struct_publish() {
+        let e = SorobanExpr::PublishEvent {
+            event_name: Some("Transfer".into()),
+            topics: vec![],
+            data: boxed(SorobanExpr::StructConstruct {
+                type_name: "Transfer".into(),
+                fields: vec![("amount".into(), SorobanExpr::U64Literal(1))],
+            }),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("Transfer { amount : 1 } . publish (& env)"));
+    }
+
+    #[test]
+    fn publish_event_low_level_uses_env_events_publish() {
+        let e = SorobanExpr::PublishEvent {
+            event_name: None,
+            topics: vec![SorobanExpr::SymbolLiteral("t".into())],
+            data: boxed(SorobanExpr::U64Literal(7)),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . events () . publish"));
+        assert!(out.contains("symbol_short ! (\"t\")"));
+    }
+
+    #[test]
+    fn publish_event_flattens_tuple_topics() {
+        // Single TupleConstruct topic gets unwrapped into the publish tuple.
+        let e = SorobanExpr::PublishEvent {
+            event_name: None,
+            topics: vec![SorobanExpr::TupleConstruct(vec![
+                SorobanExpr::SymbolLiteral("a".into()),
+                SorobanExpr::SymbolLiteral("b".into()),
+            ])],
+            data: boxed(SorobanExpr::U64Literal(7)),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . events () . publish"));
+        assert!(out.contains("symbol_short ! (\"a\")"));
+        assert!(out.contains("symbol_short ! (\"b\")"));
+    }
+
+    // ----- Cross-contract calls -----
+
+    #[test]
+    fn invoke_contract_with_typed_return() {
+        let e = SorobanExpr::InvokeContract {
+            address: boxed(SorobanExpr::Param("addr".into())),
+            function: boxed(SorobanExpr::SymbolLiteral("add".into())),
+            args: vec![SorobanExpr::Param("x".into())],
+            return_type: Some("u64".into()),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . invoke_contract :: < u64 >"));
+        assert!(out.contains("symbol_short ! (\"add\")"));
+        assert!(out.contains("x . into_val (& env)"));
+    }
+
+    #[test]
+    fn invoke_contract_untyped_falls_back_to_val() {
+        let e = SorobanExpr::InvokeContract {
+            address: boxed(SorobanExpr::Param("addr".into())),
+            function: boxed(SorobanExpr::SymbolLiteral("f".into())),
+            args: vec![],
+            return_type: None,
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . invoke_contract :: < soroban_sdk :: Val >"));
+    }
+
+    #[test]
+    fn try_invoke_contract_emits_try_variant() {
+        let e = SorobanExpr::TryInvokeContract {
+            address: boxed(SorobanExpr::Param("addr".into())),
+            function: boxed(SorobanExpr::SymbolLiteral("f".into())),
+            args: vec![],
+            return_type: Some("i32".into()),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . try_invoke_contract :: < i32 >"));
+    }
+
+    // ----- Type constructors -----
+
+    #[test]
+    fn struct_construct_uses_shorthand_when_field_eq_param() {
+        let e = SorobanExpr::StructConstruct {
+            type_name: "Transfer".into(),
+            fields: vec![
+                ("from".into(), SorobanExpr::Param("from".into())),
+                ("amount".into(), SorobanExpr::U64Literal(1)),
+            ],
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("Transfer { from , amount : 1 }"), "got: {out}");
+    }
+
+    #[test]
+    fn enum_construct_unit_and_tuple_variants() {
+        let unit = SorobanExpr::EnumConstruct {
+            type_name: "Flag".into(),
+            variant: "A".into(),
+            fields: vec![],
+        };
+        assert_eq!(collapse(&s(generate_expr(&unit))), "Flag :: A");
+
+        let tup = SorobanExpr::EnumConstruct {
+            type_name: "DataKey".into(),
+            variant: "Persistent".into(),
+            fields: vec![SorobanExpr::U32Literal(7)],
+        };
+        assert_eq!(
+            collapse(&s(generate_expr(&tup))),
+            "DataKey :: Persistent (7)"
+        );
+    }
+
+    #[test]
+    fn tuple_construct_single_unwraps_paren() {
+        // 1-element TupleConstruct should not emit `(x,)` — it unwraps.
+        let e = SorobanExpr::TupleConstruct(vec![SorobanExpr::U32Literal(5)]);
+        assert_eq!(collapse(&s(generate_expr(&e))), "5");
+
+        let multi = SorobanExpr::TupleConstruct(vec![
+            SorobanExpr::U32Literal(1),
+            SorobanExpr::U32Literal(2),
+        ]);
+        assert_eq!(collapse(&s(generate_expr(&multi))), "(1 , 2)");
+    }
+
+    #[test]
+    fn vec_and_map_construct() {
+        let v =
+            SorobanExpr::VecConstruct(vec![SorobanExpr::U32Literal(1), SorobanExpr::U32Literal(2)]);
+        let out = collapse(&s(generate_expr(&v)));
+        assert!(out.contains("vec ! [& env , 1 , 2]"));
+
+        let m = SorobanExpr::MapConstruct(vec![(
+            SorobanExpr::SymbolLiteral("k".into()),
+            SorobanExpr::U32Literal(1),
+        )]);
+        let out = collapse(&s(generate_expr(&m)));
+        assert!(out.contains("map ! [& env ,"));
+    }
+
+    #[test]
+    fn collection_new() {
+        let v = SorobanExpr::CollectionNew("Vec".into());
+        assert_eq!(collapse(&s(generate_expr(&v))), "Vec :: new (& env)");
+    }
+
+    #[test]
+    fn field_access_named_and_indexed() {
+        let named = SorobanExpr::FieldAccess {
+            object: boxed(SorobanExpr::Param("s".into())),
+            field: "amount".into(),
+        };
+        assert_eq!(collapse(&s(generate_expr(&named))), "s . amount");
+
+        // Numeric field becomes tuple index.
+        let idx = SorobanExpr::FieldAccess {
+            object: boxed(SorobanExpr::Param("t".into())),
+            field: "0".into(),
+        };
+        assert_eq!(collapse(&s(generate_expr(&idx))), "t . 0");
+    }
+
+    #[test]
+    fn method_call_simple() {
+        let e = SorobanExpr::MethodCall {
+            object: boxed(SorobanExpr::Param("a".into())),
+            method: "to_string".into(),
+            args: vec![],
+        };
+        assert_eq!(collapse(&s(generate_expr(&e))), "a . to_string ()");
+    }
+
+    // ----- Error handling -----
+
+    #[test]
+    fn contract_error_with_enum_variant() {
+        let e = SorobanExpr::ContractError {
+            error_code: 1,
+            error_type: Some("Error".into()),
+            variant_name: Some("AnError".into()),
+        };
+        assert_eq!(collapse(&s(generate_expr(&e))), "Error :: AnError");
+    }
+
+    #[test]
+    fn contract_error_with_type_only_uses_from() {
+        let e = SorobanExpr::ContractError {
+            error_code: 9,
+            error_type: Some("Error".into()),
+            variant_name: None,
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("Error :: from (9)"), "got: {out}");
+    }
+
+    #[test]
+    fn contract_error_raw_code() {
+        let e = SorobanExpr::ContractError {
+            error_code: 9,
+            error_type: None,
+            variant_name: None,
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(
+            out.contains("soroban_sdk :: Error :: from_contract_error (9)"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn error_from_code_panic_with_error_and_panic() {
+        let efc = SorobanExpr::ErrorFromCode(boxed(SorobanExpr::U32Literal(5)));
+        let out = collapse(&s(generate_expr(&efc)));
+        assert!(out.contains("Error :: from_contract_error (5)"));
+
+        let pwe = SorobanExpr::PanicWithError(boxed(SorobanExpr::ContractError {
+            error_code: 0,
+            error_type: Some("Error".into()),
+            variant_name: Some("Bad".into()),
+        }));
+        let out = collapse(&s(generate_expr(&pwe)));
+        assert!(out.contains("panic_with_error ! (& env , Error :: Bad)"));
+
+        assert_eq!(
+            collapse(&s(generate_expr(&SorobanExpr::Panic))),
+            "panic ! ()"
+        );
+    }
+
+    // ----- Crypto -----
+
+    #[test]
+    fn crypto_sha256_keccak256() {
+        let data = SorobanExpr::Param("d".into());
+        let sha = SorobanExpr::CryptoSha256(boxed(data.clone()));
+        let kec = SorobanExpr::CryptoKeccak256(boxed(data));
+        assert!(collapse(&s(generate_expr(&sha))).contains("env . crypto () . sha256 (& d)"));
+        assert!(collapse(&s(generate_expr(&kec))).contains("env . crypto () . keccak256 (& d)"));
+    }
+
+    #[test]
+    fn crypto_ed25519_verify() {
+        let e = SorobanExpr::CryptoEd25519Verify {
+            public_key: boxed(SorobanExpr::Param("pk".into())),
+            message: boxed(SorobanExpr::Param("m".into())),
+            signature: boxed(SorobanExpr::Param("sig".into())),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . crypto () . ed25519_verify (& pk , & m , & sig)"));
+    }
+
+    #[test]
+    fn crypto_secp256k1_recover() {
+        let e = SorobanExpr::CryptoSecp256k1Recover {
+            msg_digest: boxed(SorobanExpr::Param("md".into())),
+            signature: boxed(SorobanExpr::Param("sig".into())),
+            recovery_id: boxed(SorobanExpr::U32Literal(0)),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . crypto () . secp256k1_recover (& md , & sig , 0)"));
+    }
+
+    // ----- Ledger info -----
+
+    #[test]
+    fn ledger_atoms() {
+        for (e, want) in [
+            (SorobanExpr::LedgerSequence, "env . ledger () . sequence ()"),
+            (
+                SorobanExpr::LedgerTimestamp,
+                "env . ledger () . timestamp ()",
+            ),
+            (
+                SorobanExpr::LedgerNetworkId,
+                "env . ledger () . network_id ()",
+            ),
+            (
+                SorobanExpr::CurrentContractAddress,
+                "env . current_contract_address ()",
+            ),
+            (
+                SorobanExpr::MaxLiveUntilLedger,
+                "env . ledger () . max_live_until_ledger ()",
+            ),
+        ] {
+            assert_eq!(collapse(&s(generate_expr(&e))), want);
+        }
+    }
+
+    // ----- PRNG -----
+
+    #[test]
+    fn prng_variants() {
+        let r = SorobanExpr::PrngReseed(boxed(SorobanExpr::Param("seed".into())));
+        assert!(collapse(&s(generate_expr(&r))).contains("env . prng () . reseed (& seed)"));
+
+        let b = SorobanExpr::PrngBytesNew(boxed(SorobanExpr::U32Literal(32)));
+        assert!(collapse(&s(generate_expr(&b))).contains("env . prng () . gen_len (32)"));
+
+        let u = SorobanExpr::PrngU64InRange {
+            low: boxed(SorobanExpr::U64Literal(1)),
+            high: boxed(SorobanExpr::U64Literal(10)),
+        };
+        assert!(collapse(&s(generate_expr(&u))).contains("env . prng () . gen_range (1 ..= 10)"));
+
+        let sh = SorobanExpr::PrngVecShuffle(boxed(SorobanExpr::Param("v".into())));
+        assert!(collapse(&s(generate_expr(&sh))).contains("env . prng () . shuffle (v)"));
+    }
+
+    // ----- Address & log -----
+
+    #[test]
+    fn strkey_address_and_log() {
+        let sk = SorobanExpr::StrkeyToAddress(boxed(SorobanExpr::Param("s".into())));
+        assert!(collapse(&s(generate_expr(&sk))).contains("Address :: from_string (& s)"));
+
+        let to = SorobanExpr::AddressToStrkey(boxed(SorobanExpr::Param("a".into())));
+        assert_eq!(collapse(&s(generate_expr(&to))), "a . to_string ()");
+
+        let l = SorobanExpr::Log(vec![
+            SorobanExpr::StringLiteral("x".into()),
+            SorobanExpr::Param("n".into()),
+        ]);
+        let out = collapse(&s(generate_expr(&l)));
+        assert!(out.starts_with("log ! (& env ,"), "got: {out}");
+    }
+
+    // ----- Fallbacks -----
+
+    #[test]
+    fn raw_host_call_valid_idents_emits_method() {
+        let e = SorobanExpr::RawHostCall {
+            module: "Ctx".into(),
+            function: "do_thing".into(),
+            args: vec![SorobanExpr::U32Literal(7)],
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . ctx () . do_thing (7)"));
+    }
+
+    #[test]
+    fn raw_host_call_invalid_falls_back_to_todo() {
+        let e = SorobanExpr::RawHostCall {
+            module: "0bad".into(),
+            function: "f".into(),
+            args: vec![],
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("todo ! ("), "got: {out}");
+    }
+
+    #[test]
+    fn unknown_val_emits_todo() {
+        let out = collapse(&s(generate_expr(&SorobanExpr::UnknownVal)));
+        assert!(out.contains("todo ! (\"unknown value\")"));
+    }
+
+    #[test]
+    fn val_convert_pass_through() {
+        let e = SorobanExpr::ValConvert {
+            value: boxed(SorobanExpr::U64Literal(7)),
+            target_type: "u64".into(),
+        };
+        assert_eq!(collapse(&s(generate_expr(&e))), "7");
+    }
+
+    #[test]
+    fn cast_as_valid_type() {
+        let e = SorobanExpr::CastAs {
+            value: boxed(SorobanExpr::Param("n".into())),
+            target_type: "i64".into(),
+        };
+        assert_eq!(collapse(&s(generate_expr(&e))), "n as i64");
+    }
+
+    #[test]
+    fn cast_as_invalid_type_falls_back_to_ident() {
+        let e = SorobanExpr::CastAs {
+            value: boxed(SorobanExpr::Param("n".into())),
+            target_type: "not a type".into(),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.starts_with("n as "), "got: {out}");
+    }
+}
+
+#[cfg(test)]
+mod generate_stmt_tests {
+    use super::*;
+
+    fn s(t: TokenStream) -> String {
+        t.to_string()
+    }
+    fn collapse(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn expr_stmt_has_semicolon() {
+        let stmt = SorobanStmt::Expr(SorobanExpr::U32Literal(7));
+        assert_eq!(collapse(&s(generate_stmt(&stmt))), "7 ;");
+    }
+
+    #[test]
+    fn let_immutable_and_mutable() {
+        let im = SorobanStmt::Let {
+            name: "x".into(),
+            mutable: false,
+            value: SorobanExpr::U32Literal(1),
+        };
+        assert_eq!(collapse(&s(generate_stmt(&im))), "let x = 1 ;");
+
+        let mu = SorobanStmt::Let {
+            name: "y".into(),
+            mutable: true,
+            value: SorobanExpr::U32Literal(2),
+        };
+        assert_eq!(collapse(&s(generate_stmt(&mu))), "let mut y = 2 ;");
+    }
+
+    #[test]
+    fn assign_stmt() {
+        let stmt = SorobanStmt::Assign {
+            target: "x".into(),
+            value: SorobanExpr::U32Literal(3),
+        };
+        assert_eq!(collapse(&s(generate_stmt(&stmt))), "x = 3 ;");
+    }
+
+    #[test]
+    fn return_with_and_without_value() {
+        let r = SorobanStmt::Return(Some(SorobanExpr::U32Literal(7)));
+        assert_eq!(collapse(&s(generate_stmt(&r))), "return 7 ;");
+        let r = SorobanStmt::Return(None);
+        assert_eq!(collapse(&s(generate_stmt(&r))), "return ;");
+    }
+
+    #[test]
+    fn if_with_and_without_else() {
+        let no_else = SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(1))],
+            else_body: vec![],
+        };
+        let out = collapse(&s(generate_stmt(&no_else)));
+        assert_eq!(out, "if true { 1 ; }");
+
+        let with_else = SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(false),
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(1))],
+            else_body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(2))],
+        };
+        let out = collapse(&s(generate_stmt(&with_else)));
+        assert_eq!(out, "if false { 1 ; } else { 2 ; }");
+    }
+
+    #[test]
+    fn match_with_literal_arms_uses_match() {
+        let stmt = SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("n".into()),
+            arms: vec![
+                MatchArm {
+                    pattern: MatchPattern::Literal(SorobanExpr::U32Literal(0)),
+                    body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(10))],
+                },
+                MatchArm {
+                    pattern: MatchPattern::Wildcard,
+                    body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(20))],
+                },
+            ],
+        };
+        let out = collapse(&s(generate_stmt(&stmt)));
+        assert!(out.starts_with("match n {"), "got: {out}");
+        assert!(out.contains("0 => { 10 ; }"));
+        assert!(out.contains("_ => { 20 ; }"));
+    }
+
+    #[test]
+    fn match_with_only_unit_enum_variants_uses_if_else_chain() {
+        let stmt = SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("k".into()),
+            arms: vec![
+                MatchArm {
+                    pattern: MatchPattern::EnumVariant {
+                        type_name: "DK".into(),
+                        variant: "A".into(),
+                        bindings: vec![],
+                    },
+                    body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(1))],
+                },
+                MatchArm {
+                    pattern: MatchPattern::EnumVariant {
+                        type_name: "DK".into(),
+                        variant: "B".into(),
+                        bindings: vec![],
+                    },
+                    body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(2))],
+                },
+            ],
+        };
+        let out = collapse(&s(generate_stmt(&stmt)));
+        // Unit-only arms are collapsed into an if/else if chain.
+        assert!(out.contains("if k == DK :: A"), "got: {out}");
+        assert!(out.contains("else if k == DK :: B"), "got: {out}");
+    }
+
+    #[test]
+    fn loop_block_break_continue_comment() {
+        let loop_stmt = SorobanStmt::Loop {
+            body: vec![SorobanStmt::Break],
+        };
+        let out = collapse(&s(generate_stmt(&loop_stmt)));
+        assert!(out.contains("loop { break ; }"), "got: {out}");
+
+        let block = SorobanStmt::Block(vec![SorobanStmt::Continue]);
+        assert!(collapse(&s(generate_stmt(&block))).contains("continue ;"));
+
+        assert_eq!(collapse(&s(generate_stmt(&SorobanStmt::Break))), "break ;");
+        assert_eq!(
+            collapse(&s(generate_stmt(&SorobanStmt::Continue))),
+            "continue ;"
+        );
+
+        // Comments don't survive TokenStream parsing (proc_macro2 strips them);
+        // codegen falls back to empty. Asserts the no-panic contract.
+        let c = SorobanStmt::Comment("hi".into());
+        assert_eq!(collapse(&s(generate_stmt(&c))), "");
+    }
+
+    // ----- Tail variants -----
+
+    #[test]
+    fn stmt_tail_strips_trailing_semicolon() {
+        let e = SorobanStmt::Expr(SorobanExpr::U32Literal(7));
+        let out = collapse(&s(generate_stmt_tail(&e)));
+        assert_eq!(out, "7");
+    }
+
+    #[test]
+    fn stmt_tail_return_drops_keyword() {
+        let r = SorobanStmt::Return(Some(SorobanExpr::U32Literal(7)));
+        let out = collapse(&s(generate_stmt_tail(&r)));
+        assert_eq!(out, "7");
+        let r = SorobanStmt::Return(None);
+        assert_eq!(collapse(&s(generate_stmt_tail(&r))), "");
+    }
+
+    #[test]
+    fn stmts_with_tail_keeps_only_last_as_tail() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "x".into(),
+                mutable: false,
+                value: SorobanExpr::U32Literal(1),
+            },
+            SorobanStmt::Expr(SorobanExpr::Add(
+                Box::new(SorobanExpr::NamedLocal("x".into())),
+                Box::new(SorobanExpr::U32Literal(2)),
+            )),
+        ];
+        let tokens = generate_stmts_with_tail(&stmts);
+        let joined: String = tokens.iter().map(|t| t.to_string()).collect();
+        let out = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(out.contains("let x = 1 ;"), "got: {out}");
+        assert!(out.ends_with("x + 2"), "got: {out}");
+    }
+
+    #[test]
+    fn stmts_with_tail_empty_returns_empty() {
+        let tokens = generate_stmts_with_tail(&[]);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn stmt_result_wrapped_wraps_naked_return() {
+        // Naked Return(Expr) gets wrapped as Ok(Expr) in result-returning fns.
+        let stmt = SorobanStmt::Return(Some(SorobanExpr::U32Literal(7)));
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert!(out.contains("return Ok (7) ;"), "got: {out}");
+    }
+
+    #[test]
+    fn stmt_result_wrapped_typed_error_becomes_err() {
+        let stmt = SorobanStmt::Return(Some(SorobanExpr::ContractError {
+            error_code: 1,
+            error_type: Some("Error".into()),
+            variant_name: Some("Bad".into()),
+        }));
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert!(out.contains("return Err (Error :: Bad) ;"), "got: {out}");
+    }
+}

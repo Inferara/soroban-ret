@@ -467,3 +467,202 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::high_level_ir::{ContractFn, ContractModule};
+    use std::collections::BTreeMap;
+
+    fn empty_registry() -> TypeRegistry {
+        TypeRegistry {
+            functions: BTreeMap::new(),
+            structs: BTreeMap::new(),
+            unions: BTreeMap::new(),
+            enums: BTreeMap::new(),
+            error_enums: BTreeMap::new(),
+            events: BTreeMap::new(),
+            meta: Vec::new(),
+            spec_entries: Vec::new(),
+        }
+    }
+
+    fn empty_fn(name: &str) -> ContractFn {
+        ContractFn {
+            name: name.to_string(),
+            params: Vec::new(),
+            return_type: None,
+            body: Vec::new(),
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        }
+    }
+
+    fn collapse(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    // ---- compute_extra_imports ----
+
+    #[test]
+    fn extra_imports_empty_when_nothing_needed() {
+        let module = ContractModule::new("Contract".to_string());
+        assert!(compute_extra_imports(&module).is_empty());
+    }
+
+    #[test]
+    fn extra_imports_emits_context_for_check_auth() {
+        let mut module = ContractModule::new("Contract".to_string());
+        let mut f = empty_fn("__check_auth");
+        f.is_check_auth = true;
+        module.functions.push(f);
+        let out = collapse(&compute_extra_imports(&module).to_string());
+        assert!(
+            out.contains("use soroban_sdk :: auth :: Context"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn extra_imports_emits_bn254_aliases() {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.crypto_usage.uses_bn254 = true;
+        let out = collapse(&compute_extra_imports(&module).to_string());
+        assert!(out.contains("crypto :: bn254"));
+        assert!(out.contains("Bn254G1Affine"));
+        assert!(out.contains("Bn254G2Affine"));
+        assert!(out.contains("Fr"));
+    }
+
+    #[test]
+    fn extra_imports_emits_bls12_381_aliases() {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.crypto_usage.uses_bls12_381 = true;
+        let out = collapse(&compute_extra_imports(&module).to_string());
+        assert!(out.contains("crypto :: bls12_381"));
+        assert!(out.contains("Bls12381Fp"));
+        assert!(out.contains("Bls12381Fp2"));
+        assert!(out.contains("Bls12381G1Affine"));
+        assert!(out.contains("Bls12381G2Affine"));
+    }
+
+    #[test]
+    fn extra_imports_combines_all_flags() {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.crypto_usage.uses_bn254 = true;
+        module.crypto_usage.uses_bls12_381 = true;
+        let mut f = empty_fn("__check_auth");
+        f.is_check_auth = true;
+        module.functions.push(f);
+        let out = collapse(&compute_extra_imports(&module).to_string());
+        assert!(out.contains("Context"));
+        assert!(out.contains("bn254"));
+        assert!(out.contains("bls12_381"));
+    }
+
+    // ---- compute_imports ----
+
+    #[test]
+    fn imports_empty_module_emits_minimal_use() {
+        let module = ContractModule::new("Contract".to_string());
+        let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
+        assert!(out.contains("use soroban_sdk"));
+        assert!(out.contains("contract") && out.contains("contractimpl"));
+    }
+
+    #[test]
+    fn imports_emits_env_when_any_fn_takes_env() {
+        let mut module = ContractModule::new("Contract".to_string());
+        let mut f = empty_fn("uses_env");
+        f.takes_env = true;
+        module.functions.push(f);
+        let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
+        assert!(out.contains("Env"), "missing Env import: {out}");
+    }
+
+    #[test]
+    fn imports_emits_contracttype_when_types_present() {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.types.push(crate::ir::high_level_ir::TypeDef {
+            kind: crate::ir::high_level_ir::TypeDefKind::Struct,
+            name: "T".into(),
+            generated_tokens: None,
+        });
+        let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
+        assert!(out.contains("contracttype"));
+    }
+
+    #[test]
+    fn imports_emits_contracterror_when_error_enums_present() {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.error_enums.push(crate::ir::high_level_ir::TypeDef {
+            kind: crate::ir::high_level_ir::TypeDefKind::ErrorEnum,
+            name: "E".into(),
+            generated_tokens: None,
+        });
+        let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
+        assert!(out.contains("contracterror"));
+    }
+
+    #[test]
+    fn imports_emits_contractevent_when_events_present() {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.events.push(crate::ir::high_level_ir::TypeDef {
+            kind: crate::ir::high_level_ir::TypeDefKind::Event,
+            name: "Ev".into(),
+            generated_tokens: None,
+        });
+        let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
+        assert!(out.contains("contractevent"));
+    }
+
+    #[test]
+    fn imports_scans_body_for_symbol_short_when_short_symbol_present() {
+        // SymbolLiteral in body should trigger symbol_short import.
+        let mut module = ContractModule::new("Contract".to_string());
+        let mut f = empty_fn("uses_sym");
+        f.body
+            .push(SorobanStmt::Expr(SorobanExpr::SymbolLiteral("x".into())));
+        module.functions.push(f);
+        let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
+        assert!(
+            out.contains("symbol_short") || out.contains("Symbol"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn imports_scans_body_for_invoke_contract_pulls_vec_and_intoval() {
+        let mut module = ContractModule::new("Contract".to_string());
+        let mut f = empty_fn("calls_other");
+        f.body.push(SorobanStmt::Expr(SorobanExpr::InvokeContract {
+            address: Box::new(SorobanExpr::Param("addr".into())),
+            function: Box::new(SorobanExpr::SymbolLiteral("f".into())),
+            args: vec![SorobanExpr::Param("x".into())],
+            return_type: Some("u64".into()),
+        }));
+        module.functions.push(f);
+        let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
+        // invoke_contract pulls `vec!` and `IntoVal` (via .into_val()).
+        assert!(out.contains("vec") || out.contains("IntoVal"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_param_type_address_pulls_address() {
+        use stellar_xdr::curr as stellar_xdr;
+        let mut module = ContractModule::new("Contract".to_string());
+        let mut f = empty_fn("with_addr");
+        f.params.push(crate::ir::high_level_ir::FnParam {
+            name: "a".to_string(),
+            type_def: stellar_xdr::ScSpecTypeDef::Address,
+        });
+        module.functions.push(f);
+        let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
+        assert!(out.contains("Address"), "missing Address: {out}");
+    }
+}

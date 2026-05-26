@@ -547,4 +547,139 @@ mod tests {
         assert!(formatted.contains("pub fn pair() -> (i32, i64)"));
         assert!(formatted.contains("(1, 2)"));
     }
+
+    use super::assemble_module;
+    use crate::spec::registry::TypeRegistry;
+    use quote::quote;
+    use std::collections::BTreeMap;
+
+    fn empty_registry() -> TypeRegistry {
+        TypeRegistry {
+            functions: BTreeMap::new(),
+            structs: BTreeMap::new(),
+            unions: BTreeMap::new(),
+            enums: BTreeMap::new(),
+            error_enums: BTreeMap::new(),
+            events: BTreeMap::new(),
+            meta: Vec::new(),
+            spec_entries: Vec::new(),
+        }
+    }
+
+    fn empty_fn(name: &str) -> ContractFn {
+        ContractFn {
+            name: name.to_string(),
+            params: Vec::new(),
+            return_type: None,
+            body: Vec::new(),
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        }
+    }
+
+    #[test]
+    fn assemble_module_minimal_emits_no_std_and_contract_attr() {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.functions.push(empty_fn("noop"));
+        let registry = empty_registry();
+        let tokens = assemble_module(&module, &registry);
+        let formatted = format_source(&tokens).expect("must format");
+        assert!(formatted.contains("#![no_std]"));
+        assert!(formatted.contains("#[contract]"));
+        assert!(formatted.contains("#[contractimpl]"));
+        assert!(formatted.contains("pub fn noop"));
+    }
+
+    #[test]
+    fn assemble_module_uses_constructor_block() {
+        let mut module = ContractModule::new("Contract".to_string());
+        let mut ctor = empty_fn("__constructor");
+        ctor.is_constructor = true;
+        ctor.takes_env = true;
+        module.has_constructor = true;
+        module.functions.push(ctor);
+        let registry = empty_registry();
+        let formatted = format_source(&assemble_module(&module, &registry)).expect("must format");
+        assert!(formatted.contains("__constructor"));
+    }
+
+    #[test]
+    fn assemble_module_with_check_auth_imports_context() {
+        let mut module = ContractModule::new("Contract".to_string());
+        let mut auth = empty_fn("__check_auth");
+        auth.is_check_auth = true;
+        module.functions.push(auth);
+        let registry = empty_registry();
+        let formatted = format_source(&assemble_module(&module, &registry)).expect("must format");
+        assert!(
+            formatted.contains("use soroban_sdk::auth::Context"),
+            "missing Context import: {formatted}"
+        );
+    }
+
+    #[test]
+    fn assemble_module_with_bn254_imports_crypto_aliases() {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.crypto_usage.uses_bn254 = true;
+        module.functions.push(empty_fn("noop"));
+        let registry = empty_registry();
+        let formatted = format_source(&assemble_module(&module, &registry)).expect("must format");
+        assert!(
+            formatted.contains("Bn254G1Affine") && formatted.contains("Bn254G2Affine"),
+            "missing bn254 crypto import block: {formatted}"
+        );
+    }
+
+    #[test]
+    fn assemble_module_with_bls12_381_imports_crypto_aliases() {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.crypto_usage.uses_bls12_381 = true;
+        module.functions.push(empty_fn("noop"));
+        let registry = empty_registry();
+        let formatted = format_source(&assemble_module(&module, &registry)).expect("must format");
+        assert!(
+            formatted.contains("Bls12381Fp") && formatted.contains("Bls12381G2Affine"),
+            "missing bls12_381 crypto import block: {formatted}"
+        );
+    }
+
+    #[test]
+    fn format_source_propagates_syn_error_on_invalid_tokens() {
+        // `: ;` is not a valid Rust file; format_source should surface a syn::Error
+        // rather than panicking.
+        let bad: proc_macro2::TokenStream = quote! { : ; };
+        let result = format_source(&bad);
+        assert!(result.is_err(), "expected error from format_source");
+    }
+
+    #[test]
+    fn assemble_generic_module_with_typed_signature() {
+        let mut module = ContractModule::new("g".to_string());
+        module.is_soroban = false;
+        module.functions.push(ContractFn {
+            name: "add".to_string(),
+            params: Vec::new(),
+            return_type: None,
+            body: vec![SorobanStmt::Return(Some(SorobanExpr::I32Literal(42)))],
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: Some(WasmFnSignature {
+                params: vec![WasmType::I32, WasmType::I32],
+                results: vec![WasmType::I32],
+            }),
+        });
+        let formatted =
+            format_source(&assemble_generic_module(&module)).expect("must format generic module");
+        assert!(formatted.contains("pub fn add"));
+        assert!(formatted.contains("-> i32"));
+    }
 }

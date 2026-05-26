@@ -828,3 +828,800 @@ fn extract_storage_type(expr: Option<SorobanExpr>) -> StorageType {
         _ => StorageType::Persistent, // Default to persistent
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hf(module: HostModule, name: &str) -> HostFunction {
+        HostFunction {
+            module,
+            name: name.to_string(),
+            import_index: 0,
+            type_index: 0,
+        }
+    }
+
+    fn key() -> SorobanExpr {
+        SorobanExpr::SymbolLiteral("k".to_string())
+    }
+    fn val() -> SorobanExpr {
+        SorobanExpr::U64Literal(7)
+    }
+    fn storage_persistent() -> SorobanExpr {
+        SorobanExpr::I64Literal(1)
+    }
+    fn storage_temp() -> SorobanExpr {
+        SorobanExpr::I64Literal(0)
+    }
+    fn storage_instance() -> SorobanExpr {
+        SorobanExpr::I64Literal(2)
+    }
+
+    fn obj() -> SorobanExpr {
+        SorobanExpr::Param("o".to_string())
+    }
+
+    // ----- Top-level dispatch -----
+
+    #[test]
+    fn unknown_module_returns_raw_host_call() {
+        let f = hf(HostModule::Unknown, "do_thing");
+        let out = lift_host_call(&f, vec![]);
+        match out {
+            SorobanExpr::RawHostCall {
+                module, function, ..
+            } => {
+                assert_eq!(module, "Unknown");
+                assert_eq!(function, "do_thing");
+            }
+            other => panic!("expected RawHostCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_module_returns_raw_host_call() {
+        let f = hf(HostModule::Test, "dummy0");
+        let out = lift_host_call(&f, vec![]);
+        assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+    }
+
+    // ----- Ledger storage -----
+
+    #[test]
+    fn ledger_put_get_has_del_storage_type_disambiguation() {
+        // put_contract_data(key, val, storage_type=Persistent)
+        let out = lift_host_call(
+            &hf(HostModule::Ledger, "put_contract_data"),
+            vec![key(), val(), storage_persistent()],
+        );
+        assert!(matches!(
+            out,
+            SorobanExpr::StorageSet {
+                storage_type: StorageType::Persistent,
+                ..
+            }
+        ));
+
+        // get_contract_data with storage_type=Temporary
+        let out = lift_host_call(
+            &hf(HostModule::Ledger, "get_contract_data"),
+            vec![key(), storage_temp()],
+        );
+        assert!(matches!(
+            out,
+            SorobanExpr::StorageGet {
+                storage_type: StorageType::Temporary,
+                unwrap: true,
+                ..
+            }
+        ));
+
+        // has_contract_data with storage_type=Instance
+        let out = lift_host_call(
+            &hf(HostModule::Ledger, "has_contract_data"),
+            vec![key(), storage_instance()],
+        );
+        assert!(matches!(
+            out,
+            SorobanExpr::StorageHas {
+                storage_type: StorageType::Instance,
+                ..
+            }
+        ));
+
+        // del_contract_data
+        let out = lift_host_call(
+            &hf(HostModule::Ledger, "del_contract_data"),
+            vec![key(), storage_persistent()],
+        );
+        assert!(matches!(out, SorobanExpr::StorageRemove { .. }));
+    }
+
+    #[test]
+    fn ledger_extend_ttl_variants() {
+        let out = lift_host_call(
+            &hf(HostModule::Ledger, "extend_contract_data_ttl"),
+            vec![
+                key(),
+                storage_persistent(),
+                SorobanExpr::U32Literal(100),
+                SorobanExpr::U32Literal(1000),
+            ],
+        );
+        assert!(matches!(out, SorobanExpr::StorageExtendTtl { .. }));
+
+        let out = lift_host_call(
+            &hf(
+                HostModule::Ledger,
+                "extend_current_contract_instance_and_code_ttl",
+            ),
+            vec![SorobanExpr::U32Literal(10), SorobanExpr::U32Literal(20)],
+        );
+        assert!(matches!(out, SorobanExpr::ExtendInstanceAndCodeTtl { .. }));
+    }
+
+    #[test]
+    fn ledger_unknown_falls_back_to_raw() {
+        let out = lift_host_call(&hf(HostModule::Ledger, "unknown_op"), vec![]);
+        assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+    }
+
+    // ----- Address -----
+
+    #[test]
+    fn address_auth_variants() {
+        let out = lift_host_call(
+            &hf(HostModule::Address, "require_auth"),
+            vec![SorobanExpr::Param("a".into())],
+        );
+        assert!(matches!(out, SorobanExpr::RequireAuth(_)));
+
+        let out = lift_host_call(
+            &hf(HostModule::Address, "require_auth_for_args"),
+            vec![
+                SorobanExpr::Param("a".into()),
+                SorobanExpr::TupleConstruct(vec![]),
+            ],
+        );
+        assert!(matches!(out, SorobanExpr::RequireAuthForArgs { .. }));
+
+        let out = lift_host_call(
+            &hf(HostModule::Address, "authorize_as_curr_contract"),
+            vec![SorobanExpr::VecConstruct(vec![])],
+        );
+        assert!(matches!(out, SorobanExpr::AuthorizeAsCurrContract(_)));
+    }
+
+    #[test]
+    fn address_muxed_extraction_methods() {
+        let out = lift_host_call(
+            &hf(HostModule::Address, "get_address_from_muxed_address"),
+            vec![SorobanExpr::Param("mux".into())],
+        );
+        match out {
+            SorobanExpr::MethodCall { method, .. } => assert_eq!(method, "address"),
+            other => panic!("expected MethodCall, got {other:?}"),
+        }
+
+        let out = lift_host_call(
+            &hf(HostModule::Address, "get_id_from_muxed_address"),
+            vec![SorobanExpr::Param("mux".into())],
+        );
+        match out {
+            SorobanExpr::MethodCall { method, .. } => assert_eq!(method, "id"),
+            other => panic!("expected MethodCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn address_unknown_falls_back_to_raw() {
+        let out = lift_host_call(&hf(HostModule::Address, "unknown"), vec![]);
+        assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+    }
+
+    // ----- Context -----
+
+    #[test]
+    fn context_ledger_atoms() {
+        for (name, expected) in [
+            ("get_ledger_sequence", SorobanExpr::LedgerSequence),
+            ("get_ledger_timestamp", SorobanExpr::LedgerTimestamp),
+            ("get_ledger_network_id", SorobanExpr::LedgerNetworkId),
+            (
+                "get_current_contract_address",
+                SorobanExpr::CurrentContractAddress,
+            ),
+            ("get_max_live_until_ledger", SorobanExpr::MaxLiveUntilLedger),
+        ] {
+            let out = lift_host_call(&hf(HostModule::Context, name), vec![]);
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
+    fn context_contract_event_log_fail() {
+        let out = lift_host_call(
+            &hf(HostModule::Context, "contract_event"),
+            vec![SorobanExpr::SymbolLiteral("t".into()), val()],
+        );
+        assert!(matches!(
+            out,
+            SorobanExpr::PublishEvent {
+                event_name: None,
+                ..
+            }
+        ));
+
+        let out = lift_host_call(
+            &hf(HostModule::Context, "log_from_linear_memory"),
+            vec![val()],
+        );
+        assert!(matches!(out, SorobanExpr::Log(_)));
+
+        let out = lift_host_call(
+            &hf(HostModule::Context, "fail_with_error"),
+            vec![SorobanExpr::U32Literal(1)],
+        );
+        assert!(matches!(out, SorobanExpr::PanicWithError(_)));
+    }
+
+    #[test]
+    fn context_unknown_falls_back_to_raw() {
+        let out = lift_host_call(&hf(HostModule::Context, "unknown"), vec![]);
+        assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+    }
+
+    // ----- Crypto -----
+
+    #[test]
+    fn crypto_hash_variants() {
+        let out = lift_host_call(
+            &hf(HostModule::Crypto, "compute_hash_sha256"),
+            vec![SorobanExpr::Param("d".into())],
+        );
+        assert!(matches!(out, SorobanExpr::CryptoSha256(_)));
+
+        let out = lift_host_call(
+            &hf(HostModule::Crypto, "compute_hash_keccak256"),
+            vec![SorobanExpr::Param("d".into())],
+        );
+        assert!(matches!(out, SorobanExpr::CryptoKeccak256(_)));
+    }
+
+    #[test]
+    fn crypto_ed25519_verify() {
+        let out = lift_host_call(
+            &hf(HostModule::Crypto, "verify_sig_ed25519"),
+            vec![
+                SorobanExpr::Param("pk".into()),
+                SorobanExpr::Param("m".into()),
+                SorobanExpr::Param("sig".into()),
+            ],
+        );
+        assert!(matches!(out, SorobanExpr::CryptoEd25519Verify { .. }));
+    }
+
+    #[test]
+    fn crypto_secp256k1_recover() {
+        let out = lift_host_call(
+            &hf(HostModule::Crypto, "recover_key_ecdsa_secp256k1"),
+            vec![
+                SorobanExpr::Param("md".into()),
+                SorobanExpr::Param("sig".into()),
+                SorobanExpr::U32Literal(0),
+            ],
+        );
+        assert!(matches!(out, SorobanExpr::CryptoSecp256k1Recover { .. }));
+    }
+
+    #[test]
+    fn crypto_bn254_arithmetic() {
+        let out = lift_host_call(
+            &hf(HostModule::Crypto, "bn254_g1_add"),
+            vec![
+                SorobanExpr::Param("a".into()),
+                SorobanExpr::Param("b".into()),
+            ],
+        );
+        assert!(matches!(out, SorobanExpr::Add(_, _)));
+
+        let out = lift_host_call(
+            &hf(HostModule::Crypto, "bn254_g1_mul"),
+            vec![
+                SorobanExpr::Param("p".into()),
+                SorobanExpr::Param("s".into()),
+            ],
+        );
+        assert!(matches!(out, SorobanExpr::Mul(_, _)));
+
+        let out = lift_host_call(
+            &hf(HostModule::Crypto, "bn254_multi_pairing_check"),
+            vec![
+                SorobanExpr::Param("p".into()),
+                SorobanExpr::Param("q".into()),
+            ],
+        );
+        match out {
+            SorobanExpr::MethodCall { method, .. } => assert_eq!(method, "pairing_check"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn crypto_bls12_381_full_surface() {
+        let methods = [
+            ("bls12_381_g1_add", "g1_add", 2),
+            ("bls12_381_g1_mul", "g1_mul", 2),
+            ("bls12_381_g1_msm", "g1_msm", 2),
+            ("bls12_381_g2_add", "g2_add", 2),
+            ("bls12_381_g2_mul", "g2_mul", 2),
+            ("bls12_381_g2_msm", "g2_msm", 2),
+            ("bls12_381_multi_pairing_check", "pairing_check", 2),
+            ("bls12_381_check_g1_is_in_subgroup", "g1_is_in_subgroup", 1),
+            ("bls12_381_check_g2_is_in_subgroup", "g2_is_in_subgroup", 1),
+            ("bls12_381_map_fp_to_g1", "map_fp_to_g1", 1),
+            ("bls12_381_map_fp2_to_g2", "map_fp2_to_g2", 1),
+            ("bls12_381_hash_to_g1", "hash_to_g1", 2),
+            ("bls12_381_hash_to_g2", "hash_to_g2", 2),
+            ("bls12_381_fr_add", "fr_add", 2),
+            ("bls12_381_fr_sub", "fr_sub", 2),
+            ("bls12_381_fr_mul", "fr_mul", 2),
+            ("bls12_381_fr_pow", "fr_pow", 2),
+            ("bls12_381_fr_inv", "fr_inv", 1),
+        ];
+        for (host_name, sdk_method, arg_count) in methods {
+            let args: Vec<_> = (0..arg_count)
+                .map(|i| SorobanExpr::Param(format!("arg{i}")))
+                .collect();
+            let out = lift_host_call(&hf(HostModule::Crypto, host_name), args);
+            match out {
+                SorobanExpr::MethodCall { method, .. } => assert_eq!(
+                    method, sdk_method,
+                    "host {host_name} should map to .{sdk_method}()"
+                ),
+                other => panic!("{host_name}: expected MethodCall, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn crypto_unknown_falls_back_to_raw() {
+        let out = lift_host_call(&hf(HostModule::Crypto, "unknown"), vec![]);
+        assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+    }
+
+    // ----- Call / contract invocation -----
+
+    #[test]
+    fn contract_call_and_try_call() {
+        let out = lift_host_call(
+            &hf(HostModule::Call, "call"),
+            vec![
+                SorobanExpr::Param("addr".into()),
+                SorobanExpr::SymbolLiteral("fn".into()),
+                SorobanExpr::VecConstruct(vec![SorobanExpr::U32Literal(1)]),
+            ],
+        );
+        match out {
+            SorobanExpr::InvokeContract { args, .. } => assert_eq!(args.len(), 1),
+            other => panic!("got {other:?}"),
+        }
+
+        let out = lift_host_call(
+            &hf(HostModule::Call, "try_call"),
+            vec![
+                SorobanExpr::Param("addr".into()),
+                SorobanExpr::SymbolLiteral("fn".into()),
+                SorobanExpr::VecConstruct(vec![]),
+            ],
+        );
+        assert!(matches!(out, SorobanExpr::TryInvokeContract { .. }));
+    }
+
+    #[test]
+    fn contract_call_unwraps_tuple_args_with_multi_elements() {
+        // TupleConstruct with multiple elements gets unwrapped.
+        let out = lift_host_call(
+            &hf(HostModule::Call, "call"),
+            vec![
+                SorobanExpr::Param("addr".into()),
+                SorobanExpr::SymbolLiteral("fn".into()),
+                SorobanExpr::TupleConstruct(vec![
+                    SorobanExpr::U32Literal(1),
+                    SorobanExpr::U32Literal(2),
+                ]),
+            ],
+        );
+        match out {
+            SorobanExpr::InvokeContract { args, .. } => assert_eq!(args.len(), 2),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contract_call_keeps_single_tuple_as_single_arg() {
+        // Single-element TupleConstruct stays as 1 arg (not unwrapped).
+        let out = lift_host_call(
+            &hf(HostModule::Call, "call"),
+            vec![
+                SorobanExpr::Param("addr".into()),
+                SorobanExpr::SymbolLiteral("fn".into()),
+                SorobanExpr::TupleConstruct(vec![SorobanExpr::U32Literal(1)]),
+            ],
+        );
+        match out {
+            SorobanExpr::InvokeContract { args, .. } => assert_eq!(args.len(), 1),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contract_call_unknown_falls_back() {
+        let out = lift_host_call(&hf(HostModule::Call, "unknown"), vec![]);
+        assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+    }
+
+    // ----- Int -----
+
+    #[test]
+    fn int_conversions_64_bit() {
+        for name in ["obj_from_u64", "obj_to_u64"] {
+            let out = lift_host_call(&hf(HostModule::Int, name), vec![val()]);
+            match out {
+                SorobanExpr::ValConvert { target_type, .. } => assert_eq!(target_type, "u64"),
+                other => panic!("got {other:?}"),
+            }
+        }
+        for name in ["obj_from_i64", "obj_to_i64"] {
+            let out = lift_host_call(&hf(HostModule::Int, name), vec![val()]);
+            match out {
+                SorobanExpr::ValConvert { target_type, .. } => assert_eq!(target_type, "i64"),
+                other => panic!("got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn int_extraction_128_bit() {
+        for name in ["obj_to_u128_lo64", "obj_to_u128_hi64"] {
+            let out = lift_host_call(&hf(HostModule::Int, name), vec![val()]);
+            match out {
+                SorobanExpr::ValConvert { target_type, .. } => assert_eq!(target_type, "u128"),
+                other => panic!("got {other:?}"),
+            }
+        }
+        for name in ["obj_to_i128_lo64", "obj_to_i128_hi64"] {
+            let out = lift_host_call(&hf(HostModule::Int, name), vec![val()]);
+            match out {
+                SorobanExpr::ValConvert { target_type, .. } => assert_eq!(target_type, "i128"),
+                other => panic!("got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn int_piece_constructors_128_and_256() {
+        let out = lift_host_call(
+            &hf(HostModule::Int, "obj_from_u128_pieces"),
+            vec![SorobanExpr::U64Literal(0), SorobanExpr::U64Literal(1)],
+        );
+        match out {
+            SorobanExpr::ValConvert { target_type, .. } => assert_eq!(target_type, "u128"),
+            other => panic!("got {other:?}"),
+        }
+
+        let out = lift_host_call(
+            &hf(HostModule::Int, "obj_from_i128_pieces"),
+            vec![SorobanExpr::U64Literal(0), SorobanExpr::U64Literal(1)],
+        );
+        match out {
+            SorobanExpr::ValConvert { target_type, .. } => assert_eq!(target_type, "i128"),
+            other => panic!("got {other:?}"),
+        }
+
+        let out = lift_host_call(
+            &hf(HostModule::Int, "obj_from_u256_pieces"),
+            vec![
+                SorobanExpr::U64Literal(0),
+                SorobanExpr::U64Literal(1),
+                SorobanExpr::U64Literal(2),
+                SorobanExpr::U64Literal(3),
+            ],
+        );
+        match out {
+            SorobanExpr::ValConvert { target_type, .. } => assert_eq!(target_type, "U256"),
+            other => panic!("got {other:?}"),
+        }
+
+        let out = lift_host_call(
+            &hf(HostModule::Int, "obj_from_i256_pieces"),
+            vec![
+                SorobanExpr::U64Literal(0),
+                SorobanExpr::U64Literal(1),
+                SorobanExpr::U64Literal(2),
+                SorobanExpr::U64Literal(3),
+            ],
+        );
+        match out {
+            SorobanExpr::ValConvert { target_type, .. } => assert_eq!(target_type, "I256"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn int_timepoint_duration() {
+        for name in ["timepoint_obj_from_u64", "timepoint_obj_to_u64"] {
+            let out = lift_host_call(&hf(HostModule::Int, name), vec![val()]);
+            assert!(matches!(out, SorobanExpr::ValConvert { .. }));
+        }
+        for name in ["duration_obj_from_u64", "duration_obj_to_u64"] {
+            let out = lift_host_call(&hf(HostModule::Int, name), vec![val()]);
+            assert!(matches!(out, SorobanExpr::ValConvert { .. }));
+        }
+    }
+
+    #[test]
+    fn int_unknown_uses_name_as_target_type() {
+        let out = lift_host_call(&hf(HostModule::Int, "mystery_conversion"), vec![val()]);
+        match out {
+            SorobanExpr::ValConvert { target_type, .. } => {
+                assert_eq!(target_type, "mystery_conversion")
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    // ----- PRNG -----
+
+    #[test]
+    fn prng_all_variants() {
+        let out = lift_host_call(
+            &hf(HostModule::Prng, "prng_reseed"),
+            vec![SorobanExpr::Param("s".into())],
+        );
+        assert!(matches!(out, SorobanExpr::PrngReseed(_)));
+
+        let out = lift_host_call(
+            &hf(HostModule::Prng, "prng_bytes_new"),
+            vec![SorobanExpr::U32Literal(32)],
+        );
+        assert!(matches!(out, SorobanExpr::PrngBytesNew(_)));
+
+        let out = lift_host_call(
+            &hf(HostModule::Prng, "prng_u64_in_inclusive_range"),
+            vec![SorobanExpr::U64Literal(1), SorobanExpr::U64Literal(10)],
+        );
+        assert!(matches!(out, SorobanExpr::PrngU64InRange { .. }));
+
+        let out = lift_host_call(
+            &hf(HostModule::Prng, "prng_vec_shuffle"),
+            vec![SorobanExpr::Param("v".into())],
+        );
+        assert!(matches!(out, SorobanExpr::PrngVecShuffle(_)));
+
+        let out = lift_host_call(&hf(HostModule::Prng, "unknown"), vec![]);
+        assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+    }
+
+    // ----- Map -----
+
+    #[test]
+    fn map_full_surface() {
+        assert!(matches!(
+            lift_host_call(&hf(HostModule::Map, "map_new"), vec![]),
+            SorobanExpr::CollectionNew(_)
+        ));
+        for (name, sdk_method) in [
+            ("map_put", "set"),
+            ("map_get", "get"),
+            ("map_del", "remove"),
+            ("map_has", "contains_key"),
+        ] {
+            let arg_count = if name == "map_put" { 3 } else { 2 };
+            let args: Vec<_> = (0..arg_count).map(|_| obj()).collect();
+            let out = lift_host_call(&hf(HostModule::Map, name), args);
+            match out {
+                SorobanExpr::MethodCall { method, .. } => assert_eq!(method, sdk_method),
+                other => panic!("{name}: got {other:?}"),
+            }
+        }
+        for (name, sdk_method) in [
+            ("map_len", "len"),
+            ("map_keys", "keys"),
+            ("map_values", "values"),
+        ] {
+            let out = lift_host_call(&hf(HostModule::Map, name), vec![obj()]);
+            match out {
+                SorobanExpr::MethodCall { method, .. } => assert_eq!(method, sdk_method),
+                other => panic!("{name}: got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn map_linear_memory_variants_pass_through_raw() {
+        for name in ["map_new_from_linear_memory", "map_unpack_to_linear_memory"] {
+            let out = lift_host_call(&hf(HostModule::Map, name), vec![]);
+            assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+        }
+    }
+
+    #[test]
+    fn map_unknown_falls_back_to_raw() {
+        let out = lift_host_call(&hf(HostModule::Map, "unknown"), vec![]);
+        assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+    }
+
+    // ----- Vec -----
+
+    #[test]
+    fn vec_full_surface() {
+        assert!(matches!(
+            lift_host_call(&hf(HostModule::Vec, "vec_new"), vec![]),
+            SorobanExpr::CollectionNew(_)
+        ));
+        // 2-arg ops yielding MethodCall
+        for (name, sdk_method) in [
+            ("vec_get", "get"),
+            ("vec_del", "remove"),
+            ("vec_push_front", "push_front"),
+            ("vec_push_back", "push_back"),
+            ("vec_append", "append"),
+            ("vec_first_index_of", "first_index_of"),
+            ("vec_last_index_of", "last_index_of"),
+            ("vec_binary_search", "binary_search"),
+        ] {
+            let out = lift_host_call(&hf(HostModule::Vec, name), vec![obj(), obj()]);
+            match out {
+                SorobanExpr::MethodCall { method, .. } => assert_eq!(method, sdk_method),
+                other => panic!("{name}: got {other:?}"),
+            }
+        }
+        // 1-arg ops
+        for (name, sdk_method) in [
+            ("vec_len", "len"),
+            ("vec_pop_front", "pop_front"),
+            ("vec_pop_back", "pop_back"),
+            ("vec_front", "first"),
+            ("vec_back", "last"),
+        ] {
+            let out = lift_host_call(&hf(HostModule::Vec, name), vec![obj()]);
+            match out {
+                SorobanExpr::MethodCall { method, .. } => assert_eq!(method, sdk_method),
+                other => panic!("{name}: got {other:?}"),
+            }
+        }
+        // 3-arg ops
+        for (name, sdk_method) in [
+            ("vec_put", "set"),
+            ("vec_insert", "insert"),
+            ("vec_slice", "slice"),
+        ] {
+            let out = lift_host_call(&hf(HostModule::Vec, name), vec![obj(), obj(), obj()]);
+            match out {
+                SorobanExpr::MethodCall { method, .. } => assert_eq!(method, sdk_method),
+                other => panic!("{name}: got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn vec_linear_memory_and_unknown_fall_back() {
+        for name in [
+            "vec_new_from_linear_memory",
+            "vec_unpack_to_linear_memory",
+            "unknown",
+        ] {
+            let out = lift_host_call(&hf(HostModule::Vec, name), vec![]);
+            assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+        }
+    }
+
+    // ----- Buf -----
+
+    #[test]
+    fn buf_serialize_and_deserialize() {
+        let out = lift_host_call(
+            &hf(HostModule::Buf, "serialize_to_bytes"),
+            vec![SorobanExpr::Param("v".into())],
+        );
+        match out {
+            SorobanExpr::MethodCall { method, .. } => assert_eq!(method, "to_xdr"),
+            other => panic!("got {other:?}"),
+        }
+        let out = lift_host_call(
+            &hf(HostModule::Buf, "deserialize_from_bytes"),
+            vec![SorobanExpr::Param("b".into())],
+        );
+        match out {
+            SorobanExpr::MethodCall { method, .. } => assert_eq!(method, "from_xdr"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buf_len_variants() {
+        for name in ["bytes_len", "string_len", "symbol_len"] {
+            let out = lift_host_call(&hf(HostModule::Buf, name), vec![obj()]);
+            match out {
+                SorobanExpr::MethodCall { method, .. } => assert_eq!(method, "len"),
+                other => panic!("{name}: got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn buf_bytes_ops() {
+        let cases = [
+            ("bytes_new", 0, "bytes_new"),
+            ("bytes_push", 2, "push"),
+            ("bytes_append", 2, "append"),
+            ("bytes_slice", 3, "slice"),
+            ("bytes_get", 2, "get"),
+            ("bytes_put", 3, "set"),
+        ];
+        for (name, arg_count, sdk_method) in cases {
+            let args: Vec<_> = (0..arg_count).map(|_| obj()).collect();
+            let out = lift_host_call(&hf(HostModule::Buf, name), args);
+            match out {
+                SorobanExpr::MethodCall { method, .. } => assert_eq!(method, sdk_method),
+                other => panic!("{name}: got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn buf_unknown_falls_back_to_raw() {
+        let out = lift_host_call(&hf(HostModule::Buf, "unknown"), vec![]);
+        assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
+    }
+
+    // ----- extract_storage_type direct tests -----
+
+    #[test]
+    fn extract_storage_type_dispatch() {
+        assert_eq!(extract_storage_type(None), StorageType::Persistent);
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::I64Literal(0))),
+            StorageType::Temporary
+        );
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::I32Literal(0))),
+            StorageType::Temporary
+        );
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::U32Literal(0))),
+            StorageType::Temporary
+        );
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::BoolLiteral(false))),
+            StorageType::Temporary
+        );
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::I64Literal(2))),
+            StorageType::Instance
+        );
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::I32Literal(2))),
+            StorageType::Instance
+        );
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::U32Literal(2))),
+            StorageType::Instance
+        );
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::Void)),
+            StorageType::Instance
+        );
+        // Other values default to Persistent.
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::I64Literal(1))),
+            StorageType::Persistent
+        );
+        assert_eq!(
+            extract_storage_type(Some(SorobanExpr::Param("p".into()))),
+            StorageType::Persistent
+        );
+    }
+}
