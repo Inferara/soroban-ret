@@ -1228,14 +1228,14 @@ fn try_generate_while(
         else_body,
     } = &body[0]
         && else_body.is_empty()
-            && then_body.len() == 1
-            && matches!(then_body[0], SorobanStmt::Break)
-        {
-            // Negate the condition cleanly: flip comparisons directly instead of wrapping in !()
-            let neg_cond = negate_condition(condition);
-            let rest: Vec<_> = body[1..].iter().map(gen_stmt).collect();
-            return Some(quote! { while #neg_cond { #(#rest)* } });
-        }
+        && then_body.len() == 1
+        && matches!(then_body[0], SorobanStmt::Break)
+    {
+        // Negate the condition cleanly: flip comparisons directly instead of wrapping in !()
+        let neg_cond = negate_condition(condition);
+        let rest: Vec<_> = body[1..].iter().map(gen_stmt).collect();
+        return Some(quote! { while #neg_cond { #(#rest)* } });
+    }
     None
 }
 

@@ -17,9 +17,9 @@ use crate::ir::soroban_ir::{MatchPattern, SorobanExpr, SorobanStmt, StorageType}
 use crate::pattern::lift_functions;
 use crate::pattern::lifter::find_identity_passthrough_param;
 use crate::spec::registry::TypeRegistry;
+use crate::wasm::WasmModule;
 use crate::wasm::imports::HostModule;
 use crate::wasm::validate::validate_soroban;
-use crate::wasm::WasmModule;
 use crate::{
     DecompileError, DecompileHints, DecompileIR, DecompileMode, DecompileOptions, DecompileResult,
     HintValue, ValidationReport,
@@ -177,23 +177,27 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // When optimization empties a function body that had host calls,
         // re-optimize preserving orphan host calls so users see
         // env.module().function() calls instead of todo!().
-        if func.body.is_empty() && func.had_host_calls
-            && let Some(stmts) = pre_opt_body {
-                func.body = optimize_stmts_preserve_host_calls(stmts);
-            }
+        if func.body.is_empty()
+            && func.had_host_calls
+            && let Some(stmts) = pre_opt_body
+        {
+            func.body = optimize_stmts_preserve_host_calls(stmts);
+        }
 
         // Identity-passthrough detection: after optimization removes orphan host calls,
         // if the body is empty and a parameter's type matches the return type, this is
         // a validate-and-return function (e.g., test_i64(v: i64) -> i64 { v }).
         // Guard: skip when the lifter detected host calls — those functions had real
         // logic that was lost during lifting, not genuine identity passthroughs.
-        if func.body.is_empty() && !func.had_host_calls
+        if func.body.is_empty()
+            && !func.had_host_calls
             && let Some(ret_ty) = &func.return_type
-                && let Some(param_name) = find_identity_passthrough_param(&func.params, ret_ty) {
-                    cov_mark::hit!(identity_passthrough_applied);
-                    func.body
-                        .push(SorobanStmt::Return(Some(SorobanExpr::Param(param_name))));
-                }
+            && let Some(param_name) = find_identity_passthrough_param(&func.params, ret_ty)
+        {
+            cov_mark::hit!(identity_passthrough_applied);
+            func.body
+                .push(SorobanStmt::Return(Some(SorobanExpr::Param(param_name))));
+        }
 
         // Extended identity-passthrough: body is a single `param.get(0)` return/expr
         // or `StructConstruct { field: param.field, ... }` where param type matches
@@ -202,21 +206,22 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // host calls (like vec_unpack) were used for parameter destructuring.
         if func.body.len() == 1
             && let Some(ret_ty) = &func.return_type
-                && let Some(param_name) = find_identity_passthrough_param(&func.params, ret_ty) {
-                    let get_expr = match &func.body[0] {
-                        SorobanStmt::Expr(e) => Some(e),
-                        SorobanStmt::Return(Some(e)) => Some(e),
-                        _ => None,
-                    };
-                    let is_passthrough = get_expr.is_some_and(|e| {
-                        is_identity_get_pattern(e, &param_name)
-                            || is_identity_struct_reconstruct(e, &param_name)
-                            || is_identity_bool_literal(e, ret_ty)
-                    });
-                    if is_passthrough {
-                        func.body = vec![SorobanStmt::Return(Some(SorobanExpr::Param(param_name)))];
-                    }
-                }
+            && let Some(param_name) = find_identity_passthrough_param(&func.params, ret_ty)
+        {
+            let get_expr = match &func.body[0] {
+                SorobanStmt::Expr(e) => Some(e),
+                SorobanStmt::Return(Some(e)) => Some(e),
+                _ => None,
+            };
+            let is_passthrough = get_expr.is_some_and(|e| {
+                is_identity_get_pattern(e, &param_name)
+                    || is_identity_struct_reconstruct(e, &param_name)
+                    || is_identity_bool_literal(e, ret_ty)
+            });
+            if is_passthrough {
+                func.body = vec![SorobanStmt::Return(Some(SorobanExpr::Param(param_name)))];
+            }
+        }
 
         // Artifact loop unwrap: `loop { expr }` as the sole body statement of a
         // function with a return type → inline `expr`. SDK copy-loop patterns
@@ -376,12 +381,13 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         for func in &mut contract_module.functions {
             if let Some(stellar_xdr::curr::ScSpecTypeDef::Result(r)) = &func.return_type
                 && matches!(*r.ok_type, stellar_xdr::curr::ScSpecTypeDef::Void)
-                    && let Some(SorobanStmt::Expr(SorobanExpr::MethodCall {
-                        method, args, ..
-                    })) = func.body.last()
-                        && method == "len" && args.is_empty() {
-                            func.body.pop();
-                        }
+                && let Some(SorobanStmt::Expr(SorobanExpr::MethodCall { method, args, .. })) =
+                    func.body.last()
+                && method == "len"
+                && args.is_empty()
+            {
+                func.body.pop();
+            }
         }
         log::trace!("Pipeline pass: stage_4d remove_trailing_len");
 
@@ -495,10 +501,11 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // Stage 4n: Fix BoolLiteral in numeric-returning functions.
         for func in &mut contract_module.functions {
             if let Some(ref ret_ty) = func.return_type
-                && is_numeric_type(ret_ty) {
-                    cov_mark::hit!(stage_4n_bool_literal_fixed);
-                    fix_bool_literal_returns(&mut func.body);
-                }
+                && is_numeric_type(ret_ty)
+            {
+                cov_mark::hit!(stage_4n_bool_literal_fixed);
+                fix_bool_literal_returns(&mut func.body);
+            }
         }
         log::trace!("Pipeline pass: stage_4n fix_bool_literal_returns");
 
@@ -2116,15 +2123,17 @@ fn set_invoke_return_type_in_expr(
     match expr {
         // invoke_contract::<T> returns T, so use the function's return type directly
         SorobanExpr::InvokeContract { return_type, .. }
-            if !matches!(spec, stellar_xdr::curr::ScSpecTypeDef::Result(_)) => {
-                *return_type = Some(type_str.to_string());
-            }
+            if !matches!(spec, stellar_xdr::curr::ScSpecTypeDef::Result(_)) =>
+        {
+            *return_type = Some(type_str.to_string());
+        }
         // try_invoke_contract::<T> returns Result<T, _>, so extract the ok type
         SorobanExpr::TryInvokeContract { return_type, .. } => {
             if let stellar_xdr::curr::ScSpecTypeDef::Result(r) = spec
-                && let Some(ok_str) = spec_type_to_string(&r.ok_type) {
-                    *return_type = Some(ok_str);
-                }
+                && let Some(ok_str) = spec_type_to_string(&r.ok_type)
+            {
+                *return_type = Some(ok_str);
+            }
         }
         _ => {}
     }
@@ -2705,21 +2714,23 @@ fn collect_rebound_locals(stmts: &[SorobanStmt], rebound: &mut std::collections:
         match stmt {
             SorobanStmt::Let { name, value, .. } => {
                 if let Some(idx_str) = name.strip_prefix("var_")
-                    && let Ok(idx) = idx_str.parse::<u32>() {
-                        if is_param_alias_binding(idx, value) {
-                            continue;
-                        }
-                        rebound.insert(idx);
+                    && let Ok(idx) = idx_str.parse::<u32>()
+                {
+                    if is_param_alias_binding(idx, value) {
+                        continue;
                     }
+                    rebound.insert(idx);
+                }
             }
             SorobanStmt::Assign { target, value } => {
                 if let Some(idx_str) = target.strip_prefix("var_")
-                    && let Ok(idx) = idx_str.parse::<u32>() {
-                        if is_param_alias_binding(idx, value) {
-                            continue;
-                        }
-                        rebound.insert(idx);
+                    && let Ok(idx) = idx_str.parse::<u32>()
+                {
+                    if is_param_alias_binding(idx, value) {
+                        continue;
                     }
+                    rebound.insert(idx);
+                }
             }
             SorobanStmt::If {
                 then_body,
@@ -3104,24 +3115,24 @@ fn resolve_unbound_invoke_locals(stmts: &mut [SorobanStmt]) {
             && let Some(idx) = name
                 .strip_prefix("var_")
                 .and_then(|s| s.parse::<u32>().ok())
-            {
-                // Only count as "meaningfully defined" if the value is not
-                // just a Local() reference or UnknownVal (which are artifacts
-                // from bind_unbound_locals or branch-sequential execution)
-                let is_meaningful =
-                    !matches!(value, SorobanExpr::Local(_) | SorobanExpr::UnknownVal);
-                if is_meaningful {
-                    meaningfully_defined.insert(idx);
-                }
-                // Track ValConvert { FieldAccess } bindings
-                if let SorobanExpr::ValConvert {
-                    value: inner,
-                    target_type,
-                } = value
-                    && matches!(inner.as_ref(), SorobanExpr::FieldAccess { .. }) {
-                        field_access_bindings.push((idx, target_type.clone()));
-                    }
+        {
+            // Only count as "meaningfully defined" if the value is not
+            // just a Local() reference or UnknownVal (which are artifacts
+            // from bind_unbound_locals or branch-sequential execution)
+            let is_meaningful = !matches!(value, SorobanExpr::Local(_) | SorobanExpr::UnknownVal);
+            if is_meaningful {
+                meaningfully_defined.insert(idx);
             }
+            // Track ValConvert { FieldAccess } bindings
+            if let SorobanExpr::ValConvert {
+                value: inner,
+                target_type,
+            } = value
+                && matches!(inner.as_ref(), SorobanExpr::FieldAccess { .. })
+            {
+                field_access_bindings.push((idx, target_type.clone()));
+            }
+        }
     }
 
     if field_access_bindings.is_empty() {
@@ -3191,9 +3202,10 @@ fn resolve_unbound_locals_in_expr(
                 _ => false,
             };
             if needs_resolve
-                && let Some((binding_idx, _)) = bindings.iter().find(|(_, t)| t == target_type) {
-                    **value = SorobanExpr::Local(*binding_idx);
-                }
+                && let Some((binding_idx, _)) = bindings.iter().find(|(_, t)| t == target_type)
+            {
+                **value = SorobanExpr::Local(*binding_idx);
+            }
             resolve_unbound_locals_in_expr(value, defined, bindings);
         }
         // Recurse into sub-expressions
@@ -3712,22 +3724,20 @@ fn recover_enum_cast_arms(stmts: &mut [SorobanStmt], registry: &TypeRegistry) {
                         variant,
                         bindings,
                     } = &mut arm.pattern
-                        && bindings.len() == 1 && bindings[0] == "_"
-                            && let Some(data_type) =
-                                registry.find_variant_data_type(type_name, variant)
-                                && let Some(type_name_str) = registry.resolve_type_name(&data_type)
-                                    && registry.is_integer_enum(&type_name_str)
-                                        && arm_has_unknown_val(&arm.body)
-                                    {
-                                        bindings[0] = "val".to_string();
-                                        let replacement = SorobanExpr::CastAs {
-                                            value: Box::new(SorobanExpr::NamedLocal(
-                                                "val".to_string(),
-                                            )),
-                                            target_type: "i64".to_string(),
-                                        };
-                                        replace_unknown_val_in_body(&mut arm.body, &replacement);
-                                    }
+                        && bindings.len() == 1
+                        && bindings[0] == "_"
+                        && let Some(data_type) = registry.find_variant_data_type(type_name, variant)
+                        && let Some(type_name_str) = registry.resolve_type_name(&data_type)
+                        && registry.is_integer_enum(&type_name_str)
+                        && arm_has_unknown_val(&arm.body)
+                    {
+                        bindings[0] = "val".to_string();
+                        let replacement = SorobanExpr::CastAs {
+                            value: Box::new(SorobanExpr::NamedLocal("val".to_string())),
+                            target_type: "i64".to_string(),
+                        };
+                        replace_unknown_val_in_body(&mut arm.body, &replacement);
+                    }
                 }
                 // Recurse into arm bodies
                 for arm in arms.iter_mut() {
@@ -4200,19 +4210,20 @@ fn replace_match_arm_artifact_refs(stmts: &mut Vec<SorobanStmt>, registry: &Type
                             variant,
                             bindings,
                         } = &arm.pattern
-                            && bindings.len() == 1 && bindings[0] == "_"
-                                && let Some(data_type) =
-                                    registry.find_variant_data_type(type_name, variant)
-                                {
-                                    let is_int_enum = registry
-                                        .resolve_type_name(&data_type)
-                                        .is_some_and(|tn| registry.is_integer_enum(&tn));
-                                    if !is_int_enum {
-                                        let binding = derive_binding_name(&data_type, registry);
-                                        replacements.push((j, arm_idx, binding));
-                                        continue;
-                                    }
-                                }
+                            && bindings.len() == 1
+                            && bindings[0] == "_"
+                            && let Some(data_type) =
+                                registry.find_variant_data_type(type_name, variant)
+                        {
+                            let is_int_enum = registry
+                                .resolve_type_name(&data_type)
+                                .is_some_and(|tn| registry.is_integer_enum(&tn));
+                            if !is_int_enum {
+                                let binding = derive_binding_name(&data_type, registry);
+                                replacements.push((j, arm_idx, binding));
+                                continue;
+                            }
+                        }
                         all_replaceable = false;
                     }
                 }
@@ -4233,9 +4244,10 @@ fn replace_match_arm_artifact_refs(stmts: &mut Vec<SorobanStmt>, registry: &Type
             if let SorobanStmt::Match { arms, .. } = &mut stmts[match_idx] {
                 let arm = &mut arms[arm_idx];
                 if let MatchPattern::EnumVariant { bindings, .. } = &mut arm.pattern
-                    && bindings.len() == 1 {
-                        bindings[0] = binding.clone();
-                    }
+                    && bindings.len() == 1
+                {
+                    bindings[0] = binding.clone();
+                }
                 replace_local_in_body(&mut arm.body, artifact_name, *local_idx, binding);
             }
         }
@@ -4691,29 +4703,31 @@ fn resolve_indirect_enum_key_in_expr(
         _ => None,
     };
     if let Some(fields) = fields
-        && fields.len() == 2 {
-            let variant_name = match &fields[0] {
-                SorobanExpr::NamedLocal(name) | SorobanExpr::Param(name) => {
-                    symbol_bindings.get(name).cloned()
-                }
-                // Local(N) maps to `var_N` bindings
-                SorobanExpr::Local(idx) => {
-                    let var_name = format!("var_{}", idx);
-                    symbol_bindings.get(&var_name).cloned()
-                }
-                _ => None,
+        && fields.len() == 2
+    {
+        let variant_name = match &fields[0] {
+            SorobanExpr::NamedLocal(name) | SorobanExpr::Param(name) => {
+                symbol_bindings.get(name).cloned()
+            }
+            // Local(N) maps to `var_N` bindings
+            SorobanExpr::Local(idx) => {
+                let var_name = format!("var_{}", idx);
+                symbol_bindings.get(&var_name).cloned()
+            }
+            _ => None,
+        };
+        if let Some(variant_name) = variant_name
+            && let Some((union_name, has_data)) = registry.find_union_variant(&variant_name)
+            && has_data
+        {
+            *expr = SorobanExpr::EnumConstruct {
+                type_name: union_name,
+                variant: variant_name,
+                fields: vec![fields[1].clone()],
             };
-            if let Some(variant_name) = variant_name
-                && let Some((union_name, has_data)) = registry.find_union_variant(&variant_name)
-                    && has_data {
-                        *expr = SorobanExpr::EnumConstruct {
-                            type_name: union_name,
-                            variant: variant_name,
-                            fields: vec![fields[1].clone()],
-                        };
-                        return;
-                    }
+            return;
         }
+    }
 
     // Recurse into sub-expressions (only the ones commonly containing tuple patterns)
     match expr {
@@ -4844,25 +4858,27 @@ fn try_convert_enum_key(expr: &SorobanExpr, registry: &TypeRegistry) -> Option<S
         {
             if let SorobanExpr::SymbolLiteral(variant_name) = &fields[0]
                 && let Some((union_name, has_data)) = registry.find_union_variant(variant_name)
-                    && has_data {
-                        return Some(SorobanExpr::EnumConstruct {
-                            type_name: union_name,
-                            variant: variant_name.clone(),
-                            fields: vec![fields[1].clone()],
-                        });
-                    }
+                && has_data
+            {
+                return Some(SorobanExpr::EnumConstruct {
+                    type_name: union_name,
+                    variant: variant_name.clone(),
+                    fields: vec![fields[1].clone()],
+                });
+            }
             None
         }
         // Void variant used as storage key: SymbolLiteral("Variant") → Type::Variant
         SorobanExpr::SymbolLiteral(name) => {
             if let Some((union_name, has_data)) = registry.find_union_variant(name)
-                && !has_data {
-                    return Some(SorobanExpr::EnumConstruct {
-                        type_name: union_name,
-                        variant: name.clone(),
-                        fields: vec![],
-                    });
-                }
+                && !has_data
+            {
+                return Some(SorobanExpr::EnumConstruct {
+                    type_name: union_name,
+                    variant: name.clone(),
+                    fields: vec![],
+                });
+            }
             None
         }
         _ => None,
@@ -5026,19 +5042,20 @@ fn drop_dead_lets(stmts: &mut Vec<SorobanStmt>) {
     let mut i = 0;
     while i < stmts.len() {
         if let SorobanStmt::Let { name, value, .. } = &stmts[i]
-            && !name_referenced_in(&stmts[i + 1..], name) {
-                if is_pure_value(value) {
-                    stmts.remove(i);
-                    continue;
-                } else {
-                    // Side-effectful → keep as Expr
-                    if let SorobanStmt::Let { value, .. } =
-                        std::mem::replace(&mut stmts[i], SorobanStmt::Return(None))
-                    {
-                        stmts[i] = SorobanStmt::Expr(value);
-                    }
+            && !name_referenced_in(&stmts[i + 1..], name)
+        {
+            if is_pure_value(value) {
+                stmts.remove(i);
+                continue;
+            } else {
+                // Side-effectful → keep as Expr
+                if let SorobanStmt::Let { value, .. } =
+                    std::mem::replace(&mut stmts[i], SorobanStmt::Return(None))
+                {
+                    stmts[i] = SorobanStmt::Expr(value);
                 }
             }
+        }
         i += 1;
     }
 }
@@ -5184,21 +5201,22 @@ fn replace_incomplete_struct_in_expr(
 ) {
     // First, try to replace this expression itself if it's an incomplete StructConstruct
     if let SorobanExpr::StructConstruct { type_name, fields } = expr
-        && struct_has_artifacts(fields) {
-            // Find params whose type resolves to this struct type
-            let matching: Vec<&FnParam> = params
-                .iter()
-                .filter(|p| {
-                    registry.resolve_type_name(&p.type_def).as_deref() == Some(type_name.as_str())
-                })
-                .collect();
-            // Only replace when exactly one param matches (no ambiguity)
-            if matching.len() == 1 {
-                cov_mark::hit!(stage_4q_struct_replaced_with_param);
-                *expr = SorobanExpr::Param(matching[0].name.clone());
-                return;
-            }
+        && struct_has_artifacts(fields)
+    {
+        // Find params whose type resolves to this struct type
+        let matching: Vec<&FnParam> = params
+            .iter()
+            .filter(|p| {
+                registry.resolve_type_name(&p.type_def).as_deref() == Some(type_name.as_str())
+            })
+            .collect();
+        // Only replace when exactly one param matches (no ambiguity)
+        if matching.len() == 1 {
+            cov_mark::hit!(stage_4q_struct_replaced_with_param);
+            *expr = SorobanExpr::Param(matching[0].name.clone());
+            return;
         }
+    }
 
     // Recurse into sub-expressions
     match expr {
@@ -5357,11 +5375,7 @@ fn recover_map_unpack_getter(
                         _ => false,
                     }
                 });
-                if has_matching_get {
-                    0
-                } else {
-                    usize::MAX
-                }
+                if has_matching_get { 0 } else { usize::MAX }
             });
             if count == usize::MAX {
                 return;
@@ -5375,17 +5389,18 @@ fn recover_map_unpack_getter(
     // The function returns the whole struct (e.g., get_state() -> State).
     if let Some(ret_name) = registry.resolve_type_name(&ret_type)
         && let Some(spec) = registry.structs.get(&ret_name)
-            && (unpack_count == 0 || spec.fields.len() == unpack_count) {
-                let get_expr = SorobanExpr::StorageGet {
-                    storage_type,
-                    key: Box::new(key_expr.clone()),
-                    unwrap: true,
-                };
-                cov_mark::hit!(stage_4s_getter_recovered);
-                func.body = vec![SorobanStmt::Return(Some(get_expr))];
-                func.takes_env = true;
-                return;
-            }
+        && (unpack_count == 0 || spec.fields.len() == unpack_count)
+    {
+        let get_expr = SorobanExpr::StorageGet {
+            storage_type,
+            key: Box::new(key_expr.clone()),
+            unwrap: true,
+        };
+        cov_mark::hit!(stage_4s_getter_recovered);
+        func.body = vec![SorobanStmt::Return(Some(get_expr))];
+        func.takes_env = true;
+        return;
+    }
 
     // Case 2: Return type matches a FIELD of a struct.
     // For getter functions, the return type uniquely identifies which field is read.
@@ -5406,9 +5421,10 @@ fn recover_map_unpack_getter(
         for field in spec.fields.iter() {
             let field_type_str = spec_type_to_string(&field.type_);
             if field_type_str.as_deref() == Some(&ret_type_str)
-                && let Ok(field_name) = field.name.to_utf8_string() {
-                    all_matches.push((struct_name.clone(), field_name));
-                }
+                && let Ok(field_name) = field.name.to_utf8_string()
+            {
+                all_matches.push((struct_name.clone(), field_name));
+            }
         }
     }
 
@@ -5832,9 +5848,10 @@ fn resolve_unknown_key_field_access(stmts: &mut [SorobanStmt]) {
                 },
             ..
         } = stmt
-            && !matches!(key.as_ref(), SorobanExpr::UnknownVal) {
-                bindings.push((name.clone(), *storage_type));
-            }
+            && !matches!(key.as_ref(), SorobanExpr::UnknownVal)
+        {
+            bindings.push((name.clone(), *storage_type));
+        }
     }
 
     if bindings.is_empty() {
@@ -5894,10 +5911,11 @@ fn replace_unknown_get_in_expr(expr: &mut SorobanExpr, bindings: &[(String, Stor
             unwrap: true,
         } = object.as_ref()
             && matches!(key.as_ref(), SorobanExpr::UnknownVal)
-                && let Some((name, _)) = bindings.iter().find(|(_, st)| st == storage_type) {
-                    **object = SorobanExpr::NamedLocal(name.clone());
-                    return;
-                }
+            && let Some((name, _)) = bindings.iter().find(|(_, st)| st == storage_type)
+        {
+            **object = SorobanExpr::NamedLocal(name.clone());
+            return;
+        }
         // Recurse into FieldAccess object
         replace_unknown_get_in_expr(object, bindings);
         return;
@@ -5991,9 +6009,10 @@ fn fix_require_auth_on_enum_key(stmts: &mut [SorobanStmt]) {
             },
         ) = (&w[0], &w[1])
             && let SorobanExpr::NamedLocal(k) = key.as_ref()
-                && k == key_name {
-                    key_to_value.push((key_name.clone(), val_name.clone()));
-                }
+            && k == key_name
+        {
+            key_to_value.push((key_name.clone(), val_name.clone()));
+        }
     }
 
     if key_to_value.is_empty() {
@@ -6031,10 +6050,11 @@ fn fix_auth_in_stmt(stmt: &mut SorobanStmt, pairs: &[(String, String)]) {
 fn fix_auth_in_expr(expr: &mut SorobanExpr, pairs: &[(String, String)]) {
     if let SorobanExpr::RequireAuth(inner) = expr {
         if let SorobanExpr::NamedLocal(name) = inner.as_ref()
-            && let Some((_, val_name)) = pairs.iter().find(|(k, _)| k == name) {
-                **inner = SorobanExpr::NamedLocal(val_name.clone());
-                return;
-            }
+            && let Some((_, val_name)) = pairs.iter().find(|(k, _)| k == name)
+        {
+            **inner = SorobanExpr::NamedLocal(val_name.clone());
+            return;
+        }
         fix_auth_in_expr(inner, pairs);
     }
     // Also fix in PublishEvent topics and nested expressions
@@ -6282,15 +6302,16 @@ fn resolve_var_to_param(
             } else if allow_index_fallback {
                 let param_idx = idx.saturating_sub(param_local_base) as usize;
                 if let Some(param) = params.get(param_idx)
-                    && param.name != "env" && !topic_param_names.contains(&param.name) {
-                        *expr = SorobanExpr::Param(param.name.clone());
-                    }
+                    && param.name != "env"
+                    && !topic_param_names.contains(&param.name)
+                {
+                    *expr = SorobanExpr::Param(param.name.clone());
+                }
             }
         }
-        SorobanExpr::UnknownVal
-            if allow_candidate_fallback && data_candidates.len() == 1 => {
-                *expr = SorobanExpr::Param(data_candidates[0].name.clone());
-            }
+        SorobanExpr::UnknownVal if allow_candidate_fallback && data_candidates.len() == 1 => {
+            *expr = SorobanExpr::Param(data_candidates[0].name.clone());
+        }
         SorobanExpr::StructConstruct { fields, .. } => {
             for (field_name, value) in fields.iter_mut() {
                 if allow_candidate_fallback

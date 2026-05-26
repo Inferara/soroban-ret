@@ -208,10 +208,11 @@ fn generate_contract_fn(
         Some(if let ScSpecTypeDef::Result(r) = rt {
             let ok = gen_type(&r.ok_type);
             if matches!(&*r.error_type, ScSpecTypeDef::Error)
-                && let Some(ename) = error_enum_name {
-                    let err = format_ident!("{}", ename);
-                    return Some(quote! { -> Result<#ok, #err> });
-                }
+                && let Some(ename) = error_enum_name
+            {
+                let err = format_ident!("{}", ename);
+                return Some(quote! { -> Result<#ok, #err> });
+            }
             let err = gen_type(&r.error_type);
             quote! { -> Result<#ok, #err> }
         } else {

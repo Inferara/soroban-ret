@@ -180,17 +180,20 @@ pub fn remove_self_assignments(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                 mutable,
                 ref value,
             } = stmt
-                && is_self_referential(name, value) && (!mutable || is_param_expr(value)) {
-                    return None;
-                }
+                && is_self_referential(name, value)
+                && (!mutable || is_param_expr(value))
+            {
+                return None;
+            }
             // Filter out self-referential assigns (e.g., `var_2 = var_2;`)
             if let SorobanStmt::Assign {
                 ref target,
                 ref value,
             } = stmt
-                && is_self_referential(target, value) {
-                    return None;
-                }
+                && is_self_referential(target, value)
+            {
+                return None;
+            }
             // Recurse into nested bodies
             Some(remove_self_assignments_stmt(stmt))
         })
@@ -349,10 +352,11 @@ fn remove_orphan_has_before_get(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             ref key,
         }) = stmt
             && let Some(next) = iter.peek()
-                && stmt_contains_matching_get(next, storage_type, key) {
-                    // Skip the orphan .has()
-                    continue;
-                }
+            && stmt_contains_matching_get(next, storage_type, key)
+        {
+            // Skip the orphan .has()
+            continue;
+        }
         // Recurse into nested bodies
         result.push(remove_orphan_has_before_get_stmt(stmt));
     }
@@ -425,9 +429,11 @@ fn expr_contains_matching_get(expr: &SorobanExpr, st: &StorageType, key: &Soroba
         key: get_key,
         ..
     } = expr
-        && storage_type == st && get_key.as_ref() == key {
-            return true;
-        }
+        && storage_type == st
+        && get_key.as_ref() == key
+    {
+        return true;
+    }
     // Recurse into sub-expressions
     for child in expr_children(expr) {
         if expr_contains_matching_get(child, st, key) {
@@ -1029,16 +1035,17 @@ fn remove_duplicate_exprs(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             _ => None,
         };
         if let Some(curr) = curr_expr
-            && let Some(SorobanStmt::Expr(prev)) = result.last() {
-                // Remove previous standalone Expr if:
-                // 1. It's identical to current expression, OR
-                // 2. It appears as a subexpression within current expression
-                //    (lifter artifact: result stored in local, then inlined)
-                if expr_contains(curr, prev) {
-                    cov_mark::hit!(duplicate_expr_removed);
-                    result.pop();
-                }
+            && let Some(SorobanStmt::Expr(prev)) = result.last()
+        {
+            // Remove previous standalone Expr if:
+            // 1. It's identical to current expression, OR
+            // 2. It appears as a subexpression within current expression
+            //    (lifter artifact: result stored in local, then inlined)
+            if expr_contains(curr, prev) {
+                cov_mark::hit!(duplicate_expr_removed);
+                result.pop();
             }
+        }
         result.push(stmt);
     }
     result
@@ -1520,12 +1527,13 @@ fn fold_has_get_pattern(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     let mut i = 0;
     while i < stmts.len() {
         if i + 1 < stmts.len()
-            && let Some(folded) = try_fold_has_get(&stmts[i], &stmts[i + 1]) {
-                cov_mark::hit!(fold_has_get_merged);
-                result.push(SorobanStmt::Expr(folded));
-                i += 2;
-                continue;
-            }
+            && let Some(folded) = try_fold_has_get(&stmts[i], &stmts[i + 1])
+        {
+            cov_mark::hit!(fold_has_get_merged);
+            result.push(SorobanStmt::Expr(folded));
+            i += 2;
+            continue;
+        }
         // Single-statement fold: If { condition: StorageHas, body: [...], else: [] }
         // Handles the common case where the lifter produces has() only as the If
         // condition (no standalone Expr(StorageHas)), so the pair-based fold above
@@ -1558,16 +1566,18 @@ fn fold_has_get_pattern(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                     key: get_key,
                     unwrap,
                 }) = get_expr
-                    && get_st == storage_type && get_key.as_ref() == has_key.as_ref() {
-                        cov_mark::hit!(fold_has_get_merged);
-                        result.push(SorobanStmt::Expr(SorobanExpr::StorageGet {
-                            storage_type: *get_st,
-                            key: get_key.clone(),
-                            unwrap: *unwrap,
-                        }));
-                        i += 1;
-                        continue;
-                    }
+                    && get_st == storage_type
+                    && get_key.as_ref() == has_key.as_ref()
+                {
+                    cov_mark::hit!(fold_has_get_merged);
+                    result.push(SorobanStmt::Expr(SorobanExpr::StorageGet {
+                        storage_type: *get_st,
+                        key: get_key.clone(),
+                        unwrap: *unwrap,
+                    }));
+                    i += 1;
+                    continue;
+                }
                 // Pattern 2: body is [Panic] — inverted unwrap check.
                 // The structurizer put the error path (panic) in the then-body
                 // and lost the success path (get). Replace with get().unwrap()
@@ -1709,13 +1719,15 @@ fn extract_storage_get_without_unwrap(
     if let SorobanStmt::Expr(SorobanExpr::StorageGet {
         storage_type, key, ..
     }) = &body[0]
-        && storage_type == expected_st && key.as_ref() == expected_key {
-            return Some(SorobanExpr::StorageGet {
-                storage_type: *storage_type,
-                key: key.clone(),
-                unwrap: false,
-            });
-        }
+        && storage_type == expected_st
+        && key.as_ref() == expected_key
+    {
+        return Some(SorobanExpr::StorageGet {
+            storage_type: *storage_type,
+            key: key.clone(),
+            unwrap: false,
+        });
+    }
     None
 }
 
@@ -2207,9 +2219,10 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
                 };
             }
             if is_zero_expr(&rhs)
-                && let Some((a, b)) = try_fold_signum(&lhs) {
-                    return SorobanExpr::Eq(a, b);
-                }
+                && let Some((a, b)) = try_fold_signum(&lhs)
+            {
+                return SorobanExpr::Eq(a, b);
+            }
             // bool_expr == 1 → bool_expr;  bool_expr == 0 → !bool_expr
             if is_bool_typed(&lhs) {
                 if is_one_expr(&rhs) {
@@ -2234,13 +2247,15 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
             }
             // x * c == 0 → x == 0 (c is non-zero constant)
             if is_zero_literal(&rhs)
-                && let Some(x) = extract_mul_nonzero(&lhs) {
-                    return SorobanExpr::Eq(Box::new(x.clone()), Box::new(rhs));
-                }
+                && let Some(x) = extract_mul_nonzero(&lhs)
+            {
+                return SorobanExpr::Eq(Box::new(x.clone()), Box::new(rhs));
+            }
             if is_zero_literal(&lhs)
-                && let Some(x) = extract_mul_nonzero(&rhs) {
-                    return SorobanExpr::Eq(Box::new(lhs), Box::new(x.clone()));
-                }
+                && let Some(x) = extract_mul_nonzero(&rhs)
+            {
+                return SorobanExpr::Eq(Box::new(lhs), Box::new(x.clone()));
+            }
             // Constant comparison: Eq(lit, lit) → BoolLiteral
             if let Some(result) = try_fold_literal_cmp(&lhs, &rhs, |a, b| a == b) {
                 return result;
@@ -2270,9 +2285,10 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
                 };
             }
             if is_zero_expr(&rhs)
-                && let Some((a, b)) = try_fold_signum(&lhs) {
-                    return SorobanExpr::Ne(a, b);
-                }
+                && let Some((a, b)) = try_fold_signum(&lhs)
+            {
+                return SorobanExpr::Ne(a, b);
+            }
             // bool_expr != 0 → bool_expr;  bool_expr != 1 → !bool_expr
             if is_bool_typed(&lhs) {
                 if is_zero_expr(&rhs) {
@@ -2297,13 +2313,15 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
             }
             // x * c != 0 → x != 0 (c is non-zero constant)
             if is_zero_literal(&rhs)
-                && let Some(x) = extract_mul_nonzero(&lhs) {
-                    return SorobanExpr::Ne(Box::new(x.clone()), Box::new(rhs));
-                }
+                && let Some(x) = extract_mul_nonzero(&lhs)
+            {
+                return SorobanExpr::Ne(Box::new(x.clone()), Box::new(rhs));
+            }
             if is_zero_literal(&lhs)
-                && let Some(x) = extract_mul_nonzero(&rhs) {
-                    return SorobanExpr::Ne(Box::new(lhs), Box::new(x.clone()));
-                }
+                && let Some(x) = extract_mul_nonzero(&rhs)
+            {
+                return SorobanExpr::Ne(Box::new(lhs), Box::new(x.clone()));
+            }
             // Constant comparison: Ne(lit, lit) → BoolLiteral
             if let Some(result) = try_fold_literal_cmp(&lhs, &rhs, |a, b| a != b) {
                 return result;
@@ -2332,9 +2350,10 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
             }
             // Signum fold: Sub(Gt(a,b), Lt(a,b)) < 0  →  a < b
             if is_zero_expr(&rhs)
-                && let Some((a, b)) = try_fold_signum(&lhs) {
-                    return SorobanExpr::Lt(a, b);
-                }
+                && let Some((a, b)) = try_fold_signum(&lhs)
+            {
+                return SorobanExpr::Lt(a, b);
+            }
             // Constant comparison: Lt(lit, lit) → BoolLiteral
             if let Some(result) = try_fold_literal_cmp(&lhs, &rhs, |a, b| a < b) {
                 return result;
@@ -2362,9 +2381,10 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
                 };
             }
             if is_zero_expr(&rhs)
-                && let Some((a, b)) = try_fold_signum(&lhs) {
-                    return SorobanExpr::Le(a, b);
-                }
+                && let Some((a, b)) = try_fold_signum(&lhs)
+            {
+                return SorobanExpr::Le(a, b);
+            }
             // Constant comparison: Le(lit, lit) → BoolLiteral
             if let Some(result) = try_fold_literal_cmp(&lhs, &rhs, |a, b| a <= b) {
                 return result;
@@ -2392,9 +2412,10 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
                 };
             }
             if is_zero_expr(&rhs)
-                && let Some((a, b)) = try_fold_signum(&lhs) {
-                    return SorobanExpr::Gt(a, b);
-                }
+                && let Some((a, b)) = try_fold_signum(&lhs)
+            {
+                return SorobanExpr::Gt(a, b);
+            }
             // Constant comparison: Gt(lit, lit) → BoolLiteral
             if let Some(result) = try_fold_literal_cmp(&lhs, &rhs, |a, b| a > b) {
                 return result;
@@ -2422,9 +2443,10 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
                 };
             }
             if is_zero_expr(&rhs)
-                && let Some((a, b)) = try_fold_signum(&lhs) {
-                    return SorobanExpr::Ge(a, b);
-                }
+                && let Some((a, b)) = try_fold_signum(&lhs)
+            {
+                return SorobanExpr::Ge(a, b);
+            }
             // Constant comparison: Ge(lit, lit) → BoolLiteral
             if let Some(result) = try_fold_literal_cmp(&lhs, &rhs, |a, b| a >= b) {
                 return result;
@@ -2655,9 +2677,11 @@ fn try_fold_obj_cmp(
     _rhs: &SorobanExpr,
 ) -> Option<(Box<SorobanExpr>, Box<SorobanExpr>)> {
     if let SorobanExpr::RawHostCall { function, args, .. } = lhs
-        && function == "obj_cmp" && args.len() == 2 {
-            return Some((Box::new(args[0].clone()), Box::new(args[1].clone())));
-        }
+        && function == "obj_cmp"
+        && args.len() == 2
+    {
+        return Some((Box::new(args[0].clone()), Box::new(args[1].clone())));
+    }
     None
 }
 
@@ -2666,9 +2690,11 @@ fn try_fold_obj_cmp(
 fn try_fold_signum(e: &SorobanExpr) -> Option<(Box<SorobanExpr>, Box<SorobanExpr>)> {
     if let SorobanExpr::Sub(lhs, rhs) = e
         && let (SorobanExpr::Gt(a1, b1), SorobanExpr::Lt(a2, b2)) = (lhs.as_ref(), rhs.as_ref())
-            && a1 == a2 && b1 == b2 {
-                return Some((a1.clone(), b1.clone()));
-            }
+        && a1 == a2
+        && b1 == b2
+    {
+        return Some((a1.clone(), b1.clone()));
+    }
     None
 }
 
@@ -2902,29 +2928,29 @@ fn remove_redundant_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                     unwrap,
                 },
         } = &stmts[i]
-            && let Some(idx) = let_name_to_local_idx(name) {
-                if let Some((_, _, _, earlier_idx, _)) =
-                    seen_gets.iter().find(|(st, k, uw, _, _)| {
-                        st == storage_type && k == key.as_ref() && uw == unwrap
-                    })
-                {
-                    cov_mark::hit!(cse_duplicate_storage_get_eliminated);
-                    let earlier_idx = *earlier_idx;
-                    let name_owned = name.clone();
-                    stmts.remove(i);
-                    // Only substitute up to the next redefinition of the same var.
-                    // WASM local reuse means the same var_N can be redefined with
-                    // a different value later — substitutions must not cross that.
-                    let redef_limit = find_next_redef(&stmts[i..], &name_owned);
-                    substitute_local(
-                        &mut stmts[i..i + redef_limit],
-                        idx,
-                        &SorobanExpr::Local(earlier_idx),
-                    );
-                    continue;
-                }
-                seen_gets.push((*storage_type, (**key).clone(), *unwrap, idx, name.clone()));
+            && let Some(idx) = let_name_to_local_idx(name)
+        {
+            if let Some((_, _, _, earlier_idx, _)) = seen_gets
+                .iter()
+                .find(|(st, k, uw, _, _)| st == storage_type && k == key.as_ref() && uw == unwrap)
+            {
+                cov_mark::hit!(cse_duplicate_storage_get_eliminated);
+                let earlier_idx = *earlier_idx;
+                let name_owned = name.clone();
+                stmts.remove(i);
+                // Only substitute up to the next redefinition of the same var.
+                // WASM local reuse means the same var_N can be redefined with
+                // a different value later — substitutions must not cross that.
+                let redef_limit = find_next_redef(&stmts[i..], &name_owned);
+                substitute_local(
+                    &mut stmts[i..i + redef_limit],
+                    idx,
+                    &SorobanExpr::Local(earlier_idx),
+                );
+                continue;
             }
+            seen_gets.push((*storage_type, (**key).clone(), *unwrap, idx, name.clone()));
+        }
         i += 1;
     }
 
@@ -2942,64 +2968,65 @@ fn remove_redundant_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             mutable,
             value,
         } = &stmts[i]
-            && let Some(idx) = let_name_to_local_idx(name) {
-                // Only count uses up to the next redefinition of the same var_N.
-                // Uses after a redefinition refer to the later binding, not this one.
-                let redef_limit = find_next_redef(&stmts[i + 1..], name);
-                let (uses, in_loop) = count_local_uses(&stmts[i + 1..i + 1 + redef_limit], idx);
-                let side_effect = expr_has_side_effects(value);
+            && let Some(idx) = let_name_to_local_idx(name)
+        {
+            // Only count uses up to the next redefinition of the same var_N.
+            // Uses after a redefinition refer to the later binding, not this one.
+            let redef_limit = find_next_redef(&stmts[i + 1..], name);
+            let (uses, in_loop) = count_local_uses(&stmts[i + 1..i + 1 + redef_limit], idx);
+            let side_effect = expr_has_side_effects(value);
 
-                // Dead store: never used and no side effects → drop it.
-                if uses == 0 && !side_effect {
-                    cov_mark::hit!(dead_let_removed);
-                    if *mutable {
-                        // Dead mutable variable: defined and possibly assigned in
-                        // match/if arms, but never READ in any expression.
-                        // Remove subsequent Assign statements targeting this var.
-                        let removed_name = name.clone();
-                        stmts.remove(i);
-                        remove_dead_assigns(&mut stmts[i..], &removed_name);
-                    } else {
-                        stmts.remove(i);
-                    }
-                    continue;
+            // Dead store: never used and no side effects → drop it.
+            if uses == 0 && !side_effect {
+                cov_mark::hit!(dead_let_removed);
+                if *mutable {
+                    // Dead mutable variable: defined and possibly assigned in
+                    // match/if arms, but never READ in any expression.
+                    // Remove subsequent Assign statements targeting this var.
+                    let removed_name = name.clone();
+                    stmts.remove(i);
+                    remove_dead_assigns(&mut stmts[i..], &removed_name);
+                } else {
+                    stmts.remove(i);
                 }
+                continue;
+            }
 
-                // Dead store with side effects: never used but the expression
-                // might have side effects → keep the expression, drop the binding.
-                if uses == 0 && side_effect && !*mutable {
+            // Dead store with side effects: never used but the expression
+            // might have side effects → keep the expression, drop the binding.
+            if uses == 0 && side_effect && !*mutable {
+                let SorobanStmt::Let { value, .. } = stmts.remove(i) else {
+                    unreachable!()
+                };
+                stmts.insert(i, SorobanStmt::Expr(value));
+                i += 1;
+                continue;
+            }
+
+            // Immutable single-use, not inside a loop, and side-effect-free → inline.
+            if !*mutable && uses == 1 && !in_loop && !side_effect {
+                cov_mark::hit!(redundant_let_inlined);
+                let SorobanStmt::Let { value, .. } = stmts.remove(i) else {
+                    unreachable!()
+                };
+                substitute_local(&mut stmts[i..], idx, &value);
+                // Don't advance i: re-check the (now different) statement at i.
+                continue;
+            }
+
+            // Immutable single-use with side effects, used in immediately next
+            // statement → safe to inline (execution order unchanged).
+            if !*mutable && uses == 1 && !in_loop && side_effect && i + 1 < stmts.len() {
+                let (next_uses, _) = count_local_uses(&stmts[i + 1..i + 2], idx);
+                if next_uses == 1 {
                     let SorobanStmt::Let { value, .. } = stmts.remove(i) else {
                         unreachable!()
                     };
-                    stmts.insert(i, SorobanStmt::Expr(value));
-                    i += 1;
+                    substitute_local(&mut stmts[i..i + 1], idx, &value);
                     continue;
-                }
-
-                // Immutable single-use, not inside a loop, and side-effect-free → inline.
-                if !*mutable && uses == 1 && !in_loop && !side_effect {
-                    cov_mark::hit!(redundant_let_inlined);
-                    let SorobanStmt::Let { value, .. } = stmts.remove(i) else {
-                        unreachable!()
-                    };
-                    substitute_local(&mut stmts[i..], idx, &value);
-                    // Don't advance i: re-check the (now different) statement at i.
-                    continue;
-                }
-
-                // Immutable single-use with side effects, used in immediately next
-                // statement → safe to inline (execution order unchanged).
-                if !*mutable && uses == 1 && !in_loop && side_effect && i + 1 < stmts.len() {
-                    let (next_uses, _) = count_local_uses(&stmts[i + 1..i + 2], idx);
-                    if next_uses == 1 {
-                        let SorobanStmt::Let { value, .. } = stmts.remove(i) else {
-                            unreachable!()
-                        };
-                        substitute_local(&mut stmts[i..i + 1], idx, &value);
-                        continue;
-                    }
                 }
             }
+        }
         i += 1;
     }
 
@@ -3016,21 +3043,20 @@ fn remove_redundant_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             value,
         } = &stmts[i]
             && let Some(idx) = let_name_to_local_idx(name)
-                && !expr_has_side_effects(value) {
-                    // Check if we've seen an identical value before
-                    if let Some((_, earlier_idx, _)) =
-                        seen_values.iter().find(|(v, _, _)| v == value)
-                    {
-                        cov_mark::hit!(cse_duplicate_let_eliminated);
-                        let earlier_idx = *earlier_idx;
-                        // Substitute all references to this binding with the earlier one
-                        stmts.remove(i);
-                        substitute_local(&mut stmts[i..], idx, &SorobanExpr::Local(earlier_idx));
-                        continue; // Don't advance i; re-check statement at i
-                    }
-                    // First occurrence — record it
-                    seen_values.push((value.clone(), idx, name.clone()));
-                }
+            && !expr_has_side_effects(value)
+        {
+            // Check if we've seen an identical value before
+            if let Some((_, earlier_idx, _)) = seen_values.iter().find(|(v, _, _)| v == value) {
+                cov_mark::hit!(cse_duplicate_let_eliminated);
+                let earlier_idx = *earlier_idx;
+                // Substitute all references to this binding with the earlier one
+                stmts.remove(i);
+                substitute_local(&mut stmts[i..], idx, &SorobanExpr::Local(earlier_idx));
+                continue; // Don't advance i; re-check statement at i
+            }
+            // First occurrence — record it
+            seen_values.push((value.clone(), idx, name.clone()));
+        }
         i += 1;
     }
 
@@ -3051,16 +3077,18 @@ fn resolve_valconvert_locals(stmts: &mut [SorobanStmt]) {
 
     for stmt in stmts.iter() {
         if let SorobanStmt::Let { name, value, .. } = stmt
-            && let Some(idx) = let_name_to_local_idx(name) {
-                defined.insert(idx);
-                if let SorobanExpr::ValConvert {
-                    value: inner,
-                    target_type,
-                } = value
-                    && matches!(inner.as_ref(), SorobanExpr::FieldAccess { .. }) {
-                        typed_field_bindings.push((idx, target_type.clone()));
-                    }
+            && let Some(idx) = let_name_to_local_idx(name)
+        {
+            defined.insert(idx);
+            if let SorobanExpr::ValConvert {
+                value: inner,
+                target_type,
+            } = value
+                && matches!(inner.as_ref(), SorobanExpr::FieldAccess { .. })
+            {
+                typed_field_bindings.push((idx, target_type.clone()));
             }
+        }
     }
 
     if typed_field_bindings.is_empty() {
@@ -3123,10 +3151,10 @@ fn resolve_valconvert_in_expr(
         SorobanExpr::ValConvert { value, target_type } => {
             if let SorobanExpr::Local(idx) = value.as_ref()
                 && !defined.contains(idx)
-                    && let Some((binding_idx, _)) = bindings.iter().find(|(_, t)| t == target_type)
-                    {
-                        **value = SorobanExpr::Local(*binding_idx);
-                    }
+                && let Some((binding_idx, _)) = bindings.iter().find(|(_, t)| t == target_type)
+            {
+                **value = SorobanExpr::Local(*binding_idx);
+            }
             resolve_valconvert_in_expr(value, defined, bindings);
         }
         SorobanExpr::InvokeContract { args, address, .. }
@@ -3189,9 +3217,10 @@ fn let_name_to_local_idx(name: &str) -> Option<u32> {
 fn find_next_redef(stmts: &[SorobanStmt], name: &str) -> usize {
     for (j, stmt) in stmts.iter().enumerate() {
         if let SorobanStmt::Let { name: n, .. } = stmt
-            && n == name {
-                return j;
-            }
+            && n == name
+        {
+            return j;
+        }
     }
     stmts.len()
 }
@@ -3234,13 +3263,14 @@ fn remove_dead_assigns_stmt(stmt: &mut SorobanStmt, name: &str) {
 fn remove_dead_assigns_from_body(body: &mut Vec<SorobanStmt>, name: &str) {
     body.retain_mut(|stmt| {
         if let SorobanStmt::Assign { target, value } = stmt
-            && target == name {
-                if expr_has_side_effects(value) {
-                    *stmt = SorobanStmt::Expr(std::mem::replace(value, SorobanExpr::Void));
-                    return true;
-                }
-                return false;
+            && target == name
+        {
+            if expr_has_side_effects(value) {
+                *stmt = SorobanStmt::Expr(std::mem::replace(value, SorobanExpr::Void));
+                return true;
             }
+            return false;
+        }
         remove_dead_assigns_stmt(stmt, name);
         true
     });
@@ -3859,18 +3889,20 @@ fn is_option_field(
     if let Some(spec) = registry.structs.get(type_name) {
         for field in spec.fields.iter() {
             if let Ok(name) = field.name.to_utf8_string()
-                && name == field_name {
-                    return matches!(field.type_, ScSpecTypeDef::Option(_));
-                }
+                && name == field_name
+            {
+                return matches!(field.type_, ScSpecTypeDef::Option(_));
+            }
         }
     }
     // Check events (params)
     if let Some(spec) = registry.events.get(type_name) {
         for param in spec.params.iter() {
             if let Ok(name) = param.name.to_utf8_string()
-                && name == field_name {
-                    return matches!(param.type_, ScSpecTypeDef::Option(_));
-                }
+                && name == field_name
+            {
+                return matches!(param.type_, ScSpecTypeDef::Option(_));
+            }
         }
     }
     false
@@ -3890,18 +3922,17 @@ fn recover_keys_in_stmt(stmt: SorobanStmt) -> SorobanStmt {
                 .iter()
                 .any(|arm| matches!(arm.pattern, MatchPattern::EnumVariant { .. }));
 
-            if has_enum_arms
-                && let SorobanExpr::Param(ref param_name) = scrutinee {
-                    let replacement = SorobanExpr::Param(param_name.clone());
-                    let arms = arms
-                        .into_iter()
-                        .map(|arm| MatchArm {
-                            pattern: arm.pattern,
-                            body: replace_unknown_storage_keys(arm.body, &replacement),
-                        })
-                        .collect();
-                    return SorobanStmt::Match { scrutinee, arms };
-                }
+            if has_enum_arms && let SorobanExpr::Param(ref param_name) = scrutinee {
+                let replacement = SorobanExpr::Param(param_name.clone());
+                let arms = arms
+                    .into_iter()
+                    .map(|arm| MatchArm {
+                        pattern: arm.pattern,
+                        body: replace_unknown_storage_keys(arm.body, &replacement),
+                    })
+                    .collect();
+                return SorobanStmt::Match { scrutinee, arms };
+            }
             // Recurse into arms even if no substitution
             SorobanStmt::Match {
                 scrutinee,
@@ -4080,15 +4111,14 @@ pub fn propagate_variable_names(
             SorobanStmt::Match { scrutinee, arms },
         ) = (&w[0], &w[1])
             && name.starts_with("var_")
-                && !arms.is_empty()
-                && arms.iter().all(|arm| {
-                    arm.body.is_empty()
-                        || (arm.body.len() == 1
-                            && matches!(&arm.body[0], SorobanStmt::Assign { target, .. } if target == name))
-                })
-                && let Some(derived) = derive_name_from_expr(scrutinee) {
-                    let_match_names.insert(name.clone(), derived);
-                }
+            && !arms.is_empty() && arms.iter().all(|arm| {
+            arm.body.is_empty()
+                || (arm.body.len() == 1
+                    && matches!(&arm.body[0], SorobanStmt::Assign { target, .. } if target == name))
+        }) && let Some(derived) = derive_name_from_expr(scrutinee)
+        {
+            let_match_names.insert(name.clone(), derived);
+        }
     }
 
     // Streaming approach: process each statement sequentially, accumulating
@@ -4411,19 +4441,20 @@ fn deshadow_variable_names(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     // First pass: detect shadowed Let bindings
     for stmt in &stmts {
         if let SorobanStmt::Let { name, .. } = stmt
-            && !seen.insert(name.clone()) {
-                // Name collision — find a unique suffix
-                let mut suffix = 2u32;
-                loop {
-                    let candidate = format!("{}_{}", name, suffix);
-                    if !seen.contains(&candidate) {
-                        seen.insert(candidate.clone());
-                        renames.insert(name.clone(), candidate);
-                        break;
-                    }
-                    suffix += 1;
+            && !seen.insert(name.clone())
+        {
+            // Name collision — find a unique suffix
+            let mut suffix = 2u32;
+            loop {
+                let candidate = format!("{}_{}", name, suffix);
+                if !seen.contains(&candidate) {
+                    seen.insert(candidate.clone());
+                    renames.insert(name.clone(), candidate);
+                    break;
                 }
+                suffix += 1;
             }
+        }
     }
 
     if renames.is_empty() {
@@ -4440,16 +4471,17 @@ fn deshadow_variable_names(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
         .into_iter()
         .map(|stmt| {
             if let SorobanStmt::Let { ref name, .. } = stmt
-                && renames.contains_key(name) {
-                    if first_seen.contains(name) {
-                        // This is the shadowed (second+) definition — rename it
-                        let new_name = renames.get(name).unwrap().clone();
-                        active_renames.insert(name.clone(), new_name.clone());
-                        let stmt = rename_in_stmt(stmt, &active_renames);
-                        return stmt;
-                    }
-                    first_seen.insert(name.clone());
+                && renames.contains_key(name)
+            {
+                if first_seen.contains(name) {
+                    // This is the shadowed (second+) definition — rename it
+                    let new_name = renames.get(name).unwrap().clone();
+                    active_renames.insert(name.clone(), new_name.clone());
+                    let stmt = rename_in_stmt(stmt, &active_renames);
+                    return stmt;
                 }
+                first_seen.insert(name.clone());
+            }
             if active_renames.is_empty() {
                 stmt
             } else {
@@ -4774,39 +4806,39 @@ fn resolve_self_referential_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                 mutable: false,
                 value,
             }) = iter.peek()
-            {
-                if is_self_referential(name, value) {
-                    let name = name.clone();
-                    // Extract the Expr value
-                    let SorobanStmt::Expr(expr) = stmt else {
-                        unreachable!()
-                    };
-                    // Skip the self-referential Let
-                    iter.next();
-                    // Emit Let binding with the Expr's value
-                    result.push(SorobanStmt::Let {
-                        name,
-                        mutable: false,
-                        value: expr,
-                    });
-                    continue;
-                }
-
-                // Check: Expr(something) + Let var_N = VecConstruct([..., Local(N), ...])
-                // Inline the Expr value into the VecConstruct, replacing the
-                // self-referential Local(N) element.
-                if let Some((replaced_value, replaced_name)) =
-                    try_inline_vec_self_ref(name, value, &stmt)
-                {
-                    iter.next();
-                    result.push(SorobanStmt::Let {
-                        name: replaced_name,
-                        mutable: false,
-                        value: replaced_value,
-                    });
-                    continue;
-                }
+        {
+            if is_self_referential(name, value) {
+                let name = name.clone();
+                // Extract the Expr value
+                let SorobanStmt::Expr(expr) = stmt else {
+                    unreachable!()
+                };
+                // Skip the self-referential Let
+                iter.next();
+                // Emit Let binding with the Expr's value
+                result.push(SorobanStmt::Let {
+                    name,
+                    mutable: false,
+                    value: expr,
+                });
+                continue;
             }
+
+            // Check: Expr(something) + Let var_N = VecConstruct([..., Local(N), ...])
+            // Inline the Expr value into the VecConstruct, replacing the
+            // self-referential Local(N) element.
+            if let Some((replaced_value, replaced_name)) =
+                try_inline_vec_self_ref(name, value, &stmt)
+            {
+                iter.next();
+                result.push(SorobanStmt::Let {
+                    name: replaced_name,
+                    mutable: false,
+                    value: replaced_value,
+                });
+                continue;
+            }
+        }
 
         result.push(resolve_self_referential_lets_stmt(stmt));
     }
@@ -4893,19 +4925,20 @@ fn bind_unbound_locals(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
         }
 
         if let Some(pos) = expr_pos
-            && !bound.contains(&idx) {
-                // Replace the standalone Expr with a Let binding
-                let expr = match std::mem::replace(&mut stmts[pos], SorobanStmt::Break) {
-                    SorobanStmt::Expr(e) => e,
-                    _ => unreachable!(),
-                };
-                stmts[pos] = SorobanStmt::Let {
-                    name: format!("var_{}", idx),
-                    mutable: false,
-                    value: expr,
-                };
-                bound.insert(idx);
-            }
+            && !bound.contains(&idx)
+        {
+            // Replace the standalone Expr with a Let binding
+            let expr = match std::mem::replace(&mut stmts[pos], SorobanStmt::Break) {
+                SorobanStmt::Expr(e) => e,
+                _ => unreachable!(),
+            };
+            stmts[pos] = SorobanStmt::Let {
+                name: format!("var_{}", idx),
+                mutable: false,
+                value: expr,
+            };
+            bound.insert(idx);
+        }
     }
 
     stmts

@@ -210,10 +210,9 @@ fn scan_type_def(type_def: &ScSpecTypeDef, needs: &mut ImportNeeds, crypto: &Cry
             }
         }
         ScSpecTypeDef::String => needs.string_type = true,
-        ScSpecTypeDef::U256
-            if !crypto.has_any() => {
-                needs.u256 = true;
-            }
+        ScSpecTypeDef::U256 if !crypto.has_any() => {
+            needs.u256 = true;
+        }
         ScSpecTypeDef::I256 => needs.i256 = true,
         ScSpecTypeDef::Timepoint => needs.timepoint = true,
         ScSpecTypeDef::Duration => needs.duration = true,
