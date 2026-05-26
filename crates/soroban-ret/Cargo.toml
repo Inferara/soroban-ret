@@ -14,15 +14,18 @@ categories.workspace = true
 [dependencies]
 soroban-spec = { workspace = true }
 soroban-meta = { workspace = true }
+soroban-spec-rust = { workspace = true }
 stellar-xdr = { workspace = true }
 wasmparser = { workspace = true }
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }
+prettyplease = { workspace = true }
 thiserror = { workspace = true }
+log = { workspace = true }
+cov-mark = { workspace = true }
 wasmprinter = { workspace = true, optional = true }
 
 [dev-dependencies]
-pretty_assertions = "1.2.1"
 insta = "1.40"
-proptest = "1.4"
-glob = "0.3"
 wat = "1"
-regex = "1"

@@ -1,0 +1,40 @@
+---
+source: crates/soroban-ret/tests/integration.rs
+expression: source
+---
+#![no_std]
+use soroban_sdk::{contract, contractevent, contractimpl, Address, Env, MuxedAddress};
+#[contractevent(export = false, topics = ["transfer"])]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct Transfer {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+    pub to_muxed_id: Option<u64>,
+}
+#[contract]
+pub struct Contract;
+#[contractimpl]
+impl Contract {
+    pub fn failed_transfer(env: Env, from: Address, to: Address, amount: i128) {
+        Transfer {
+            from,
+            to,
+            amount,
+            to_muxed_id: None,
+        }
+        .publish(&env);
+        panic!();
+    }
+    pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
+        Transfer {
+            from,
+            to: to.address(),
+            amount,
+            to_muxed_id: None,
+        }
+        .publish(&env);
+    }
+}

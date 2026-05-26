@@ -7,10 +7,16 @@
 
 ## Status
 
-Early development. The current cut covers two pipeline stages:
+Early development. The current cut covers the full five-stage pipeline, with
+partial decompilation working end-to-end for contracts limited to simple
+arithmetic, basic storage, custom types, events, auth, and cross-contract
+calls.
 
 - **Stage 1** — WASM parsing: sections, imports, exports, function bodies, data segments, custom sections (`contractspecv0`, `contractmetav0`, `contractenvmetav0`).
 - **Stage 2** — Spec extraction: typed lookup tables for functions, structs, unions, enums, error enums, and events from the contract's `contractspecv0` XDR; SEP-41 / Stellar Asset standard-interface detection; SDK version from `contractmetav0`.
+- **Stage 3** — Pattern matcher: host-call lifting, control-flow structurization, dispatch peeling, wrapper detection.
+- **Stage 4** — IR optimizer + post-optimization passes: constant folding, has/get fusion, storage-key recovery, enum-key construction, event-publish recovery, auth/cross-contract repair, dead-code elimination.
+- **Stage 5** — Rust source emitter: type definitions via `soroban-spec-rust`, function bodies, module assembly with `#[contract]`/`#[contractimpl]`, formatting via `prettyplease`.
 
 ## Install
 
@@ -27,44 +33,68 @@ cargo install soroban-ret-cli
 ## CLI usage
 
 ```bash
+# Print decompiled Rust to stdout
 soroban-ret path/to/contract.wasm
+
+# Write decompiled Rust to a file
+soroban-ret path/to/contract.wasm -o lib.rs
+
+# Print only type definitions and function signatures
+soroban-ret path/to/contract.wasm --spec-only
+
+# Print contract metadata (SDK version, function/type counts, signatures)
+soroban-ret path/to/contract.wasm --info
+
+# Force generic WASM mode (no Soroban assumptions)
+soroban-ret path/to/contract.wasm --generic
 ```
 
-Output is a one-line summary of the parsed module, e.g.:
+Flags:
 
-```
-Functions: 13, Types: 4, Imports: 27
-```
-> [!NOTE]
-> The output is organized in the following manner
-> - Functions: $N$ = Soroban contract spec functions from contractspecv0
-> - Types: $N$ = Soroban user-defined spec types: structs + unions + enums
-> - Imports: $N$ = actual WASM function imports
->## 
-> ### It does not mean:
-> - raw WASM function-section count
-> - raw WASM type-section count
-
-The CLI currently takes only the input WASM path. Flags for source-file output, spec-only emission, and verbose logging will be added once the corresponding pipeline stages land.
+| Flag | Purpose |
+|---|---|
+| `-o, --output <FILE>` | Write decompiled source to a file instead of stdout |
+| `--spec-only` | Emit only type definitions and function signatures |
+| `-O, --pre-optimize` | Pre-optimize the WASM with `wasm-opt` before decompilation (requires binaryen) |
+| `--info` | Print contract metadata (SDK version, functions, types, events) and exit |
+| `--generic` | Force generic WASM mode (no Soroban assumptions) |
+| `-v, --verbose` | Enable debug logging |
 
 ## Library usage
 
 ```rust
-use soroban_ret::{TypeRegistry, WasmModule};
+use soroban_ret::{decompile, decompile_with_options, DecompileOptions};
 
 let wasm = std::fs::read("contract.wasm")?;
 
-let module = WasmModule::parse(&wasm)?;
-println!("imports: {}", module.imports.functions.len());
-println!("functions: {}", module.functions.len());
+// Simple: WASM bytes → formatted Rust source.
+let source: String = decompile(&wasm)?;
+println!("{source}");
 
-let registry = TypeRegistry::from_wasm(&wasm)?;
-for name in registry.functions.keys() {
-    println!("fn {name}");
+// With options + metadata.
+let mut options = DecompileOptions::default();
+options.spec_only = true;
+let result = decompile_with_options(&wasm, &options)?;
+println!("SDK version: {:?}", result.sdk_version);
+println!("Standard interfaces: {:?}", result.standard_interfaces);
+for diag in &result.validation.diagnostics {
+    eprintln!("diag: {diag}");
 }
 ```
 
-Validation diagnostics for non-Soroban-compliant constructs (floats, reference types, multi-memory, `call_indirect`, etc.) are available via `WasmModule::parse_diagnostics`.
+For lower-level inspection (raw parsed WASM, typed spec registry, validation
+diagnostics) the stage-1 / stage-2 APIs are still public:
+
+```rust
+use soroban_ret::{TypeRegistry, WasmModule};
+
+let module = WasmModule::parse(&wasm)?;
+let registry = TypeRegistry::from_wasm(&wasm)?;
+```
+
+Validation diagnostics for non-Soroban-compliant constructs (floats, reference
+types, multi-memory, `call_indirect`, etc.) are available via
+`WasmModule::parse_diagnostics`.
 
 ## Build from source
 
@@ -85,9 +115,15 @@ cargo run -p soroban-ret-cli -- path/to/contract.wasm
 |---|---|---|
 | 1 | WASM parser | done |
 | 2 | Spec extractor + standard-interface detector | done |
-| 3 | Pattern matcher: host-call lifting, control-flow structurization, wrapper detection | planned |
-| 4 | IR optimizer + post-optimization passes | planned |
-| 5 | Rust source emitter | planned |
+| 3 | Pattern matcher: host-call lifting, control-flow structurization, wrapper detection | done (partial) |
+| 4 | IR optimizer + post-optimization passes | done (partial) |
+| 5 | Rust source emitter | done (partial) |
+
+"Partial" reflects the current deliverable scope: simple arithmetic, basic
+storage, custom types, events, auth, and cross-contract calls produce
+compilable Rust with correct types and signatures. Coverage of more advanced
+patterns (allowance flows, complex token contracts, snapshot-quality
+recovery) is on the roadmap.
 
 ## Acknowledgements
 
