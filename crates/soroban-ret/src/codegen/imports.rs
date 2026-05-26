@@ -665,4 +665,401 @@ mod tests {
         let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
         assert!(out.contains("Address"), "missing Address: {out}");
     }
+
+    // ---------------- scan_type_def coverage ----------------
+
+    fn fn_with_param_type(ty: stellar_xdr::curr::ScSpecTypeDef) -> ContractFn {
+        let mut f = empty_fn("g");
+        f.params.push(crate::ir::high_level_ir::FnParam {
+            name: "x".to_string(),
+            type_def: ty,
+        });
+        f
+    }
+
+    fn compute_with_param_type(ty: stellar_xdr::curr::ScSpecTypeDef) -> String {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.functions.push(fn_with_param_type(ty));
+        collapse(&compute_imports(&module, &empty_registry()).to_string())
+    }
+
+    #[test]
+    fn imports_param_bytes_pulls_bytes_import() {
+        let out = compute_with_param_type(stellar_xdr::curr::ScSpecTypeDef::Bytes);
+        assert!(out.contains("Bytes"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_param_string_pulls_string_import() {
+        let out = compute_with_param_type(stellar_xdr::curr::ScSpecTypeDef::String);
+        assert!(out.contains("String"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_param_i256_timepoint_duration() {
+        use stellar_xdr::curr::ScSpecTypeDef;
+        for (ty, want) in [
+            (ScSpecTypeDef::I256, "I256"),
+            (ScSpecTypeDef::Timepoint, "Timepoint"),
+            (ScSpecTypeDef::Duration, "Duration"),
+        ] {
+            let out = compute_with_param_type(ty);
+            assert!(out.contains(want), "expected {want} in {out}");
+        }
+    }
+
+    #[test]
+    fn imports_param_map_pulls_map_and_recurses() {
+        use stellar_xdr::curr::{ScSpecTypeDef, ScSpecTypeMap};
+        let map = ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+            key_type: Box::new(ScSpecTypeDef::Bytes),
+            value_type: Box::new(ScSpecTypeDef::Timepoint),
+        }));
+        let out = compute_with_param_type(map);
+        assert!(out.contains("Map"), "missing Map: {out}");
+        assert!(out.contains("Bytes"), "key Bytes import missing: {out}");
+        assert!(out.contains("Timepoint"), "value Timepoint missing: {out}");
+    }
+
+    #[test]
+    fn imports_param_option_recurses() {
+        use stellar_xdr::curr::{ScSpecTypeDef, ScSpecTypeOption};
+        let o = ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+            value_type: Box::new(ScSpecTypeDef::Duration),
+        }));
+        let out = compute_with_param_type(o);
+        assert!(out.contains("Duration"), "missing Duration: {out}");
+    }
+
+    #[test]
+    fn imports_param_result_recurses_into_both_arms() {
+        use stellar_xdr::curr::{ScSpecTypeDef, ScSpecTypeResult};
+        let r = ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+            ok_type: Box::new(ScSpecTypeDef::Bytes),
+            error_type: Box::new(ScSpecTypeDef::String),
+        }));
+        let out = compute_with_param_type(r);
+        assert!(out.contains("Bytes"));
+        assert!(out.contains("String"));
+    }
+
+    #[test]
+    fn imports_param_tuple_recurses() {
+        use stellar_xdr::curr::{ScSpecTypeDef, ScSpecTypeTuple};
+        let t = ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
+            value_types: vec![ScSpecTypeDef::Bytes, ScSpecTypeDef::Timepoint]
+                .try_into()
+                .unwrap(),
+        }));
+        let out = compute_with_param_type(t);
+        assert!(out.contains("Bytes"));
+        assert!(out.contains("Timepoint"));
+    }
+
+    #[test]
+    fn imports_param_bytesn_pulls_bytesn_unless_crypto_aliased() {
+        use stellar_xdr::curr::{ScSpecTypeBytesN, ScSpecTypeDef};
+        // Without crypto: BytesN<32> should pull `BytesN`.
+        let out = compute_with_param_type(ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 32 }));
+        assert!(out.contains("BytesN"), "got: {out}");
+        // With BLS12-381 active and a 48-byte BytesN (Fp): no BytesN import.
+        let mut module = ContractModule::new("Contract".to_string());
+        module.crypto_usage.uses_bls12_381 = true;
+        module
+            .functions
+            .push(fn_with_param_type(ScSpecTypeDef::BytesN(
+                ScSpecTypeBytesN { n: 48 },
+            )));
+        let out = collapse(&compute_imports(&module, &empty_registry()).to_string());
+        assert!(!out.contains("BytesN ,") && !out.contains("BytesN }"));
+    }
+
+    // ---------------- scan_stmts coverage ----------------
+
+    fn compute_with_body(body: Vec<SorobanStmt>) -> String {
+        let mut module = ContractModule::new("Contract".to_string());
+        let mut f = empty_fn("g");
+        f.body = body;
+        module.functions.push(f);
+        collapse(&compute_imports(&module, &empty_registry()).to_string())
+    }
+
+    #[test]
+    fn imports_stmt_if_match_loop_block_comment_walk() {
+        // Build a body containing every stmt kind so scan_stmt's match arms are all hit.
+        use crate::ir::soroban_ir::{MatchArm, MatchPattern};
+        let body = vec![
+            SorobanStmt::Comment("c".into()),
+            SorobanStmt::Break,
+            SorobanStmt::Continue,
+            SorobanStmt::Return(None),
+            SorobanStmt::Return(Some(SorobanExpr::SymbolLiteral("x".into()))),
+            SorobanStmt::Let {
+                name: "y".into(),
+                mutable: false,
+                value: SorobanExpr::StringLiteral("hi".into()),
+            },
+            SorobanStmt::Assign {
+                target: "y".into(),
+                value: SorobanExpr::Param("p".into()),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::BoolLiteral(true),
+                then_body: vec![SorobanStmt::Expr(SorobanExpr::Log(vec![
+                    SorobanExpr::StringLiteral("l".into()),
+                ]))],
+                else_body: vec![SorobanStmt::Expr(SorobanExpr::Log(vec![]))],
+            },
+            SorobanStmt::Match {
+                scrutinee: SorobanExpr::Param("z".into()),
+                arms: vec![MatchArm {
+                    pattern: MatchPattern::Wildcard,
+                    body: vec![SorobanStmt::Expr(SorobanExpr::VecConstruct(vec![
+                        SorobanExpr::U32Literal(1),
+                    ]))],
+                }],
+            },
+            SorobanStmt::Loop {
+                body: vec![SorobanStmt::Block(vec![SorobanStmt::Expr(
+                    SorobanExpr::MapConstruct(vec![(
+                        SorobanExpr::SymbolLiteral("k".into()),
+                        SorobanExpr::U32Literal(1),
+                    )]),
+                )])],
+            },
+        ];
+        let out = compute_with_body(body);
+        // Substrings that pinpoint each branch was scanned.
+        assert!(out.contains("symbol_short"), "missing symbol_short: {out}");
+        assert!(out.contains("log"), "missing log: {out}");
+        assert!(out.contains("vec"), "missing vec macro: {out}");
+        assert!(out.contains("map"), "missing map macro: {out}");
+        assert!(out.contains("Vec"), "missing Vec import: {out}");
+        assert!(out.contains("Map"), "missing Map import: {out}");
+        assert!(out.contains("String"), "missing String import: {out}");
+    }
+
+    // ---------------- scan_expr coverage ----------------
+
+    fn compute_with_expr(e: SorobanExpr) -> String {
+        compute_with_body(vec![SorobanStmt::Expr(e)])
+    }
+
+    fn boxed(e: SorobanExpr) -> Box<SorobanExpr> {
+        Box::new(e)
+    }
+
+    #[test]
+    fn imports_long_symbol_pulls_symbol_not_short() {
+        let out = compute_with_expr(SorobanExpr::SymbolLiteral("ten_chars_!".into()));
+        assert!(out.contains("Symbol"), "missing Symbol: {out}");
+        // Long symbol should NOT pull symbol_short (in isolation).
+        assert!(!out.contains("symbol_short"), "stray symbol_short: {out}");
+    }
+
+    #[test]
+    fn imports_binary_operators_recurse_into_both_sides() {
+        // Each binary op contains a SymbolLiteral on the left — verify recursion fires.
+        let sym = SorobanExpr::SymbolLiteral("s".into());
+        for op in [
+            SorobanExpr::Add(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Sub(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Mul(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Div(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Rem(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Eq(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Ne(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Lt(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Le(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Gt(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Ge(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::And(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Or(boxed(sym.clone()), boxed(SorobanExpr::U32Literal(1))),
+            SorobanExpr::Not(boxed(sym.clone())),
+        ] {
+            let out = compute_with_expr(op);
+            assert!(
+                out.contains("symbol_short"),
+                "operator failed to recurse: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn imports_storage_has_extend_and_instance_ttl_walks_args() {
+        use crate::ir::soroban_ir::StorageType;
+        let sym = SorobanExpr::SymbolLiteral("k".into());
+        let out = compute_with_expr(SorobanExpr::StorageHas {
+            storage_type: StorageType::Persistent,
+            key: boxed(sym.clone()),
+        });
+        assert!(out.contains("symbol_short"), "got: {out}");
+
+        let out = compute_with_expr(SorobanExpr::StorageExtendTtl {
+            storage_type: StorageType::Persistent,
+            key: boxed(sym.clone()),
+            threshold: boxed(SorobanExpr::SymbolLiteral("th".into())),
+            extend_to: boxed(SorobanExpr::SymbolLiteral("ex".into())),
+        });
+        assert!(
+            out.contains("symbol_short"),
+            "extend_ttl args not scanned: {out}"
+        );
+
+        let out = compute_with_expr(SorobanExpr::ExtendInstanceAndCodeTtl {
+            threshold: boxed(SorobanExpr::SymbolLiteral("th".into())),
+            extend_to: boxed(SorobanExpr::SymbolLiteral("ex".into())),
+        });
+        assert!(out.contains("symbol_short"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_invoke_contract_walks_args_and_address() {
+        let out = compute_with_expr(SorobanExpr::InvokeContract {
+            address: boxed(SorobanExpr::Param("a".into())),
+            function: boxed(SorobanExpr::SymbolLiteral("f".into())),
+            args: vec![SorobanExpr::SymbolLiteral("arg".into())],
+            return_type: Some("u64".into()),
+        });
+        // Both function (short symbol) and the arg (short symbol) must hit symbol_short.
+        assert!(out.contains("symbol_short"), "got: {out}");
+        assert!(out.contains("vec"), "vec macro missing: {out}");
+        assert!(out.contains("IntoVal"), "IntoVal missing: {out}");
+    }
+
+    #[test]
+    fn imports_authorize_publish_log_address_strkey() {
+        let s = SorobanExpr::SymbolLiteral("s".into());
+        for e in [
+            SorobanExpr::AuthorizeAsCurrContract(boxed(s.clone())),
+            SorobanExpr::PublishEvent {
+                event_name: None,
+                topics: vec![s.clone()],
+                data: boxed(s.clone()),
+            },
+            SorobanExpr::Log(vec![s.clone()]),
+            SorobanExpr::StrkeyToAddress(boxed(s.clone())),
+            SorobanExpr::AddressToStrkey(boxed(s.clone())),
+        ] {
+            let out = compute_with_expr(e);
+            assert!(out.contains("symbol_short"), "got: {out}");
+        }
+        // StrkeyToAddress should also pull Address.
+        let out = compute_with_expr(SorobanExpr::StrkeyToAddress(boxed(s)));
+        assert!(out.contains("Address"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_crypto_exprs_recurse_into_args() {
+        let s = SorobanExpr::SymbolLiteral("s".into());
+        for e in [
+            SorobanExpr::CryptoSha256(boxed(s.clone())),
+            SorobanExpr::CryptoKeccak256(boxed(s.clone())),
+            SorobanExpr::CryptoEd25519Verify {
+                public_key: boxed(s.clone()),
+                message: boxed(s.clone()),
+                signature: boxed(s.clone()),
+            },
+            SorobanExpr::CryptoSecp256k1Recover {
+                msg_digest: boxed(s.clone()),
+                signature: boxed(s.clone()),
+                recovery_id: boxed(s.clone()),
+            },
+        ] {
+            let out = compute_with_expr(e);
+            assert!(out.contains("symbol_short"), "got: {out}");
+        }
+    }
+
+    #[test]
+    fn imports_prng_exprs_recurse_into_args() {
+        let s = SorobanExpr::SymbolLiteral("s".into());
+        for e in [
+            SorobanExpr::PrngReseed(boxed(s.clone())),
+            SorobanExpr::PrngBytesNew(boxed(s.clone())),
+            SorobanExpr::PrngU64InRange {
+                low: boxed(s.clone()),
+                high: boxed(s.clone()),
+            },
+            SorobanExpr::PrngVecShuffle(boxed(s.clone())),
+        ] {
+            let out = compute_with_expr(e);
+            assert!(out.contains("symbol_short"), "got: {out}");
+        }
+    }
+
+    #[test]
+    fn imports_misc_recursive_exprs() {
+        let s = SorobanExpr::SymbolLiteral("s".into());
+        // ErrorFromCode
+        let out = compute_with_expr(SorobanExpr::ErrorFromCode(boxed(s.clone())));
+        assert!(out.contains("symbol_short"), "got: {out}");
+
+        // RawHostCall walks args.
+        let out = compute_with_expr(SorobanExpr::RawHostCall {
+            module: "M".into(),
+            function: "f".into(),
+            args: vec![s.clone()],
+        });
+        assert!(out.contains("symbol_short"), "got: {out}");
+
+        // ValConvert and CastAs walk their value.
+        let out = compute_with_expr(SorobanExpr::ValConvert {
+            value: boxed(s.clone()),
+            target_type: "u64".into(),
+        });
+        assert!(out.contains("symbol_short"), "got: {out}");
+        let out = compute_with_expr(SorobanExpr::CastAs {
+            value: boxed(s.clone()),
+            target_type: "i64".into(),
+        });
+        assert!(out.contains("symbol_short"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_panic_with_error_pulls_macro() {
+        let out = compute_with_expr(SorobanExpr::PanicWithError(boxed(SorobanExpr::U32Literal(
+            1,
+        ))));
+        assert!(out.contains("panic_with_error"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_collection_new_map_pulls_map_type() {
+        let out = compute_with_expr(SorobanExpr::CollectionNew("Map".into()));
+        assert!(out.contains("Map"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_collection_new_vec_pulls_vec_type() {
+        let out = compute_with_expr(SorobanExpr::CollectionNew("Vec".into()));
+        assert!(out.contains("Vec"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_string_literal_in_body_pulls_string() {
+        let out = compute_with_expr(SorobanExpr::StringLiteral("hi".into()));
+        assert!(out.contains("String"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_vec_construct_recurses_and_pulls_macro() {
+        let out = compute_with_expr(SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral(
+            "a".into(),
+        )]));
+        assert!(out.contains("vec"), "got: {out}");
+        assert!(out.contains("Vec"), "got: {out}");
+        assert!(out.contains("symbol_short"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_map_construct_recurses_and_pulls_macro() {
+        let out = compute_with_expr(SorobanExpr::MapConstruct(vec![(
+            SorobanExpr::SymbolLiteral("k".into()),
+            SorobanExpr::SymbolLiteral("v".into()),
+        )]));
+        assert!(out.contains("map"), "got: {out}");
+        assert!(out.contains("Map"), "got: {out}");
+        assert!(out.contains("symbol_short"), "got: {out}");
+    }
 }

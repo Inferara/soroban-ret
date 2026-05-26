@@ -498,4 +498,183 @@ mod tests {
             .replace(' ', "");
         assert_eq!(out, "Address");
     }
+
+    #[test]
+    fn generate_type_ident_crypto_recurses_into_map() {
+        // Map<BytesN<64>, U256> with BN254 active: key → Bn254G1Affine, value → Fr.
+        let bn = CryptoUsage {
+            uses_bn254: true,
+            uses_bls12_381: false,
+        };
+        let map = ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+            key_type: Box::new(ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 64 })),
+            value_type: Box::new(ScSpecTypeDef::U256),
+        }));
+        let out = generate_type_ident_crypto(&map, &bn, None)
+            .to_string()
+            .replace(' ', "");
+        assert_eq!(out, "Map<Bn254G1Affine,Fr>");
+    }
+
+    #[test]
+    fn generate_type_ident_crypto_recurses_into_option() {
+        let bls = CryptoUsage {
+            uses_bn254: false,
+            uses_bls12_381: true,
+        };
+        let o = ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+            value_type: Box::new(ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 48 })),
+        }));
+        let out = generate_type_ident_crypto(&o, &bls, None)
+            .to_string()
+            .replace(' ', "");
+        assert_eq!(out, "Option<Bls12381Fp>");
+    }
+
+    #[test]
+    fn generate_type_ident_crypto_recurses_into_result() {
+        let bls = CryptoUsage {
+            uses_bn254: false,
+            uses_bls12_381: true,
+        };
+        let r = ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+            ok_type: Box::new(ScSpecTypeDef::U256),
+            error_type: Box::new(ScSpecTypeDef::Error),
+        }));
+        let out = generate_type_ident_crypto(&r, &bls, None)
+            .to_string()
+            .replace(' ', "");
+        assert_eq!(out, "Result<Fr,soroban_sdk::Error>");
+    }
+
+    #[test]
+    fn generate_type_ident_crypto_recurses_into_tuple_single_and_multi() {
+        let bn = CryptoUsage {
+            uses_bn254: true,
+            uses_bls12_381: false,
+        };
+        // Single-element tuple still emits `(T,)` trailing comma.
+        let t1 = ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
+            value_types: vec![ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 64 })]
+                .try_into()
+                .unwrap(),
+        }));
+        assert_eq!(
+            generate_type_ident_crypto(&t1, &bn, None)
+                .to_string()
+                .replace(' ', ""),
+            "(Bn254G1Affine,)"
+        );
+
+        // Multi-element tuple recurses element-wise.
+        let t2 = ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
+            value_types: vec![
+                ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 64 }),
+                ScSpecTypeDef::U256,
+            ]
+            .try_into()
+            .unwrap(),
+        }));
+        assert_eq!(
+            generate_type_ident_crypto(&t2, &bn, None)
+                .to_string()
+                .replace(' ', ""),
+            "(Bn254G1Affine,Fr)"
+        );
+    }
+
+    #[test]
+    fn resolve_crypto_alias_no_alias_when_crypto_off() {
+        // CryptoUsage default (no flags) → all variants return None.
+        let none = CryptoUsage::default();
+        for size in [32u32, 48, 64, 96, 128, 192, 256] {
+            let t = ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: size });
+            assert!(resolve_crypto_alias(&t, &none, None).is_none());
+        }
+        // Non-BytesN, non-U256 variants always None.
+        assert!(resolve_crypto_alias(&ScSpecTypeDef::Address, &none, None).is_none());
+    }
+
+    fn struct_field(name: &str, ty: ScSpecTypeDef) -> stellar_xdr::ScSpecUdtStructFieldV0 {
+        stellar_xdr::ScSpecUdtStructFieldV0 {
+            doc: "".try_into().unwrap(),
+            name: name.try_into().unwrap(),
+            type_: ty,
+        }
+    }
+
+    fn struct_spec(
+        name: &str,
+        fields: Vec<stellar_xdr::ScSpecUdtStructFieldV0>,
+    ) -> stellar_xdr::ScSpecUdtStructV0 {
+        stellar_xdr::ScSpecUdtStructV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: name.try_into().unwrap(),
+            fields: fields.try_into().unwrap(),
+        }
+    }
+
+    #[test]
+    fn generate_struct_with_crypto_no_crypto_field_uses_full_ord_derive() {
+        let none = CryptoUsage::default();
+        let spec = struct_spec(
+            "Plain",
+            vec![
+                struct_field("a", ScSpecTypeDef::U64),
+                struct_field("b", ScSpecTypeDef::Address),
+            ],
+        );
+        let out = generate_struct_with_crypto(&spec, &none).to_string();
+        // Plain struct gets the full derive including Ord/PartialOrd.
+        assert!(
+            out.contains("Ord") && out.contains("PartialOrd"),
+            "missing Ord derive: {out}"
+        );
+        assert!(out.contains("pub struct Plain"));
+    }
+
+    #[test]
+    fn generate_struct_with_crypto_with_crypto_field_drops_ord_derive() {
+        let bls = CryptoUsage {
+            uses_bn254: false,
+            uses_bls12_381: true,
+        };
+        let spec = struct_spec(
+            "WithCrypto",
+            vec![
+                struct_field("addr", ScSpecTypeDef::Address),
+                // 48-byte BytesN → Bls12381Fp (unorderable).
+                struct_field("fp", ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 48 })),
+            ],
+        );
+        let out = generate_struct_with_crypto(&spec, &bls).to_string();
+        // Crypto field present → Ord/PartialOrd dropped from the derive.
+        assert!(
+            !out.contains("Ord") && !out.contains("PartialOrd"),
+            "should not derive Ord: {out}"
+        );
+        // The crypto field uses the alias type.
+        assert!(out.contains("Bls12381Fp"), "missing Fp alias: {out}");
+        // contracttype attr is on every Soroban type.
+        assert!(out.contains("contracttype"));
+    }
+
+    #[test]
+    fn generate_struct_with_crypto_fp2_field_hint() {
+        // A field named with "fp2" anywhere gets the Bls12381Fp2 alias for 96-byte BytesN.
+        let bls = CryptoUsage {
+            uses_bn254: false,
+            uses_bls12_381: true,
+        };
+        let spec = struct_spec(
+            "T",
+            vec![struct_field(
+                "fp2_val",
+                ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 96 }),
+            )],
+        );
+        let out = generate_struct_with_crypto(&spec, &bls).to_string();
+        assert!(out.contains("Bls12381Fp2"), "missing Fp2 hint: {out}");
+    }
 }

@@ -2361,4 +2361,394 @@ mod generate_stmt_tests {
         let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
         assert!(out.contains("return Err (Error :: Bad) ;"), "got: {out}");
     }
+
+    // -------- generate_stmt_tail with control flow --------
+
+    #[test]
+    fn stmt_tail_if_recurses_with_tail_form() {
+        let stmt = SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(1))],
+            else_body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(2))],
+        };
+        let out = collapse(&s(generate_stmt_tail(&stmt)));
+        // No trailing `;` on the tail expressions.
+        assert_eq!(out, "if true { 1 } else { 2 }");
+    }
+
+    #[test]
+    fn stmt_tail_if_no_else() {
+        let stmt = SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(7))],
+            else_body: vec![],
+        };
+        let out = collapse(&s(generate_stmt_tail(&stmt)));
+        assert_eq!(out, "if true { 7 }");
+    }
+
+    #[test]
+    fn stmt_tail_match_literal_keeps_match_form() {
+        let stmt = SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("n".into()),
+            arms: vec![
+                MatchArm {
+                    pattern: MatchPattern::Literal(SorobanExpr::U32Literal(0)),
+                    body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(10))],
+                },
+                MatchArm {
+                    pattern: MatchPattern::Wildcard,
+                    body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(20))],
+                },
+            ],
+        };
+        let out = collapse(&s(generate_stmt_tail(&stmt)));
+        // Tail form: no `;` on the inner expressions.
+        assert!(out.starts_with("match n {"), "got: {out}");
+        assert!(out.contains("0 => { 10 }"));
+        assert!(out.contains("_ => { 20 }"));
+    }
+
+    #[test]
+    fn stmt_tail_match_unit_enum_collapses_to_if_else_chain() {
+        let stmt = SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("k".into()),
+            arms: vec![
+                MatchArm {
+                    pattern: MatchPattern::EnumVariant {
+                        type_name: "DK".into(),
+                        variant: "A".into(),
+                        bindings: vec![],
+                    },
+                    body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(1))],
+                },
+                MatchArm {
+                    pattern: MatchPattern::EnumVariant {
+                        type_name: "DK".into(),
+                        variant: "B".into(),
+                        bindings: vec![],
+                    },
+                    body: vec![SorobanStmt::Expr(SorobanExpr::U32Literal(2))],
+                },
+            ],
+        };
+        let out = collapse(&s(generate_stmt_tail(&stmt)));
+        assert!(out.contains("if k == DK :: A"));
+        assert!(out.contains("else if k == DK :: B"));
+    }
+
+    #[test]
+    fn stmt_tail_loop_uses_standard_stmt_form() {
+        let stmt = SorobanStmt::Loop {
+            body: vec![SorobanStmt::Break],
+        };
+        let out = collapse(&s(generate_stmt_tail(&stmt)));
+        assert!(out.contains("loop { break ; }"));
+    }
+
+    #[test]
+    fn stmt_tail_block_recurses_with_tail() {
+        let stmt = SorobanStmt::Block(vec![
+            SorobanStmt::Let {
+                name: "x".into(),
+                mutable: false,
+                value: SorobanExpr::U32Literal(1),
+            },
+            SorobanStmt::Expr(SorobanExpr::NamedLocal("x".into())),
+        ]);
+        let out = collapse(&s(generate_stmt_tail(&stmt)));
+        // Block's last stmt is tail (no `;`).
+        assert!(out.contains("let x = 1 ;"));
+        assert!(out.ends_with("x }"), "got: {out}");
+    }
+
+    #[test]
+    fn stmt_tail_other_delegates_to_generate_stmt() {
+        // A Comment is delegated to generate_stmt (which emits the parsed comment text or empty).
+        let stmt = SorobanStmt::Comment("hi".into());
+        assert_eq!(collapse(&s(generate_stmt_tail(&stmt))), "");
+    }
+
+    // -------- generate_stmt_result_wrapped with control flow --------
+
+    #[test]
+    fn stmt_result_wrapped_void_return_passes_through() {
+        let stmt = SorobanStmt::Return(Some(SorobanExpr::Void));
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        // Void/UnknownVal/Panic skip Ok() wrapping.
+        assert_eq!(out, "return () ;");
+    }
+
+    #[test]
+    fn stmt_result_wrapped_panic_passes_through() {
+        let stmt = SorobanStmt::Return(Some(SorobanExpr::Panic));
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert_eq!(out, "return panic ! () ;");
+    }
+
+    #[test]
+    fn stmt_result_wrapped_if_propagates_wrapping_into_branches() {
+        let stmt = SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(1)))],
+            else_body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(2)))],
+        };
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        // Both arms wrap their returns in Ok().
+        assert!(out.contains("return Ok (1) ;"), "got: {out}");
+        assert!(out.contains("return Ok (2) ;"), "got: {out}");
+    }
+
+    #[test]
+    fn stmt_result_wrapped_if_no_else() {
+        let stmt = SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(false),
+            then_body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(1)))],
+            else_body: vec![],
+        };
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert!(out.contains("return Ok (1) ;"));
+        assert!(!out.contains("else"), "stray else: {out}");
+    }
+
+    #[test]
+    fn stmt_result_wrapped_match_unit_enum_collapses_to_chain() {
+        let stmt = SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("k".into()),
+            arms: vec![
+                MatchArm {
+                    pattern: MatchPattern::EnumVariant {
+                        type_name: "K".into(),
+                        variant: "A".into(),
+                        bindings: vec![],
+                    },
+                    body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(1)))],
+                },
+                MatchArm {
+                    pattern: MatchPattern::Wildcard,
+                    body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(2)))],
+                },
+            ],
+        };
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert!(out.contains("if k == K :: A"), "got: {out}");
+        assert!(out.contains("Ok (1)"));
+        assert!(out.contains("Ok (2)"));
+    }
+
+    #[test]
+    fn stmt_result_wrapped_match_with_literal_keeps_match_form() {
+        let stmt = SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("n".into()),
+            arms: vec![MatchArm {
+                pattern: MatchPattern::Literal(SorobanExpr::U32Literal(0)),
+                body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(99)))],
+            }],
+        };
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert!(out.contains("match n {"), "got: {out}");
+        assert!(out.contains("Ok (99)"));
+    }
+
+    #[test]
+    fn stmt_result_wrapped_loop_body_returns_get_wrapped() {
+        let stmt = SorobanStmt::Loop {
+            body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(7)))],
+        };
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert!(out.contains("loop {"), "got: {out}");
+        assert!(out.contains("return Ok (7) ;"), "got: {out}");
+    }
+
+    #[test]
+    fn stmt_result_wrapped_block_recurses() {
+        let stmt = SorobanStmt::Block(vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(5)))]);
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert!(out.contains("{ return Ok (5) ; }"), "got: {out}");
+    }
+
+    #[test]
+    fn stmt_result_wrapped_panic_with_error_becomes_err() {
+        // PanicWithError(ContractError with type+variant) in a Result-returning fn
+        // converts back to `return Err(variant);`.
+        let stmt = SorobanStmt::Expr(SorobanExpr::PanicWithError(Box::new(
+            SorobanExpr::ContractError {
+                error_code: 1,
+                error_type: Some("E".into()),
+                variant_name: Some("Bad".into()),
+            },
+        )));
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert_eq!(out, "return Err (E :: Bad) ;");
+    }
+
+    #[test]
+    fn stmt_result_wrapped_panic_with_error_untyped_stays_as_call() {
+        // Untyped (raw code) PanicWithError stays as a statement, not Err.
+        let stmt = SorobanStmt::Expr(SorobanExpr::PanicWithError(Box::new(
+            SorobanExpr::ErrorFromCode(Box::new(SorobanExpr::U32Literal(5))),
+        )));
+        let out = collapse(&s(generate_stmt_result_wrapped(&stmt)));
+        assert!(out.contains("panic_with_error !"), "got: {out}");
+        assert!(
+            !out.contains("return Err"),
+            "should not wrap raw codes: {out}"
+        );
+    }
+
+    // -------- generate_stmts_with_tail_result_wrapped --------
+
+    fn render_stmts_with_tail_result_wrapped(stmts: &[SorobanStmt]) -> String {
+        let toks = generate_stmts_with_tail_result_wrapped(stmts);
+        let joined: String = toks.iter().map(|t| t.to_string()).collect();
+        joined.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn stmts_with_tail_result_wrapped_empty_returns_empty() {
+        assert!(generate_stmts_with_tail_result_wrapped(&[]).is_empty());
+    }
+
+    #[test]
+    fn stmts_with_tail_result_wrapped_wraps_only_last_return() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "x".into(),
+                mutable: false,
+                value: SorobanExpr::U32Literal(1),
+            },
+            SorobanStmt::Return(Some(SorobanExpr::NamedLocal("x".into()))),
+        ];
+        let out = render_stmts_with_tail_result_wrapped(&stmts);
+        assert!(out.contains("let x = 1 ;"));
+        assert!(out.ends_with("Ok (x)"), "got: {out}");
+    }
+
+    #[test]
+    fn stmts_with_tail_result_wrapped_typed_error_tail() {
+        let stmts = vec![SorobanStmt::Return(Some(SorobanExpr::ContractError {
+            error_code: 1,
+            error_type: Some("E".into()),
+            variant_name: Some("X".into()),
+        }))];
+        let out = render_stmts_with_tail_result_wrapped(&stmts);
+        assert_eq!(out, "Err (E :: X)");
+    }
+
+    #[test]
+    fn stmts_with_tail_result_wrapped_void_return_empty() {
+        let stmts = vec![SorobanStmt::Return(None)];
+        let out = render_stmts_with_tail_result_wrapped(&stmts);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn stmts_with_tail_result_wrapped_panic_with_error_tail() {
+        // tail-position PanicWithError(typed) → Err(...) without trailing semicolon.
+        let stmts = vec![SorobanStmt::Expr(SorobanExpr::PanicWithError(Box::new(
+            SorobanExpr::ContractError {
+                error_code: 1,
+                error_type: Some("E".into()),
+                variant_name: Some("X".into()),
+            },
+        )))];
+        let out = render_stmts_with_tail_result_wrapped(&stmts);
+        assert_eq!(out, "Err (E :: X)");
+    }
+
+    #[test]
+    fn stmts_with_tail_result_wrapped_if_propagates_into_branches() {
+        let stmts = vec![SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(1)))],
+            else_body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(2)))],
+        }];
+        let out = render_stmts_with_tail_result_wrapped(&stmts);
+        // Tail context: both branches wrap returns as tail expressions.
+        assert!(out.contains("Ok (1)"));
+        assert!(out.contains("Ok (2)"));
+        assert!(out.contains("if true"));
+    }
+
+    #[test]
+    fn stmts_with_tail_result_wrapped_match_literal_keeps_match() {
+        let stmts = vec![SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("n".into()),
+            arms: vec![MatchArm {
+                pattern: MatchPattern::Literal(SorobanExpr::U32Literal(0)),
+                body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(7)))],
+            }],
+        }];
+        let out = render_stmts_with_tail_result_wrapped(&stmts);
+        assert!(out.starts_with("match n {"));
+        assert!(out.contains("Ok (7)"));
+    }
+
+    #[test]
+    fn stmts_with_tail_result_wrapped_loop_uses_standard_form() {
+        let stmts = vec![SorobanStmt::Loop {
+            body: vec![SorobanStmt::Break],
+        }];
+        let out = render_stmts_with_tail_result_wrapped(&stmts);
+        assert!(out.contains("loop { break ; }"));
+    }
+
+    #[test]
+    fn stmts_with_tail_result_wrapped_block_recurses() {
+        let stmts = vec![SorobanStmt::Block(vec![SorobanStmt::Return(Some(
+            SorobanExpr::U32Literal(7),
+        ))])];
+        let out = render_stmts_with_tail_result_wrapped(&stmts);
+        // Block in tail position recurses; inner Return tail-wraps as Ok(7).
+        assert!(out.contains("Ok (7)"), "got: {out}");
+    }
+
+    // -------- Misc smaller branches in generate_expr_base --------
+
+    #[test]
+    fn invoke_contract_multi_args_each_into_val() {
+        let e = SorobanExpr::InvokeContract {
+            address: Box::new(SorobanExpr::Param("a".into())),
+            function: Box::new(SorobanExpr::SymbolLiteral("f".into())),
+            args: vec![
+                SorobanExpr::Param("x".into()),
+                SorobanExpr::Param("y".into()),
+            ],
+            return_type: Some("u64".into()),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        // Both args go through .into_val(&env).
+        assert!(
+            out.contains("x . into_val (& env)") && out.contains("y . into_val (& env)"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn raw_host_call_no_args_emits_no_paren_arg_list() {
+        let e = SorobanExpr::RawHostCall {
+            module: "Ctx".into(),
+            function: "f".into(),
+            args: vec![],
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        // Should be `env.ctx().f()` without an arg list.
+        assert_eq!(out, "env . ctx () . f ()");
+    }
+
+    #[test]
+    fn publish_event_multiple_topics_emits_tuple() {
+        let e = SorobanExpr::PublishEvent {
+            event_name: None,
+            topics: vec![
+                SorobanExpr::SymbolLiteral("a".into()),
+                SorobanExpr::SymbolLiteral("b".into()),
+            ],
+            data: Box::new(SorobanExpr::U64Literal(7)),
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("env . events () . publish"));
+        assert!(out.contains("symbol_short ! (\"a\")"));
+        assert!(out.contains("symbol_short ! (\"b\")"));
+    }
 }

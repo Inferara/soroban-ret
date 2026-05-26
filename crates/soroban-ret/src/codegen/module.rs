@@ -682,4 +682,205 @@ mod tests {
         assert!(formatted.contains("pub fn add"));
         assert!(formatted.contains("-> i32"));
     }
+
+    use crate::ir::high_level_ir::FnParam;
+    use stellar_xdr::curr::{ScSpecTypeBytesN, ScSpecTypeDef, ScSpecTypeResult};
+
+    #[test]
+    fn assemble_generic_module_uses_spec_when_no_wasm_signature() {
+        // No wasm_signature → params/return come from ScSpecTypeDef.
+        let mut module = ContractModule::new("g".to_string());
+        module.is_soroban = false;
+        module.functions.push(ContractFn {
+            name: "spec_only".to_string(),
+            params: vec![FnParam {
+                name: "addr".to_string(),
+                type_def: ScSpecTypeDef::Address,
+            }],
+            return_type: Some(ScSpecTypeDef::U64),
+            body: vec![SorobanStmt::Return(Some(SorobanExpr::U64Literal(7)))],
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        });
+        let formatted =
+            format_source(&assemble_generic_module(&module)).expect("must format generic module");
+        assert!(
+            formatted.contains("pub fn spec_only(addr"),
+            "got: {formatted}"
+        );
+        assert!(formatted.contains("-> u64"), "got: {formatted}");
+    }
+
+    #[test]
+    fn assemble_generic_module_void_return_has_no_arrow() {
+        let mut module = ContractModule::new("g".to_string());
+        module.is_soroban = false;
+        module.functions.push(ContractFn {
+            name: "voidfn".to_string(),
+            params: vec![],
+            return_type: Some(ScSpecTypeDef::Void),
+            body: vec![],
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        });
+        let formatted =
+            format_source(&assemble_generic_module(&module)).expect("must format generic module");
+        assert!(formatted.contains("pub fn voidfn()"), "got: {formatted}");
+        assert!(
+            !formatted.contains(" -> "),
+            "void should omit arrow: {formatted}"
+        );
+    }
+
+    fn fn_with_result_return(error_type: ScSpecTypeDef) -> ContractFn {
+        ContractFn {
+            name: "f".to_string(),
+            params: vec![],
+            return_type: Some(ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+                ok_type: Box::new(ScSpecTypeDef::U64),
+                error_type: Box::new(error_type),
+            }))),
+            body: vec![SorobanStmt::Return(Some(SorobanExpr::U64Literal(1)))],
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        }
+    }
+
+    #[test]
+    fn assemble_module_result_with_named_error_enum() {
+        // Result<T, Error> + exactly one error enum named "Error" → substitutes the
+        // enum name into the return type.
+        let mut module = ContractModule::new("Contract".to_string());
+        module.error_enums.push(crate::ir::high_level_ir::TypeDef {
+            kind: crate::ir::high_level_ir::TypeDefKind::ErrorEnum,
+            name: "MyError".to_string(),
+            generated_tokens: Some(quote! { pub enum MyError { Bad = 1 } }),
+        });
+        module
+            .functions
+            .push(fn_with_result_return(ScSpecTypeDef::Error));
+        let formatted =
+            format_source(&assemble_module(&module, &empty_registry())).expect("must format");
+        assert!(
+            formatted.contains("Result<u64, MyError>"),
+            "expected Result<u64, MyError>: {formatted}"
+        );
+    }
+
+    #[test]
+    fn assemble_module_result_with_non_error_error_type() {
+        // Error type is not `Error` (it's a UDT or other type) → just renders verbatim.
+        let mut module = ContractModule::new("Contract".to_string());
+        // Use U64 as a stand-in "error type" (the codegen path doesn't care semantically).
+        module
+            .functions
+            .push(fn_with_result_return(ScSpecTypeDef::U64));
+        let formatted =
+            format_source(&assemble_module(&module, &empty_registry())).expect("must format");
+        assert!(formatted.contains("Result<u64, u64>"), "got: {formatted}");
+    }
+
+    #[test]
+    fn assemble_module_with_crypto_substitutes_params() {
+        // BLS12-381 active + a fn with BytesN<48> param → param type becomes Bls12381Fp.
+        let mut module = ContractModule::new("Contract".to_string());
+        module.crypto_usage.uses_bls12_381 = true;
+        module.functions.push(ContractFn {
+            name: "doit".to_string(),
+            params: vec![FnParam {
+                name: "x".to_string(),
+                type_def: ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 48 }),
+            }],
+            return_type: None,
+            body: vec![],
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        });
+        let formatted =
+            format_source(&assemble_module(&module, &empty_registry())).expect("must format");
+        assert!(formatted.contains("Bls12381Fp"), "got: {formatted}");
+    }
+
+    #[test]
+    fn assemble_module_result_unit_ok_appends_ok_unit_tail() {
+        // Result<(), Error> with no explicit return in body → codegen appends Ok(()).
+        let mut module = ContractModule::new("Contract".to_string());
+        module.error_enums.push(crate::ir::high_level_ir::TypeDef {
+            kind: crate::ir::high_level_ir::TypeDefKind::ErrorEnum,
+            name: "MyError".to_string(),
+            generated_tokens: Some(quote! { pub enum MyError { Bad = 1 } }),
+        });
+        module.functions.push(ContractFn {
+            name: "do_or_fail".to_string(),
+            params: vec![],
+            return_type: Some(ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+                ok_type: Box::new(ScSpecTypeDef::Void),
+                error_type: Box::new(ScSpecTypeDef::Error),
+            }))),
+            // Empty body → expects Ok(()) to be appended.
+            body: vec![],
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        });
+        let formatted =
+            format_source(&assemble_module(&module, &empty_registry())).expect("must format");
+        assert!(
+            formatted.contains("Ok(())"),
+            "missing Ok(()) tail: {formatted}"
+        );
+        assert!(
+            formatted.contains("Result<(), MyError>"),
+            "got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn assemble_module_empty_body_with_return_type_emits_todo() {
+        // Non-Result return + empty body → todo!() placeholder.
+        let mut module = ContractModule::new("Contract".to_string());
+        module.functions.push(ContractFn {
+            name: "stub".to_string(),
+            params: vec![],
+            return_type: Some(ScSpecTypeDef::U64),
+            body: vec![],
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        });
+        let formatted =
+            format_source(&assemble_module(&module, &empty_registry())).expect("must format");
+        assert!(
+            formatted.contains("todo!(\"decompiled function body\")"),
+            "got: {formatted}"
+        );
+    }
 }
