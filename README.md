@@ -125,6 +125,9 @@ compilable Rust with correct types and signatures. Coverage of more advanced
 patterns (allowance flows, complex token contracts, snapshot-quality
 recovery) is on the roadmap.
 
+A per-pattern audit of code, fixtures, and explicit assertions lives in
+[`docs/pattern-coverage.md`](docs/pattern-c overage.md).
+
 ## Acknowledgements
 
 This project is funded by the [Stellar Community Fund](https://communityfund.stellar.org/).

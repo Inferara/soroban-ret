@@ -614,6 +614,83 @@ fn test_decompile_fuzz() {
 }
 
 // -------------------------------------------------------------------------
+// Crypto patterns
+//
+// Exercises `pattern/host_calls.rs::lift_crypto_call` and the crypto type
+// alias generation in `codegen/types.rs::generate_type_ident_crypto`.
+// -------------------------------------------------------------------------
+
+#[test]
+fn test_decompile_bls() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_bls.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    // Type aliases for BLS12-381 must resolve via generate_type_ident_crypto.
+    assert!(
+        source.contains("Bls12381"),
+        "missing BLS12-381 type alias: {source}"
+    );
+    assert!(
+        source.contains("soroban_sdk::crypto::bls12_381"),
+        "missing bls12_381 module import"
+    );
+    // Host calls dispatched through env.crypto().bls12_381().
+    assert!(
+        source.contains("env.crypto().bls12_381()"),
+        "missing crypto().bls12_381() dispatch"
+    );
+    // Negative: no decompiler artifacts.
+    assert!(!source.contains("todo!("), "unexpected todo! artifact");
+    assert!(
+        !source.contains("RawHostCall"),
+        "unexpected RawHostCall artifact"
+    );
+}
+
+#[test]
+fn test_decompile_bn254() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_bn254.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    assert!(
+        source.contains("Bn254"),
+        "missing BN254 type alias: {source}"
+    );
+    assert!(
+        source.contains("soroban_sdk::crypto::bn254"),
+        "missing bn254 module import"
+    );
+    assert!(
+        source.contains("env.crypto().bn254()"),
+        "missing crypto().bn254() dispatch"
+    );
+    assert!(!source.contains("todo!("), "unexpected todo! artifact");
+    assert!(
+        !source.contains("RawHostCall"),
+        "unexpected RawHostCall artifact"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Control flow reconstruction
+//
+// `test_decompile_auth` covers the positive in-order shape of fn2's body.
+// This test adds the complementary *negative* claim that structurize +
+// `collapse_trivial_loops` left no residual `loop { ... break; }` wrapping.
+// None of the canonical Level 1-4 fixtures should emit a bare `loop {`
+// block — real iteration codegens to `while` (see `codegen/functions.rs`
+// while-loop emission).
+// -------------------------------------------------------------------------
+
+#[test]
+fn test_decompile_auth_control_flow() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_auth.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    assert!(
+        !source.contains("loop {"),
+        "expected control flow collapsed; residual `loop {{` block present:\n{source}"
+    );
+}
+
+// -------------------------------------------------------------------------
 // Option / api surface
 // -------------------------------------------------------------------------
 
@@ -630,7 +707,7 @@ fn test_decompile_spec_only() {
 }
 
 // -------------------------------------------------------------------------
-// Smoke tests covering all 28 fixtures (18 deliverable + 10 extended)
+// Smoke tests covering all 30 fixtures (18 deliverable + 10 extended + 2 crypto)
 // -------------------------------------------------------------------------
 
 const ALL_FIXTURES: &[(&str, &[u8])] = &[
@@ -746,6 +823,14 @@ const ALL_FIXTURES: &[(&str, &[u8])] = &[
     (
         "test_multiimpl",
         include_bytes!("../../../tests/fixtures/test_multiimpl.wasm"),
+    ),
+    (
+        "test_bls",
+        include_bytes!("../../../tests/fixtures/test_bls.wasm"),
+    ),
+    (
+        "test_bn254",
+        include_bytes!("../../../tests/fixtures/test_bn254.wasm"),
     ),
 ];
 
