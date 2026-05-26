@@ -58,3 +58,91 @@ pub fn resolve_exports_generic(module: &WasmModule) -> Vec<ResolvedFunction> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(wasm: &[u8]) -> (WasmModule, TypeRegistry) {
+        let module = WasmModule::parse(wasm).expect("wasm parse");
+        let registry = TypeRegistry::from_wasm(wasm).expect("spec extract");
+        (module, registry)
+    }
+
+    #[test]
+    fn resolve_exports_picks_up_spec_functions() {
+        let wasm = include_bytes!("../../../../tests/fixtures/test_add_u64.wasm");
+        let (module, registry) = load(wasm);
+        let resolved = resolve_exports(&module, &registry);
+        assert!(
+            resolved.iter().any(|r| r.export_name == "add"),
+            "expected `add` export among resolved: {:?}",
+            resolved.iter().map(|r| &r.export_name).collect::<Vec<_>>()
+        );
+        // All resolved spec fns should have constructor/check_auth = false.
+        for r in &resolved {
+            if r.export_name != "__constructor" && r.export_name != "__check_auth" {
+                assert!(!r.is_constructor && !r.is_check_auth);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_exports_picks_up_constructor() {
+        let wasm = include_bytes!("../../../../tests/fixtures/test_constructor.wasm");
+        let (module, registry) = load(wasm);
+        let resolved = resolve_exports(&module, &registry);
+        let ctor = resolved
+            .iter()
+            .find(|r| r.export_name == "__constructor")
+            .expect("__constructor should be resolved");
+        assert!(ctor.is_constructor);
+        assert!(!ctor.is_check_auth);
+    }
+
+    #[test]
+    fn resolve_exports_picks_up_check_auth() {
+        let wasm = include_bytes!("../../../../tests/fixtures/test_account.wasm");
+        let (module, registry) = load(wasm);
+        let resolved = resolve_exports(&module, &registry);
+        let auth = resolved
+            .iter()
+            .find(|r| r.export_name == "__check_auth")
+            .expect("__check_auth should be resolved");
+        assert!(auth.is_check_auth);
+        assert!(!auth.is_constructor);
+    }
+
+    #[test]
+    fn resolve_exports_skips_non_spec_non_magic_exports() {
+        let wasm = include_bytes!("../../../../tests/fixtures/test_add_u64.wasm");
+        let (module, registry) = load(wasm);
+        let resolved = resolve_exports(&module, &registry);
+        // Every resolved name must be in spec OR be a magic name.
+        for r in &resolved {
+            let is_spec = registry.get_function(&r.export_name).is_some();
+            let is_magic = r.export_name == "__constructor" || r.export_name == "__check_auth";
+            assert!(
+                is_spec || is_magic,
+                "unexpected non-spec, non-magic export: {}",
+                r.export_name
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_exports_generic_filters_underscore_prefix() {
+        let wasm = include_bytes!("../../../../tests/fixtures/test_add_u64.wasm");
+        let module = WasmModule::parse(wasm).expect("parse");
+        let resolved = resolve_exports_generic(&module);
+        for r in &resolved {
+            assert!(
+                !r.export_name.starts_with('_'),
+                "generic mode must skip underscore-prefixed exports, got: {}",
+                r.export_name
+            );
+            assert!(!r.is_constructor);
+            assert!(!r.is_check_auth);
+        }
+    }
+}

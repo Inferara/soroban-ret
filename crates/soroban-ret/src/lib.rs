@@ -212,4 +212,46 @@ mod catch_unwind_tests {
             other => panic!("expected InternalPanic, got {other:?}"),
         }
     }
+
+    #[test]
+    fn panics_with_owned_string_become_internal_panic_errors() {
+        // panic!("{}", String) yields a String payload (vs &'static str).
+        let result: Result<DecompileResult, DecompileError> =
+            catch_decompile_panic(|| panic!("{}", String::from("dynamic message")));
+        match result {
+            Err(DecompileError::InternalPanic(msg)) => {
+                assert!(msg.contains("dynamic message"), "got: {msg}");
+            }
+            other => panic!("expected InternalPanic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn panics_with_non_string_payload_become_internal_panic_errors() {
+        // panic_any with a non-string payload exercises the fallback arm.
+        let result: Result<DecompileResult, DecompileError> =
+            catch_decompile_panic(|| std::panic::panic_any(42_u32));
+        match result {
+            Err(DecompileError::InternalPanic(msg)) => {
+                assert_eq!(msg, "non-string panic payload");
+            }
+            other => panic!("expected InternalPanic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_result_is_passed_through() {
+        let result: Result<u32, DecompileError> = catch_decompile_panic(|| Ok(7));
+        assert!(matches!(result, Ok(7)));
+    }
+
+    #[test]
+    fn err_result_is_passed_through() {
+        let result: Result<u32, DecompileError> =
+            catch_decompile_panic(|| Err(DecompileError::WasmParse("boom".to_string())));
+        match result {
+            Err(DecompileError::WasmParse(msg)) => assert_eq!(msg, "boom"),
+            other => panic!("expected WasmParse, got {other:?}"),
+        }
+    }
 }

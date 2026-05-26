@@ -305,6 +305,109 @@ mod tests {
     }
 
     #[test]
+    fn test_structurize_eof_inside_unclosed_block_does_not_panic() {
+        // Malformed: Block opened with no matching End. Parser should consume
+        // available body without panicking.
+        let instrs = vec![
+            WasmInstr::Block {
+                block_type: BlockType::Empty,
+            },
+            WasmInstr::I32Const(1),
+            WasmInstr::I32Const(2),
+            // (no End)
+        ];
+        let result = structurize(&instrs);
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            StructuredBlock::Block { body, .. } => {
+                assert_eq!(body.len(), 2);
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_structurize_eof_inside_unclosed_if_does_not_panic() {
+        // Malformed: If opened with no matching End or Else.
+        let instrs = vec![
+            WasmInstr::If {
+                block_type: BlockType::Empty,
+            },
+            WasmInstr::I32Const(7),
+            // (no End, no Else)
+        ];
+        let result = structurize(&instrs);
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            StructuredBlock::IfElse {
+                then_body,
+                else_body,
+                ..
+            } => {
+                assert_eq!(then_body.len(), 1);
+                assert!(else_body.is_empty());
+            }
+            other => panic!("expected IfElse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_structurize_top_level_else_truncates_sequence() {
+        // Malformed: Else at top level. Parser returns immediately at the Else,
+        // preserving any prefix instructions and discarding the rest.
+        let instrs = vec![
+            WasmInstr::I32Const(1),
+            WasmInstr::Else,
+            WasmInstr::I32Const(2),
+        ];
+        let result = structurize(&instrs);
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            StructuredBlock::Instruction(WasmInstr::I32Const(1)) => {}
+            other => panic!("expected only the prefix I32Const(1), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_structurize_top_level_end_truncates_sequence() {
+        // Malformed: End at top level. Parser returns without advancing cursor;
+        // the End and any tail instructions are dropped.
+        let instrs = vec![
+            WasmInstr::I32Const(1),
+            WasmInstr::End,
+            WasmInstr::I32Const(2),
+        ];
+        let result = structurize(&instrs);
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            StructuredBlock::Instruction(WasmInstr::I32Const(1)) => {}
+            other => panic!("expected only the prefix I32Const(1), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_skip_to_matching_end_handles_nested_blocks() {
+        // Drive skip_to_matching_end through MAX_RECURSION_DEPTH+1 nesting so
+        // that the recursion limit triggers; each nested Block must be skipped
+        // past its End, leaving cursor positioned past the outermost End.
+        let extra = 5_usize;
+        let depth = MAX_RECURSION_DEPTH as usize + extra;
+        let mut instrs = Vec::with_capacity(depth * 2);
+        for _ in 0..depth {
+            instrs.push(WasmInstr::Block {
+                block_type: BlockType::Empty,
+            });
+        }
+        for _ in 0..depth {
+            instrs.push(WasmInstr::End);
+        }
+        let result = structurize(&instrs);
+        // The outermost wrapper is preserved; inner depth-exhausted blocks
+        // appear as empty-bodied Block nodes.
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
     fn test_structurize_br_table_in_nested_blocks() {
         let instrs = vec![
             WasmInstr::Block {
