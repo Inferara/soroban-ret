@@ -24,6 +24,8 @@ run `soroban-ret --info <fixture>` to read it back.
 | `test_add_u64.wasm` | rs-soroban-sdk | u64 arithmetic shape |
 | `test_alloc.wasm` | rs-soroban-sdk | Allocator-using contract |
 | `test_auth.wasm` | rs-soroban-sdk | `require_auth` / `require_auth_for_args` |
+| `test_bls.wasm` | rs-soroban-sdk | BLS12-381 host calls (g1/g2/msm/pairing) |
+| `test_bn254.wasm` | rs-soroban-sdk | BN254 host calls (g1/g2/pairing_check) |
 | `test_constructor.wasm` | rs-soroban-sdk | `__constructor` with state setup |
 | `test_contract_data.wasm` | rs-soroban-sdk | persistent/temporary/instance storage |
 | `test_empty.wasm` | synthetic | Smallest possible contract (1-fn no-op) |
