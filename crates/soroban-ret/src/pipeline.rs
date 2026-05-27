@@ -7821,4 +7821,51 @@ mod tests {
             other => panic!("unexpected stmt shape: {other:?}"),
         }
     }
+
+    // ----- Val tag expression walkers (issue #4) ----------------------
+
+    /// Every `&mut SorobanExpr` repair walker must traverse `ValTag` (recurse into
+    /// its inner value) and treat `ValTagName` as a leaf, without panicking. A
+    /// `ValTag` wrapping a benign `Param` is left unchanged by each repair.
+    #[test]
+    fn repair_walkers_traverse_val_tag_expressions() {
+        let tag = || SorobanExpr::ValTag(Box::new(SorobanExpr::Param("v".to_string())));
+        let name = || SorobanExpr::ValTagName("VecObject".to_string());
+        let replacement = SorobanExpr::Param("repl".to_string());
+
+        let mut e = tag();
+        repair_unknown_invoke_functions_in_expr(&mut e, &replacement);
+        assert_eq!(e, tag());
+        let mut e = name();
+        repair_unknown_invoke_functions_in_expr(&mut e, &replacement);
+        assert_eq!(e, name());
+
+        let mut e = tag();
+        repair_unknown_storage_keys_in_expr(&mut e, &replacement);
+        assert_eq!(e, tag());
+
+        let event_hint = EventRepairHint {
+            topics: Vec::new(),
+            data: Vec::new(),
+        };
+        let mut e = tag();
+        repair_unknown_event_values_in_expr(&mut e, &event_hint);
+        assert_eq!(e, tag());
+        let mut e = name();
+        repair_unknown_event_values_in_expr(&mut e, &event_hint);
+        assert_eq!(e, name());
+
+        let auth_hint = AuthRepairHint {
+            address: None,
+            args: SorobanExpr::Void,
+        };
+        let mut e = tag();
+        repair_weak_auth_in_expr(&mut e, &auth_hint);
+        assert_eq!(e, tag());
+
+        // Read-only scorer: traverses ValTag, scores the inner param.
+        let rebound = std::collections::HashSet::new();
+        let score = score_param_local_base_in_expr(&tag(), 0, 0, &rebound);
+        assert_eq!(score.total_hits, 0);
+    }
 }

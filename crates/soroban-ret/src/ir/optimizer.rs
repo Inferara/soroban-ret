@@ -6373,4 +6373,42 @@ mod tests {
             "orphan RawHostCall must survive DCE; got: {out:?}"
         );
     }
+
+    // ----- Val tag expression walkers (issue #4) ----------------------
+
+    #[test]
+    fn expr_contains_recurses_into_val_tag() {
+        let needle = SorobanExpr::Param("x".to_string());
+        let tag = SorobanExpr::ValTag(Box::new(SorobanExpr::Param("x".to_string())));
+        assert!(expr_contains(&tag, &needle));
+        // ValTagName is a leaf and never contains another expr.
+        assert!(!expr_contains(
+            &SorobanExpr::ValTagName("VecObject".to_string()),
+            &needle
+        ));
+    }
+
+    #[test]
+    fn invalidate_seen_gets_for_expr_walks_val_tag() {
+        let mut seen = Vec::new();
+        // Both variants must be handled without panicking.
+        invalidate_seen_gets_for_expr(
+            &SorobanExpr::ValTag(Box::new(SorobanExpr::Param("v".to_string()))),
+            &mut seen,
+        );
+        invalidate_seen_gets_for_expr(&SorobanExpr::ValTagName("Void".to_string()), &mut seen);
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn expr_mentions_other_params_sees_through_val_tag() {
+        // ValTag wraps another param → mentions it.
+        let tag = SorobanExpr::ValTag(Box::new(SorobanExpr::Param("other".to_string())));
+        assert!(expr_mentions_other_params(&tag, "self"));
+        // ValTagName is a leaf with no params.
+        assert!(!expr_mentions_other_params(
+            &SorobanExpr::ValTagName("VecObject".to_string()),
+            "self"
+        ));
+    }
 }

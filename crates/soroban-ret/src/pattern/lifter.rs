@@ -7675,6 +7675,41 @@ fn val_tag_const_expr(tag: u64) -> SorobanExpr {
     }
 }
 
+/// Lower a Val tag comparison `(v & 0xFF) <cmp> TAG` to its `(get_tag, Tag::Name)`
+/// operand pair, in original operand order. Returns `None` if neither side is a
+/// tag-of against a constant tag byte.
+fn lower_tag_comparison(
+    a: &StackVal,
+    b: &StackVal,
+    params: &[FnParam],
+    registry: &TypeRegistry,
+    frame_slots: Option<&FrameSlotMap>,
+) -> Option<(SorobanExpr, SorobanExpr)> {
+    if let Some(ValShape::TagOf(inner)) = recognize_val_shape(a)
+        && let Some(tag) = to_u64(b)
+    {
+        let lhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr(
+            &inner,
+            params,
+            registry,
+            frame_slots,
+        )));
+        return Some((lhs, val_tag_const_expr(tag)));
+    }
+    if let Some(ValShape::TagOf(inner)) = recognize_val_shape(b)
+        && let Some(tag) = to_u64(a)
+    {
+        let rhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr(
+            &inner,
+            params,
+            registry,
+            frame_slots,
+        )));
+        return Some((val_tag_const_expr(tag), rhs));
+    }
+    None
+}
+
 /// A recognized Soroban Val encode/decode shape lifted from a `StackVal` subtree.
 ///
 /// Pure structural classification of the bit patterns the SDK emits when packing
@@ -8465,52 +8500,29 @@ fn stack_val_to_expr(
             // the SDK uses (n << 32) | 0xFFFFFFFF as a threshold constant. This means
             // "is the Val's upper 32 bits > n", which for U32 Vals equals "decoded > n".
             // Decode these threshold constants to produce readable comparisons.
-            let (a_expr, b_expr) = match (a.as_ref(), b.as_ref()) {
-                // Tag check: `(v & 0xFF) <cmp> TAG` → `v.get_tag() <cmp> Tag::Name`.
-                _ if matches!(recognize_val_shape(a), Some(ValShape::TagOf(_)))
-                    && to_u64(b).is_some() =>
-                {
-                    let Some(ValShape::TagOf(inner)) = recognize_val_shape(a) else {
-                        unreachable!()
-                    };
-                    let lhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr(
-                        &inner,
-                        params,
-                        registry,
-                        frame_slots,
-                    )));
-                    (lhs, val_tag_const_expr(to_u64(b).unwrap()))
-                }
-                _ if matches!(recognize_val_shape(b), Some(ValShape::TagOf(_)))
-                    && to_u64(a).is_some() =>
-                {
-                    let Some(ValShape::TagOf(inner)) = recognize_val_shape(b) else {
-                        unreachable!()
-                    };
-                    let rhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr(
-                        &inner,
-                        params,
-                        registry,
-                        frame_slots,
-                    )));
-                    (val_tag_const_expr(to_u64(a).unwrap()), rhs)
-                }
-                (_, StackVal::I64(v)) if is_val_threshold_constant(*v as u64) => {
-                    let decoded = (*v as u64) >> 32;
-                    let a_e = stack_val_to_expr(a, params, registry, frame_slots);
-                    (a_e, SorobanExpr::I64Literal(decoded as i64))
-                }
-                (StackVal::I64(v), _) if is_val_threshold_constant(*v as u64) => {
-                    let decoded = (*v as u64) >> 32;
-                    let b_e = stack_val_to_expr(b, params, registry, frame_slots);
-                    (SorobanExpr::I64Literal(decoded as i64), b_e)
-                }
-                _ => {
-                    let a_e = stack_val_to_arith_expr(a, params, registry, frame_slots);
-                    let b_e = stack_val_to_arith_expr(b, params, registry, frame_slots);
-                    (a_e, b_e)
-                }
-            };
+            // Tag check: `(v & 0xFF) <cmp> TAG` → `v.get_tag() <cmp> Tag::Name`.
+            let (a_expr, b_expr) =
+                if let Some(pair) = lower_tag_comparison(a, b, params, registry, frame_slots) {
+                    pair
+                } else {
+                    match (a.as_ref(), b.as_ref()) {
+                        (_, StackVal::I64(v)) if is_val_threshold_constant(*v as u64) => {
+                            let decoded = (*v as u64) >> 32;
+                            let a_e = stack_val_to_expr(a, params, registry, frame_slots);
+                            (a_e, SorobanExpr::I64Literal(decoded as i64))
+                        }
+                        (StackVal::I64(v), _) if is_val_threshold_constant(*v as u64) => {
+                            let decoded = (*v as u64) >> 32;
+                            let b_e = stack_val_to_expr(b, params, registry, frame_slots);
+                            (SorobanExpr::I64Literal(decoded as i64), b_e)
+                        }
+                        _ => {
+                            let a_e = stack_val_to_arith_expr(a, params, registry, frame_slots);
+                            let b_e = stack_val_to_arith_expr(b, params, registry, frame_slots);
+                            (a_e, b_e)
+                        }
+                    }
+                };
             match op {
                 CmpOp::Eq => SorobanExpr::Eq(Box::new(a_expr), Box::new(b_expr)),
                 CmpOp::Ne => SorobanExpr::Ne(Box::new(a_expr), Box::new(b_expr)),
@@ -9135,5 +9147,268 @@ mod tests {
             Box::new(StackVal::I64(TAG_U32 as i64)),
         );
         assert_eq!(extract_u32_from_stack_val(&encoded), Some(7));
+    }
+
+    // ----- coverage: tag table, helpers, edge shapes (issue #4) -------
+
+    #[test]
+    fn val_tag_name_covers_every_known_tag() {
+        let expected: &[(u64, &str)] = &[
+            (TAG_FALSE, "False"),
+            (TAG_TRUE, "True"),
+            (TAG_VOID, "Void"),
+            (TAG_ERROR, "Error"),
+            (TAG_U32, "U32Val"),
+            (TAG_I32, "I32Val"),
+            (TAG_U64_SMALL, "U64Small"),
+            (TAG_I64_SMALL, "I64Small"),
+            (TAG_TIMEPOINT_SMALL, "TimepointSmall"),
+            (TAG_DURATION_SMALL, "DurationSmall"),
+            (TAG_U128_SMALL, "U128Small"),
+            (TAG_I128_SMALL, "I128Small"),
+            (TAG_U256_SMALL, "U256Small"),
+            (TAG_I256_SMALL, "I256Small"),
+            (TAG_SYMBOL_SMALL, "SymbolSmall"),
+            (TAG_U64_OBJECT, "U64Object"),
+            (TAG_I64_OBJECT, "I64Object"),
+            (TAG_TIMEPOINT_OBJECT, "TimepointObject"),
+            (TAG_DURATION_OBJECT, "DurationObject"),
+            (TAG_U128_OBJECT, "U128Object"),
+            (TAG_I128_OBJECT, "I128Object"),
+            (TAG_U256_OBJECT, "U256Object"),
+            (TAG_I256_OBJECT, "I256Object"),
+            (TAG_BYTES_OBJECT, "BytesObject"),
+            (TAG_STRING_OBJECT, "StringObject"),
+            (TAG_SYMBOL_OBJECT, "SymbolObject"),
+            (TAG_VEC_OBJECT, "VecObject"),
+            (TAG_MAP_OBJECT, "MapObject"),
+            (TAG_ADDRESS_OBJECT, "AddressObject"),
+            (TAG_MUXED_ADDRESS_OBJECT, "MuxedAddressObject"),
+        ];
+        for (tag, name) in expected {
+            assert_eq!(val_tag_name(*tag), Some(*name), "tag {tag}");
+        }
+        // Reserved codes, bound markers, and the invalid `Bad` byte are not tags.
+        for non_tag in [15u64, 63, 0x80, 0xFF] {
+            assert_eq!(val_tag_name(non_tag), None, "byte {non_tag}");
+        }
+    }
+
+    #[test]
+    fn val_tag_const_expr_named_and_numeric_fallback() {
+        assert_eq!(
+            val_tag_const_expr(TAG_VEC_OBJECT),
+            SorobanExpr::ValTagName("VecObject".to_string())
+        );
+        // Unknown tag byte falls back to a raw numeric literal.
+        assert_eq!(val_tag_const_expr(0x99), SorobanExpr::U32Literal(0x99));
+    }
+
+    #[test]
+    fn recognize_val_shape_rejects_or_without_shl_inner() {
+        // `param | TAG` (no inner shift) is not a Val construction.
+        let v = StackVal::BinOp(
+            Box::new(StackVal::Param("p".to_string())),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U32 as i64)),
+        );
+        assert_eq!(recognize_val_shape(&v), None);
+    }
+
+    #[test]
+    fn stack_val_to_expr_non_tag_and_mask_is_unknown() {
+        // `v & 0xF0` is not a tag extraction, so it stays unrecovered.
+        let v = StackVal::BinOp(
+            Box::new(StackVal::Param("p".to_string())),
+            BinOper::And,
+            Box::new(StackVal::I64(0xF0)),
+        );
+        assert_eq!(
+            stack_val_to_expr(&v, &[], &empty_registry(), None),
+            SorobanExpr::UnknownVal
+        );
+    }
+
+    #[test]
+    fn extract_u32_from_stack_val_payload_variants() {
+        // i32 payload.
+        let i32_payload = StackVal::BinOp(
+            Box::new(shl(StackVal::I32(9), 32)),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U32 as i64)),
+        );
+        assert_eq!(extract_u32_from_stack_val(&i32_payload), Some(9));
+        // Non-integer payload: no value.
+        let param_payload = StackVal::BinOp(
+            Box::new(shl(StackVal::Param("p".to_string()), 32)),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U32 as i64)),
+        );
+        assert_eq!(extract_u32_from_stack_val(&param_payload), None);
+        // A BinOp that isn't a U32 construction: no value.
+        let not_construct = StackVal::BinOp(
+            Box::new(StackVal::Param("p".to_string())),
+            BinOper::And,
+            Box::new(StackVal::I64(0xFF)),
+        );
+        assert_eq!(extract_u32_from_stack_val(&not_construct), None);
+    }
+
+    #[test]
+    fn extract_frame_slot_from_stack_val_decodes_and_rejects() {
+        let encoded = StackVal::BinOp(
+            Box::new(shl(StackVal::FrameSlot(3, 16), 32)),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U32 as i64)),
+        );
+        assert_eq!(extract_frame_slot_from_stack_val(&encoded), Some((3, 16)));
+        // Direct frame slot passes through.
+        assert_eq!(
+            extract_frame_slot_from_stack_val(&StackVal::FrameSlot(1, 8)),
+            Some((1, 8))
+        );
+        // A U32 construction over a non-frame-slot payload is rejected.
+        let not_slot = StackVal::BinOp(
+            Box::new(shl(StackVal::I64(5), 32)),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U32 as i64)),
+        );
+        assert_eq!(extract_frame_slot_from_stack_val(&not_slot), None);
+    }
+
+    #[test]
+    fn lower_tag_comparison_handles_both_orders_and_misses() {
+        let reg = empty_registry();
+        // tag-of on the left.
+        let (l, r) =
+            lower_tag_comparison(&tag_of("v"), &StackVal::I64(75), &[], &reg, None).unwrap();
+        assert_eq!(
+            l,
+            SorobanExpr::ValTag(Box::new(SorobanExpr::Param("v".to_string())))
+        );
+        assert_eq!(r, SorobanExpr::ValTagName("VecObject".to_string()));
+        // tag-of on the right.
+        let (l, r) =
+            lower_tag_comparison(&StackVal::I64(75), &tag_of("v"), &[], &reg, None).unwrap();
+        assert_eq!(l, SorobanExpr::ValTagName("VecObject".to_string()));
+        assert_eq!(
+            r,
+            SorobanExpr::ValTag(Box::new(SorobanExpr::Param("v".to_string())))
+        );
+        // Neither side is a tag check.
+        assert!(
+            lower_tag_comparison(
+                &StackVal::Param("x".to_string()),
+                &StackVal::I64(1),
+                &[],
+                &reg,
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn is_tag_check_condition_detects_tag_compares() {
+        // `(v & 0xFF) != TAG`, both operand orders.
+        assert!(is_tag_check_condition(&StackVal::Compare(
+            Box::new(tag_of("v")),
+            CmpOp::Ne,
+            Box::new(StackVal::I64(TAG_VEC_OBJECT as i64)),
+        )));
+        assert!(is_tag_check_condition(&StackVal::Compare(
+            Box::new(StackVal::I64(TAG_VEC_OBJECT as i64)),
+            CmpOp::Eq,
+            Box::new(tag_of("v")),
+        )));
+        // Not a tag comparison.
+        assert!(!is_tag_check_condition(&StackVal::Compare(
+            Box::new(StackVal::Param("a".to_string())),
+            CmpOp::Eq,
+            Box::new(StackVal::Param("b".to_string())),
+        )));
+        // Not a comparison at all.
+        assert!(!is_tag_check_condition(&StackVal::Param("a".to_string())));
+    }
+
+    fn empty_lift_module() -> WasmModule {
+        WasmModule::parse(b"\0asm\x01\x00\x00\x00").expect("empty WASM parses")
+    }
+
+    #[test]
+    fn i64and_tag_extraction_constant_on_either_side() {
+        use crate::wasm::ir::WasmInstr;
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let expected = StackVal::BinOp(
+            Box::new(StackVal::Param("v".to_string())),
+            BinOper::And,
+            Box::new(StackVal::I64(0xFF)),
+        );
+
+        // Value on the left, 0xFF mask on the right: `v & 0xFF`.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        ctx.stack.push(StackVal::Param("v".to_string()));
+        ctx.stack.push(StackVal::I64(0xFF));
+        ctx.lift_instruction(&WasmInstr::I64And);
+        assert_eq!(ctx.stack.pop(), Some(expected.clone()));
+
+        // 0xFF mask on the left, value on the right: `0xFF & v`.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        ctx.stack.push(StackVal::I64(0xFF));
+        ctx.stack.push(StackVal::Param("v".to_string()));
+        ctx.lift_instruction(&WasmInstr::I64And);
+        assert_eq!(ctx.stack.pop(), Some(expected));
+    }
+
+    #[test]
+    fn i64and_tag_extraction_suppressed_inside_inlined_helper() {
+        use crate::wasm::ir::WasmInstr;
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        // inline_depth > 0: the tag check must NOT be recovered (stays Unknown so
+        // the inlined helper's success-status propagation is preserved).
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        ctx.inline_depth = 1;
+        ctx.stack.push(StackVal::Param("v".to_string()));
+        ctx.stack.push(StackVal::I64(0xFF));
+        ctx.lift_instruction(&WasmInstr::I64And);
+        assert_eq!(ctx.stack.pop(), Some(StackVal::Unknown));
+    }
+
+    #[test]
+    fn stack_val_to_expr_decodes_val_threshold_constants() {
+        let reg = empty_registry();
+        // (10 << 32) | 0xFFFFFFFF sits between U32(10) and U32(11) in unsigned
+        // order, so `len > threshold` decodes to `len > 10`.
+        let threshold = StackVal::I64(((10u64 << 32) | 0xFFFFFFFF) as i64);
+
+        let right = StackVal::Compare(
+            Box::new(StackVal::Param("len".to_string())),
+            CmpOp::GtU,
+            Box::new(threshold.clone()),
+        );
+        assert_eq!(
+            stack_val_to_expr(&right, &[], &reg, None),
+            SorobanExpr::Gt(
+                Box::new(SorobanExpr::Param("len".to_string())),
+                Box::new(SorobanExpr::I64Literal(10)),
+            )
+        );
+
+        let left = StackVal::Compare(
+            Box::new(threshold),
+            CmpOp::LtU,
+            Box::new(StackVal::Param("len".to_string())),
+        );
+        assert_eq!(
+            stack_val_to_expr(&left, &[], &reg, None),
+            SorobanExpr::Lt(
+                Box::new(SorobanExpr::I64Literal(10)),
+                Box::new(SorobanExpr::Param("len".to_string())),
+            )
+        );
     }
 }
