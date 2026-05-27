@@ -192,6 +192,13 @@ pub enum SorobanExpr {
     // Placeholder for unknown/untracked stack values
     UnknownVal,
 
+    // The 8-bit Soroban Val tag of a value, recovered from a `v & 0xFF` pattern.
+    // Renders as `<value>.get_tag()`.
+    ValTag(Box<SorobanExpr>),
+    // A named Soroban Val tag constant (e.g. `VecObject`), recovered as the
+    // right-hand side of a tag comparison. Renders as `Tag::<name>`.
+    ValTagName(String),
+
     // Val type conversion (for patterns we couldn't fully lift)
     ValConvert {
         value: Box<SorobanExpr>,

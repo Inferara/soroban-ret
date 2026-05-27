@@ -16,6 +16,10 @@ use stellar_xdr::curr as stellar_xdr;
 
 // Soroban Val tag constants (low byte of a 64-bit packed Val).
 // See: https://github.com/stellar/rs-soroban-env/blob/main/soroban-env-common/src/val.rs
+//
+// Small-value tags (< 64) pack their payload directly in the upper bits; object
+// tags (>= 64) carry a 32-bit handle in the major field that must be resolved
+// through a host call. Names match the upstream `Tag` enum.
 const TAG_FALSE: u64 = 0x00;
 const TAG_TRUE: u64 = 0x01;
 const TAG_VOID: u64 = 0x02;
@@ -24,7 +28,30 @@ const TAG_U32: u64 = 0x04;
 const TAG_I32: u64 = 0x05;
 const TAG_U64_SMALL: u64 = 0x06;
 const TAG_I64_SMALL: u64 = 0x07;
+const TAG_TIMEPOINT_SMALL: u64 = 0x08;
+const TAG_DURATION_SMALL: u64 = 0x09;
+const TAG_U128_SMALL: u64 = 0x0a;
+const TAG_I128_SMALL: u64 = 0x0b;
+const TAG_U256_SMALL: u64 = 0x0c;
+const TAG_I256_SMALL: u64 = 0x0d;
 const TAG_SYMBOL_SMALL: u64 = 0x0e;
+
+// Object tags (low byte 0x40..=0x7f): the major field is a 32-bit object handle.
+const TAG_U64_OBJECT: u64 = 64;
+const TAG_I64_OBJECT: u64 = 65;
+const TAG_TIMEPOINT_OBJECT: u64 = 66;
+const TAG_DURATION_OBJECT: u64 = 67;
+const TAG_U128_OBJECT: u64 = 68;
+const TAG_I128_OBJECT: u64 = 69;
+const TAG_U256_OBJECT: u64 = 70;
+const TAG_I256_OBJECT: u64 = 71;
+const TAG_BYTES_OBJECT: u64 = 72;
+const TAG_STRING_OBJECT: u64 = 73;
+const TAG_SYMBOL_OBJECT: u64 = 74;
+const TAG_VEC_OBJECT: u64 = 75;
+const TAG_MAP_OBJECT: u64 = 76;
+const TAG_ADDRESS_OBJECT: u64 = 77;
+const TAG_MUXED_ADDRESS_OBJECT: u64 = 78;
 
 use crate::codegen::types as codegen_types;
 use crate::ir::high_level_ir::{
@@ -2088,6 +2115,37 @@ impl<'a> LiftContext<'a> {
                         cov_mark::hit!(i64and_val_mask_passthrough);
                         self.stack.push(b);
                     }
+                    // Tag extraction: `v & 0xFF` keeps only the Val tag byte. Track it as
+                    // a BinOp so recognize_val_shape / stack_val_to_expr can lift it to a
+                    // tag-of expression (e.g. `v.get_tag()`). Disjoint from the `mask > 0xFF`
+                    // val-mask passthrough above. The non-constant guard avoids re-wrapping
+                    // a value that the const-fold arm should have already handled.
+                    //
+                    // Only at the top level (inline_depth == 0): inside inlined SDK
+                    // unpack helpers, the same `& 0xFF` checks gate a success/error
+                    // status flag that the caller constant-folds to reach the happy
+                    // path. Recognizing them there turns the flag into a live branch
+                    // and drops the helper's result, so keep the old Unknown behavior.
+                    (_, Some(0xFF))
+                        if self.inline_depth == 0
+                            && !matches!(a, StackVal::I32(_) | StackVal::I64(_)) =>
+                    {
+                        self.stack.push(StackVal::BinOp(
+                            Box::new(a),
+                            BinOper::And,
+                            Box::new(StackVal::I64(0xFF)),
+                        ));
+                    }
+                    (Some(0xFF), _)
+                        if self.inline_depth == 0
+                            && !matches!(b, StackVal::I32(_) | StackVal::I64(_)) =>
+                    {
+                        self.stack.push(StackVal::BinOp(
+                            Box::new(b),
+                            BinOper::And,
+                            Box::new(StackVal::I64(0xFF)),
+                        ));
+                    }
                     _ => self.stack.push(StackVal::Unknown),
                 }
             }
@@ -2641,7 +2699,14 @@ impl<'a> LiftContext<'a> {
                         // on a Soroban Val parameter), this is a dispatch preamble type-check
                         // guard that we cannot evaluate statically. Treat it as always-pass
                         // and emit the body directly without an if wrapper.
-                        if stack_val_contains_unknown(&cond_val) {
+                        //
+                        // A lone Val tag check (`(v & 0xFF) == TAG`) is handled the same
+                        // way: wrapping a value-returning body in `if tag == X { ... }`
+                        // would drop its tail/return. Multi-guard validation preambles
+                        // (process_guard_brif_chain) still surface tag checks explicitly.
+                        if stack_val_contains_unknown(&cond_val)
+                            || is_tag_check_condition(&cond_val)
+                        {
                             self.stack = body_ctx.stack;
                             self.locals = body_ctx.locals;
                             self.memory_stores = body_ctx.memory_stores;
@@ -7543,27 +7608,140 @@ fn is_small_val_tag(tag: u64) -> bool {
             | TAG_I32
             | TAG_U64_SMALL
             | TAG_I64_SMALL
+            | TAG_TIMEPOINT_SMALL
+            | TAG_DURATION_SMALL
+            | TAG_U128_SMALL
+            | TAG_I128_SMALL
+            | TAG_U256_SMALL
+            | TAG_I256_SMALL
             | TAG_SYMBOL_SMALL
     )
 }
 
-/// Strip a Soroban Val-encode pattern: `(inner << N) | tag` → `inner`.
+/// Returns true if `tag` is an object tag (low byte in `0x40..=0x7f`): the Val
+/// carries a 32-bit object handle in its major field rather than an inline payload.
+fn is_object_tag(tag: u64) -> bool {
+    (0x40..=0x7f).contains(&(tag & 0xFF))
+}
+
+/// Map a Val tag byte to its canonical upstream `Tag` variant name.
+///
+/// Returns `None` for bytes that are not a recognized tag (reserved codes,
+/// bound markers, the invalid `Bad` code). Single source of truth for both the
+/// `Tag::<name>` rendering of recovered tag checks and any tag-name diagnostics.
+fn val_tag_name(tag: u64) -> Option<&'static str> {
+    Some(match tag & 0xFF {
+        TAG_FALSE => "False",
+        TAG_TRUE => "True",
+        TAG_VOID => "Void",
+        TAG_ERROR => "Error",
+        TAG_U32 => "U32Val",
+        TAG_I32 => "I32Val",
+        TAG_U64_SMALL => "U64Small",
+        TAG_I64_SMALL => "I64Small",
+        TAG_TIMEPOINT_SMALL => "TimepointSmall",
+        TAG_DURATION_SMALL => "DurationSmall",
+        TAG_U128_SMALL => "U128Small",
+        TAG_I128_SMALL => "I128Small",
+        TAG_U256_SMALL => "U256Small",
+        TAG_I256_SMALL => "I256Small",
+        TAG_SYMBOL_SMALL => "SymbolSmall",
+        TAG_U64_OBJECT => "U64Object",
+        TAG_I64_OBJECT => "I64Object",
+        TAG_TIMEPOINT_OBJECT => "TimepointObject",
+        TAG_DURATION_OBJECT => "DurationObject",
+        TAG_U128_OBJECT => "U128Object",
+        TAG_I128_OBJECT => "I128Object",
+        TAG_U256_OBJECT => "U256Object",
+        TAG_I256_OBJECT => "I256Object",
+        TAG_BYTES_OBJECT => "BytesObject",
+        TAG_STRING_OBJECT => "StringObject",
+        TAG_SYMBOL_OBJECT => "SymbolObject",
+        TAG_VEC_OBJECT => "VecObject",
+        TAG_MAP_OBJECT => "MapObject",
+        TAG_ADDRESS_OBJECT => "AddressObject",
+        TAG_MUXED_ADDRESS_OBJECT => "MuxedAddressObject",
+        _ => return None,
+    })
+}
+
+/// Build the right-hand side of a recovered tag comparison from a tag byte:
+/// a named `Tag::<name>` constant when the byte is a known tag, otherwise the
+/// raw numeric value.
+fn val_tag_const_expr(tag: u64) -> SorobanExpr {
+    match val_tag_name(tag) {
+        Some(name) => SorobanExpr::ValTagName(name.to_string()),
+        None => SorobanExpr::U32Literal(tag as u32),
+    }
+}
+
+/// A recognized Soroban Val encode/decode shape lifted from a `StackVal` subtree.
+///
+/// Pure structural classification of the bit patterns the SDK emits when packing
+/// or unpacking a Val. Centralizes recognition so every operand position (load,
+/// store, arithmetic, compare, branch, return) shares one source of truth; each
+/// consumer decides which tags/shifts it cares about.
+#[derive(Debug, Clone, PartialEq)]
+enum ValShape {
+    /// `v & 0xFF` — extract the 8-bit tag of `v`.
+    TagOf(StackVal),
+    /// `(payload << shift) | tag` — construct a Val from `payload` carrying `tag`.
+    Construct {
+        payload: StackVal,
+        shift: u32,
+        tag: u64,
+    },
+}
+
+/// Classify a `StackVal` as a Soroban Val encode/decode shape, if it matches one.
+///
+/// Purely structural: matches the immediate `BinOp` shape and does not recurse
+/// into the operands' own shapes.
+fn recognize_val_shape(val: &StackVal) -> Option<ValShape> {
+    let StackVal::BinOp(lhs, op, rhs) = val else {
+        return None;
+    };
+    match op {
+        // Tag extraction: `v & 0xFF`.
+        BinOper::And if to_u64(rhs) == Some(0xFF) => Some(ValShape::TagOf((**lhs).clone())),
+        // Construction: `(payload << shift) | tag` where `tag` is a known Val tag.
+        BinOper::Or => {
+            let tag = to_u64(rhs)?;
+            if tag > 0xFF || val_tag_name(tag).is_none() {
+                return None;
+            }
+            let StackVal::BinOp(payload, BinOper::Shl, shift_val) = &**lhs else {
+                return None;
+            };
+            let shift = to_u64(shift_val)? as u32;
+            Some(ValShape::Construct {
+                payload: (**payload).clone(),
+                shift,
+                tag,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Strip a Soroban Val-encode pattern: `(inner << N) | small_tag` → `inner`.
 ///
 /// Used in the `>> 32` handler to decode a previously-encoded Val back to its
 /// Rust-level arithmetic value. Also used in the arithmetic fallback to extract
-/// the clean expression from the Val-encoded stack top.
+/// the clean expression from the Val-encoded stack top. Only small-value tags
+/// are stripped: an object construction `(handle << 32) | object_tag` carries an
+/// opaque handle, not a Rust-level value, so it is left as `Unknown`.
 fn strip_val_encode(val: StackVal) -> StackVal {
+    // Construction `(inner << N) | small_tag` → inner (centralized recognition).
+    if let Some(ValShape::Construct { payload, tag, .. }) = recognize_val_shape(&val)
+        && is_small_val_tag(tag)
+    {
+        return payload;
+    }
     match val {
-        // Pattern: (inner << N) | tag  where tag is a small Val tag
-        StackVal::BinOp(inner_shl, BinOper::Or, tag_val) => {
-            if let StackVal::I64(tag) = *tag_val
-                && is_small_val_tag(tag as u64)
-                && let StackVal::BinOp(inner, BinOper::Shl, _) = *inner_shl
-            {
-                return *inner;
-            }
-            StackVal::Unknown
-        }
+        // A `| tag` shape that wasn't a strippable small-value construction
+        // (object tag, non-Shl inner, …) decodes to nothing recoverable here.
+        StackVal::BinOp(_, BinOper::Or, _) => StackVal::Unknown,
         // Param + (N << 32): inline Val arithmetic. The SDK adds N directly
         // in Val encoding space. Low 32 bits == 0 confirms this is a shifted
         // constant, not a raw value. Decode to Param + N.
@@ -7635,6 +7813,9 @@ enum BinOper {
     Shl,
     /// Bitwise or — Val-encode step, tracked so strip_val_encode can remove it.
     Or,
+    /// Bitwise and — used for Val tag extraction (`v & 0xFF`), tracked so
+    /// recognize_val_shape can lift it to a tag-of expression.
+    And,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -8171,6 +8352,21 @@ fn stack_val_contains_unknown(val: &StackVal) -> bool {
     }
 }
 
+/// True if `val` is a Soroban Val tag comparison: `(v & 0xFF) <cmp> TAG`.
+///
+/// These are the SDK's argument type-validation checks. A multi-guard validation
+/// preamble keeps them as explicit `if ... { panic!() }` guards, but a lone
+/// `block { tag-check; br_if; <value-returning body> }` would otherwise wrap the
+/// body's tail in `if tag == X { ... }` and drop the return value. Treating a lone
+/// tag check as a pass-through (like an unknown condition) keeps such bodies intact.
+fn is_tag_check_condition(val: &StackVal) -> bool {
+    let StackVal::Compare(a, _, b) = val else {
+        return false;
+    };
+    (matches!(recognize_val_shape(a), Some(ValShape::TagOf(_))) && to_u64(b).is_some())
+        || (matches!(recognize_val_shape(b), Some(ValShape::TagOf(_))) && to_u64(a).is_some())
+}
+
 /// Narrow I32Literal(0/1) to BoolLiteral when the function's return type is bool.
 fn narrow_to_bool(expr: SorobanExpr, return_type: &Option<ScSpecTypeDef>) -> SorobanExpr {
     if matches!(return_type, Some(ScSpecTypeDef::Bool)) {
@@ -8243,6 +8439,20 @@ fn stack_val_to_expr(
                         ref other => stack_val_to_expr(other, params, registry, frame_slots),
                     }
                 }
+                // Tag extraction `v & 0xFF` → `v.get_tag()`. Anything else AND-shaped
+                // wasn't a recognized Val pattern, so it stays unknown.
+                BinOper::And => {
+                    if to_u64(b) == Some(0xFF) {
+                        SorobanExpr::ValTag(Box::new(stack_val_to_expr(
+                            a,
+                            params,
+                            registry,
+                            frame_slots,
+                        )))
+                    } else {
+                        SorobanExpr::UnknownVal
+                    }
+                }
             }
         }
         StackVal::Compare(a, op, b) => {
@@ -8256,6 +8466,35 @@ fn stack_val_to_expr(
             // "is the Val's upper 32 bits > n", which for U32 Vals equals "decoded > n".
             // Decode these threshold constants to produce readable comparisons.
             let (a_expr, b_expr) = match (a.as_ref(), b.as_ref()) {
+                // Tag check: `(v & 0xFF) <cmp> TAG` → `v.get_tag() <cmp> Tag::Name`.
+                _ if matches!(recognize_val_shape(a), Some(ValShape::TagOf(_)))
+                    && to_u64(b).is_some() =>
+                {
+                    let Some(ValShape::TagOf(inner)) = recognize_val_shape(a) else {
+                        unreachable!()
+                    };
+                    let lhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr(
+                        &inner,
+                        params,
+                        registry,
+                        frame_slots,
+                    )));
+                    (lhs, val_tag_const_expr(to_u64(b).unwrap()))
+                }
+                _ if matches!(recognize_val_shape(b), Some(ValShape::TagOf(_)))
+                    && to_u64(a).is_some() =>
+                {
+                    let Some(ValShape::TagOf(inner)) = recognize_val_shape(b) else {
+                        unreachable!()
+                    };
+                    let rhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr(
+                        &inner,
+                        params,
+                        registry,
+                        frame_slots,
+                    )));
+                    (val_tag_const_expr(to_u64(a).unwrap()), rhs)
+                }
                 (_, StackVal::I64(v)) if is_val_threshold_constant(*v as u64) => {
                     let decoded = (*v as u64) >> 32;
                     let a_e = stack_val_to_expr(a, params, registry, frame_slots);
@@ -8431,8 +8670,10 @@ fn try_decode_val(v: i64, registry: &TypeRegistry) -> SorobanExpr {
                 SorobanExpr::I64Literal(v)
             }
         }
-        // Storage type discriminants (these appear as raw small ints in some contexts)
-        // 0x40..=0x7f are object types - can't decode without host
+        // Object tags (0x40..=0x7f) carry a 32-bit handle, not an inline value, so
+        // a constant Val with an object tag cannot be decoded without the host.
+        // Storage type discriminants and other raw small ints also land here.
+        _ if is_object_tag(tag) => SorobanExpr::I64Literal(v),
         _ => {
             // If it looks like a raw small value with no special tag, return as-is
             SorobanExpr::I64Literal(v)
@@ -8455,20 +8696,19 @@ fn extract_u32_from_stack_val(val: &StackVal) -> Option<u32> {
                 None
             }
         }
-        StackVal::BinOp(inner, BinOper::Or, tag_val) => {
-            // Pattern: (x << 32) | 4  — Val-encoding of u32
-            if matches!(**tag_val, StackVal::I64(4) | StackVal::I32(4))
-                && let StackVal::BinOp(x, BinOper::Shl, shift) = &**inner
-                && matches!(**shift, StackVal::I64(32) | StackVal::I32(32))
-            {
-                return match **x {
-                    StackVal::I32(v) => Some(v as u32),
-                    StackVal::I64(v) => Some(v as u32),
-                    _ => None,
-                };
-            }
-            None
-        }
+        // Pattern: (x << 32) | 4  — Val-encoding of u32 (centralized recognition).
+        StackVal::BinOp(..) => match recognize_val_shape(val) {
+            Some(ValShape::Construct {
+                payload,
+                shift: 32,
+                tag: TAG_U32,
+            }) => match payload {
+                StackVal::I32(v) => Some(v as u32),
+                StackVal::I64(v) => Some(v as u32),
+                _ => None,
+            },
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -8482,18 +8722,15 @@ fn extract_u32_from_stack_val(val: &StackVal) -> Option<u32> {
 fn extract_frame_slot_from_stack_val(val: &StackVal) -> Option<(u32, i32)> {
     match val {
         StackVal::FrameSlot(id, offset) => Some((*id, *offset)),
-        // Val-encoded: (FrameSlot << 32) | 4
-        StackVal::BinOp(inner, BinOper::Or, tag_val)
-            if matches!(**tag_val, StackVal::I64(4) | StackVal::I32(4)) =>
-        {
-            if let StackVal::BinOp(x, BinOper::Shl, shift) = &**inner
-                && matches!(**shift, StackVal::I64(32) | StackVal::I32(32))
-                && let StackVal::FrameSlot(id, offset) = &**x
-            {
-                return Some((*id, *offset));
-            }
-            None
-        }
+        // Val-encoded: (FrameSlot << 32) | 4 (centralized recognition).
+        StackVal::BinOp(..) => match recognize_val_shape(val) {
+            Some(ValShape::Construct {
+                payload: StackVal::FrameSlot(id, offset),
+                shift: 32,
+                tag: TAG_U32,
+            }) => Some((id, offset)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -8721,4 +8958,182 @@ mod tests {
     // (1024) and obvious. Direct testing requires constructing a synthetic
     // WASM function body, which is heavy enough to belong in its own
     // follow-up rather than this PR.
+
+    // ----- Val tag table + naming (issue #4) ---------------------------
+
+    #[test]
+    fn object_tags_and_names_match_canonical_layout() {
+        assert!(is_object_tag(TAG_VEC_OBJECT)); // 75
+        assert!(is_object_tag(64));
+        assert!(is_object_tag(127));
+        assert!(!is_object_tag(TAG_U32)); // small value
+        assert!(!is_object_tag(7));
+
+        assert_eq!(val_tag_name(TAG_VEC_OBJECT), Some("VecObject"));
+        assert_eq!(val_tag_name(TAG_ADDRESS_OBJECT), Some("AddressObject"));
+        assert_eq!(val_tag_name(TAG_U32), Some("U32Val"));
+        assert_eq!(val_tag_name(TAG_SYMBOL_SMALL), Some("SymbolSmall"));
+        // Bound markers / reserved bytes are not tags.
+        assert_eq!(val_tag_name(63), None);
+        assert_eq!(val_tag_name(200), None);
+    }
+
+    // ----- recognize_val_shape (issue #4) ------------------------------
+
+    fn shl(inner: StackVal, by: i64) -> StackVal {
+        StackVal::BinOp(Box::new(inner), BinOper::Shl, Box::new(StackVal::I64(by)))
+    }
+
+    #[test]
+    fn recognize_val_shape_tag_extraction() {
+        let v = StackVal::BinOp(
+            Box::new(StackVal::Param("v".to_string())),
+            BinOper::And,
+            Box::new(StackVal::I64(0xFF)),
+        );
+        assert_eq!(
+            recognize_val_shape(&v),
+            Some(ValShape::TagOf(StackVal::Param("v".to_string())))
+        );
+    }
+
+    #[test]
+    fn recognize_val_shape_constructions() {
+        // (payload << 32) | U32 tag
+        let c32 = StackVal::BinOp(
+            Box::new(shl(StackVal::Param("p".to_string()), 32)),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U32 as i64)),
+        );
+        assert_eq!(
+            recognize_val_shape(&c32),
+            Some(ValShape::Construct {
+                payload: StackVal::Param("p".to_string()),
+                shift: 32,
+                tag: TAG_U32,
+            })
+        );
+
+        // (payload << 8) | U64Small tag
+        let c8 = StackVal::BinOp(
+            Box::new(shl(StackVal::I64(5), 8)),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U64_SMALL as i64)),
+        );
+        assert_eq!(
+            recognize_val_shape(&c8),
+            Some(ValShape::Construct {
+                payload: StackVal::I64(5),
+                shift: 8,
+                tag: TAG_U64_SMALL,
+            })
+        );
+    }
+
+    #[test]
+    fn recognize_val_shape_rejects_unknown_tag() {
+        // `(x << 32) | 0x99` is not a known tag → not a construction.
+        let bogus = StackVal::BinOp(
+            Box::new(shl(StackVal::Param("p".to_string()), 32)),
+            BinOper::Or,
+            Box::new(StackVal::I64(0x99)),
+        );
+        assert_eq!(recognize_val_shape(&bogus), None);
+    }
+
+    // ----- tag-equality lowering (issue #4, DoD item 5) ---------------
+
+    fn tag_of(param: &str) -> StackVal {
+        StackVal::BinOp(
+            Box::new(StackVal::Param(param.to_string())),
+            BinOper::And,
+            Box::new(StackVal::I64(0xFF)),
+        )
+    }
+
+    #[test]
+    fn tag_check_in_kept_branch_lifts_to_named_guard() {
+        // `(arg & 0xFF) != 75` → `arg.get_tag() != Tag::VecObject`.
+        let cmp = StackVal::Compare(
+            Box::new(tag_of("arg")),
+            CmpOp::Ne,
+            Box::new(StackVal::I64(TAG_VEC_OBJECT as i64)),
+        );
+        let expr = stack_val_to_expr(&cmp, &[], &empty_registry(), None);
+        assert_eq!(
+            expr,
+            SorobanExpr::Ne(
+                Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param(
+                    "arg".to_string()
+                )))),
+                Box::new(SorobanExpr::ValTagName("VecObject".to_string())),
+            )
+        );
+        // Crucially, the recovered condition has no Unknown placeholder.
+        assert!(!matches!(expr, SorobanExpr::UnknownVal));
+    }
+
+    #[test]
+    fn tag_check_equality_with_constant_on_left() {
+        // `75 == (arg & 0xFF)` → `Tag::VecObject == arg.get_tag()`.
+        let cmp = StackVal::Compare(
+            Box::new(StackVal::I64(TAG_VEC_OBJECT as i64)),
+            CmpOp::Eq,
+            Box::new(tag_of("arg")),
+        );
+        let expr = stack_val_to_expr(&cmp, &[], &empty_registry(), None);
+        assert_eq!(
+            expr,
+            SorobanExpr::Eq(
+                Box::new(SorobanExpr::ValTagName("VecObject".to_string())),
+                Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param(
+                    "arg".to_string()
+                )))),
+            )
+        );
+    }
+
+    #[test]
+    fn standalone_tag_extraction_lifts_to_get_tag() {
+        // A bare `v & 0xFF` (not in a comparison) becomes `v.get_tag()`.
+        let expr = stack_val_to_expr(&tag_of("v"), &[], &empty_registry(), None);
+        assert_eq!(
+            expr,
+            SorobanExpr::ValTag(Box::new(SorobanExpr::Param("v".to_string())))
+        );
+    }
+
+    // ----- non-regression: centralized routing preserves behavior -----
+
+    #[test]
+    fn strip_val_encode_still_strips_small_construction() {
+        // `(param << 32) | U32` strips back to the param.
+        let encoded = StackVal::BinOp(
+            Box::new(shl(StackVal::Param("p".to_string()), 32)),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U32 as i64)),
+        );
+        assert_eq!(strip_val_encode(encoded), StackVal::Param("p".to_string()));
+    }
+
+    #[test]
+    fn strip_val_encode_leaves_object_construction_unknown() {
+        // Object constructions carry an opaque handle, not a Rust value.
+        let encoded = StackVal::BinOp(
+            Box::new(shl(StackVal::I64(7), 32)),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_VEC_OBJECT as i64)),
+        );
+        assert_eq!(strip_val_encode(encoded), StackVal::Unknown);
+    }
+
+    #[test]
+    fn extract_u32_from_stack_val_still_decodes_construction() {
+        let encoded = StackVal::BinOp(
+            Box::new(shl(StackVal::I64(7), 32)),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U32 as i64)),
+        );
+        assert_eq!(extract_u32_from_stack_val(&encoded), Some(7));
+    }
 }

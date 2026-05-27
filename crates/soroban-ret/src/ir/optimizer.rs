@@ -1127,6 +1127,7 @@ fn expr_contains(haystack: &SorobanExpr, needle: &SorobanExpr) -> bool {
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::ValTagName(_)
         | SorobanExpr::ContractError { .. } => false,
 
         // One child (Box)
@@ -1141,7 +1142,8 @@ fn expr_contains(haystack: &SorobanExpr, needle: &SorobanExpr) -> bool {
         | SorobanExpr::PrngBytesNew(e)
         | SorobanExpr::PrngVecShuffle(e)
         | SorobanExpr::StrkeyToAddress(e)
-        | SorobanExpr::AddressToStrkey(e) => c(e),
+        | SorobanExpr::AddressToStrkey(e)
+        | SorobanExpr::ValTag(e) => c(e),
 
         SorobanExpr::ValConvert { value, .. } | SorobanExpr::CastAs { value, .. } => c(value),
         SorobanExpr::FieldAccess { object, .. } => c(object),
@@ -3063,6 +3065,7 @@ fn invalidate_seen_gets_for_expr(
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::ValTag(inner)
         | SorobanExpr::ErrorFromCode(inner) => {
             invalidate_seen_gets_for_expr(inner, seen_gets);
         }
@@ -3152,6 +3155,7 @@ fn invalidate_seen_gets_for_expr(
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::ValTagName(_)
         | SorobanExpr::ContractError { .. } => {}
     }
 }
@@ -4367,6 +4371,7 @@ fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::ValTag(inner)
         | SorobanExpr::ErrorFromCode(inner) => expr_mentions_other_params(inner, excluded),
         SorobanExpr::MethodCall { object, args, .. } => {
             expr_mentions_other_params(object, excluded)
@@ -4479,6 +4484,7 @@ fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::ValTagName(_)
         | SorobanExpr::ContractError { .. } => false,
     }
 }

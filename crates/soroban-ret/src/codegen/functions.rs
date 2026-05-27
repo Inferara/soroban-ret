@@ -664,6 +664,15 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             quote! { todo!("unknown value") }
         }
 
+        SorobanExpr::ValTag(inner) => {
+            let val = generate_expr(inner);
+            quote! { #val.get_tag() }
+        }
+        SorobanExpr::ValTagName(name) => {
+            let ident = safe_ident(name);
+            quote! { Tag::#ident }
+        }
+
         SorobanExpr::ValConvert {
             value,
             target_type: _,
@@ -2844,5 +2853,21 @@ mod generate_stmt_tests {
         assert!(out.contains("env . events () . publish"));
         assert!(out.contains("symbol_short ! (\"a\")"));
         assert!(out.contains("symbol_short ! (\"b\")"));
+    }
+
+    #[test]
+    fn val_tag_check_renders_get_tag_and_named_tag() {
+        // `arg.get_tag() != Tag::VecObject` — a recovered tag guard (issue #4).
+        let e = SorobanExpr::Ne(
+            Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param(
+                "arg".into(),
+            )))),
+            Box::new(SorobanExpr::ValTagName("VecObject".into())),
+        );
+        let out = collapse(&s(generate_expr(&e)));
+        assert!(out.contains("arg . get_tag ()"), "got: {out}");
+        assert!(out.contains("Tag :: VecObject"), "got: {out}");
+        assert!(out.contains("!="), "got: {out}");
+        assert!(!out.contains("todo !"), "got: {out}");
     }
 }
