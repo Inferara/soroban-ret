@@ -8,7 +8,7 @@
 /// For Phase 1-2: produces spec-only output (signatures without bodies).
 /// Function body lifting will be enhanced in Phase 3.
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use stellar_xdr::ScSpecTypeDef;
@@ -74,6 +74,37 @@ fn frame_slot_key(base: i32, offset: u32) -> Option<i32> {
 /// Single source of truth — both `lift_instruction` (entry) and
 /// `lift_inline_call` (recursive callee) check against this.
 const MAX_INLINE_CALL_DEPTH: u32 = 5;
+
+thread_local! {
+    /// Frame slots currently being resolved on the active `stack_val_to_expr`
+    /// recursion path. A slot's stored value can transitively reference the
+    /// same slot (e.g. a Val-encoded `BinOp` that embeds the slot), forming a
+    /// cycle the single-level guard in the `FrameSlot` arm cannot detect.
+    static RESOLVING_FRAME_SLOTS: RefCell<HashSet<(u32, i32)>> =
+        RefCell::new(HashSet::new());
+}
+
+/// RAII marker that records a frame slot as being resolved for the duration of
+/// a `stack_val_to_expr` call, clearing it on return so sibling branches can
+/// still resolve the same slot. `acquire` returns `None` when the slot is
+/// already on the current path — i.e. a cyclic frame-slot reference.
+struct FrameSlotGuard((u32, i32));
+impl FrameSlotGuard {
+    fn acquire(key: (u32, i32)) -> Option<Self> {
+        // Release the borrow before building the guard: the guard's Drop also
+        // borrows RESOLVING_FRAME_SLOTS, so constructing it (and dropping it on
+        // the `false` path) while the borrow is live would panic.
+        let inserted = RESOLVING_FRAME_SLOTS.with(|s| s.borrow_mut().insert(key));
+        inserted.then(|| FrameSlotGuard(key))
+    }
+}
+impl Drop for FrameSlotGuard {
+    fn drop(&mut self) {
+        RESOLVING_FRAME_SLOTS.with(|s| {
+            s.borrow_mut().remove(&self.0);
+        });
+    }
+}
 
 /// Lift all contract functions from WASM module into a ContractModule.
 pub fn lift_functions(
@@ -8275,7 +8306,15 @@ fn stack_val_to_expr(
                     stored,
                     StackVal::FrameSlot(_, _) | StackVal::FrameBase(_) | StackVal::Unknown
                 ) {
-                    return stack_val_to_expr(stored, params, registry, frame_slots);
+                    // The stored value may transitively reference this same slot
+                    // (e.g. a Val-encoded BinOp embedding it), which the matches!
+                    // check above cannot see. Track slots on the current
+                    // resolution path; a revisit means a cycle, so degrade to
+                    // UnknownVal instead of recursing forever.
+                    return match FrameSlotGuard::acquire((*id, *offset)) {
+                        Some(_guard) => stack_val_to_expr(stored, params, registry, frame_slots),
+                        None => SorobanExpr::UnknownVal,
+                    };
                 }
             }
             SorobanExpr::UnknownVal
@@ -8603,6 +8642,74 @@ mod tests {
         assert!(result.content.is_none());
         assert!(result.memory_stores.is_empty());
         assert!(result.stack_result.is_none());
+    }
+
+    // ----- stack_val_to_expr frame-slot cycle guard --------------------
+
+    fn empty_registry() -> crate::spec::registry::TypeRegistry {
+        crate::spec::registry::TypeRegistry {
+            functions: std::collections::BTreeMap::new(),
+            structs: std::collections::BTreeMap::new(),
+            unions: std::collections::BTreeMap::new(),
+            enums: std::collections::BTreeMap::new(),
+            error_enums: std::collections::BTreeMap::new(),
+            events: std::collections::BTreeMap::new(),
+            meta: Vec::new(),
+            spec_entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stack_val_to_expr_breaks_self_referential_frame_slot() {
+        // Regression for the aquarius.wasm stack overflow: a frame slot whose
+        // stored value is a Val-encoded `(inner << 32) | tag` that embeds the
+        // *same* slot. `strip_val_encode` peels the encoding back to the slot,
+        // and resolving it re-enters the slot lookup forever. The one-level
+        // `matches!` guard can't see the embedded slot (the stored value is a
+        // BinOp, not a bare FrameSlot), so the path tracker must break the cycle.
+        let slot = StackVal::FrameSlot(0, 0);
+        let encoded = StackVal::BinOp(
+            Box::new(StackVal::BinOp(
+                Box::new(slot.clone()),
+                BinOper::Shl,
+                Box::new(StackVal::I64(32)),
+            )),
+            BinOper::Or,
+            Box::new(StackVal::I64(TAG_U32 as i64)),
+        );
+        let mut slots: FrameSlotMap = HashMap::new();
+        slots.insert((0, 0), encoded);
+
+        let registry = empty_registry();
+        // Terminates (no overflow) and degrades the cyclic value to UnknownVal.
+        let expr = stack_val_to_expr(&slot, &[], &registry, Some(&slots));
+        assert_eq!(expr, SorobanExpr::UnknownVal);
+    }
+
+    #[test]
+    fn stack_val_to_expr_breaks_indirect_frame_slot_cycle() {
+        // Two slots that reference each other through a non-FrameSlot wrapper
+        // (Eqz), so the one-level guard passes at each hop. The path tracker
+        // must still terminate the mutual recursion.
+        let mut slots: FrameSlotMap = HashMap::new();
+        slots.insert((0, 0), StackVal::Eqz(Box::new(StackVal::FrameSlot(0, 8))));
+        slots.insert((0, 8), StackVal::Eqz(Box::new(StackVal::FrameSlot(0, 0))));
+
+        let registry = empty_registry();
+        // The only assertion that matters is that this returns at all.
+        let _ = stack_val_to_expr(&StackVal::FrameSlot(0, 0), &[], &registry, Some(&slots));
+    }
+
+    #[test]
+    fn stack_val_to_expr_still_resolves_acyclic_frame_slot() {
+        // The guard must not break legitimate (acyclic) slot resolution: a slot
+        // holding a plain parameter should resolve to that parameter.
+        let mut slots: FrameSlotMap = HashMap::new();
+        slots.insert((0, 0), StackVal::Param("amount".to_string()));
+
+        let registry = empty_registry();
+        let expr = stack_val_to_expr(&StackVal::FrameSlot(0, 0), &[], &registry, Some(&slots));
+        assert_eq!(expr, SorobanExpr::Param("amount".to_string()));
     }
 
     // ----- detect_memory_copy_loop bound -------------------
