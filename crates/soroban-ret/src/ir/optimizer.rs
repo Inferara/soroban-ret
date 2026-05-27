@@ -26,24 +26,30 @@ pub fn optimize_stmts(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
 fn optimize_stmts_to_fixpoint(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<SorobanStmt> {
     const MAX_ITERATIONS: usize = 4;
     let mut current = optimize_stmts_inner(stmts, preserve_orphans);
+    let mut converged = false;
     for iteration in 1..MAX_ITERATIONS {
         let prev_repr = format!("{:?}", &current);
         let next = optimize_stmts_inner(current.clone(), preserve_orphans);
         let next_repr = format!("{:?}", &next);
+        current = next;
         if prev_repr == next_repr {
             log::trace!(
                 "Optimizer reached fixpoint after {} extra iteration(s)",
                 iteration - 1
             );
-            return next;
+            converged = true;
+            break;
         }
-        current = next;
     }
     debug_assert!(
-        false,
+        converged,
         "optimizer did not converge in {MAX_ITERATIONS} iterations — pass ordering may need review",
     );
-    current
+    // Render recovered counted loops as `for i in start..end` AFTER the fixpoint
+    // converges, so every other pass (name propagation, DCE, let-binding) has
+    // already processed the loop as a `Loop`. This confines `SorobanStmt::For`
+    // to a single late rewrite + codegen, instead of every optimizer walker.
+    recover_for_loops(current)
 }
 
 fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<SorobanStmt> {
@@ -775,10 +781,269 @@ fn collapse_trivial_loops(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             SorobanStmt::Block(body) => {
                 result.push(SorobanStmt::Block(collapse_trivial_loops(body)));
             }
+            // A `for` is never collapsed (it carries its own bound), but recurse
+            // into its body so nested trivial loops are still removed.
+            SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => result.push(SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body: collapse_trivial_loops(body),
+            }),
             other => result.push(other),
         }
     }
     result
+}
+
+/// Rewrite a recovered counted loop into a `for var in start..end` (with
+/// `.step_by` for non-unit steps) when its induction variable is dead after the
+/// loop — `for` scopes the counter, so it must not be read afterward.
+///
+/// Matches the shape produced by loop-carried recovery in the lifter:
+/// ```text
+/// let mut var_i = <start>;
+/// loop { if var_i == <end> { break; }  <body...>  var_i = var_i + <step>; }
+/// ```
+/// and rewrites it to `for var_i in start..end { <body without the break-guard
+/// and the increment> }`, dropping the now-redundant `let mut`.
+fn recover_for_loops(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    // Recurse into nested bodies first so inner loops are handled.
+    let mut stmts: Vec<SorobanStmt> = stmts.into_iter().map(recover_for_loops_in_stmt).collect();
+
+    let mut i = 0;
+    while i < stmts.len() {
+        let SorobanStmt::Loop { body } = &stmts[i] else {
+            i += 1;
+            continue;
+        };
+        let Some((counter_idx, step, end_expr)) = counted_for_shape(body) else {
+            i += 1;
+            continue;
+        };
+        // Only ascending unit-or-positive steps map cleanly to `start..end`.
+        if step <= 0 {
+            i += 1;
+            continue;
+        }
+        // The counter must be dead after the loop (the `for` binding is scoped).
+        if count_local_in_stmts(&stmts[i + 1..], counter_idx, false).0 != 0 {
+            i += 1;
+            continue;
+        }
+        // Find the `let mut var_{idx} = <start>` that initializes the counter.
+        let name = format!("var_{counter_idx}");
+        let Some(let_pos) = stmts[..i].iter().rposition(
+            |s| matches!(s, SorobanStmt::Let { name: n, mutable: true, .. } if *n == name),
+        ) else {
+            i += 1;
+            continue;
+        };
+        // Between the init and the loop the counter must be untouched (it really
+        // is just the loop's induction variable).
+        if count_local_in_stmts(&stmts[let_pos + 1..i], counter_idx, false).0 != 0 {
+            i += 1;
+            continue;
+        }
+        let SorobanStmt::Let {
+            value: start_expr, ..
+        } = stmts[let_pos].clone()
+        else {
+            unreachable!()
+        };
+        // The range must reach the `== end` exit exactly and ascend: otherwise
+        // `(start..end).step_by(step)` would iterate a different number of times
+        // than the WASM `i == end` loop (e.g. step 2 over 0..5 stops at 4 while
+        // the WASM never hits 5). Bail to the plain `while` form in that case.
+        match (expr_as_int(&start_expr), expr_as_int(&end_expr)) {
+            (Some(s), Some(e)) if e >= s && (e - s) % step == 0 => {}
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        let SorobanStmt::Loop { body } = &stmts[i] else {
+            unreachable!()
+        };
+        let for_body = build_for_body(body, counter_idx);
+        stmts[i] = SorobanStmt::For {
+            var: name,
+            start: start_expr,
+            end: end_expr,
+            step,
+            body: for_body,
+        };
+        stmts.remove(let_pos);
+        // `let_pos < i`, so the new `For` now sits at `i - 1`; `i` already points
+        // at the following statement. Continue without advancing.
+    }
+    stmts
+}
+
+fn recover_for_loops_in_stmt(stmt: SorobanStmt) -> SorobanStmt {
+    match stmt {
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => SorobanStmt::If {
+            condition,
+            then_body: recover_for_loops(then_body),
+            else_body: recover_for_loops(else_body),
+        },
+        SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+            scrutinee,
+            arms: arms
+                .into_iter()
+                .map(|arm| MatchArm {
+                    pattern: arm.pattern,
+                    body: recover_for_loops(arm.body),
+                })
+                .collect(),
+        },
+        SorobanStmt::Loop { body } => SorobanStmt::Loop {
+            body: recover_for_loops(body),
+        },
+        SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body,
+        } => SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body: recover_for_loops(body),
+        },
+        SorobanStmt::Block(body) => SorobanStmt::Block(recover_for_loops(body)),
+        other => other,
+    }
+}
+
+/// Extract a small integer value from an integer literal expression.
+fn expr_as_int(expr: &SorobanExpr) -> Option<i64> {
+    match expr {
+        SorobanExpr::I32Literal(v) => Some(*v as i64),
+        SorobanExpr::I64Literal(v) => Some(*v),
+        SorobanExpr::U32Literal(v) => Some(*v as i64),
+        SorobanExpr::U64Literal(v) => Some(*v as i64),
+        _ => None,
+    }
+}
+
+/// For a counter-exit test `var_i == <const>`, return `(i, end_const_expr)`.
+fn eq_counter_and_end(cond: &SorobanExpr) -> Option<(u32, SorobanExpr)> {
+    let SorobanExpr::Eq(a, b) = cond else {
+        return None;
+    };
+    match (a.as_ref(), b.as_ref()) {
+        (SorobanExpr::Local(idx), other) if expr_as_int(other).is_some() => {
+            Some((*idx, (**b).clone()))
+        }
+        (other, SorobanExpr::Local(idx)) if expr_as_int(other).is_some() => {
+            Some((*idx, (**a).clone()))
+        }
+        _ => None,
+    }
+}
+
+/// For a counter step `var_i = var_i + C` / `var_i - C`, return the signed step.
+fn increment_step(value: &SorobanExpr, idx: u32) -> Option<i64> {
+    match value {
+        SorobanExpr::Add(a, b) => match (a.as_ref(), b.as_ref()) {
+            (SorobanExpr::Local(i), other) if *i == idx => expr_as_int(other),
+            (other, SorobanExpr::Local(i)) if *i == idx => expr_as_int(other),
+            _ => None,
+        },
+        SorobanExpr::Sub(a, b) => match (a.as_ref(), b.as_ref()) {
+            (SorobanExpr::Local(i), other) if *i == idx => expr_as_int(other).map(|s| -s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Recognize the `loop { if i == end { break; } ...; i = i + step }` shape and
+/// return `(counter_index, step, end_expr)`. Requires the break-guard as the
+/// first statement and exactly one counter-increment assignment.
+fn counted_for_shape(body: &[SorobanStmt]) -> Option<(u32, i64, SorobanExpr)> {
+    if body.len() < 2 {
+        return None;
+    }
+    let SorobanStmt::If {
+        condition,
+        then_body,
+        else_body,
+    } = &body[0]
+    else {
+        return None;
+    };
+    if !(else_body.is_empty() && then_body.len() == 1 && matches!(then_body[0], SorobanStmt::Break))
+    {
+        return None;
+    }
+    let (counter_idx, end_expr) = eq_counter_and_end(condition)?;
+
+    let name = format!("var_{counter_idx}");
+    let mut step = None;
+    let mut assign_count = 0u32;
+    let mut increment_pos = None;
+    for (k, s) in body.iter().enumerate().skip(1) {
+        if let SorobanStmt::Assign { target, value } = s
+            && *target == name
+        {
+            assign_count += 1;
+            if let Some(st) = increment_step(value, counter_idx) {
+                step = Some(st);
+                increment_pos = Some(k);
+            }
+        }
+    }
+    if assign_count != 1 {
+        return None;
+    }
+    // The increment must be the last meaningful statement (a trailing `continue`
+    // is fine and gets stripped). Otherwise a statement after it reads the
+    // counter post-increment, but `build_for_body` removes the increment and the
+    // `for` range steps the counter — so that statement would see the wrong value.
+    let last_meaningful = body
+        .iter()
+        .rposition(|s| !matches!(s, SorobanStmt::Continue))?;
+    if increment_pos? != last_meaningful {
+        return None;
+    }
+    Some((counter_idx, step?, end_expr))
+}
+
+/// Build the `for` body: the loop body minus the leading break-guard, the
+/// counter increment, and a redundant trailing `continue`.
+fn build_for_body(body: &[SorobanStmt], counter_idx: u32) -> Vec<SorobanStmt> {
+    let name = format!("var_{counter_idx}");
+    let mut out: Vec<SorobanStmt> = body
+        .iter()
+        .enumerate()
+        .filter(|(k, s)| {
+            if *k == 0 {
+                return false; // the break-guard
+            }
+            // the counter increment
+            !matches!(s, SorobanStmt::Assign { target, value }
+                if *target == name && increment_step(value, counter_idx).is_some())
+        })
+        .map(|(_, s)| s.clone())
+        .collect();
+    if matches!(out.last(), Some(SorobanStmt::Continue)) {
+        out.pop();
+    }
+    out
 }
 
 /// Check if a statement list contains a `Break` or `Continue` (but don't recurse
@@ -2996,6 +3261,7 @@ fn invalidate_seen_gets_for_stmt(
         SorobanStmt::If { .. }
         | SorobanStmt::Match { .. }
         | SorobanStmt::Loop { .. }
+        | SorobanStmt::For { .. }
         | SorobanStmt::Block(_) => {
             seen_gets.clear();
             return;
@@ -3603,6 +3869,15 @@ fn count_local_in_stmt(stmt: &SorobanStmt, idx: u32, inside_loop: bool) -> (u32,
             // Any use inside a loop body is flagged as in_loop.
             let (c, _) = count_local_in_stmts(body, idx, true);
             (c, c > 0)
+        }
+        SorobanStmt::For {
+            start, end, body, ..
+        } => {
+            let sc = count_local_in_expr(start, idx);
+            let ec = count_local_in_expr(end, idx);
+            let (bc, _) = count_local_in_stmts(body, idx, true);
+            let total = sc + ec + bc;
+            (total, total > 0)
         }
         SorobanStmt::Block(stmts) => count_local_in_stmts(stmts, idx, inside_loop),
     }
@@ -4335,6 +4610,13 @@ fn stmt_mentions_other_params(stmt: &SorobanStmt, excluded: &str) -> bool {
         }
         SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
             arm_mentions_other_params(body, excluded)
+        }
+        SorobanStmt::For {
+            start, end, body, ..
+        } => {
+            expr_mentions_other_params(start, excluded)
+                || expr_mentions_other_params(end, excluded)
+                || arm_mentions_other_params(body, excluded)
         }
     }
 }
@@ -6410,5 +6692,104 @@ mod tests {
             &SorobanExpr::ValTagName("VecObject".to_string()),
             "self"
         ));
+    }
+
+    // ----- for-loop recovery (issue #6, Step 2) -----------------------
+
+    /// `let mut var_0 = 0; loop { if var_0 == 5 { break } acc; var_0 += 1 }`
+    /// with the counter dead afterward becomes `for var_0 in 0..5 { acc }`,
+    /// dropping the counter's `let` and its increment.
+    #[test]
+    fn recover_for_loops_rewrites_dead_counter() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_0".into(),
+                mutable: true,
+                value: SorobanExpr::I64Literal(0),
+            },
+            SorobanStmt::Loop {
+                body: vec![
+                    SorobanStmt::If {
+                        condition: SorobanExpr::Eq(
+                            Box::new(SorobanExpr::Local(0)),
+                            Box::new(SorobanExpr::I64Literal(5)),
+                        ),
+                        then_body: vec![SorobanStmt::Break],
+                        else_body: Vec::new(),
+                    },
+                    SorobanStmt::Assign {
+                        target: "var_2".into(),
+                        value: SorobanExpr::Add(
+                            Box::new(SorobanExpr::Local(2)),
+                            Box::new(SorobanExpr::Local(0)),
+                        ),
+                    },
+                    SorobanStmt::Assign {
+                        target: "var_0".into(),
+                        value: SorobanExpr::Add(
+                            Box::new(SorobanExpr::Local(0)),
+                            Box::new(SorobanExpr::I64Literal(1)),
+                        ),
+                    },
+                ],
+            },
+            SorobanStmt::Return(Some(SorobanExpr::Local(2))), // counter unused here
+        ];
+        let out = recover_for_loops(stmts);
+        // The `let mut var_0` is gone; the loop is a `for` with a single-stmt body.
+        assert_eq!(out.len(), 2, "expected For + Return; got: {out:?}");
+        match &out[0] {
+            SorobanStmt::For {
+                var, step, body, ..
+            } => {
+                assert_eq!(var, "var_0");
+                assert_eq!(*step, 1);
+                assert_eq!(body.len(), 1, "increment/guard not stripped: {body:?}");
+                assert!(matches!(
+                    &body[0],
+                    SorobanStmt::Assign { target, .. } if target == "var_2"
+                ));
+            }
+            other => panic!("expected For; got: {other:?}"),
+        }
+    }
+
+    /// When the counter is read after the loop, `for` (which scopes the counter)
+    /// is unsafe, so the loop must stay a `Loop`.
+    #[test]
+    fn recover_for_loops_keeps_loop_when_counter_live_out() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_0".into(),
+                mutable: true,
+                value: SorobanExpr::I64Literal(0),
+            },
+            SorobanStmt::Loop {
+                body: vec![
+                    SorobanStmt::If {
+                        condition: SorobanExpr::Eq(
+                            Box::new(SorobanExpr::Local(0)),
+                            Box::new(SorobanExpr::I64Literal(5)),
+                        ),
+                        then_body: vec![SorobanStmt::Break],
+                        else_body: Vec::new(),
+                    },
+                    SorobanStmt::Assign {
+                        target: "var_0".into(),
+                        value: SorobanExpr::Add(
+                            Box::new(SorobanExpr::Local(0)),
+                            Box::new(SorobanExpr::I64Literal(1)),
+                        ),
+                    },
+                ],
+            },
+            SorobanStmt::Return(Some(SorobanExpr::Local(0))), // counter live-out
+        ];
+        let out = recover_for_loops(stmts);
+        assert!(
+            matches!(&out[0], SorobanStmt::Let { .. })
+                && matches!(&out[1], SorobanStmt::Loop { .. }),
+            "loop with live-out counter must not become a `for`; got: {out:?}"
+        );
     }
 }

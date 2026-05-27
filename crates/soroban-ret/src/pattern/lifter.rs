@@ -536,6 +536,20 @@ struct LiftContext<'a> {
     /// these locals because the phi-merge already captured per-arm values.
     /// Set by `try_recognize_match` after phi-merge fires, cleared by `lift_structured`.
     phi_protected_locals: Vec<u32>,
+    /// Locals recovered as loop-carried by the loop dataflow analysis. While
+    /// lifting a loop body, `LocalSet`/`LocalTee` to one of these emits an
+    /// `Assign { target: var_idx, value }` statement (the loop mutates a real
+    /// `let mut` variable) instead of the usual silent abstract update.
+    /// Populated only for the duration of a recognized loop body.
+    loop_carried_locals: Vec<u32>,
+    /// Frame slots promoted to a synthetic scalar variable by loop-carried
+    /// recovery: maps a `(frame_id, offset)` slot key to the synthetic local
+    /// index naming its `let mut var_{idx}`. A load from a promoted slot reads
+    /// the variable; a store emits `var_{idx} = <value>`. Lets an accumulator
+    /// spilled to the shadow stack (the aquarius case) survive the loop instead
+    /// of degrading to a self-referential `UnknownVal`. The index is allocated by
+    /// extending `locals`, so it never collides with a real WASM local.
+    promoted_slots: HashMap<(u32, i32), u32>,
     /// Depth of guard-error-path blocks we're nested inside. When > 0, the flat
     /// BrIf(0) handler can safely treat constant-true conditions as pass-through
     /// (instead of no-ops) because the enclosing block has an error path.
@@ -569,6 +583,8 @@ impl<'a> LiftContext<'a> {
             enum_match_scrutinee: None,
             enum_match_counter: Rc::new(RefCell::new(HashMap::new())),
             phi_protected_locals: Vec::new(),
+            loop_carried_locals: Vec::new(),
+            promoted_slots: HashMap::new(),
             guard_block_depth: 0,
         }
     }
@@ -593,8 +609,186 @@ impl<'a> LiftContext<'a> {
             enum_match_scrutinee: self.enum_match_scrutinee.clone(),
             enum_match_counter: Rc::clone(&self.enum_match_counter),
             phi_protected_locals: Vec::new(),
+            loop_carried_locals: self.loop_carried_locals.clone(),
+            promoted_slots: self.promoted_slots.clone(),
             guard_block_depth: self.guard_block_depth,
         }
+    }
+
+    /// Emit `var_{idx} = <value>` for a loop-carried local and rebind the local
+    /// to `var_{idx}` so later reads (in the body and after the loop) reference
+    /// the mutable variable the Loop arm declared before the loop. If `value` is
+    /// a host call that was speculatively emitted as a trailing `Expr(call)`,
+    /// rewrite that statement in place rather than duplicating the call.
+    fn emit_loop_carried_assign(&mut self, idx: u32, val: &StackVal) {
+        let value = {
+            let slots = self.frame_slots.borrow();
+            stack_val_to_expr(val, self.params, self.registry, Some(&slots))
+        };
+        let assign = SorobanStmt::Assign {
+            target: format!("var_{}", idx),
+            value: value.clone(),
+        };
+        // Only rewrite the trailing `Expr` in place when it is exactly the call
+        // that produced this value (same guard as the implicit-return path);
+        // otherwise an unrelated speculative side-effecting call would be dropped.
+        if matches!(val, StackVal::HostCallResult(_))
+            && matches!(self.stmts.last(), Some(SorobanStmt::Expr(e)) if *e == value)
+        {
+            *self.stmts.last_mut().unwrap() = assign;
+        } else {
+            self.stmts.push(assign);
+        }
+        if let Some(local) = self.locals.get_mut(idx as usize) {
+            *local = StackVal::LetBinding(idx);
+        }
+    }
+
+    /// Record a store of `value` to frame slot `(id, slot)`. If the slot has been
+    /// promoted to a loop-carried scalar, emit `var_{idx} = <value>` (the loop
+    /// mutates the synthetic `let mut` declared before it) and keep the slot
+    /// bound to that variable so later loads read it; otherwise update the
+    /// abstract frame-slot map as usual.
+    fn store_frame_slot(&mut self, id: u32, slot: i32, value: StackVal) {
+        if let Some(&var_idx) = self.promoted_slots.get(&(id, slot)) {
+            let expr = {
+                let slots = self.frame_slots.borrow();
+                stack_val_to_expr(&value, self.params, self.registry, Some(&slots))
+            };
+            self.stmts.push(SorobanStmt::Assign {
+                target: format!("var_{}", var_idx),
+                value: expr,
+            });
+            self.frame_slots
+                .borrow_mut()
+                .insert((id, slot), StackVal::LetBinding(var_idx));
+        } else {
+            self.frame_slots.borrow_mut().insert((id, slot), value);
+        }
+    }
+
+    /// Find the loop-carried locals of a structured loop body: body-local locals
+    /// (idx >= num_wasm_params) whose value flows across the back edge — i.e.
+    /// their post-body abstract value transitively references their own loop-head
+    /// value. Seeds every body-written local with `LoopPhi(idx)`, lifts the body
+    /// once on a throwaway context (with a deep-cloned `frame_slots` so it can't
+    /// corrupt real state), and keeps the locals whose result still references
+    /// their seed. Returns the carried indices in body-write order.
+    fn analyze_loop_carried_locals(
+        &self,
+        body: &[super::structurize::StructuredBlock],
+    ) -> Vec<(u32, StackVal)> {
+        use crate::wasm::ir::WasmInstr;
+
+        let mut instrs = Vec::new();
+        collect_instrs(body, &mut instrs);
+        let mut written: Vec<u32> = Vec::new();
+        for &i in &instrs {
+            if let WasmInstr::LocalSet(idx) | WasmInstr::LocalTee(idx) = i
+                && *idx >= self.num_wasm_params
+                && !written.contains(idx)
+            {
+                written.push(*idx);
+            }
+        }
+        if written.is_empty() {
+            return Vec::new();
+        }
+
+        let mut sim = self.child_context();
+        sim.frame_slots = Rc::new(RefCell::new(self.frame_slots.borrow().clone()));
+        sim.next_frame_id = Rc::new(RefCell::new(*self.next_frame_id.borrow()));
+        // Detach shared mutable state so this throwaway pass can't perturb the
+        // real lift's enum-variant disambiguation counter.
+        sim.enum_match_counter = Rc::new(RefCell::new(HashMap::new()));
+        for &l in &written {
+            if let Some(slot) = sim.locals.get_mut(l as usize) {
+                *slot = StackVal::LoopPhi(l);
+            }
+        }
+        sim.lift_structured_loop(body);
+
+        written
+            .into_iter()
+            .filter_map(|l| {
+                let v = sim.locals.get(l as usize)?;
+                // Exclude a local left as its bare `LoopPhi` seed (written with an
+                // identity value) — it isn't genuinely loop-carried.
+                let modified = !matches!(v, StackVal::LoopPhi(i) if *i == l);
+                (modified && stackval_references_loop_phi(v, l)).then(|| (l, v.clone()))
+            })
+            .collect()
+    }
+
+    /// Find loop-carried frame slots: shadow-stack slots whose value flows across
+    /// the back edge (an accumulator spilled to the frame, the aquarius case).
+    /// Seeds every slot live at loop entry with `FrameSlotPhi`, lifts the body
+    /// once on a throwaway deep-cloned context, and keeps the slots whose
+    /// post-body stored value references their own seed and is a genuine
+    /// accumulator (not a pure counter, and not a plain copy of another slot —
+    /// those don't self-reference). Returns `(slot_key, pre_loop_value)` pairs.
+    fn analyze_loop_carried_slots(
+        &self,
+        body: &[super::structurize::StructuredBlock],
+    ) -> Vec<((u32, i32), StackVal)> {
+        use crate::wasm::ir::WasmInstr;
+
+        let mut pre_keys: Vec<(u32, i32)> = self.frame_slots.borrow().keys().copied().collect();
+        if pre_keys.is_empty() {
+            return Vec::new();
+        }
+        // Sort for deterministic output: `frame_slots` is a HashMap, and the
+        // order here decides synthetic spill-variable index allocation. Without
+        // sorting, two runs could name the same promoted slots differently.
+        pre_keys.sort_unstable();
+
+        let mut sim = self.child_context();
+        let mut seeded = self.frame_slots.borrow().clone();
+        for &(id, off) in &pre_keys {
+            seeded.insert((id, off), StackVal::FrameSlotPhi(id, off));
+        }
+        sim.frame_slots = Rc::new(RefCell::new(seeded));
+        sim.next_frame_id = Rc::new(RefCell::new(*self.next_frame_id.borrow()));
+        sim.enum_match_counter = Rc::new(RefCell::new(HashMap::new()));
+        // Also seed body-written locals with LoopPhi so an accumulator that adds
+        // the counter (`acc += i`) stays symbolic — otherwise the counter's
+        // pre-loop constant would make the slot look like a pure `acc + const`
+        // counter and wrongly disqualify it.
+        let mut instrs = Vec::new();
+        collect_instrs(body, &mut instrs);
+        for &i in &instrs {
+            if let WasmInstr::LocalSet(idx) | WasmInstr::LocalTee(idx) = i
+                && *idx >= self.num_wasm_params
+                && let Some(slot) = sim.locals.get_mut(*idx as usize)
+            {
+                *slot = StackVal::LoopPhi(*idx);
+            }
+        }
+        sim.lift_structured_loop(body);
+
+        let result = sim.frame_slots.borrow();
+        pre_keys
+            .into_iter()
+            .filter_map(|(id, off)| {
+                let v = result.get(&(id, off))?;
+                // Carried iff the body actually rewrote the slot into a value that
+                // references its own seed. A slot left untouched still holds its
+                // bare `FrameSlotPhi` seed — that "references its phi" trivially
+                // but is not loop-carried, so exclude the bare-seed case.
+                let modified = !matches!(v, StackVal::FrameSlotPhi(i, o) if *i == id && *o == off);
+                let carried = modified
+                    && stackval_references_frame_slot_phi(v, id, off)
+                    && !is_pure_counter_slot_update(v, id, off);
+                // The pre-loop value is what the slot held before the loop.
+                carried.then(|| {
+                    (
+                        (id, off),
+                        self.frame_slots.borrow().get(&(id, off)).cloned(),
+                    )
+                })
+            })
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect()
     }
 
     fn lift_instruction(&mut self, instr: &crate::wasm::ir::WasmInstr) {
@@ -622,6 +816,13 @@ impl<'a> LiftContext<'a> {
                 // with a stale branch-corrupted value, causing the return expression
                 // to reference the wrong variable.
                 if self.phi_protected_locals.contains(idx) {
+                    return;
+                }
+                // Loop-carried locals: emit `var_idx = <value>` so the loop body
+                // mutates the `let mut var_idx` the Loop arm declared before the
+                // loop, and keep the local bound to `var_idx` for later reads.
+                if self.loop_carried_locals.contains(idx) {
+                    self.emit_loop_carried_assign(*idx, &val);
                     return;
                 }
                 // For host-call results stored into body-local slots: convert the preceding
@@ -671,6 +872,16 @@ impl<'a> LiftContext<'a> {
                 }
                 // Skip writes to phi-merge-protected locals (same as LocalSet).
                 if self.phi_protected_locals.contains(idx) {
+                    return;
+                }
+                // Loop-carried locals: emit `var_idx = <value>` and keep the
+                // value on the stack (tee). Leave the local bound to `var_idx`.
+                if self.loop_carried_locals.contains(idx) {
+                    let val = self.stack.last().cloned().unwrap_or(StackVal::Unknown);
+                    self.emit_loop_carried_assign(*idx, &val);
+                    if let Some(slot) = self.stack.last_mut() {
+                        *slot = StackVal::LetBinding(*idx);
+                    }
                     return;
                 }
                 // Existing handler:
@@ -2289,6 +2500,11 @@ impl<'a> LiftContext<'a> {
                 let addr = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let loaded = if let StackVal::FrameSlot(id, base) = addr {
                     match frame_slot_key(base, *off) {
+                        // A slot promoted to a loop-carried scalar reads as its
+                        // synthetic `var_{idx}` rather than the spilled value.
+                        Some(slot) if self.promoted_slots.contains_key(&(id, slot)) => {
+                            StackVal::LetBinding(self.promoted_slots[&(id, slot)])
+                        }
                         Some(slot) => self
                             .frame_slots
                             .borrow()
@@ -2358,7 +2574,7 @@ impl<'a> LiftContext<'a> {
                 if let StackVal::FrameSlot(id, base) = addr
                     && let Some(slot) = frame_slot_key(base, *offset)
                 {
-                    self.frame_slots.borrow_mut().insert((id, slot), value);
+                    self.store_frame_slot(id, slot, value);
                 }
             }
             WasmInstr::I32Store(offset) => {
@@ -2370,7 +2586,7 @@ impl<'a> LiftContext<'a> {
                 if let StackVal::FrameSlot(id, base) = addr
                     && let Some(slot) = frame_slot_key(base, *offset)
                 {
-                    self.frame_slots.borrow_mut().insert((id, slot), value);
+                    self.store_frame_slot(id, slot, value);
                 }
             }
             WasmInstr::I32Store8(offset)
@@ -2387,7 +2603,7 @@ impl<'a> LiftContext<'a> {
                 if let StackVal::FrameSlot(id, base) = addr
                     && let Some(slot) = frame_slot_key(base, *offset)
                 {
-                    self.frame_slots.borrow_mut().insert((id, slot), value);
+                    self.store_frame_slot(id, slot, value);
                 }
             }
 
@@ -2821,7 +3037,136 @@ impl<'a> LiftContext<'a> {
                     // second iteration. Propagate the result explicitly.
                     let rotation = detect_register_rotation(body);
 
+                    // Recover loop-carried locals: locals whose value flows across
+                    // the back edge (an accumulator or a counter). Each becomes a
+                    // `let mut var_idx = <pre-loop init>` declared before the loop;
+                    // the body then mutates it via Assign (see emit_loop_carried_assign),
+                    // and post-loop reads resolve to the variable instead of Unknown.
+                    //
+                    // Gated on a positive counted-loop match: only the bounded
+                    // `i += step; i == N` shape opts into recovery. Every other loop
+                    // (memory copies, host-call-driven iteration, SDK limb arithmetic
+                    // whose value strips cleanly out of the stack top) stays on the
+                    // single-pass path with byte-identical output.
+                    //
+                    // Recovery only fires for locals whose pre-loop init is a known
+                    // value — otherwise the initializer would itself be `todo!()`.
+                    let mut carried: Vec<u32> = Vec::new();
+                    let counted = detect_counted_loop(body).is_some();
+
+                    // Step 1 — local accumulators, only in side-effect-free counted
+                    // loops. The genuine-accumulator gate (not a pure counter)
+                    // excludes boilerplate index loops the baseline already collapses.
+                    let local_analyzed = if counted && !loop_body_has_side_effects(body) {
+                        self.analyze_loop_carried_locals(body)
+                    } else {
+                        Vec::new()
+                    };
+                    let has_local_accumulator = local_analyzed
+                        .iter()
+                        .any(|(idx, val)| !is_pure_counter_update(val, *idx));
+
+                    // Step 3 — accumulators spilled to the shadow-stack frame. Allowed
+                    // to contain memory stores (the spill is a store) but never calls.
+                    let slot_analyzed = if counted && !loop_body_has_calls(body) {
+                        self.analyze_loop_carried_slots(body)
+                    } else {
+                        Vec::new()
+                    };
+                    let has_slot_accumulator = !slot_analyzed.is_empty();
+
+                    // Locals to recover. The slot path needs the loop's counter
+                    // local(s) too (for the `while` condition), even though the loop
+                    // stores — so re-derive carried locals without the side-effect gate.
+                    let local_candidates: Vec<(u32, StackVal)> = if has_local_accumulator {
+                        local_analyzed
+                    } else if has_slot_accumulator {
+                        self.analyze_loop_carried_locals(body)
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Resolve each carried local's and slot's pre-loop init. The
+                    // arithmetic conversion (like phi-merge's init) keeps a numeric
+                    // `0` from being Val-decoded into `false`.
+                    let local_inits: Vec<(u32, SorobanExpr)> = local_candidates
+                        .iter()
+                        .map(|(l, _)| {
+                            let pre = self
+                                .locals
+                                .get(*l as usize)
+                                .cloned()
+                                .unwrap_or(StackVal::Unknown);
+                            let slots = self.frame_slots.borrow();
+                            (
+                                *l,
+                                stack_val_to_arith_expr(
+                                    &pre,
+                                    self.params,
+                                    self.registry,
+                                    Some(&slots),
+                                ),
+                            )
+                        })
+                        .collect();
+                    let slot_inits: Vec<((u32, i32), SorobanExpr)> = slot_analyzed
+                        .iter()
+                        .map(|(key, pre_val)| {
+                            let slots = self.frame_slots.borrow();
+                            (
+                                *key,
+                                stack_val_to_arith_expr(
+                                    pre_val,
+                                    self.params,
+                                    self.registry,
+                                    Some(&slots),
+                                ),
+                            )
+                        })
+                        .collect();
+
+                    // Recovery is all-or-nothing and requires every init to be an
+                    // integer literal. A non-literal init (param/field) would be
+                    // renamed onto its source by name propagation, turning the
+                    // recovered `let mut` into a mutation of an immutable binding.
+                    // Recovering only some carried values (e.g. the counter but not
+                    // its accumulator) would lose the rest, so bail on the whole loop.
+                    let any = !local_inits.is_empty() || !slot_inits.is_empty();
+                    let all_literal = local_inits.iter().all(|(_, e)| is_int_literal_expr(e))
+                        && slot_inits.iter().all(|(_, e)| is_int_literal_expr(e));
+
+                    if any && all_literal {
+                        for (l, init) in local_inits {
+                            self.stmts.push(SorobanStmt::Let {
+                                name: format!("var_{}", l),
+                                mutable: true,
+                                value: init,
+                            });
+                            if let Some(slot) = self.locals.get_mut(l as usize) {
+                                *slot = StackVal::LetBinding(l);
+                            }
+                            carried.push(l);
+                        }
+                        // Promote each loop-carried frame slot to a fresh `let mut`
+                        // variable (synthetic index allocated past the real locals).
+                        for ((id, off), init) in slot_inits {
+                            let var_idx = self.locals.len() as u32;
+                            self.locals.push(StackVal::LetBinding(var_idx));
+                            self.stmts.push(SorobanStmt::Let {
+                                name: format!("var_{}", var_idx),
+                                mutable: true,
+                                value: init,
+                            });
+                            // Slot stores are emitted via store_frame_slot/promoted_slots,
+                            // not LocalSet, so the synthetic index is NOT a loop_carried
+                            // local — it only needs the promoted_slots mapping.
+                            self.promoted_slots.insert((id, off), var_idx);
+                        }
+                        cov_mark::hit!(loop_carried_recovered);
+                    }
+
                     let mut loop_ctx = self.child_context();
+                    loop_ctx.loop_carried_locals = carried;
                     loop_ctx.lift_structured_loop(body);
                     let loop_stmts = loop_ctx.stmts;
                     self.memory_stores = loop_ctx.memory_stores;
@@ -4896,7 +5241,21 @@ fn lift_function_body(
     // This pattern occurs when the SDK compiles `panic!()` as a call to a bare
     // `unreachable` trap function in the dispatch wrapper, placed after the body call.
     // If we found no meaningful host calls, try pattern detection
-    if !ctx.found_host_calls && return_type.is_some() && has_arithmetic_pattern(&func.body) {
+    if !ctx.found_host_calls
+        && return_type.is_some()
+        && has_arithmetic_pattern(&func.body)
+        // The arithmetic shortcut reduces a function to a single `return <expr>`
+        // built from the stack top, discarding any emitted statements. That is
+        // correct for straight-line arithmetic (the loop, if any, is SDK
+        // boilerplate and the real value strips out of the stack top), but wrong
+        // when the stack top is a recovered loop-carried variable whose `let mut`
+        // declaration lives in the discarded statements. Skip it in that case.
+        && !ctx
+            .stack
+            .last()
+            .map(stackval_references_let_or_phi)
+            .unwrap_or(false)
+    {
         // Try to extract the clean Rust expression by stripping Val encode/decode boilerplate.
         // This handles arithmetic like `a + b` where the stack holds `(a+b << N) | tag`.
         // We only use the stripped result when it contains no Unknown sub-values; if the inner
@@ -7398,6 +7757,32 @@ fn detect_register_rotation(body: &[super::structurize::StructuredBlock]) -> Opt
     Some((target, source))
 }
 
+/// Recursively flatten a structured block tree into a flat list of the
+/// instructions it contains, in execution order. Shared by the loop
+/// recognizers (`detect_memory_copy_loop`, `detect_counted_loop`) and the
+/// loop-carried dataflow analysis.
+fn collect_instrs<'a>(
+    blocks: &'a [super::structurize::StructuredBlock],
+    out: &mut Vec<&'a crate::wasm::ir::WasmInstr>,
+) {
+    use super::structurize::StructuredBlock;
+    for b in blocks {
+        match b {
+            StructuredBlock::Instruction(i) => out.push(i),
+            StructuredBlock::Block { body, .. } => collect_instrs(body, out),
+            StructuredBlock::Loop { body, .. } => collect_instrs(body, out),
+            StructuredBlock::IfElse {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_instrs(then_body, out);
+                collect_instrs(else_body, out);
+            }
+        }
+    }
+}
+
 /// Information about a detected memory copy loop.
 struct MemoryCopyLoopInfo {
     src_base: i32,
@@ -7426,29 +7811,11 @@ struct MemoryCopyLoopInfo {
 fn detect_memory_copy_loop(
     body: &[super::structurize::StructuredBlock],
 ) -> Option<MemoryCopyLoopInfo> {
-    use super::structurize::StructuredBlock;
     use crate::wasm::ir::WasmInstr;
 
     // The loop body should be a Block (break target) containing either
     // a sequence of instructions or nested blocks. Flatten to find key instructions.
     let mut all_instrs = Vec::new();
-    fn collect_instrs<'a>(blocks: &'a [StructuredBlock], out: &mut Vec<&'a WasmInstr>) {
-        for b in blocks {
-            match b {
-                StructuredBlock::Instruction(i) => out.push(i),
-                StructuredBlock::Block { body, .. } => collect_instrs(body, out),
-                StructuredBlock::Loop { body, .. } => collect_instrs(body, out),
-                StructuredBlock::IfElse {
-                    then_body,
-                    else_body,
-                    ..
-                } => {
-                    collect_instrs(then_body, out);
-                    collect_instrs(else_body, out);
-                }
-            }
-        }
-    }
     collect_instrs(body, &mut all_instrs);
 
     // Need: I64Load + I64Store pair, counter increment pattern
@@ -7575,6 +7942,141 @@ fn detect_memory_copy_loop(
         limit,
         step,
     })
+}
+
+/// A loop recognized as counted: a single induction variable stepped by a
+/// constant and compared against a constant bound to decide the exit.
+struct CountedLoopInfo {
+    #[allow(dead_code)]
+    counter_local: u32,
+    #[allow(dead_code)]
+    step: i64,
+    #[allow(dead_code)]
+    bound: i64,
+}
+
+/// Recognize a counted loop: a body containing both a counter step
+/// `local.get C; (i32|i64).const S; (i32|i64).add; local.set C` (S != 0) and an
+/// exit test against a constant `local.get C; (i32|i64).const N; (i32|i64).(eq|ne)`
+/// on the same counter `C`. This is the gate for loop-carried value recovery —
+/// it positively identifies the bounded-iteration shape (`for i in ..` /
+/// `while i != N`) and leaves every other loop (memory copies, host-call-driven
+/// iteration, SDK limb arithmetic) on the existing single-pass path untouched.
+fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<CountedLoopInfo> {
+    use crate::wasm::ir::WasmInstr;
+
+    let mut all_instrs = Vec::new();
+    collect_instrs(body, &mut all_instrs);
+
+    // Step: `local.get C; const S; (add|sub); local.set C` (same C, S != 0).
+    // A `sub` is a descending counter, recorded as a negative step.
+    let mut counter_step: Option<(u32, i64)> = None;
+    for w in all_instrs.windows(4) {
+        let (cnt, s) = match (w[0], w[1], w[2], w[3]) {
+            (
+                WasmInstr::LocalGet(c),
+                WasmInstr::I32Const(s),
+                WasmInstr::I32Add,
+                WasmInstr::LocalSet(c2),
+            ) if c == c2 => (*c, *s as i64),
+            (
+                WasmInstr::LocalGet(c),
+                WasmInstr::I64Const(s),
+                WasmInstr::I64Add,
+                WasmInstr::LocalSet(c2),
+            ) if c == c2 => (*c, *s),
+            (
+                WasmInstr::LocalGet(c),
+                WasmInstr::I32Const(s),
+                WasmInstr::I32Sub,
+                WasmInstr::LocalSet(c2),
+            ) if c == c2 => (*c, -(*s as i64)),
+            (
+                WasmInstr::LocalGet(c),
+                WasmInstr::I64Const(s),
+                WasmInstr::I64Sub,
+                WasmInstr::LocalSet(c2),
+                // `-i64::MIN` overflows; such a pathological step isn't a real
+                // counter, so skip it rather than panic.
+            ) if c == c2 => match s.checked_neg() {
+                Some(neg) => (*c, neg),
+                None => continue,
+            },
+            _ => continue,
+        };
+        if s != 0 {
+            counter_step = Some((cnt, s));
+            break;
+        }
+    }
+    let (counter_local, step) = counter_step?;
+
+    // Exit test: `local.get C; const N; (eq|ne)` on the same counter.
+    let mut bound: Option<i64> = None;
+    for w in all_instrs.windows(3) {
+        let (c, n) = match (w[0], w[1], w[2]) {
+            (
+                WasmInstr::LocalGet(c),
+                WasmInstr::I32Const(n),
+                WasmInstr::I32Eq | WasmInstr::I32Ne,
+            ) => (*c, *n as i64),
+            (
+                WasmInstr::LocalGet(c),
+                WasmInstr::I64Const(n),
+                WasmInstr::I64Eq | WasmInstr::I64Ne,
+            ) => (*c, *n),
+            _ => continue,
+        };
+        if c == counter_local {
+            bound = Some(n);
+            break;
+        }
+    }
+    let bound = bound?;
+
+    Some(CountedLoopInfo {
+        counter_local,
+        step,
+        bound,
+    })
+}
+
+/// True if the loop body performs observable side effects — a call (host or
+/// internal) or a memory store. Loop-carried recovery is restricted to
+/// side-effect-free bodies: loops that publish events, copy memory, or invoke
+/// contracts are handled by the existing idiom recognizers and must not be
+/// rewritten into a `let mut` + mutation loop.
+fn loop_body_has_side_effects(body: &[super::structurize::StructuredBlock]) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    let mut instrs = Vec::new();
+    collect_instrs(body, &mut instrs);
+    instrs.iter().any(|i| {
+        matches!(
+            i,
+            WasmInstr::Call(_)
+                | WasmInstr::CallIndirect(_)
+                | WasmInstr::I32Store(_)
+                | WasmInstr::I64Store(_)
+                | WasmInstr::I32Store8(_)
+                | WasmInstr::I32Store16(_)
+                | WasmInstr::I64Store8(_)
+                | WasmInstr::I64Store16(_)
+                | WasmInstr::I64Store32(_)
+        )
+    })
+}
+
+/// True if the loop body contains a call (host or internal). Frame-slot
+/// promotion tolerates memory stores (the spill is itself a store) but never
+/// calls — a loop that invokes a contract, requires auth, or publishes an event
+/// is handled by the existing recognizers and left untouched.
+fn loop_body_has_calls(body: &[super::structurize::StructuredBlock]) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    let mut instrs = Vec::new();
+    collect_instrs(body, &mut instrs);
+    instrs
+        .iter()
+        .any(|i| matches!(i, WasmInstr::Call(_) | WasmInstr::CallIndirect(_)))
 }
 
 /// Extract an i32-compatible constant from a StackVal (for cross-type constant folding).
@@ -7827,6 +8329,19 @@ enum StackVal {
     /// Bound to a Let statement; references the Let by WASM local index.
     /// Converted to SorobanExpr::Local(idx) which codegen renders as `var_{idx}`.
     LetBinding(u32),
+    /// The loop-head merge value of a loop-carried local (by WASM local index).
+    /// An opaque height-1 leaf used to seed the loop dataflow analysis: a local
+    /// whose post-body value transitively references its own `LoopPhi` is
+    /// loop-carried and becomes a `let mut var_{idx}` the body mutates.
+    /// Like `LetBinding`, it converts to `SorobanExpr::Local(idx)` (`var_{idx}`).
+    LoopPhi(u32),
+    /// The loop-head merge value of a loop-carried frame slot (by frame_id and
+    /// byte offset). The slot analogue of `LoopPhi`: a slot whose post-body
+    /// stored value references its own `FrameSlotPhi` is loop-carried (an
+    /// accumulator spilled to the shadow stack) and is promoted to a synthetic
+    /// `let mut` variable. Only ever lives in the throwaway analysis context's
+    /// `frame_slots`; if it reaches codegen it degrades to `UnknownVal`.
+    FrameSlotPhi(u32, i32),
     /// Transitional: `global_get 0` (the WASM stack pointer)
     StackPtrRef,
     /// Transitional: `StackPtrRef - frame_size` before local_tee assigns it.
@@ -8374,6 +8889,94 @@ fn stack_val_has_val_constant(val: &StackVal) -> bool {
 ///
 /// Used to detect dispatch preamble type-check conditions that cannot be evaluated
 /// statically (e.g., I64And(param, 0xFF) != expected_tag).
+/// True if `val` transitively references `LoopPhi(idx)` — the test that decides
+/// whether a body-written local is genuinely loop-carried (its new value depends
+/// on its own loop-head value) versus freshly recomputed each iteration.
+fn stackval_references_loop_phi(val: &StackVal, idx: u32) -> bool {
+    match val {
+        StackVal::LoopPhi(i) => *i == idx,
+        StackVal::BinOp(a, _, b) | StackVal::Compare(a, _, b) => {
+            stackval_references_loop_phi(a, idx) || stackval_references_loop_phi(b, idx)
+        }
+        StackVal::Eqz(a) => stackval_references_loop_phi(a, idx),
+        _ => false,
+    }
+}
+
+/// True if `val` transitively references `FrameSlotPhi(id, off)` — the slot
+/// analogue of [`stackval_references_loop_phi`]. Decides whether a frame slot is
+/// genuinely loop-carried (its new value depends on its own loop-head value).
+fn stackval_references_frame_slot_phi(val: &StackVal, id: u32, off: i32) -> bool {
+    match val {
+        StackVal::FrameSlotPhi(i, o) => *i == id && *o == off,
+        StackVal::BinOp(a, _, b) | StackVal::Compare(a, _, b) => {
+            stackval_references_frame_slot_phi(a, id, off)
+                || stackval_references_frame_slot_phi(b, id, off)
+        }
+        StackVal::Eqz(a) => stackval_references_frame_slot_phi(a, id, off),
+        _ => false,
+    }
+}
+
+/// True if `val` is a pure induction-counter update for the frame slot
+/// `(id, off)`: exactly `slot ± constant`. A slot stepped like a counter is not
+/// an accumulator worth promoting (and is almost never a real spill).
+fn is_pure_counter_slot_update(val: &StackVal, id: u32, off: i32) -> bool {
+    let StackVal::BinOp(a, BinOper::Add | BinOper::Sub, b) = val else {
+        return false;
+    };
+    let is_self = |v: &StackVal| matches!(v, StackVal::FrameSlotPhi(i, o) if *i == id && *o == off);
+    let is_const = |v: &StackVal| matches!(v, StackVal::I32(_) | StackVal::I64(_));
+    (is_self(a) && is_const(b)) || (is_const(a) && is_self(b))
+}
+
+/// True if `val` is a pure induction-counter update for local `idx`: exactly
+/// `idx ± constant` (`LoopPhi(idx) + C` / `C + LoopPhi(idx)` / `LoopPhi(idx) - C`).
+/// A counted loop whose *only* loop-carried locals are pure counters does no
+/// real work (it just steps an index that is dead after the loop) and is SDK
+/// boilerplate the baseline already drops — so recovery skips it. A loop with a
+/// genuine accumulator (`acc + i`, `acc + load`, ...) is not pure and is recovered.
+fn is_pure_counter_update(val: &StackVal, idx: u32) -> bool {
+    let StackVal::BinOp(a, BinOper::Add | BinOper::Sub, b) = val else {
+        return false;
+    };
+    let is_self = |v: &StackVal| matches!(v, StackVal::LoopPhi(i) if *i == idx);
+    let is_const = |v: &StackVal| matches!(v, StackVal::I32(_) | StackVal::I64(_));
+    (is_self(a) && is_const(b)) || (is_const(a) && is_self(b))
+}
+
+/// True if `expr` is a plain integer literal. Loop-carried recovery only fires
+/// when the pre-loop init is a literal: a named init (param, field access, ...)
+/// would be renamed onto its source by variable-name propagation, turning the
+/// recovered `let mut` into a mutation of an immutable binding (e.g. a function
+/// parameter) that does not compile. A literal has no derivable name, so the
+/// recovered variable keeps its `let mut var_N` declaration.
+fn is_int_literal_expr(expr: &SorobanExpr) -> bool {
+    matches!(
+        expr,
+        SorobanExpr::I32Literal(_)
+            | SorobanExpr::I64Literal(_)
+            | SorobanExpr::U32Literal(_)
+            | SorobanExpr::U64Literal(_)
+    )
+}
+
+/// True if `val` transitively references a `LetBinding` or `LoopPhi` — i.e. a
+/// named variable (e.g. a recovered loop-carried local). Used to decide whether
+/// the arithmetic shortcut may reduce a function to its stack top: a top that
+/// names such a variable depends on emitted `let`/`let mut` statements and must
+/// not be lifted out of them.
+fn stackval_references_let_or_phi(val: &StackVal) -> bool {
+    match val {
+        StackVal::LetBinding(_) | StackVal::LoopPhi(_) => true,
+        StackVal::BinOp(a, _, b) | StackVal::Compare(a, _, b) => {
+            stackval_references_let_or_phi(a) || stackval_references_let_or_phi(b)
+        }
+        StackVal::Eqz(a) => stackval_references_let_or_phi(a),
+        _ => false,
+    }
+}
+
 fn stack_val_contains_unknown(val: &StackVal) -> bool {
     match val {
         StackVal::Unknown => true,
@@ -8547,6 +9150,9 @@ fn stack_val_to_expr(
             }
         }
         StackVal::LetBinding(idx) => SorobanExpr::Local(*idx),
+        StackVal::LoopPhi(idx) => SorobanExpr::Local(*idx),
+        // Analysis-only marker; should never reach codegen. Degrade safely.
+        StackVal::FrameSlotPhi(_, _) => SorobanExpr::UnknownVal,
         StackVal::FrameSlot(id, offset) => {
             // Try to resolve FrameSlot by looking up what was stored at this location.
             if let Some(slots) = frame_slots

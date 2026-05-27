@@ -245,6 +245,16 @@ pub enum SorobanStmt {
     Loop {
         body: Vec<SorobanStmt>,
     },
+    /// A counted `for var in start..end` loop (with an optional non-unit step,
+    /// rendered via `.step_by`). Produced by the optimizer when a recovered
+    /// counted loop's induction variable is dead after the loop.
+    For {
+        var: String,
+        start: SorobanExpr,
+        end: SorobanExpr,
+        step: i64,
+        body: Vec<SorobanStmt>,
+    },
     Block(Vec<SorobanStmt>),
     Comment(String),
     Break,

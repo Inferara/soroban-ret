@@ -788,6 +788,24 @@ pub fn generate_stmt(stmt: &SorobanStmt) -> TokenStream {
                 quote! { loop { #(#body_stmts)* } }
             }
         }
+        SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body,
+        } => {
+            let ident = safe_ident(var);
+            let start_e = generate_expr(start);
+            let end_e = generate_expr(end);
+            let body_stmts = generate_stmt_list_with(body, generate_stmt);
+            if *step == 1 {
+                quote! { for #ident in #start_e..#end_e { #(#body_stmts)* } }
+            } else {
+                let step_lit = proc_macro2::Literal::usize_unsuffixed(*step as usize);
+                quote! { for #ident in (#start_e..#end_e).step_by(#step_lit) { #(#body_stmts)* } }
+            }
+        }
         SorobanStmt::Block(stmts) => {
             let body_stmts = generate_stmt_list_with(stmts, generate_stmt);
             quote! { { #(#body_stmts)* } }
@@ -1112,6 +1130,7 @@ fn stmt_has_assign_to(stmt: &SorobanStmt, name: &str) -> bool {
         } => has_assign_to_in(then_body, name) || has_assign_to_in(else_body, name),
         SorobanStmt::Match { arms, .. } => arms.iter().any(|arm| has_assign_to_in(&arm.body, name)),
         SorobanStmt::Loop { body } => has_assign_to_in(body, name),
+        SorobanStmt::For { body, .. } => has_assign_to_in(body, name),
         SorobanStmt::Block(stmts) => has_assign_to_in(stmts, name),
         _ => false,
     }

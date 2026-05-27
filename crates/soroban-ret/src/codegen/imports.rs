@@ -268,6 +268,13 @@ fn scan_stmt(stmt: &SorobanStmt, needs: &mut ImportNeeds) {
             }
         }
         SorobanStmt::Loop { body } => scan_stmts(body, needs),
+        SorobanStmt::For {
+            start, end, body, ..
+        } => {
+            scan_expr(start, needs);
+            scan_expr(end, needs);
+            scan_stmts(body, needs);
+        }
         SorobanStmt::Block(stmts) => scan_stmts(stmts, needs),
         SorobanStmt::Comment(_) | SorobanStmt::Break | SorobanStmt::Continue => {}
     }

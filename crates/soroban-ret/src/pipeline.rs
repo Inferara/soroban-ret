@@ -856,7 +856,7 @@ fn repair_unknown_invoke_functions_in_stmt(stmt: &mut SorobanStmt, function: &So
                 repair_unknown_invoke_functions_from_hint(&mut arm.body, function);
             }
         }
-        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) | SorobanStmt::For { body, .. } => {
             repair_unknown_invoke_functions_from_hint(body, function);
         }
         SorobanStmt::Return(None)
@@ -1086,7 +1086,7 @@ fn repair_unknown_event_values_in_stmt(stmt: &mut SorobanStmt, hint: &EventRepai
                 repair_unknown_event_values_from_hint(&mut arm.body, hint);
             }
         }
-        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) | SorobanStmt::For { body, .. } => {
             repair_unknown_event_values_from_hint(body, hint);
         }
         SorobanStmt::Return(None)
@@ -1330,7 +1330,7 @@ fn repair_weak_auth_in_stmt(stmt: &mut SorobanStmt, hint: &AuthRepairHint) {
                 repair_weak_auth_from_hint(&mut arm.body, hint);
             }
         }
-        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) | SorobanStmt::For { body, .. } => {
             repair_weak_auth_from_hint(body, hint);
         }
         SorobanStmt::Return(None)
@@ -1568,7 +1568,7 @@ fn repair_unknown_storage_keys_in_stmt(stmt: &mut SorobanStmt, key: &SorobanExpr
                 repair_unknown_storage_keys_from_hint(&mut arm.body, key);
             }
         }
-        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) | SorobanStmt::For { body, .. } => {
             repair_unknown_storage_keys_from_hint(body, key);
         }
         SorobanStmt::Return(None)
@@ -2821,6 +2821,9 @@ fn stmt_uses_env(stmt: &SorobanStmt) -> bool {
             expr_uses_env(scrutinee) || arms.iter().any(|arm| stmts_use_env(&arm.body))
         }
         SorobanStmt::Loop { body } | SorobanStmt::Block(body) => stmts_use_env(body),
+        SorobanStmt::For {
+            start, end, body, ..
+        } => expr_uses_env(start) || expr_uses_env(end) || stmts_use_env(body),
     }
 }
 

@@ -897,3 +897,227 @@ fn snapshot_contract_with_constructor() {
     let source = decompile(wasm).expect("decompile contract_with_constructor");
     insta::assert_snapshot!("contract_with_constructor", source);
 }
+
+/// Regression for issue #6 (iterative/fixpoint dataflow over loops). A bounded
+/// loop with a loop-carried accumulator must recover the accumulation as a
+/// mutable variable the loop updates, instead of dropping the loop body and
+/// emitting `todo!()`. The fixture computes `sum(0..5)`.
+#[test]
+fn loop_carried_accumulator_is_recovered() {
+    let wat = r#"(module
+      (func (export "accumulate") (result i64)
+        (local $i i64) (local $acc i64)
+        (local.set $i (i64.const 0))
+        (local.set $acc (i64.const 0))
+        (block $exit
+          (loop $top
+            (br_if $exit (i64.eq (local.get $i) (i64.const 5)))
+            (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+            (br $top)))
+        (local.get $acc)))"#;
+    let wasm = wat::parse_str(wat).expect("assemble wat");
+    let source = decompile(&wasm).expect("decompilation failed");
+
+    // The loop body is recovered, not dropped to a stub.
+    assert!(
+        !source.contains("todo!"),
+        "loop dropped to todo!():\n{source}"
+    );
+    // The accumulator (var_1) becomes a `let mut` declared before the loop.
+    assert!(
+        source.contains("let mut var_1 = 0"),
+        "accumulator not recovered as `let mut`:\n{source}"
+    );
+    // The counter is dead after the loop, so the counted loop renders as a
+    // `for` over the recovered range (DoD #2) rather than a `while`.
+    assert!(
+        source.contains("for var_0 in 0..5"),
+        "counted loop not rendered as a `for` range:\n{source}"
+    );
+    // The accumulation `acc = acc + i` runs in the loop body, and the explicit
+    // counter step is gone (the range steps it).
+    assert!(
+        source.contains("var_1 = (var_1 + var_0)"),
+        "accumulation not recovered:\n{source}"
+    );
+    assert!(
+        !source.contains("var_0 = (var_0 + 1)"),
+        "counter step should be subsumed by the `for` range:\n{source}"
+    );
+    // The function returns the accumulated value.
+    assert!(
+        source.contains("var_1\n") || source.contains("var_1 }"),
+        "missing tail return of accumulator:\n{source}"
+    );
+}
+
+/// Regression for issue #6 — the headline aquarius case: a loop-carried
+/// accumulator spilled to the shadow-stack frame (the Rust SDK's
+/// `global.get 0; i32.sub; local.tee; global.set 0` frame) round-trips through
+/// linear memory each iteration. Baseline degraded the self-referential slot to
+/// `UnknownVal` and the function returned nothing (`todo!`). It must now be
+/// promoted to a `let mut` scalar the loop mutates, and the post-loop load must
+/// return it. The fixture computes `sum(0..5)` through a frame slot.
+#[test]
+fn loop_carried_frame_slot_accumulator_is_recovered() {
+    let wat = r#"(module
+      (memory (export "memory") 1)
+      (global (mut i32) (i32.const 65536))
+      (func (export "sum_spilled") (result i64)
+        (local $fp i32) (local $i i64)
+        (global.set 0 (local.tee $fp (i32.sub (global.get 0) (i32.const 16))))
+        (i64.store offset=8 (local.get $fp) (i64.const 0))
+        (local.set $i (i64.const 0))
+        (block $exit
+          (loop $top
+            (br_if $exit (i64.eq (local.get $i) (i64.const 5)))
+            (i64.store offset=8 (local.get $fp)
+              (i64.add (i64.load offset=8 (local.get $fp)) (local.get $i)))
+            (local.set $i (i64.add (local.get $i) (i64.const 1)))
+            (br $top)))
+        (global.set 0 (i32.add (local.get $fp) (i32.const 16)))
+        (i64.load offset=8 (local.get $fp))))"#;
+    let wasm = wat::parse_str(wat).expect("assemble wat");
+    let source = decompile(&wasm).expect("decompilation failed");
+
+    // The spilled value is recovered: no dropped body, a `while`, and the
+    // accumulator + counter both become mutable variables the loop updates.
+    assert!(
+        !source.contains("todo!"),
+        "spilled accumulator dropped to todo!():\n{source}"
+    );
+    // The promoted frame slot becomes a `let mut` and the counted loop renders
+    // as a `for` over the recovered range with the counter scoped to it.
+    assert!(
+        source.contains("let mut") && source.contains("for var_1 in 0..5"),
+        "frame-slot loop not recovered as a `for` range:\n{source}"
+    );
+    // The accumulator (promoted frame slot var_2) is summed across iterations
+    // and returned.
+    assert!(
+        source.contains("var_2 = (var_2 + var_1)"),
+        "spilled accumulation not recovered:\n{source}"
+    );
+}
+
+/// Issue #6 robustness: step, direction, and liveness variants of recovered
+/// counted loops, plus a never-crash check for unhandled shapes.
+#[test]
+fn loop_recovery_loop_variants() {
+    let decomp = |wat: &str| {
+        let wasm = wat::parse_str(wat).expect("wat assembles");
+        decompile(&wasm).expect("decompile must not error")
+    };
+
+    // Non-unit step renders a `.step_by` range. (sum of 0,2,4)
+    let step2 = decomp(
+        r#"(module (func (export "f") (result i64)
+            (local $i i64) (local $acc i64)
+            (local.set $i (i64.const 0)) (local.set $acc (i64.const 0))
+            (block $e (loop $t
+              (br_if $e (i64.eq (local.get $i) (i64.const 6)))
+              (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+              (local.set $i (i64.add (local.get $i) (i64.const 2))) (br $t)))
+            (local.get $acc)))"#,
+    );
+    assert!(
+        step2.contains("for var_0 in (0..6).step_by(2)"),
+        "non-unit step not rendered as step_by range:\n{step2}"
+    );
+    assert!(
+        !step2.contains("todo!"),
+        "step2 regressed to todo!:\n{step2}"
+    );
+
+    // A descending counter is recovered but stays a `while` (a `for` range can't
+    // count down), not dropped to `todo!`.
+    let down = decomp(
+        r#"(module (func (export "f") (result i64)
+            (local $i i64) (local $acc i64)
+            (local.set $i (i64.const 5)) (local.set $acc (i64.const 0))
+            (block $e (loop $t
+              (br_if $e (i64.eq (local.get $i) (i64.const 0)))
+              (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+              (local.set $i (i64.sub (local.get $i) (i64.const 1))) (br $t)))
+            (local.get $acc)))"#,
+    );
+    assert!(
+        down.contains("while var_0 != 0") && !down.contains("for var_0"),
+        "descending counter should stay a while, not a for:\n{down}"
+    );
+    assert!(
+        !down.contains("todo!"),
+        "countdown regressed to todo!:\n{down}"
+    );
+
+    // A counter read after the loop is live-out: `for` would scope it away, so
+    // the loop must stay a `while`.
+    let live = decomp(
+        r#"(module (func (export "f") (result i64)
+            (local $i i64) (local $acc i64)
+            (local.set $i (i64.const 0)) (local.set $acc (i64.const 0))
+            (block $e (loop $t
+              (br_if $e (i64.eq (local.get $i) (i64.const 5)))
+              (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+              (local.set $i (i64.add (local.get $i) (i64.const 1))) (br $t)))
+            (i64.add (local.get $i) (local.get $acc))))"#,
+    );
+    assert!(
+        live.contains("while var_0 != 5") && !live.contains("for var_0"),
+        "live-out counter must keep the loop a while:\n{live}"
+    );
+
+    // Unhandled shapes must degrade gracefully (no panic, no error) — nested
+    // counted loops and an infinite loop with no counter.
+    let _ = decomp(
+        r#"(module (func (export "f") (result i64)
+            (local $i i64) (local $j i64) (local $acc i64)
+            (local.set $acc (i64.const 0)) (local.set $i (i64.const 0))
+            (block $eo (loop $to
+              (br_if $eo (i64.eq (local.get $i) (i64.const 3)))
+              (local.set $j (i64.const 0))
+              (block $ei (loop $ti
+                (br_if $ei (i64.eq (local.get $j) (i64.const 3)))
+                (local.set $acc (i64.add (local.get $acc) (local.get $j)))
+                (local.set $j (i64.add (local.get $j) (i64.const 1))) (br $ti)))
+              (local.set $i (i64.add (local.get $i) (i64.const 1))) (br $to)))
+            (local.get $acc)))"#,
+    );
+    let _ = decomp(r#"(module (func (export "f") (loop $t (br $t))))"#);
+
+    // A step that does not evenly reach the `== end` bound must NOT become a
+    // `for` range (it would change the iteration count); it stays a `while`.
+    let nondiv = decomp(
+        r#"(module (func (export "f") (result i64)
+            (local $i i64) (local $acc i64)
+            (local.set $i (i64.const 0)) (local.set $acc (i64.const 0))
+            (block $e (loop $t
+              (br_if $e (i64.eq (local.get $i) (i64.const 5)))
+              (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+              (local.set $i (i64.add (local.get $i) (i64.const 2))) (br $t)))
+            (local.get $acc)))"#,
+    );
+    assert!(
+        !nondiv.contains("for var_0"),
+        "non-dividing step must not become a for range:\n{nondiv}"
+    );
+
+    // An accumulator initialized from a parameter (non-literal init) is NOT
+    // recovered — recovering it would rename the `let mut` onto the immutable
+    // param, mutating it (non-compiling). Falls back to valid output instead.
+    let param_init = decomp(
+        r#"(module (func (export "f") (param $base i64) (result i64)
+            (local $i i64) (local $acc i64)
+            (local.set $acc (local.get $base)) (local.set $i (i64.const 0))
+            (block $e (loop $t
+              (br_if $e (i64.eq (local.get $i) (i64.const 5)))
+              (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+              (local.set $i (i64.add (local.get $i) (i64.const 1))) (br $t)))
+            (local.get $acc)))"#,
+    );
+    assert!(
+        !param_init.contains("arg0 = ") && !param_init.contains("arg0 +="),
+        "must not emit assignment to an immutable parameter:\n{param_init}"
+    );
+}
