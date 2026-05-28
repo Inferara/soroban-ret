@@ -936,7 +936,8 @@ fn repair_unknown_invoke_functions_in_expr(expr: &mut SorobanExpr, replacement: 
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
-        | SorobanExpr::ValTag(inner) => {
+        | SorobanExpr::ValTag(inner)
+        | SorobanExpr::SretResult(inner) => {
             repair_unknown_invoke_functions_in_expr(inner, replacement);
         }
         SorobanExpr::ExtendInstanceAndCodeTtl {
@@ -1033,7 +1034,8 @@ fn repair_unknown_invoke_functions_in_expr(expr: &mut SorobanExpr, replacement: 
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::ValTagName(_)
-        | SorobanExpr::UnknownVal => {}
+        | SorobanExpr::UnknownVal
+        | SorobanExpr::CyclicSlot { .. } => {}
     }
 }
 
@@ -1156,7 +1158,8 @@ fn repair_unknown_event_values_in_expr(expr: &mut SorobanExpr, hint: &EventRepai
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
-        | SorobanExpr::ValTag(inner) => {
+        | SorobanExpr::ValTag(inner)
+        | SorobanExpr::SretResult(inner) => {
             repair_unknown_event_values_in_expr(inner, hint);
         }
         SorobanExpr::ExtendInstanceAndCodeTtl {
@@ -1265,7 +1268,8 @@ fn repair_unknown_event_values_in_expr(expr: &mut SorobanExpr, hint: &EventRepai
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::ValTagName(_)
-        | SorobanExpr::UnknownVal => {}
+        | SorobanExpr::UnknownVal
+        | SorobanExpr::CyclicSlot { .. } => {}
     }
 }
 
@@ -1411,7 +1415,8 @@ fn repair_weak_auth_in_expr(expr: &mut SorobanExpr, hint: &AuthRepairHint) {
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
-        | SorobanExpr::ValTag(inner) => repair_weak_auth_in_expr(inner, hint),
+        | SorobanExpr::ValTag(inner)
+        | SorobanExpr::SretResult(inner) => repair_weak_auth_in_expr(inner, hint),
         SorobanExpr::PublishEvent { topics, data, .. } => {
             for topic in topics {
                 repair_weak_auth_in_expr(topic, hint);
@@ -1513,7 +1518,8 @@ fn repair_weak_auth_in_expr(expr: &mut SorobanExpr, hint: &AuthRepairHint) {
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::ValTagName(_)
-        | SorobanExpr::UnknownVal => {}
+        | SorobanExpr::UnknownVal
+        | SorobanExpr::CyclicSlot { .. } => {}
     }
 }
 
@@ -1630,7 +1636,8 @@ fn repair_unknown_storage_keys_in_expr(expr: &mut SorobanExpr, replacement: &Sor
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
-        | SorobanExpr::ValTag(inner) => {
+        | SorobanExpr::ValTag(inner)
+        | SorobanExpr::SretResult(inner) => {
             repair_unknown_storage_keys_in_expr(inner, replacement);
         }
         SorobanExpr::ExtendInstanceAndCodeTtl {
@@ -1745,7 +1752,8 @@ fn repair_unknown_storage_keys_in_expr(expr: &mut SorobanExpr, replacement: &Sor
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::ValTagName(_)
-        | SorobanExpr::UnknownVal => {}
+        | SorobanExpr::UnknownVal
+        | SorobanExpr::CyclicSlot { .. } => {}
     }
 }
 
@@ -2409,7 +2417,8 @@ fn score_param_local_base_in_expr(
         | SorobanExpr::AddressToStrkey(inner)
         | SorobanExpr::PrngReseed(inner)
         | SorobanExpr::PrngBytesNew(inner)
-        | SorobanExpr::ValTag(inner) => {
+        | SorobanExpr::ValTag(inner)
+        | SorobanExpr::SretResult(inner) => {
             score_param_local_base_in_expr(inner, param_count, param_local_base, rebound)
         }
         SorobanExpr::FieldAccess { object, .. } => {
@@ -2599,6 +2608,7 @@ fn score_param_local_base_in_expr(
         SorobanExpr::ContractError { .. }
         | SorobanExpr::Panic
         | SorobanExpr::UnknownVal
+        | SorobanExpr::CyclicSlot { .. }
         | SorobanExpr::Void
         | SorobanExpr::None
         | SorobanExpr::Env
@@ -2900,7 +2910,7 @@ fn expr_uses_env(expr: &SorobanExpr) -> bool {
         SorobanExpr::ValConvert { value, .. } | SorobanExpr::CastAs { value, .. } => {
             expr_uses_env(value)
         }
-        SorobanExpr::ValTag(inner) => expr_uses_env(inner),
+        SorobanExpr::ValTag(inner) | SorobanExpr::SretResult(inner) => expr_uses_env(inner),
         SorobanExpr::ContractError { .. } => false,
 
         // Leaves that never emit `env`
@@ -2918,7 +2928,8 @@ fn expr_uses_env(expr: &SorobanExpr) -> bool {
         | SorobanExpr::NamedLocal(_)
         | SorobanExpr::Panic
         | SorobanExpr::ValTagName(_)
-        | SorobanExpr::UnknownVal => false,
+        | SorobanExpr::UnknownVal
+        | SorobanExpr::CyclicSlot { .. } => false,
     }
 }
 

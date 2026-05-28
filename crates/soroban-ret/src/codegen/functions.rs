@@ -664,6 +664,15 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             quote! { todo!("unknown value") }
         }
 
+        SorobanExpr::CyclicSlot { frame_id, offset } => {
+            let msg = format!("cyclic frame slot ({frame_id}, {offset})");
+            quote! { todo!(#msg) }
+        }
+
+        // A bare sret discriminant that wasn't consumed by a match: render the
+        // underlying call so the value is at least surfaced.
+        SorobanExpr::SretResult(inner) => generate_expr(inner),
+
         SorobanExpr::ValTag(inner) => {
             let val = generate_expr(inner);
             quote! { #val.get_tag() }
@@ -939,7 +948,10 @@ pub fn generate_stmt_result_wrapped(stmt: &SorobanStmt) -> TokenStream {
                 quote! { return Err(#e); }
             } else if matches!(
                 expr,
-                SorobanExpr::Void | SorobanExpr::UnknownVal | SorobanExpr::Panic
+                SorobanExpr::Void
+                    | SorobanExpr::UnknownVal
+                    | SorobanExpr::CyclicSlot { .. }
+                    | SorobanExpr::Panic
             ) {
                 quote! { return #e; }
             } else {
@@ -1023,7 +1035,10 @@ fn generate_stmt_tail_result_wrapped(stmt: &SorobanStmt) -> TokenStream {
                 quote! { Err(#e) }
             } else if matches!(
                 expr,
-                SorobanExpr::Void | SorobanExpr::UnknownVal | SorobanExpr::Panic
+                SorobanExpr::Void
+                    | SorobanExpr::UnknownVal
+                    | SorobanExpr::CyclicSlot { .. }
+                    | SorobanExpr::Panic
             ) {
                 let e = generate_tail_expr(expr);
                 quote! { #e }

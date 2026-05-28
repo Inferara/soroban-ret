@@ -8,7 +8,7 @@
 /// For Phase 1-2: produces spec-only output (signatures without bodies).
 /// Function body lifting will be enhanced in Phase 3.
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use stellar_xdr::ScSpecTypeDef;
@@ -96,42 +96,63 @@ fn frame_slot_key(base: i32, offset: u32) -> Option<i32> {
     i32::try_from(combined).ok()
 }
 
+/// The WASM local index backing a symbolic loop-index value, if any. Loop
+/// counters appear as a loop-carried phi, a promoted let-binding, or a raw
+/// parameter.
+fn sym_index_local(val: &StackVal) -> Option<u32> {
+    match val {
+        StackVal::LoopPhi(idx) | StackVal::LetBinding(idx) | StackVal::WasmParam(idx) => Some(*idx),
+        _ => None,
+    }
+}
+
+/// A small positive constant stride/shift amount (i32 or i64), restricted to a
+/// sane range so an adversarial module cannot synthesize pathological terms.
+fn as_small_stride(val: &StackVal) -> Option<u32> {
+    let v = match val {
+        StackVal::I32(v) => i64::from(*v),
+        StackVal::I64(v) => *v,
+        _ => return None,
+    };
+    (1..=0xFFFF).contains(&v).then_some(v as u32)
+}
+
+/// Recognize a `StackVal` as an affine loop-index term `coeff * index_local`:
+/// the bare index (coeff 1), `index * const` / `const * index`, or
+/// `index << shift` (coeff = `1 << shift`). Returns `None` for anything else,
+/// so `FrameSlot + <unrecognized>` falls through to ordinary `BinOp` handling.
+fn affine_index_term(val: &StackVal) -> Option<SymTerm> {
+    if let Some(index_local) = sym_index_local(val) {
+        return Some(SymTerm {
+            index_local,
+            coeff: 1,
+        });
+    }
+    let StackVal::BinOp(a, op, b) = val else {
+        return None;
+    };
+    match op {
+        BinOper::Mul => sym_index_local(a)
+            .zip(as_small_stride(b))
+            .or_else(|| sym_index_local(b).zip(as_small_stride(a)))
+            .map(|(index_local, coeff)| SymTerm { index_local, coeff }),
+        BinOper::Shl => {
+            let index_local = sym_index_local(a)?;
+            let shift = as_small_stride(b)?;
+            (shift < 31).then(|| SymTerm {
+                index_local,
+                coeff: 1u32 << shift,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Maximum recursion depth for inlining callee bodies into the caller's stmts.
 /// Bounds stack usage and prevents pathological mutual-recursion lifting.
 /// Single source of truth — both `lift_instruction` (entry) and
 /// `lift_inline_call` (recursive callee) check against this.
 const MAX_INLINE_CALL_DEPTH: u32 = 5;
-
-thread_local! {
-    /// Frame slots currently being resolved on the active `stack_val_to_expr`
-    /// recursion path. A slot's stored value can transitively reference the
-    /// same slot (e.g. a Val-encoded `BinOp` that embeds the slot), forming a
-    /// cycle the single-level guard in the `FrameSlot` arm cannot detect.
-    static RESOLVING_FRAME_SLOTS: RefCell<HashSet<(u32, i32)>> =
-        RefCell::new(HashSet::new());
-}
-
-/// RAII marker that records a frame slot as being resolved for the duration of
-/// a `stack_val_to_expr` call, clearing it on return so sibling branches can
-/// still resolve the same slot. `acquire` returns `None` when the slot is
-/// already on the current path — i.e. a cyclic frame-slot reference.
-struct FrameSlotGuard((u32, i32));
-impl FrameSlotGuard {
-    fn acquire(key: (u32, i32)) -> Option<Self> {
-        // Release the borrow before building the guard: the guard's Drop also
-        // borrows RESOLVING_FRAME_SLOTS, so constructing it (and dropping it on
-        // the `false` path) while the borrow is live would panic.
-        let inserted = RESOLVING_FRAME_SLOTS.with(|s| s.borrow_mut().insert(key));
-        inserted.then(|| FrameSlotGuard(key))
-    }
-}
-impl Drop for FrameSlotGuard {
-    fn drop(&mut self) {
-        RESOLVING_FRAME_SLOTS.with(|s| {
-            s.borrow_mut().remove(&self.0);
-        });
-    }
-}
 
 /// Lift all contract functions from WASM module into a ContractModule.
 pub fn lift_functions(
@@ -550,6 +571,13 @@ struct LiftContext<'a> {
     /// of degrading to a self-referential `UnknownVal`. The index is allocated by
     /// extending `locals`, so it never collides with a real WASM local.
     promoted_slots: HashMap<(u32, i32), u32>,
+    /// Frame writes through a *dynamic* (loop-indexed) offset `base + coeff*i`,
+    /// which a single static `(frame_id, offset)` key cannot represent. Keyed by
+    /// `(frame_id, term, static_base)` so a later load with the *same* symbolic
+    /// term and base reads the value back (indexed read-after-write within a
+    /// loop body). Shared via `Rc<RefCell>` like `frame_slots`. A load whose term
+    /// finds no entry degrades to `Unknown`, exactly as before.
+    dynamic_slots: Rc<RefCell<DynamicSlotMap>>,
     /// Depth of guard-error-path blocks we're nested inside. When > 0, the flat
     /// BrIf(0) handler can safely treat constant-true conditions as pass-through
     /// (instead of no-ops) because the enclosing block has an error path.
@@ -585,6 +613,7 @@ impl<'a> LiftContext<'a> {
             phi_protected_locals: Vec::new(),
             loop_carried_locals: Vec::new(),
             promoted_slots: HashMap::new(),
+            dynamic_slots: Rc::new(RefCell::new(HashMap::new())),
             guard_block_depth: 0,
         }
     }
@@ -611,6 +640,7 @@ impl<'a> LiftContext<'a> {
             phi_protected_locals: Vec::new(),
             loop_carried_locals: self.loop_carried_locals.clone(),
             promoted_slots: self.promoted_slots.clone(),
+            dynamic_slots: Rc::clone(&self.dynamic_slots),
             guard_block_depth: self.guard_block_depth,
         }
     }
@@ -665,6 +695,87 @@ impl<'a> LiftContext<'a> {
         } else {
             self.frame_slots.borrow_mut().insert((id, slot), value);
         }
+    }
+
+    /// A dynamic (loop-indexed) write `frame[base + coeff*i]` may land on any
+    /// static slot whose offset is `>= base` and congruent to `base` modulo
+    /// `coeff`. Since the analyzer doesn't know the loop bound, conservatively
+    /// drop every such static slot in this frame so a later static load can't
+    /// return a value the loop may have overwritten. (Soundness hardening; on
+    /// the current fixtures no dynamic term ever forms, so this is a no-op.)
+    fn invalidate_static_aliases(&self, id: u32, term: SymTerm, base: i32) {
+        let coeff = term.coeff as i32;
+        if coeff <= 0 {
+            return;
+        }
+        self.frame_slots.borrow_mut().retain(|&(sid, off), _| {
+            !(sid == id && off >= base && (off - base).rem_euclid(coeff) == 0)
+        });
+    }
+
+    /// Model the `Result` discriminant of an sret (struct-return) call: a void
+    /// helper that received `result_ptr` (frame slot `(id, base)`) and produced a
+    /// cross-contract call result it stored at `result_ptr + 8`, but left no usable
+    /// discriminant at `result_ptr + 0`. Seed `+0` with `SretResult(<call>)` so a
+    /// subsequent `i32.load; br_table` on it reconstructs the `Ok`/`Err` dispatch
+    /// (and the success-arm return) instead of seeing `Unknown` and being dropped.
+    ///
+    /// Tightly gated to avoid false positives: fires only when the payload slot
+    /// holds a genuine cross-contract invoke and the discriminant slot isn't
+    /// already a meaningful call result.
+    fn model_sret_discriminant(&self, id: u32, base: i32) {
+        let mut slots = self.frame_slots.borrow_mut();
+        // A discriminant already modeled as a call result — leave it.
+        if matches!(slots.get(&(id, base)), Some(StackVal::HostCallResult(_))) {
+            return;
+        }
+        let Some(StackVal::HostCallResult(payload)) = slots.get(&(id, base + 8)).cloned() else {
+            return;
+        };
+        // The helper's payload may wrap a cross-contract invoke in decoders /
+        // method chains (ValConvert / MethodCall / FieldAccess / ValTag), so look
+        // for it anywhere in the expression tree, not just at the root.
+        if expr_contains_invoke_contract(&payload) {
+            slots.insert(
+                (id, base),
+                StackVal::HostCallResult(Box::new(SorobanExpr::SretResult(payload))),
+            );
+            cov_mark::hit!(sret_discriminant_modeled);
+        }
+    }
+
+    /// For a void helper that received a `result_ptr` frame slot and transitively
+    /// performs a cross-contract call, seed `result_ptr + 0` with the success
+    /// status byte (`I64(0)`) when nothing has populated it yet. SDK helpers use
+    /// the convention `result_ptr+0 = 0 (Ok) / 1 (Err)` followed by
+    /// `i64.load; i64.const 1; i64.eq; br_if @outer` (an "if Err panic" guard).
+    /// With `+0 = 0` the guard folds to "don't branch" and the success path —
+    /// including the load of the payload at `+8` and the function's return —
+    /// inlines instead of being dropped as an unresolved scrutinee. Tightly gated
+    /// on the cross-contract-call signal to avoid misfiring on scratch buffers.
+    fn seed_sret_success_status(&self, id: u32, base: i32, target_idx: u32) {
+        let mut slots = self.frame_slots.borrow_mut();
+        if !matches!(slots.get(&(id, base)), None | Some(StackVal::Unknown)) {
+            return;
+        }
+        let chains_call = function_calls_host_in_chain(
+            self.wasm_module,
+            target_idx,
+            HostModule::Call,
+            "try_call",
+            MAX_INLINE_CALL_DEPTH,
+        ) || function_calls_host_in_chain(
+            self.wasm_module,
+            target_idx,
+            HostModule::Call,
+            "call",
+            MAX_INLINE_CALL_DEPTH,
+        );
+        if !chains_call {
+            return;
+        }
+        slots.insert((id, base), StackVal::I64(0));
+        cov_mark::hit!(sret_success_status_seeded);
     }
 
     /// Find the loop-carried locals of a structured loop body: body-local locals
@@ -863,7 +974,7 @@ impl<'a> LiftContext<'a> {
                         *fid += 1;
                         id
                     };
-                    let slot = StackVal::FrameSlot(frame_id, 0);
+                    let slot = StackVal::FrameSlot(frame_id, SlotOffset::at(0));
                     if let Some(local) = self.locals.get_mut(*idx as usize) {
                         *local = slot.clone();
                     }
@@ -1189,10 +1300,10 @@ impl<'a> LiftContext<'a> {
                                     // result_ptr + 0 = error flag (0 = success)
                                     self.frame_slots
                                         .borrow_mut()
-                                        .insert((*id, *base), StackVal::I64(0));
+                                        .insert((*id, base.base), StackVal::I64(0));
                                     // result_ptr + 8 = the constructed struct Val
                                     self.frame_slots.borrow_mut().insert(
-                                        (*id, base + 8),
+                                        (*id, base.base + 8),
                                         StackVal::HostCallResult(Box::new(struct_expr)),
                                     );
                                 }
@@ -1261,7 +1372,7 @@ impl<'a> LiftContext<'a> {
                                             count = Some(*v as u32);
                                         }
                                         StackVal::FrameSlot(id, base) if vals_ptr.is_none() => {
-                                            vals_ptr = Some((*id, *base));
+                                            vals_ptr = Some((*id, base.base));
                                         }
                                         _ => {}
                                     }
@@ -1347,9 +1458,9 @@ impl<'a> LiftContext<'a> {
                                 if let Some(StackVal::FrameSlot(id, base)) = args.first() {
                                     self.frame_slots
                                         .borrow_mut()
-                                        .insert((*id, *base), StackVal::I64(0));
+                                        .insert((*id, base.base), StackVal::I64(0));
                                     self.frame_slots.borrow_mut().insert(
-                                        (*id, base + 8),
+                                        (*id, base.base + 8),
                                         StackVal::HostCallResult(Box::new(enum_expr)),
                                     );
                                 }
@@ -1396,7 +1507,7 @@ impl<'a> LiftContext<'a> {
                                     // result_ptr + 0 = error flag (0 = success)
                                     self.frame_slots
                                         .borrow_mut()
-                                        .insert((*id, *base), StackVal::I64(0));
+                                        .insert((*id, base.base), StackVal::I64(0));
                                     // result_ptr + 8*(i+1) = decoded native field value
                                     for (i, name) in unpack_info.field_names.iter().enumerate() {
                                         let field_expr = SorobanExpr::FieldAccess {
@@ -1404,7 +1515,7 @@ impl<'a> LiftContext<'a> {
                                             field: name.clone(),
                                         };
                                         self.frame_slots.borrow_mut().insert(
-                                            (*id, base + 8 * (i as i32 + 1)),
+                                            (*id, base.base + 8 * (i as i32 + 1)),
                                             StackVal::HostCallResult(Box::new(field_expr)),
                                         );
                                     }
@@ -1445,7 +1556,7 @@ impl<'a> LiftContext<'a> {
                                             args: vec![SorobanExpr::U32Literal(i)],
                                         };
                                         self.frame_slots.borrow_mut().insert(
-                                            (*id, base + (i as i32) * 8),
+                                            (*id, base.base + (i as i32) * 8),
                                             StackVal::HostCallResult(Box::new(elem_expr)),
                                         );
                                     }
@@ -1587,12 +1698,12 @@ impl<'a> LiftContext<'a> {
                                             StackVal::HostCallResult(Box::new(get_expr));
                                         let mut fs = self.frame_slots.borrow_mut();
                                         // Status = 1 (success) at offset 0
-                                        fs.insert((*frame_id, *base), StackVal::I64(1));
+                                        fs.insert((*frame_id, base.base), StackVal::I64(1));
                                         // Value at offsets 8, 16, 24 (covers both single
                                         // value and i128 lo/hi patterns)
-                                        fs.insert((*frame_id, base + 8), result_val.clone());
-                                        fs.insert((*frame_id, base + 16), result_val.clone());
-                                        fs.insert((*frame_id, base + 24), result_val);
+                                        fs.insert((*frame_id, base.base + 8), result_val.clone());
+                                        fs.insert((*frame_id, base.base + 16), result_val.clone());
+                                        fs.insert((*frame_id, base.base + 24), result_val);
                                     }
                                     self.found_host_calls = true;
                                     true
@@ -1915,7 +2026,7 @@ impl<'a> LiftContext<'a> {
                             // Check if this is a load-struct wrapper BEFORE inlining.
                             // Save the output pointer info for post-inline gap filling.
                             let output_frame_slot = match args.first() {
-                                Some(StackVal::FrameSlot(id, base)) => Some((*id, *base)),
+                                Some(StackVal::FrameSlot(id, base)) => Some((*id, base.base)),
                                 _ => None,
                             };
                             let load_struct_info = if output_frame_slot.is_some() {
@@ -1985,6 +2096,22 @@ impl<'a> LiftContext<'a> {
                                         StackVal::HostCallResult(Box::new(field_expr)),
                                     );
                                 }
+                            }
+                            // Generic sret modeling: a void helper that received a
+                            // result_ptr and produced a cross-contract call result
+                            // (left at result_ptr+8) but no usable discriminant at
+                            // result_ptr+0. Seed +0 with the call's Result discriminant
+                            // so a later `i32.load; br_table` reconstructs
+                            // `match <call> { Ok(..) => .., Err(..) => .. }` and its
+                            // return path instead of dropping the whole dispatch.
+                            if num_results == 0
+                                && let Some((id, base)) = output_frame_slot
+                            {
+                                // Precise marker first (br_table on Ok/Err)…
+                                self.model_sret_discriminant(id, base);
+                                // …then the success-status seed (br_if-guard pattern),
+                                // which only fires when the slot is still unmodeled.
+                                self.seed_sret_success_status(id, base, *target_idx);
                             }
                             if let Some((inlined_stmts, return_expr)) = inline_result.content {
                                 self.stmts.extend(inlined_stmts);
@@ -2085,10 +2212,39 @@ impl<'a> LiftContext<'a> {
                     }
                     // FrameSlot + constant offset
                     (StackVal::FrameSlot(id, base), StackVal::I32(delta)) => {
-                        self.stack.push(StackVal::FrameSlot(*id, base + delta));
+                        self.stack
+                            .push(StackVal::FrameSlot(*id, base.shift(*delta)));
                     }
                     (StackVal::I32(delta), StackVal::FrameSlot(id, base)) => {
-                        self.stack.push(StackVal::FrameSlot(*id, delta + base));
+                        self.stack
+                            .push(StackVal::FrameSlot(*id, base.shift(*delta)));
+                    }
+                    // FrameSlot + (coeff * loop_index): a dynamic, loop-indexed
+                    // address. Attach a symbolic offset term so a matching indexed
+                    // load can resolve it via `dynamic_slots`.
+                    (StackVal::FrameSlot(id, base), other)
+                        if base.is_static() && affine_index_term(other).is_some() =>
+                    {
+                        let term = affine_index_term(other);
+                        self.stack.push(StackVal::FrameSlot(
+                            *id,
+                            SlotOffset {
+                                base: base.base,
+                                term,
+                            },
+                        ));
+                    }
+                    (other, StackVal::FrameSlot(id, base))
+                        if base.is_static() && affine_index_term(other).is_some() =>
+                    {
+                        let term = affine_index_term(other);
+                        self.stack.push(StackVal::FrameSlot(
+                            *id,
+                            SlotOffset {
+                                base: base.base,
+                                term,
+                            },
+                        ));
                     }
                     _ => self
                         .stack
@@ -2112,10 +2268,17 @@ impl<'a> LiftContext<'a> {
                     }
                     // FrameSlot arithmetic
                     (StackVal::FrameSlot(id, base), StackVal::I32(delta)) => {
-                        self.stack.push(StackVal::FrameSlot(*id, base - delta));
+                        self.stack
+                            .push(StackVal::FrameSlot(*id, base.shift(-*delta)));
                     }
                     (StackVal::I32(delta), StackVal::FrameSlot(id, base)) => {
-                        self.stack.push(StackVal::FrameSlot(*id, delta - base));
+                        self.stack.push(StackVal::FrameSlot(
+                            *id,
+                            SlotOffset {
+                                base: *delta - base.base,
+                                term: base.term,
+                            },
+                        ));
                     }
                     _ => self
                         .stack
@@ -2498,20 +2661,28 @@ impl<'a> LiftContext<'a> {
             | WasmInstr::I64Load32S(off)
             | WasmInstr::I64Load32U(off) => {
                 let addr = self.stack.pop().unwrap_or(StackVal::Unknown);
-                let loaded = if let StackVal::FrameSlot(id, base) = addr {
-                    match frame_slot_key(base, *off) {
-                        // A slot promoted to a loop-carried scalar reads as its
-                        // synthetic `var_{idx}` rather than the spilled value.
-                        Some(slot) if self.promoted_slots.contains_key(&(id, slot)) => {
+                let loaded = if let StackVal::FrameSlot(id, slot_off) = addr {
+                    match (slot_off.term, frame_slot_key(slot_off.base, *off)) {
+                        // A static slot promoted to a loop-carried scalar reads as
+                        // its synthetic `var_{idx}` rather than the spilled value.
+                        (None, Some(slot)) if self.promoted_slots.contains_key(&(id, slot)) => {
                             StackVal::LetBinding(self.promoted_slots[&(id, slot)])
                         }
-                        Some(slot) => self
+                        (None, Some(slot)) => self
                             .frame_slots
                             .borrow()
                             .get(&(id, slot))
                             .cloned()
                             .unwrap_or(StackVal::Unknown),
-                        None => StackVal::Unknown,
+                        // Dynamic (loop-indexed) offset: read the value a matching
+                        // indexed store left in the side table.
+                        (Some(term), Some(base)) => self
+                            .dynamic_slots
+                            .borrow()
+                            .get(&(id, term, base))
+                            .cloned()
+                            .unwrap_or(StackVal::Unknown),
+                        _ => StackVal::Unknown,
                     }
                 } else if let Some(const_addr) = to_u64(&addr) {
                     // Try reading from WASM data segments for constant addresses
@@ -2571,10 +2742,22 @@ impl<'a> LiftContext<'a> {
                     offset: *offset,
                     value: value.clone(),
                 });
-                if let StackVal::FrameSlot(id, base) = addr
-                    && let Some(slot) = frame_slot_key(base, *offset)
+                if let StackVal::FrameSlot(id, slot_off) = addr
+                    && let Some(base) = frame_slot_key(slot_off.base, *offset)
                 {
-                    self.store_frame_slot(id, slot, value);
+                    match slot_off.term {
+                        None => self.store_frame_slot(id, base, value),
+                        // Dynamic (loop-indexed) write: record it in the side table
+                        // keyed by the symbolic term so a matching indexed load reads
+                        // it back, and invalidate any static slot the write could
+                        // alias so a later static load can't read a stale value.
+                        Some(term) => {
+                            self.invalidate_static_aliases(id, term, base);
+                            self.dynamic_slots
+                                .borrow_mut()
+                                .insert((id, term, base), value);
+                        }
+                    }
                 }
             }
             WasmInstr::I32Store(offset) => {
@@ -2583,10 +2766,22 @@ impl<'a> LiftContext<'a> {
                 // Note: I32Store is NOT recorded in memory_stores because it's typically
                 // used for bookkeeping (lengths, offsets), not Val-encoded fields.
                 // Val-encoded fields are stored via I64Store (Soroban Vals are 64-bit).
-                if let StackVal::FrameSlot(id, base) = addr
-                    && let Some(slot) = frame_slot_key(base, *offset)
+                if let StackVal::FrameSlot(id, slot_off) = addr
+                    && let Some(base) = frame_slot_key(slot_off.base, *offset)
                 {
-                    self.store_frame_slot(id, slot, value);
+                    match slot_off.term {
+                        None => self.store_frame_slot(id, base, value),
+                        // Dynamic (loop-indexed) write: record it in the side table
+                        // keyed by the symbolic term so a matching indexed load reads
+                        // it back, and invalidate any static slot the write could
+                        // alias so a later static load can't read a stale value.
+                        Some(term) => {
+                            self.invalidate_static_aliases(id, term, base);
+                            self.dynamic_slots
+                                .borrow_mut()
+                                .insert((id, term, base), value);
+                        }
+                    }
                 }
             }
             WasmInstr::I32Store8(offset)
@@ -2600,10 +2795,22 @@ impl<'a> LiftContext<'a> {
                 // (e.g., I64Load8U) can resolve discriminant bytes written by
                 // struct/enum decoders. Not added to memory_stores (these are
                 // bookkeeping values, not Val-encoded fields).
-                if let StackVal::FrameSlot(id, base) = addr
-                    && let Some(slot) = frame_slot_key(base, *offset)
+                if let StackVal::FrameSlot(id, slot_off) = addr
+                    && let Some(base) = frame_slot_key(slot_off.base, *offset)
                 {
-                    self.store_frame_slot(id, slot, value);
+                    match slot_off.term {
+                        None => self.store_frame_slot(id, base, value),
+                        // Dynamic (loop-indexed) write: record it in the side table
+                        // keyed by the symbolic term so a matching indexed load reads
+                        // it back, and invalidate any static slot the write could
+                        // alias so a later static load can't read a stale value.
+                        Some(term) => {
+                            self.invalidate_static_aliases(id, term, base);
+                            self.dynamic_slots
+                                .borrow_mut()
+                                .insert((id, term, base), value);
+                        }
+                    }
                 }
             }
 
@@ -3943,10 +4150,14 @@ impl<'a> LiftContext<'a> {
             self.phi_protected_locals.push(phi_idx as u32);
         }
 
-        // Filter out empty-body arms (unrecoverable case bodies)
+        // Filter out empty-body arms (unrecoverable case bodies). An sret/Result
+        // dispatch always keeps both Ok/Err arms even if one body is empty, so the
+        // reconstructed dispatch (and its return path) is never dropped.
+        let scrutinee_is_sret = matches!(scrutinee, SorobanExpr::SretResult(_));
         arms.retain(|arm| {
             !arm.body.is_empty()
                 || (phi_local.is_some() && matches!(arm.pattern, MatchPattern::EnumVariant { .. }))
+                || (scrutinee_is_sret && matches!(arm.pattern, MatchPattern::EnumVariant { .. }))
         });
 
         if arms.is_empty() {
@@ -4093,6 +4304,19 @@ impl<'a> LiftContext<'a> {
         scrutinee: &SorobanExpr,
         num_targets: usize,
     ) -> Option<(String, Vec<String>, Vec<bool>)> {
+        // An sret/Result discriminant: a 2-way dispatch on a call's `Result<T, E>`
+        // written into a frame slot. Reconstruct as `Ok`/`Err` (both data-carrying)
+        // so the success *and* error paths — and the post-dispatch return — survive
+        // instead of being dropped as an unresolved (`UnknownVal`) scrutinee. Checked
+        // before the integer-enum loop so a same-arity UDT enum can't shadow it.
+        if matches!(scrutinee, SorobanExpr::SretResult(_)) {
+            return Some((
+                "Result".to_string(),
+                vec!["Ok".to_string(), "Err".to_string()],
+                vec![true, true],
+            ));
+        }
+
         // Check all integer enums in the registry.
         // Only match when the variant count >= the br_table target count
         // (some variants may share arms). This prevents misidentifying union
@@ -4781,7 +5005,7 @@ impl<'a> LiftContext<'a> {
                     args: vec![SorobanExpr::U32Literal(i)],
                 };
                 self.frame_slots.borrow_mut().insert(
-                    (*id, base + (i as i32) * 8),
+                    (*id, base.base + (i as i32) * 8),
                     StackVal::HostCallResult(Box::new(elem_expr)),
                 );
             }
@@ -4943,7 +5167,7 @@ impl<'a> LiftContext<'a> {
                         field: name.clone(),
                     };
                     self.frame_slots.borrow_mut().insert(
-                        (*id, base + (i as i32) * 8),
+                        (*id, base.base + (i as i32) * 8),
                         StackVal::HostCallResult(Box::new(field_expr)),
                     );
                 }
@@ -8186,26 +8410,29 @@ fn lower_tag_comparison(
     params: &[FnParam],
     registry: &TypeRegistry,
     frame_slots: Option<&FrameSlotMap>,
+    visiting: &mut Vec<(u32, i32)>,
 ) -> Option<(SorobanExpr, SorobanExpr)> {
     if let Some(ValShape::TagOf(inner)) = recognize_val_shape(a)
         && let Some(tag) = to_u64(b)
     {
-        let lhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr(
+        let lhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr_inner(
             &inner,
             params,
             registry,
             frame_slots,
+            visiting,
         )));
         return Some((lhs, val_tag_const_expr(tag)));
     }
     if let Some(ValShape::TagOf(inner)) = recognize_val_shape(b)
         && let Some(tag) = to_u64(a)
     {
-        let rhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr(
+        let rhs = SorobanExpr::ValTag(Box::new(stack_val_to_expr_inner(
             &inner,
             params,
             registry,
             frame_slots,
+            visiting,
         )));
         return Some((val_tag_const_expr(tag), rhs));
     }
@@ -8308,6 +8535,49 @@ fn strip_val_encode(val: StackVal) -> StackVal {
     }
 }
 
+/// A symbolic affine term on a frame-slot offset: `coeff * <index_local>`,
+/// where `index_local` is the WASM local holding a loop induction variable.
+/// Lets `frame[base + i*stride]` accesses (which otherwise fall through to
+/// `BinOp`) be addressed. A slot carrying a term is routed to the separate
+/// `dynamic_slots` table; only the static `SlotOffset::base` keys `frame_slots`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SymTerm {
+    /// WASM local index of the induction variable.
+    index_local: u32,
+    /// Byte-stride multiplier (always > 0).
+    coeff: u32,
+}
+
+/// A frame-relative byte offset carried by `StackVal::FrameSlot`. `term == None`
+/// is the purely-static case and behaves exactly like the legacy `i32` offset
+/// that keys the `frame_slots` map. A `Some` term marks a dynamic (loop-indexed)
+/// address resolved via `dynamic_slots`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SlotOffset {
+    /// Static byte offset from the frame base (the legacy slot key).
+    base: i32,
+    /// Optional affine term `coeff * index_local`. `None` == purely static.
+    term: Option<SymTerm>,
+}
+
+impl SlotOffset {
+    /// A purely-static offset — the only kind that keys `frame_slots`.
+    fn at(base: i32) -> Self {
+        SlotOffset { base, term: None }
+    }
+    /// True when this offset has no symbolic term.
+    fn is_static(&self) -> bool {
+        self.term.is_none()
+    }
+    /// Shift the static base by `delta`, preserving any symbolic term.
+    fn shift(&self, delta: i32) -> Self {
+        SlotOffset {
+            base: self.base + delta,
+            term: self.term,
+        }
+    }
+}
+
 /// Abstract value tracked on the WASM stack during simulation.
 #[derive(Debug, Clone, PartialEq)]
 enum StackVal {
@@ -8347,9 +8617,10 @@ enum StackVal {
     /// Transitional: `StackPtrRef - frame_size` before local_tee assigns it.
     /// The frame size value is not read; only the variant tag matters.
     FrameBase(#[allow(dead_code)] i32),
-    /// A frame-relative address: (globally unique frame ID, byte offset from frame base).
-    /// Arithmetic on a FrameSlot produces another FrameSlot with updated offset.
-    FrameSlot(u32, i32),
+    /// A frame-relative address: (globally unique frame ID, offset from frame base).
+    /// Arithmetic on a FrameSlot produces another FrameSlot with updated offset;
+    /// the offset may be static or carry a symbolic loop-index term (`SlotOffset`).
+    FrameSlot(u32, SlotOffset),
     /// Unknown/untracked value
     Unknown,
 }
@@ -9020,16 +9291,34 @@ fn narrow_to_bool(expr: SorobanExpr, return_type: &Option<ScSpecTypeDef>) -> Sor
 /// Type alias for frame slot storage: maps (frame_id, byte_offset) to stored StackVal.
 type FrameSlotMap = HashMap<(u32, i32), StackVal>;
 
+/// Type alias for the dynamic (loop-indexed) frame slot side table: maps
+/// `(frame_id, symbolic_term, static_base)` to the stored `StackVal`.
+type DynamicSlotMap = HashMap<(u32, SymTerm, i32), StackVal>;
+
 /// Convert a stack value to a SorobanExpr, decoding packed Soroban Val constants.
 ///
 /// When `frame_slots` is provided, FrameSlot values are resolved by looking up
 /// the stored value in the frame slot map (populated by I64Store/I32Store handlers).
-#[allow(clippy::only_used_in_recursion)]
 fn stack_val_to_expr(
     val: &StackVal,
     params: &[FnParam],
     registry: &TypeRegistry,
     frame_slots: Option<&FrameSlotMap>,
+) -> SorobanExpr {
+    // `visiting` records the frame slots on the active resolution path so a
+    // self-referential slot is detected with path-local state instead of a
+    // thread-local set.
+    let mut visiting: Vec<(u32, i32)> = Vec::new();
+    stack_val_to_expr_inner(val, params, registry, frame_slots, &mut visiting)
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn stack_val_to_expr_inner(
+    val: &StackVal,
+    params: &[FnParam],
+    registry: &TypeRegistry,
+    frame_slots: Option<&FrameSlotMap>,
+    visiting: &mut Vec<(u32, i32)>,
 ) -> SorobanExpr {
     match val {
         StackVal::I32(v) => SorobanExpr::I32Literal(*v),
@@ -9042,8 +9331,10 @@ fn stack_val_to_expr(
                 BinOper::Add | BinOper::Sub | BinOper::Mul => {
                     // Use raw-int conversion for children: constants inside stripped arithmetic
                     // are raw integers, not Val-encoded (e.g., the `2` in `b * 2`).
-                    let a_expr = stack_val_to_arith_expr(a, params, registry, frame_slots);
-                    let b_expr = stack_val_to_arith_expr(b, params, registry, frame_slots);
+                    let a_expr =
+                        stack_val_to_arith_expr_inner(a, params, registry, frame_slots, visiting);
+                    let b_expr =
+                        stack_val_to_arith_expr_inner(b, params, registry, frame_slots, visiting);
                     match op {
                         BinOper::Add => SorobanExpr::Add(Box::new(a_expr), Box::new(b_expr)),
                         BinOper::Sub => SorobanExpr::Sub(Box::new(a_expr), Box::new(b_expr)),
@@ -9064,8 +9355,13 @@ fn stack_val_to_expr(
                                 && let StackVal::I64(shift) = **b
                                 && (1..=3).contains(&shift)
                             {
-                                let a_expr =
-                                    stack_val_to_arith_expr(a, params, registry, frame_slots);
+                                let a_expr = stack_val_to_arith_expr_inner(
+                                    a,
+                                    params,
+                                    registry,
+                                    frame_slots,
+                                    visiting,
+                                );
                                 let multiplier = 1i64 << shift;
                                 return SorobanExpr::Mul(
                                     Box::new(a_expr),
@@ -9074,18 +9370,21 @@ fn stack_val_to_expr(
                             }
                             SorobanExpr::UnknownVal
                         }
-                        ref other => stack_val_to_expr(other, params, registry, frame_slots),
+                        ref other => {
+                            stack_val_to_expr_inner(other, params, registry, frame_slots, visiting)
+                        }
                     }
                 }
                 // Tag extraction `v & 0xFF` → `v.get_tag()`. Anything else AND-shaped
                 // wasn't a recognized Val pattern, so it stays unknown.
                 BinOper::And => {
                     if to_u64(b) == Some(0xFF) {
-                        SorobanExpr::ValTag(Box::new(stack_val_to_expr(
+                        SorobanExpr::ValTag(Box::new(stack_val_to_expr_inner(
                             a,
                             params,
                             registry,
                             frame_slots,
+                            visiting,
                         )))
                     } else {
                         SorobanExpr::UnknownVal
@@ -9104,28 +9403,43 @@ fn stack_val_to_expr(
             // "is the Val's upper 32 bits > n", which for U32 Vals equals "decoded > n".
             // Decode these threshold constants to produce readable comparisons.
             // Tag check: `(v & 0xFF) <cmp> TAG` → `v.get_tag() <cmp> Tag::Name`.
-            let (a_expr, b_expr) =
-                if let Some(pair) = lower_tag_comparison(a, b, params, registry, frame_slots) {
-                    pair
-                } else {
-                    match (a.as_ref(), b.as_ref()) {
-                        (_, StackVal::I64(v)) if is_val_threshold_constant(*v as u64) => {
-                            let decoded = (*v as u64) >> 32;
-                            let a_e = stack_val_to_expr(a, params, registry, frame_slots);
-                            (a_e, SorobanExpr::I64Literal(decoded as i64))
-                        }
-                        (StackVal::I64(v), _) if is_val_threshold_constant(*v as u64) => {
-                            let decoded = (*v as u64) >> 32;
-                            let b_e = stack_val_to_expr(b, params, registry, frame_slots);
-                            (SorobanExpr::I64Literal(decoded as i64), b_e)
-                        }
-                        _ => {
-                            let a_e = stack_val_to_arith_expr(a, params, registry, frame_slots);
-                            let b_e = stack_val_to_arith_expr(b, params, registry, frame_slots);
-                            (a_e, b_e)
-                        }
+            let (a_expr, b_expr) = if let Some(pair) =
+                lower_tag_comparison(a, b, params, registry, frame_slots, visiting)
+            {
+                pair
+            } else {
+                match (a.as_ref(), b.as_ref()) {
+                    (_, StackVal::I64(v)) if is_val_threshold_constant(*v as u64) => {
+                        let decoded = (*v as u64) >> 32;
+                        let a_e =
+                            stack_val_to_expr_inner(a, params, registry, frame_slots, visiting);
+                        (a_e, SorobanExpr::I64Literal(decoded as i64))
                     }
-                };
+                    (StackVal::I64(v), _) if is_val_threshold_constant(*v as u64) => {
+                        let decoded = (*v as u64) >> 32;
+                        let b_e =
+                            stack_val_to_expr_inner(b, params, registry, frame_slots, visiting);
+                        (SorobanExpr::I64Literal(decoded as i64), b_e)
+                    }
+                    _ => {
+                        let a_e = stack_val_to_arith_expr_inner(
+                            a,
+                            params,
+                            registry,
+                            frame_slots,
+                            visiting,
+                        );
+                        let b_e = stack_val_to_arith_expr_inner(
+                            b,
+                            params,
+                            registry,
+                            frame_slots,
+                            visiting,
+                        );
+                        (a_e, b_e)
+                    }
+                }
+            };
             match op {
                 CmpOp::Eq => SorobanExpr::Eq(Box::new(a_expr), Box::new(b_expr)),
                 CmpOp::Ne => SorobanExpr::Ne(Box::new(a_expr), Box::new(b_expr)),
@@ -9136,7 +9450,7 @@ fn stack_val_to_expr(
             }
         }
         StackVal::Eqz(a) => {
-            let a_expr = stack_val_to_expr(a, params, registry, frame_slots);
+            let a_expr = stack_val_to_expr_inner(a, params, registry, frame_slots, visiting);
             // If the inner expression is already a comparison, use Not to avoid
             // chained comparison operators (which Rust rejects)
             match &a_expr {
@@ -9155,8 +9469,11 @@ fn stack_val_to_expr(
         StackVal::FrameSlotPhi(_, _) => SorobanExpr::UnknownVal,
         StackVal::FrameSlot(id, offset) => {
             // Try to resolve FrameSlot by looking up what was stored at this location.
-            if let Some(slots) = frame_slots
-                && let Some(stored) = slots.get(&(*id, *offset))
+            // Only static offsets key `frame_slots`; a dynamic (loop-indexed) address
+            // has no single stored expression and degrades to UnknownVal.
+            if offset.is_static()
+                && let Some(slots) = frame_slots
+                && let Some(stored) = slots.get(&(*id, offset.base))
             {
                 // Avoid infinite recursion: don't recurse into FrameSlots or Unknown
                 if !matches!(
@@ -9165,13 +9482,24 @@ fn stack_val_to_expr(
                 ) {
                     // The stored value may transitively reference this same slot
                     // (e.g. a Val-encoded BinOp embedding it), which the matches!
-                    // check above cannot see. Track slots on the current
-                    // resolution path; a revisit means a cycle, so degrade to
-                    // UnknownVal instead of recursing forever.
-                    return match FrameSlotGuard::acquire((*id, *offset)) {
-                        Some(_guard) => stack_val_to_expr(stored, params, registry, frame_slots),
-                        None => SorobanExpr::UnknownVal,
-                    };
+                    // check above cannot see. `visiting` records the slots on the
+                    // current resolution path; a revisit means a cycle, so degrade
+                    // to UnknownVal instead of recursing forever.
+                    let key = (*id, offset.base);
+                    if visiting.contains(&key) {
+                        // Genuine self-referential slot: report it precisely
+                        // (which slot closed the cycle) rather than as an
+                        // anonymous unknown.
+                        return SorobanExpr::CyclicSlot {
+                            frame_id: *id,
+                            offset: offset.base,
+                        };
+                    }
+                    visiting.push(key);
+                    let resolved =
+                        stack_val_to_expr_inner(stored, params, registry, frame_slots, visiting);
+                    visiting.pop();
+                    return resolved;
                 }
             }
             SorobanExpr::UnknownVal
@@ -9187,12 +9515,23 @@ fn stack_val_to_expr(
 /// raw integer literals rather than going through `try_decode_val`. Constants like `2`
 /// (a multiplication factor) or `32` (a shift amount) appear as `StackVal::I64(2)` and
 /// would otherwise decode to Void/U32(0) via `try_decode_val`.
-#[allow(clippy::only_used_in_recursion)]
 fn stack_val_to_arith_expr(
     val: &StackVal,
     params: &[FnParam],
     registry: &TypeRegistry,
     frame_slots: Option<&FrameSlotMap>,
+) -> SorobanExpr {
+    let mut visiting: Vec<(u32, i32)> = Vec::new();
+    stack_val_to_arith_expr_inner(val, params, registry, frame_slots, &mut visiting)
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn stack_val_to_arith_expr_inner(
+    val: &StackVal,
+    params: &[FnParam],
+    registry: &TypeRegistry,
+    frame_slots: Option<&FrameSlotMap>,
+    visiting: &mut Vec<(u32, i32)>,
 ) -> SorobanExpr {
     match val {
         StackVal::I32(v) => SorobanExpr::I32Literal(*v),
@@ -9205,7 +9544,7 @@ fn stack_val_to_arith_expr(
             cov_mark::hit!(void_return_guard_in_arith);
             SorobanExpr::I64Literal(0)
         }
-        _ => stack_val_to_expr(val, params, registry, frame_slots),
+        _ => stack_val_to_expr_inner(val, params, registry, frame_slots, visiting),
     }
 }
 
@@ -9228,6 +9567,27 @@ fn is_void_returning_expr(expr: &SorobanExpr) -> bool {
         expr,
         SorobanExpr::ExtendInstanceAndCodeTtl { .. } | SorobanExpr::StorageExtendTtl { .. }
     )
+}
+
+/// True if `expr` is — or transitively wraps — a cross-contract invoke
+/// (`InvokeContract` / `TryInvokeContract`). Helper sret callees often store
+/// the invoke result wrapped in `ValConvert` / `MethodCall` / `FieldAccess`, so
+/// the discriminant-modeling gate has to look past those layers.
+fn expr_contains_invoke_contract(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::InvokeContract { .. } | SorobanExpr::TryInvokeContract { .. } => true,
+        SorobanExpr::ValConvert { value: inner, .. }
+        | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::FieldAccess { object: inner, .. }
+        | SorobanExpr::ValTag(inner)
+        | SorobanExpr::SretResult(inner)
+        | SorobanExpr::Not(inner)
+        | SorobanExpr::ErrorFromCode(inner) => expr_contains_invoke_contract(inner),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            expr_contains_invoke_contract(object) || args.iter().any(expr_contains_invoke_contract)
+        }
+        _ => false,
+    }
 }
 
 /// Try to decode a 64-bit value as a packed Soroban Val.
@@ -9339,14 +9699,14 @@ fn extract_u32_from_stack_val(val: &StackVal) -> Option<u32> {
 /// - Val-encoded: `(FrameSlot << 32) | 4` (the BinOp tree from u32 Val encoding)
 fn extract_frame_slot_from_stack_val(val: &StackVal) -> Option<(u32, i32)> {
     match val {
-        StackVal::FrameSlot(id, offset) => Some((*id, *offset)),
+        StackVal::FrameSlot(id, offset) => Some((*id, offset.base)),
         // Val-encoded: (FrameSlot << 32) | 4 (centralized recognition).
         StackVal::BinOp(..) => match recognize_val_shape(val) {
             Some(ValShape::Construct {
                 payload: StackVal::FrameSlot(id, offset),
                 shift: 32,
                 tag: TAG_U32,
-            }) => Some((id, offset)),
+            }) => Some((id, offset.base)),
             _ => None,
         },
         _ => None,
@@ -9522,7 +9882,7 @@ mod tests {
         // and resolving it re-enters the slot lookup forever. The one-level
         // `matches!` guard can't see the embedded slot (the stored value is a
         // BinOp, not a bare FrameSlot), so the path tracker must break the cycle.
-        let slot = StackVal::FrameSlot(0, 0);
+        let slot = StackVal::FrameSlot(0, SlotOffset::at(0));
         let encoded = StackVal::BinOp(
             Box::new(StackVal::BinOp(
                 Box::new(slot.clone()),
@@ -9536,9 +9896,16 @@ mod tests {
         slots.insert((0, 0), encoded);
 
         let registry = empty_registry();
-        // Terminates (no overflow) and degrades the cyclic value to UnknownVal.
+        // Terminates (no overflow) and reports the cycle precisely, naming the
+        // slot that closed it, instead of an anonymous UnknownVal.
         let expr = stack_val_to_expr(&slot, &[], &registry, Some(&slots));
-        assert_eq!(expr, SorobanExpr::UnknownVal);
+        assert_eq!(
+            expr,
+            SorobanExpr::CyclicSlot {
+                frame_id: 0,
+                offset: 0
+            }
+        );
     }
 
     #[test]
@@ -9547,12 +9914,28 @@ mod tests {
         // (Eqz), so the one-level guard passes at each hop. The path tracker
         // must still terminate the mutual recursion.
         let mut slots: FrameSlotMap = HashMap::new();
-        slots.insert((0, 0), StackVal::Eqz(Box::new(StackVal::FrameSlot(0, 8))));
-        slots.insert((0, 8), StackVal::Eqz(Box::new(StackVal::FrameSlot(0, 0))));
+        slots.insert(
+            (0, 0),
+            StackVal::Eqz(Box::new(StackVal::FrameSlot(0, SlotOffset::at(8)))),
+        );
+        slots.insert(
+            (0, 8),
+            StackVal::Eqz(Box::new(StackVal::FrameSlot(0, SlotOffset::at(0)))),
+        );
 
         let registry = empty_registry();
-        // The only assertion that matters is that this returns at all.
-        let _ = stack_val_to_expr(&StackVal::FrameSlot(0, 0), &[], &registry, Some(&slots));
+        // Terminates, and the recovered expression names the cyclic slot
+        // precisely somewhere inside (wrapped by the Eqz comparisons).
+        let expr = stack_val_to_expr(
+            &StackVal::FrameSlot(0, SlotOffset::at(0)),
+            &[],
+            &registry,
+            Some(&slots),
+        );
+        assert!(
+            format!("{expr:?}").contains("CyclicSlot"),
+            "expected a precise CyclicSlot marker, got {expr:?}"
+        );
     }
 
     #[test]
@@ -9563,8 +9946,246 @@ mod tests {
         slots.insert((0, 0), StackVal::Param("amount".to_string()));
 
         let registry = empty_registry();
-        let expr = stack_val_to_expr(&StackVal::FrameSlot(0, 0), &[], &registry, Some(&slots));
+        let expr = stack_val_to_expr(
+            &StackVal::FrameSlot(0, SlotOffset::at(0)),
+            &[],
+            &registry,
+            Some(&slots),
+        );
         assert_eq!(expr, SorobanExpr::Param("amount".to_string()));
+    }
+
+    // ----- symbolic dynamic offsets (issue #7) --------------------------
+
+    #[test]
+    fn affine_index_term_recognizes_index_shapes() {
+        let idx = StackVal::WasmParam(2);
+        // Bare index → stride 1.
+        assert_eq!(
+            affine_index_term(&idx),
+            Some(SymTerm {
+                index_local: 2,
+                coeff: 1
+            })
+        );
+        // index * const and const * index (either operand order).
+        let mul =
+            |a: StackVal, b: StackVal| StackVal::BinOp(Box::new(a), BinOper::Mul, Box::new(b));
+        assert_eq!(
+            affine_index_term(&mul(idx.clone(), StackVal::I32(8))),
+            Some(SymTerm {
+                index_local: 2,
+                coeff: 8
+            })
+        );
+        assert_eq!(
+            affine_index_term(&mul(StackVal::I64(8), idx.clone())),
+            Some(SymTerm {
+                index_local: 2,
+                coeff: 8
+            })
+        );
+        // index << shift → coeff = 1 << shift.
+        let shl = StackVal::BinOp(
+            Box::new(idx.clone()),
+            BinOper::Shl,
+            Box::new(StackVal::I32(3)),
+        );
+        assert_eq!(
+            affine_index_term(&shl),
+            Some(SymTerm {
+                index_local: 2,
+                coeff: 8
+            })
+        );
+        // Loop-carried phi and promoted let-binding are also valid indices.
+        assert!(affine_index_term(&StackVal::LoopPhi(5)).is_some());
+        assert!(affine_index_term(&StackVal::LetBinding(5)).is_some());
+        // Non-index shapes are rejected (fall through to plain BinOp).
+        assert_eq!(affine_index_term(&StackVal::I32(8)), None);
+        assert_eq!(
+            affine_index_term(&mul(StackVal::I32(3), StackVal::I32(8))),
+            None
+        );
+        // Stride 0 / out-of-range is rejected.
+        assert_eq!(affine_index_term(&mul(idx.clone(), StackVal::I32(0))), None);
+    }
+
+    #[test]
+    fn dynamic_offset_arithmetic_and_readback() {
+        use crate::wasm::ir::WasmInstr;
+        // `frame_ptr + i*8` forms a dynamic FrameSlot; a store then a load with
+        // the same symbolic offset round-trips the value through dynamic_slots,
+        // while a load at a different index misses (→ Unknown).
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 1);
+
+        // Build the dynamic address `FrameSlot(0, base 0) + WasmParam(0)*8`.
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.stack.push(StackVal::WasmParam(0));
+        ctx.lift_instruction(&WasmInstr::I32Const(8));
+        ctx.lift_instruction(&WasmInstr::I32Mul);
+        ctx.lift_instruction(&WasmInstr::I32Add);
+        let dyn_addr = ctx.stack.last().cloned().unwrap();
+        assert!(
+            matches!(&dyn_addr, StackVal::FrameSlot(0, off) if off.term == Some(SymTerm { index_local: 0, coeff: 8 })),
+            "expected dynamic FrameSlot, got {dyn_addr:?}"
+        );
+
+        // Store a value through the dynamic address: [addr, value] then i64.store.
+        ctx.stack.push(dyn_addr.clone());
+        ctx.stack.push(StackVal::Param("spilled".to_string()));
+        ctx.lift_instruction(&WasmInstr::I64Store(0));
+
+        // Load it back at the same index → recovers the stored value.
+        ctx.stack.push(dyn_addr);
+        ctx.lift_instruction(&WasmInstr::I64Load(0));
+        assert_eq!(
+            ctx.stack.pop(),
+            Some(StackVal::Param("spilled".to_string()))
+        );
+
+        // A load at a different index (WasmParam(1)) misses → Unknown.
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.stack.push(StackVal::WasmParam(1));
+        ctx.lift_instruction(&WasmInstr::I32Const(8));
+        ctx.lift_instruction(&WasmInstr::I32Mul);
+        ctx.lift_instruction(&WasmInstr::I32Add);
+        ctx.lift_instruction(&WasmInstr::I64Load(0));
+        assert_eq!(ctx.stack.pop(), Some(StackVal::Unknown));
+    }
+
+    #[test]
+    fn dynamic_store_invalidates_aliased_static_slots() {
+        use crate::wasm::ir::WasmInstr;
+        // A dynamic write `frame[0 + i*8]` may alias the static slot at offset 8
+        // (congruent to 0 mod 8) but not the one at offset 12, so only the former
+        // is dropped — a later static load of it can't return a stale value.
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 1);
+        ctx.frame_slots
+            .borrow_mut()
+            .insert((0, 8), StackVal::Param("a".to_string()));
+        ctx.frame_slots
+            .borrow_mut()
+            .insert((0, 12), StackVal::Param("b".to_string()));
+
+        // Build and store through the dynamic address `frame_ptr + i*8`.
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.stack.push(StackVal::WasmParam(0));
+        ctx.lift_instruction(&WasmInstr::I32Const(8));
+        ctx.lift_instruction(&WasmInstr::I32Mul);
+        ctx.lift_instruction(&WasmInstr::I32Add);
+        ctx.stack.push(StackVal::Param("c".to_string()));
+        ctx.lift_instruction(&WasmInstr::I64Store(0));
+
+        assert!(!ctx.frame_slots.borrow().contains_key(&(0, 8)));
+        assert_eq!(
+            ctx.frame_slots.borrow().get(&(0, 12)),
+            Some(&StackVal::Param("b".to_string()))
+        );
+    }
+
+    #[test]
+    fn sret_result_scrutinee_resolves_to_ok_err() {
+        // A br_table whose scrutinee is an sret/Result discriminant resolves to a
+        // two-arm Ok/Err dispatch (both data-carrying), regardless of registry
+        // contents — checked before the integer-enum heuristic.
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+
+        let scrut = SorobanExpr::SretResult(Box::new(SorobanExpr::UnknownVal));
+        assert_eq!(
+            ctx.try_resolve_enum_for_scrutinee(&scrut, 2),
+            Some((
+                "Result".to_string(),
+                vec!["Ok".to_string(), "Err".to_string()],
+                vec![true, true]
+            ))
+        );
+        // A plain unknown scrutinee with no registry types still resolves to None.
+        assert_eq!(
+            ctx.try_resolve_enum_for_scrutinee(&SorobanExpr::UnknownVal, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn model_sret_discriminant_seeds_marker_from_invoke_payload() {
+        // A void helper left a cross-contract invoke result at result_ptr+8 but no
+        // discriminant at result_ptr+0. Modeling seeds +0 with SretResult(<invoke>)
+        // so a later load+br_table reconstructs the Ok/Err dispatch.
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 1);
+
+        let invoke = SorobanExpr::TryInvokeContract {
+            address: Box::new(SorobanExpr::Param("calc".to_string())),
+            function: Box::new(SorobanExpr::SymbolLiteral("estimate_swap".to_string())),
+            args: vec![],
+            return_type: None,
+        };
+        ctx.frame_slots
+            .borrow_mut()
+            .insert((0, 8), StackVal::HostCallResult(Box::new(invoke.clone())));
+
+        ctx.model_sret_discriminant(0, 0);
+
+        // +0 now resolves to SretResult(<invoke>), which the dispatch recognizer
+        // turns into a `match .. { Ok(..) => .., Err(..) => .. }`.
+        match ctx.frame_slots.borrow().get(&(0, 0)) {
+            Some(StackVal::HostCallResult(e)) => {
+                assert_eq!(**e, SorobanExpr::SretResult(Box::new(invoke)));
+            }
+            other => panic!("expected SretResult marker at result_ptr+0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expr_contains_invoke_contract_looks_past_wrappers() {
+        // The helper's invoke result is typically wrapped in ValConvert / MethodCall /
+        // FieldAccess before being stored — the recognizer must see past those.
+        let invoke = SorobanExpr::TryInvokeContract {
+            address: Box::new(SorobanExpr::UnknownVal),
+            function: Box::new(SorobanExpr::SymbolLiteral("foo".to_string())),
+            args: vec![],
+            return_type: None,
+        };
+        assert!(expr_contains_invoke_contract(&invoke));
+        let wrapped = SorobanExpr::ValConvert {
+            value: Box::new(SorobanExpr::MethodCall {
+                object: Box::new(invoke.clone()),
+                method: "unwrap".to_string(),
+                args: vec![],
+            }),
+            target_type: "u128".to_string(),
+        };
+        assert!(expr_contains_invoke_contract(&wrapped));
+        // Pure non-invoke expressions are rejected.
+        assert!(!expr_contains_invoke_contract(&SorobanExpr::U64Literal(7)));
+    }
+
+    #[test]
+    fn model_sret_discriminant_ignores_non_invoke_payload() {
+        // No false positive: a plain (non-cross-contract) payload at +8 must not
+        // synthesize an sret discriminant.
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 1);
+        ctx.frame_slots.borrow_mut().insert(
+            (0, 8),
+            StackVal::HostCallResult(Box::new(SorobanExpr::U64Literal(7))),
+        );
+        ctx.model_sret_discriminant(0, 0);
+        assert!(ctx.frame_slots.borrow().get(&(0, 0)).is_none());
     }
 
     // ----- detect_memory_copy_loop bound -------------------
@@ -9863,14 +10484,14 @@ mod tests {
     #[test]
     fn extract_frame_slot_from_stack_val_decodes_and_rejects() {
         let encoded = StackVal::BinOp(
-            Box::new(shl(StackVal::FrameSlot(3, 16), 32)),
+            Box::new(shl(StackVal::FrameSlot(3, SlotOffset::at(16)), 32)),
             BinOper::Or,
             Box::new(StackVal::I64(TAG_U32 as i64)),
         );
         assert_eq!(extract_frame_slot_from_stack_val(&encoded), Some((3, 16)));
         // Direct frame slot passes through.
         assert_eq!(
-            extract_frame_slot_from_stack_val(&StackVal::FrameSlot(1, 8)),
+            extract_frame_slot_from_stack_val(&StackVal::FrameSlot(1, SlotOffset::at(8))),
             Some((1, 8))
         );
         // A U32 construction over a non-frame-slot payload is rejected.
@@ -9886,16 +10507,30 @@ mod tests {
     fn lower_tag_comparison_handles_both_orders_and_misses() {
         let reg = empty_registry();
         // tag-of on the left.
-        let (l, r) =
-            lower_tag_comparison(&tag_of("v"), &StackVal::I64(75), &[], &reg, None).unwrap();
+        let (l, r) = lower_tag_comparison(
+            &tag_of("v"),
+            &StackVal::I64(75),
+            &[],
+            &reg,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             l,
             SorobanExpr::ValTag(Box::new(SorobanExpr::Param("v".to_string())))
         );
         assert_eq!(r, SorobanExpr::ValTagName("VecObject".to_string()));
         // tag-of on the right.
-        let (l, r) =
-            lower_tag_comparison(&StackVal::I64(75), &tag_of("v"), &[], &reg, None).unwrap();
+        let (l, r) = lower_tag_comparison(
+            &StackVal::I64(75),
+            &tag_of("v"),
+            &[],
+            &reg,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(l, SorobanExpr::ValTagName("VecObject".to_string()));
         assert_eq!(
             r,
@@ -9908,7 +10543,8 @@ mod tests {
                 &StackVal::I64(1),
                 &[],
                 &reg,
-                None
+                None,
+                &mut Vec::new()
             )
             .is_none()
         );

@@ -192,6 +192,22 @@ pub enum SorobanExpr {
     // Placeholder for unknown/untracked stack values
     UnknownVal,
 
+    // A frame slot whose stored value transitively references itself — a genuine
+    // data cycle the lifter cannot resolve to a value. Reported precisely (with
+    // the slot identity) instead of collapsing to an anonymous `UnknownVal`.
+    CyclicSlot {
+        frame_id: u32,
+        offset: i32,
+    },
+
+    // The symbolic `Result` discriminant of an sret (struct-return) call: a void
+    // helper / cross-contract call that wrote its `Result<T, E>` into a frame
+    // slot. Produced when a load of that slot feeds a br_table/if, so the
+    // dispatch reconstructs as `match <call> { Ok(..) => .., Err(..) => .. }`.
+    // Wraps the call expression. If it reaches codegen verbatim it degrades to
+    // that inner call.
+    SretResult(Box<SorobanExpr>),
+
     // The 8-bit Soroban Val tag of a value, recovered from a `v & 0xFF` pattern.
     // Renders as `<value>.get_tag()`.
     ValTag(Box<SorobanExpr>),
