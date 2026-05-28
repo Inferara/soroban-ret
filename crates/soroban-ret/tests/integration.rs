@@ -867,6 +867,35 @@ fn test_all_fixtures_no_artifacts() {
 }
 
 // -------------------------------------------------------------------------
+// Real-contract regression fixtures (issue #7)
+//
+// Large real Soroban DeFi contracts (Aquarius AMM, Blend lending) that spill
+// aggregates to the shadow stack and dispatch on cross-contract `Result`s.
+// They exercise the points-to model, dynamic offsets, and cycle handling at a
+// scale the synthetic fixtures don't. Asserted to decompile without panicking —
+// a frame-slot cycle or unbounded recursion here would have crashed the lifter.
+// (They are intentionally NOT in ALL_FIXTURES: full reconstruction still leaves
+// `todo!()` placeholders, so they can't pass the no-artifacts gate yet.)
+// -------------------------------------------------------------------------
+
+#[test]
+fn aquarius_decompiles_without_panicking() {
+    let wasm = include_bytes!("../../../tests/fixtures/aquarius.wasm");
+    let src = decompile(wasm).expect("aquarius.wasm should decompile");
+    assert!(
+        src.contains("fn estimate_swap"),
+        "estimate_swap should be emitted"
+    );
+}
+
+#[test]
+fn blend_decompiles_without_panicking() {
+    let wasm = include_bytes!("../../../tests/fixtures/blend.wasm");
+    let src = decompile(wasm).expect("blend.wasm should decompile");
+    assert!(!src.is_empty(), "blend should produce output");
+}
+
+// -------------------------------------------------------------------------
 // Snapshot tests
 //
 // Substring assertions (`assert_ordered` / `assert_in_fn`) catch missing
