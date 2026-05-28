@@ -31,7 +31,7 @@ use crate::wasm::parser::WasmModule;
 /// Rewrite every safety-net `unreachable` in `blocks` to
 /// [`StructuredBlock::SafetyNetUnreachable`]. Idempotent.
 pub(crate) fn classify_safety_net_unreachables(
-    blocks: &mut Vec<StructuredBlock>,
+    blocks: &mut [StructuredBlock],
     wasm_module: &WasmModule,
 ) {
     classify_seq(blocks, wasm_module);
@@ -39,7 +39,7 @@ pub(crate) fn classify_safety_net_unreachables(
 
 /// Post-order: classify inner bodies first so the predicate that asks
 /// `terminates(body[i-1])` sees their final (rewritten) shape.
-fn classify_seq(body: &mut Vec<StructuredBlock>, module: &WasmModule) {
+fn classify_seq(body: &mut [StructuredBlock], module: &WasmModule) {
     for sb in body.iter_mut() {
         match sb {
             StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
