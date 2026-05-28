@@ -934,10 +934,16 @@ fn _dump_test_fuzz_run() {
 fn _count_aquarius_blend_todos() {
     let aquarius = decompile(include_bytes!("../../../tests/fixtures/aquarius.wasm"))
         .expect("aquarius decompile");
-    let blend = decompile(include_bytes!("../../../tests/fixtures/blend.wasm"))
-        .expect("blend decompile");
-    eprintln!("[#8 progress] aquarius todo!() count = {}", aquarius.matches("todo!(").count());
-    eprintln!("[#8 progress] blend todo!() count = {}", blend.matches("todo!(").count());
+    let blend =
+        decompile(include_bytes!("../../../tests/fixtures/blend.wasm")).expect("blend decompile");
+    eprintln!(
+        "[#8 progress] aquarius todo!() count = {}",
+        aquarius.matches("todo!(").count()
+    );
+    eprintln!(
+        "[#8 progress] blend todo!() count = {}",
+        blend.matches("todo!(").count()
+    );
 }
 
 #[test]
