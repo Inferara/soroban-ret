@@ -888,6 +888,64 @@ fn aquarius_decompiles_without_panicking() {
     );
 }
 
+// TODO(#8): temporary inspection harness — remove once the regression test
+// `aquarius_estimate_swap_lifts_guard_chain` lands.
+#[test]
+#[ignore]
+fn _dump_aquarius_estimate_swap() {
+    let wasm = include_bytes!("../../../tests/fixtures/aquarius.wasm");
+    let src = decompile(wasm).expect("aquarius.wasm should decompile");
+    let Some(start) = src.find("fn estimate_swap") else {
+        panic!("estimate_swap not found in output");
+    };
+    let after = &src[start..];
+    let brace_start = after.find('{').expect("no { after fn estimate_swap");
+    let mut depth = 0i32;
+    let mut end = brace_start;
+    for (i, c) in after[brace_start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = brace_start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    eprintln!("--- estimate_swap body ---\n{}\n--- end ---", &after[..end]);
+}
+
+// TODO(#8): same as above for the test_fuzz `run` function — used to debug
+// the regression in `test_decompile_fuzz`.
+#[test]
+#[ignore]
+fn _dump_test_fuzz_run() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_fuzz.wasm");
+    let src = decompile(wasm).expect("test_fuzz.wasm should decompile");
+    eprintln!("--- full test_fuzz source ---\n{}\n--- end ---", src);
+}
+
+// TODO(#8): count todo!() occurrences in aquarius/blend to track progress.
+#[test]
+#[ignore]
+fn _count_aquarius_blend_todos() {
+    let aquarius = decompile(include_bytes!("../../../tests/fixtures/aquarius.wasm"))
+        .expect("aquarius decompile");
+    let blend =
+        decompile(include_bytes!("../../../tests/fixtures/blend.wasm")).expect("blend decompile");
+    eprintln!(
+        "[#8 progress] aquarius todo!() count = {}",
+        aquarius.matches("todo!(").count()
+    );
+    eprintln!(
+        "[#8 progress] blend todo!() count = {}",
+        blend.matches("todo!(").count()
+    );
+}
+
 #[test]
 fn blend_decompiles_without_panicking() {
     let wasm = include_bytes!("../../../tests/fixtures/blend.wasm");
