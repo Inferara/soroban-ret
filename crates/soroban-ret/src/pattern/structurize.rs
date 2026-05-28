@@ -26,6 +26,12 @@ pub enum StructuredBlock {
         then_body: Vec<StructuredBlock>,
         else_body: Vec<StructuredBlock>,
     },
+    /// A `WasmInstr::Unreachable` reclassified by CFG analysis as a
+    /// compiler-emitted safety-net trap: every path reaching it has already
+    /// diverged via `return`, `br`/`br_table`, or a call to a `-> !` helper.
+    /// Emits no IR. Produced by `cfg_analysis::classify_safety_net_unreachables`,
+    /// never by `structurize` itself (which only emits `Instruction(Unreachable)`).
+    SafetyNetUnreachable,
 }
 
 /// Maximum control-flow nesting depth handled by the recursive parser.
