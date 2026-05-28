@@ -2,6 +2,7 @@
 ///
 /// Lifts WASM instructions into Soroban-aware IR by recognizing
 /// host function call patterns, dispatch wrappers, and type conversions.
+pub mod cfg_analysis;
 pub mod dispatch;
 pub mod host_calls;
 pub mod lifter;

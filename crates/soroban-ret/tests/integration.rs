@@ -888,8 +888,10 @@ fn aquarius_decompiles_without_panicking() {
     );
 }
 
-// TODO(#8): temporary inspection harness — remove once the regression test
-// `aquarius_estimate_swap_lifts_guard_chain` lands.
+// TODO(#11): inspection harness for the still-truncated `estimate_swap` case.
+// The locus-1 CFG-of-safety-net-unreachable fix landed but does not address
+// estimate_swap, whose truncation is driven by a top-level `PanicWithError`
+// from an inlined `call $fail_with_error` (separate follow-up).
 #[test]
 #[ignore]
 fn _dump_aquarius_estimate_swap() {
@@ -918,8 +920,10 @@ fn _dump_aquarius_estimate_swap() {
     eprintln!("--- estimate_swap body ---\n{}\n--- end ---", &after[..end]);
 }
 
-// TODO(#8): same as above for the test_fuzz `run` function — used to debug
-// the regression in `test_decompile_fuzz`.
+// TODO(#11): same as above for the test_fuzz `run` function — kept as a
+// canary for any future regression that might confuse user-explicit `panic!()`
+// (which compiles to `call $rust_panic_helper; unreachable`) with a safety-net
+// trap.
 #[test]
 #[ignore]
 fn _dump_test_fuzz_run() {
@@ -928,7 +932,11 @@ fn _dump_test_fuzz_run() {
     eprintln!("--- full test_fuzz source ---\n{}\n--- end ---", src);
 }
 
-// TODO(#8): count todo!() occurrences in aquarius/blend to track progress.
+// TODO(#11): count todo!() occurrences in aquarius/blend to track progress.
+// Note: this count is a *surface* metric, not a quality one. Fixing truncation
+// elsewhere typically EXPOSES previously-hidden code that contains more
+// `todo!()` placeholders, so the number can go up while decompilation quality
+// improves. Compare against the body shape (see _dump_*) when interpreting.
 #[test]
 #[ignore]
 fn _count_aquarius_blend_todos() {
@@ -937,11 +945,11 @@ fn _count_aquarius_blend_todos() {
     let blend =
         decompile(include_bytes!("../../../tests/fixtures/blend.wasm")).expect("blend decompile");
     eprintln!(
-        "[#8 progress] aquarius todo!() count = {}",
+        "[#11 progress] aquarius todo!() count = {}",
         aquarius.matches("todo!(").count()
     );
     eprintln!(
-        "[#8 progress] blend todo!() count = {}",
+        "[#11 progress] blend todo!() count = {}",
         blend.matches("todo!(").count()
     );
 }
