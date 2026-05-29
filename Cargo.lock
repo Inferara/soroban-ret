@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-ret"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "cov-mark",
  "insta",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-ret-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "assert_cmd",
  "clap",
