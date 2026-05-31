@@ -1,0 +1,1085 @@
+{
+  "contracts": {
+    "account": {
+      "name": "account",
+      "level": 4,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "__check_auth": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "Ok"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "add_i128": {
+      "name": "add_i128",
+      "level": 1,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "add": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "add"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "add_u128": {
+      "name": "add_u128",
+      "level": 1,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "add": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "add"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "add_u64": {
+      "name": "add_u64",
+      "level": 1,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "add": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "add"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "alloc": {
+      "name": "alloc",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "num_list": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "associated_types": {
+      "name": "associated_types",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "exec": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "associated_types_contracttrait": {
+      "name": "associated_types_contracttrait",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "exec2": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "auth": {
+      "name": "auth",
+      "level": 4,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "fn1": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "require_auth"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "fn2": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "require_auth_for_args"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "bls": {
+      "name": "bls",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "dummy_verify": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "g1_mul": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "g2_mul": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "bn254": {
+      "name": "bn254",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "g1_add": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "add"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "g1_mul": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "mul"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "verify_pairing": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "constructor": {
+      "name": "constructor",
+      "level": 3,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "__constructor": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "instance.set",
+            "mul",
+            "persistent.set",
+            "temporary.set"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "get_data": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "instance.get",
+            "match",
+            "persistent.get",
+            "temporary.get"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "contract_data": {
+      "name": "contract_data",
+      "level": 2,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "del": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "persistent.remove"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "get": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "persistent.get"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "put": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "persistent.set"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "contracttrait_impl_full": {
+      "name": "contracttrait_impl_full",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {}
+    },
+    "contracttrait_impl_partial": {
+      "name": "contracttrait_impl_partial",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "test_env_param": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "test_string": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "test_struct": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "mul"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "test_u32": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "add"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "contracttrait_path_crate": {
+      "name": "contracttrait_path_crate",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {}
+    },
+    "contracttrait_path_global": {
+      "name": "contracttrait_path_global",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {}
+    },
+    "contracttrait_path_relative": {
+      "name": "contracttrait_path_relative",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {}
+    },
+    "contracttrait_path_self": {
+      "name": "contracttrait_path_self",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {}
+    },
+    "contracttrait_path_super": {
+      "name": "contracttrait_path_super",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {}
+    },
+    "empty": {
+      "name": "empty",
+      "level": 1,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "empty": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "empty2": {
+      "name": "empty2",
+      "level": 1,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {}
+    },
+    "errors": {
+      "name": "errors",
+      "level": 3,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "hello": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "Err",
+            "Ok",
+            "if",
+            "panic",
+            "persistent.set",
+            "symbol_short"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "events": {
+      "name": "events",
+      "level": 3,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "failed_transfer": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "panic",
+            "publish"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "transfer": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "publish"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "events_ref": {
+      "name": "events_ref",
+      "level": 3,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "failed_transfer": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "panic",
+            "publish"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "transfer": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "publish"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "fuzz": {
+      "name": "fuzz",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "run": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "if",
+            "panic"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "generics": {
+      "name": "generics",
+      "level": 2,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "exec": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "add"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "import_contract": {
+      "name": "import_contract",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "add_with": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "invoke_contract": {
+      "name": "invoke_contract",
+      "level": 4,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "add": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "add"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "add_with": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "invoke_contract",
+            "symbol_short"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "logging": {
+      "name": "logging",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 0.0,
+      "structure_score": 100.0,
+      "overall_score": 70.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "hello": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 0.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [
+            "symbol_short"
+          ],
+          "artifact_count": 0
+        }
+      }
+    },
+    "macros": {
+      "name": "macros",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "empty": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "empty2": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "modular": {
+      "name": "modular",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "one": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "two": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "zero": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "multiimpl": {
+      "name": "multiimpl",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "empty": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "empty2": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "empty3": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "mutability": {
+      "name": "mutability",
+      "level": 2,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "calc": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "add"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "tuples": {
+      "name": "tuples",
+      "level": 1,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "tuple1": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "tuple2": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "void_fn": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "udt": {
+      "name": "udt",
+      "level": 3,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "add": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "add",
+            "match"
+          ],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "workspace_contract": {
+      "name": "workspace_contract",
+      "level": 5,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {
+        "value": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        }
+      }
+    },
+    "zero": {
+      "name": "zero",
+      "level": 1,
+      "types_score": 100.0,
+      "signatures_score": 100.0,
+      "annotations_score": 100.0,
+      "bodies_score": 100.0,
+      "structure_score": 100.0,
+      "overall_score": 100.0,
+      "artifact_score": 100.0,
+      "functions": {}
+    }
+  },
+  "levels": {
+    "1": {
+      "name": "Trivial",
+      "target": 98.0,
+      "average": 100.0,
+      "meets_target": true,
+      "count": 7
+    },
+    "2": {
+      "name": "Simple",
+      "target": 95.0,
+      "average": 100.0,
+      "meets_target": true,
+      "count": 3
+    },
+    "3": {
+      "name": "Complex",
+      "target": 92.0,
+      "average": 100.0,
+      "meets_target": true,
+      "count": 5
+    },
+    "4": {
+      "name": "Runtime",
+      "target": 88.0,
+      "average": 100.0,
+      "meets_target": true,
+      "count": 3
+    },
+    "5": {
+      "name": "Advanced",
+      "target": 80.0,
+      "average": 98.4,
+      "meets_target": true,
+      "count": 19
+    }
+  },
+  "overall_score": 99.2
+}

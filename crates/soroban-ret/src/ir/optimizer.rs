@@ -139,6 +139,11 @@ fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<
         "Optimizer pass: remove_duplicate_exprs ({} stmts)",
         stmts.len()
     );
+    let stmts = remove_val_tag_guards(stmts);
+    log::trace!(
+        "Optimizer pass: remove_val_tag_guards ({} stmts)",
+        stmts.len()
+    );
     let stmts = invert_guard_clauses(stmts);
     log::trace!(
         "Optimizer pass: invert_guard_clauses ({} stmts)",
@@ -1248,6 +1253,22 @@ fn remove_orphan_host_calls(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             {
                 // Skip — method call on discarded temporary
             }
+            // Standalone linear-memory (de)serialization host calls
+            // (`map_unpack_to_linear_memory`, `map_new_from_linear_memory`,
+            // `vec_*_linear_memory`, …). These are pure SDK marshalling that the
+            // lifter could not fold into a typed construction; codegen renders
+            // them as non-public `env.map()…` API, so they neither compile nor
+            // carry any contract-observable effect the typed Rust does not
+            // already express. Only dropped when the result is discarded (a bare
+            // expression statement) — a used result lives inside a Let/expr and
+            // is left untouched.
+            SorobanStmt::Expr(SorobanExpr::RawHostCall { ref function, .. })
+                if function.ends_with("_to_linear_memory")
+                    || function.ends_with("_from_linear_memory") =>
+            {
+                cov_mark::hit!(orphan_linear_memory_marshalling_removed);
+                // Skip — linear-memory marshalling artifact
+            }
             // Recurse into nested bodies
             SorobanStmt::If {
                 condition,
@@ -2321,6 +2342,104 @@ fn invert_guard_clauses_nested(stmt: SorobanStmt) -> SorobanStmt {
             body: invert_guard_clauses(body),
         },
         SorobanStmt::Block(body) => SorobanStmt::Block(invert_guard_clauses(body)),
+        other => other,
+    }
+}
+
+/// Remove SDK-generated argument tag-validation guards of the shape
+/// `if <val>.get_tag() != Tag::<Name> { panic!() }`.
+///
+/// The Soroban SDK emits these to assert that an incoming `Val` argument carries
+/// the expected tag before decoding it into the typed parameter. They are
+/// marshalling boilerplate, not contract logic — the typed parameter
+/// (`v: Address`, `arg: (u32, i64)`, …) already implies the check. Crucially,
+/// `Val::get_tag()` and `Tag` are **not** part of the public `soroban_sdk`
+/// surface, so the lifter's `ValTag`/`ValTagName` recovery (issue #4) surfaces
+/// code that does not compile. Stripping these guards both restores
+/// compilability and matches the canonical SDK source (which never contains
+/// them — the SDK re-inserts the marshalling when the typed contract is rebuilt).
+fn remove_val_tag_guards(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    stmts
+        .into_iter()
+        .filter_map(|stmt| match stmt {
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } if else_body.is_empty()
+                && is_val_tag_guard_condition(&condition)
+                && is_panic_body(&then_body) =>
+            {
+                None
+            }
+            other => Some(remove_val_tag_guards_nested(other)),
+        })
+        .collect()
+}
+
+/// True when `expr` is an (optionally negated) equality/inequality comparison
+/// against a recovered `Val` tag (`ValTag` / `ValTagName`).
+fn is_val_tag_guard_condition(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::Not(inner) => is_val_tag_guard_condition(inner),
+        SorobanExpr::Eq(a, b) | SorobanExpr::Ne(a, b) => is_val_tag_expr(a) || is_val_tag_expr(b),
+        _ => false,
+    }
+}
+
+fn is_val_tag_expr(expr: &SorobanExpr) -> bool {
+    matches!(expr, SorobanExpr::ValTag(_) | SorobanExpr::ValTagName(_))
+}
+
+/// True when a guard body begins with a panic (any trailing statements are dead
+/// code that later passes truncate).
+fn is_panic_body(body: &[SorobanStmt]) -> bool {
+    matches!(
+        body.first(),
+        Some(SorobanStmt::Expr(
+            SorobanExpr::Panic | SorobanExpr::PanicWithError(_)
+        ))
+    )
+}
+
+fn remove_val_tag_guards_nested(stmt: SorobanStmt) -> SorobanStmt {
+    match stmt {
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => SorobanStmt::If {
+            condition,
+            then_body: remove_val_tag_guards(then_body),
+            else_body: remove_val_tag_guards(else_body),
+        },
+        SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+            scrutinee,
+            arms: arms
+                .into_iter()
+                .map(|arm| MatchArm {
+                    pattern: arm.pattern,
+                    body: remove_val_tag_guards(arm.body),
+                })
+                .collect(),
+        },
+        SorobanStmt::Loop { body } => SorobanStmt::Loop {
+            body: remove_val_tag_guards(body),
+        },
+        SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body,
+        } => SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body: remove_val_tag_guards(body),
+        },
+        SorobanStmt::Block(body) => SorobanStmt::Block(remove_val_tag_guards(body)),
         other => other,
     }
 }
@@ -6796,6 +6915,62 @@ mod tests {
             matches!(&out[0], SorobanStmt::Let { .. })
                 && matches!(&out[1], SorobanStmt::Loop { .. }),
             "loop with live-out counter must not become a `for`; got: {out:?}"
+        );
+    }
+
+    // ----- ValTag argument-guard removal (compile-fidelity) -----
+
+    #[test]
+    fn val_tag_guard_stripped() {
+        // `if v.get_tag() != Tag::AddressObject { panic!() } return v;`
+        // The SDK arg-validation guard must be removed (it renders as non-public
+        // `Val::get_tag()`/`Tag` API), leaving the real body intact.
+        let guard = SorobanStmt::If {
+            condition: SorobanExpr::Ne(
+                Box::new(SorobanExpr::ValTag(Box::new(param("v")))),
+                Box::new(SorobanExpr::ValTagName("AddressObject".to_string())),
+            ),
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+            else_body: vec![],
+        };
+        let out = remove_val_tag_guards(vec![guard, ret(param("v"))]);
+        assert_eq!(out.len(), 1, "guard not removed: {out:?}");
+        assert!(matches!(&out[0], SorobanStmt::Return(Some(SorobanExpr::Param(n))) if n == "v"));
+    }
+
+    #[test]
+    fn val_tag_guard_kept_when_body_is_real_logic() {
+        // A ValTag comparison whose body is NOT a panic is left untouched —
+        // only the panic-guard marshalling shape is stripped.
+        let cond = SorobanExpr::Ne(
+            Box::new(SorobanExpr::ValTag(Box::new(param("v")))),
+            Box::new(SorobanExpr::ValTagName("U32Val".to_string())),
+        );
+        let stmt = SorobanStmt::If {
+            condition: cond,
+            then_body: vec![ret(u64_lit(1))],
+            else_body: vec![],
+        };
+        let out = remove_val_tag_guards(vec![stmt]);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], SorobanStmt::If { .. }));
+    }
+
+    // ----- Orphan linear-memory marshalling removal (compile-fidelity) -----
+
+    #[test]
+    fn orphan_linear_memory_marshalling_stripped() {
+        // A standalone `map_unpack_to_linear_memory(..)` host call (result
+        // discarded) renders as non-public `env.map()…` API and must be dropped.
+        let marshalling = SorobanStmt::Expr(SorobanExpr::RawHostCall {
+            module: "m".to_string(),
+            function: "map_unpack_to_linear_memory".to_string(),
+            args: vec![param("proof"), u64_lit(1048588)],
+        });
+        let out = remove_orphan_host_calls(vec![marshalling, ret(param("proof"))]);
+        assert_eq!(out.len(), 1, "marshalling not removed: {out:?}");
+        assert!(
+            matches!(&out[0], SorobanStmt::Return(Some(SorobanExpr::Param(n))) if n == "proof")
         );
     }
 }

@@ -832,6 +832,47 @@ const ALL_FIXTURES: &[(&str, &[u8])] = &[
         "test_bn254",
         include_bytes!("../../../tests/fixtures/test_bn254.wasm"),
     ),
+    // Level 5: trait-based contracts, associated types, workspace (Tranche 3)
+    (
+        "test_associated_types",
+        include_bytes!("../../../tests/fixtures/test_associated_types.wasm"),
+    ),
+    (
+        "test_associated_types_contracttrait",
+        include_bytes!("../../../tests/fixtures/test_associated_types_contracttrait.wasm"),
+    ),
+    (
+        "test_contracttrait_impl_full",
+        include_bytes!("../../../tests/fixtures/test_contracttrait_impl_full.wasm"),
+    ),
+    (
+        "test_contracttrait_impl_partial",
+        include_bytes!("../../../tests/fixtures/test_contracttrait_impl_partial.wasm"),
+    ),
+    (
+        "test_contracttrait_path_crate",
+        include_bytes!("../../../tests/fixtures/test_contracttrait_path_crate.wasm"),
+    ),
+    (
+        "test_contracttrait_path_global",
+        include_bytes!("../../../tests/fixtures/test_contracttrait_path_global.wasm"),
+    ),
+    (
+        "test_contracttrait_path_relative",
+        include_bytes!("../../../tests/fixtures/test_contracttrait_path_relative.wasm"),
+    ),
+    (
+        "test_contracttrait_path_self",
+        include_bytes!("../../../tests/fixtures/test_contracttrait_path_self.wasm"),
+    ),
+    (
+        "test_contracttrait_path_super",
+        include_bytes!("../../../tests/fixtures/test_contracttrait_path_super.wasm"),
+    ),
+    (
+        "test_workspace_contract",
+        include_bytes!("../../../tests/fixtures/test_workspace_contract.wasm"),
+    ),
 ];
 
 #[test]
