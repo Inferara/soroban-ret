@@ -46,6 +46,33 @@ run `soroban-ret --info <fixture>` to read it back.
 | `test_tuples.wasm` | rs-soroban-sdk | Tuple parameters and returns |
 | `test_udt.wasm` | rs-soroban-sdk | `#[contracttype]` structs/enums/tuples |
 | `test_zero.wasm` | synthetic | Trivial-body boundary case |
+| `test_associated_types.wasm` | rs-soroban-sdk | Trait with associated types (flattened) |
+| `test_associated_types_contracttrait.wasm` | rs-soroban-sdk | Associated types via `#[contractimpl(contracttrait)]` |
+| `test_contracttrait_impl_full.wasm` | rs-soroban-sdk | `impl Trait for Contract {}` — full default-method impl |
+| `test_contracttrait_impl_partial.wasm` | rs-soroban-sdk | Partial trait impl (some methods overridden) |
+| `test_contracttrait_path_crate.wasm` | rs-soroban-sdk | Trait referenced via `crate::` path |
+| `test_contracttrait_path_global.wasm` | rs-soroban-sdk | Trait referenced via `::global` path |
+| `test_contracttrait_path_relative.wasm` | rs-soroban-sdk | Trait referenced via relative path |
+| `test_contracttrait_path_self.wasm` | rs-soroban-sdk | Trait referenced via `self::` path |
+| `test_contracttrait_path_super.wasm` | rs-soroban-sdk | Trait referenced via `super::` path |
+| `test_workspace_contract.wasm` | rs-soroban-sdk | Multi-crate workspace contract |
+
+## Reference sources for accuracy scoring
+
+The canonical Rust source for every `test_*.wasm` fixture (except the
+`soroban-examples`-origin `test_liquidity_pool.wasm`) is checked out as a git
+submodule at `vendor/rs-soroban-sdk`, pinned to **v26.0.1**
+(commit `f52b6aa…`) — the exact SDK version+commit every fixture reports in its
+`contractmetav0` section. The `soroban-ret-accuracy` harness reads
+`vendor/rs-soroban-sdk/tests/<name>/src/` as the comparison reference. Run
+`git submodule update --init --recursive` after cloning.
+
+> **Note on trait-based contracts.** `contractspecv0` (XDR `ScSpecEntry`) carries
+> only `FunctionV0`/`UdtStructV0`/`UdtUnionV0`/`UdtEnumV0`/`UdtErrorEnumV0`/`EventV0`
+> — there is no trait-function entry. Trait structure (`impl Trait for Contract`,
+> default trait-method bodies) is therefore erased in compiled WASM, so the
+> `contracttrait_*` fixtures decompile to a semantically-equivalent flat
+> `impl Contract`. See `docs/pattern-coverage.md`.
 
 ## Regeneration
 

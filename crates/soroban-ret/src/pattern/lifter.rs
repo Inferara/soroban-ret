@@ -2568,6 +2568,21 @@ impl<'a> LiftContext<'a> {
                             Box::new(StackVal::I32(1i32 << n)),
                         ));
                     }
+                    // Sign-extend idiom `(x << k) >> k` (k ∈ {8,16,24} narrows to i8/i16/i24).
+                    // Keep the inner value as a tracked Shl so the paired `I32ShrS` can
+                    // round-trip it back to `x`. Without this, an `obj_cmp` result that the
+                    // SDK sign-extends before a `< 0` test is lost to `Unknown`, and the
+                    // whole `if a < b { panic }` guard is then dropped (the fuzz fixture).
+                    // On escape (no matching `>> k`) this renders to `UnknownVal` exactly as
+                    // the prior `Unknown` did — `strip_val_encode` leaves a bare Shl unknown.
+                    (_, Some(n)) if matches!(n, 8 | 16 | 24) => {
+                        cov_mark::hit!(i32_sign_extend_shl_tracked);
+                        self.stack.push(StackVal::BinOp(
+                            Box::new(a),
+                            BinOper::Shl,
+                            Box::new(StackVal::I32(n as i32)),
+                        ));
+                    }
                     _ => self.stack.push(StackVal::Unknown),
                 }
             }
@@ -2600,6 +2615,17 @@ impl<'a> LiftContext<'a> {
                 match (&a, &b) {
                     (StackVal::I32(x), StackVal::I32(y)) => {
                         self.stack.push(StackVal::I32(x >> y));
+                    }
+                    // Sign-extend round-trip: `(inner << k) >> k` with matching `k` restores
+                    // `inner`. Value-preserving for the subsequent `< 0` / `>= 0` sign test
+                    // the SDK emits after `obj_cmp`, which is what lets `a < b` survive.
+                    (StackVal::BinOp(inner, BinOper::Shl, shl_amt), StackVal::I32(y))
+                        if matches!(*y, 8 | 16 | 24)
+                            && matches!(**shl_amt, StackVal::I32(k) if k == *y) =>
+                    {
+                        cov_mark::hit!(i32_sign_extend_roundtrip);
+                        let inner = (**inner).clone();
+                        self.stack.push(inner);
                     }
                     _ => self.stack.push(StackVal::Unknown),
                 }
@@ -3790,8 +3816,16 @@ impl<'a> LiftContext<'a> {
                 && case_ctx.stack.len() <= parent_stack_len
             {
                 for (idx, case_local) in case_ctx.locals.iter().enumerate() {
-                    if idx < self.num_wasm_params as usize {
-                        continue; // Skip WASM params
+                    // Body-local slots are always eligible. A WASM *param* slot is
+                    // eligible only when it has been repurposed to stage a constant
+                    // return value: the SDK reuses the `env` slot (local 0) as scratch,
+                    // writing the `Ok(..)`/`Err(..)` Val constant there before the shared
+                    // tail `local.get; return` (the errors fixture's `Flag::A` arm). A
+                    // param slot still carrying its parameter value is left alone.
+                    if idx < self.num_wasm_params as usize
+                        && !matches!(case_local, StackVal::I64(_) | StackVal::I32(_))
+                    {
+                        continue; // param slot still flows the parameter — skip
                     }
                     if let Some(parent_local) = self.locals.get(idx)
                         && case_local != parent_local
@@ -3803,6 +3837,7 @@ impl<'a> LiftContext<'a> {
                             Some(&self.frame_slots.borrow()),
                         );
                         if !matches!(expr, SorobanExpr::Void | SorobanExpr::UnknownVal) {
+                            cov_mark::hit!(arm_return_from_reused_param_slot);
                             case_ctx.stmts.push(SorobanStmt::Return(Some(expr)));
                             break;
                         }
@@ -4323,6 +4358,64 @@ impl<'a> LiftContext<'a> {
                 vec!["Ok".to_string(), "Err".to_string()],
                 vec![true, true],
             ));
+        }
+
+        // Prefer an enum/union that matches one of THIS function's parameters: a
+        // br_table is almost always dispatching on a parameter, and the param's
+        // declared type disambiguates same-arity candidates. Without this, the
+        // first registry integer enum with enough variants wins and mislabels the
+        // variants — e.g. the `recursive_enum` match on `RecursiveEnum` was resolved
+        // to the unrelated 2-variant integer enum `UdtEnum2`, leaking a
+        // `todo!("unknown value")`. Unions are only considered for an unknown
+        // scrutinee, mirroring the fallback union path below (a known literal
+        // scrutinee means a result-selecting br_table, not a discriminant match).
+        for p in self.params {
+            let ScSpecTypeDef::Udt(udt) = &p.type_def else {
+                continue;
+            };
+            let Ok(tname) = udt.name.to_utf8_string() else {
+                continue;
+            };
+            if let Some(spec) = self.registry.enums.get(&tname) {
+                let mut variants: Vec<(u32, String)> = spec
+                    .cases
+                    .iter()
+                    .filter_map(|c| c.name.to_utf8_string().ok().map(|n| (c.value, n)))
+                    .collect();
+                if !variants.is_empty() && variants.len() >= num_targets {
+                    variants.sort_by_key(|(v, _)| *v);
+                    let has_data = vec![false; variants.len()];
+                    let ordered = variants.into_iter().map(|(_, n)| n).collect();
+                    cov_mark::hit!(enum_resolved_by_param_type);
+                    return Some((tname, ordered, has_data));
+                }
+            }
+            if matches!(scrutinee, SorobanExpr::UnknownVal)
+                && let Some(spec) = self.registry.unions.get(&tname)
+            {
+                let mut variants: Vec<String> = Vec::new();
+                let mut has_data: Vec<bool> = Vec::new();
+                for case in spec.cases.iter() {
+                    match case {
+                        stellar_xdr::ScSpecUdtUnionCaseV0::VoidV0(v) => {
+                            if let Ok(n) = v.name.to_utf8_string() {
+                                variants.push(n);
+                                has_data.push(false);
+                            }
+                        }
+                        stellar_xdr::ScSpecUdtUnionCaseV0::TupleV0(t) => {
+                            if let Ok(n) = t.name.to_utf8_string() {
+                                variants.push(n);
+                                has_data.push(true);
+                            }
+                        }
+                    }
+                }
+                if !variants.is_empty() && variants.len() >= num_targets {
+                    cov_mark::hit!(union_resolved_by_param_type);
+                    return Some((tname, variants, has_data));
+                }
+            }
         }
 
         // Check all integer enums in the registry.
@@ -10085,6 +10178,60 @@ mod tests {
         ctx.lift_instruction(&WasmInstr::I32Add);
         ctx.lift_instruction(&WasmInstr::I64Load(0));
         assert_eq!(ctx.stack.pop(), Some(StackVal::Unknown));
+    }
+
+    #[test]
+    fn i32_sign_extend_idiom_round_trips_inner_value() {
+        use crate::wasm::ir::WasmInstr;
+        // `(x << k) >> k` for k ∈ {8,16,24} sign-extends a narrow value; for the
+        // `< 0` sign test the SDK emits after `obj_cmp` it is value-preserving, so
+        // the lifter must round-trip the inner value rather than dropping it to
+        // `Unknown` (regression guard for the fuzz fixture: `if a < b { panic }`).
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 1);
+
+        let inner = StackVal::HostCallResult(Box::new(SorobanExpr::Param("a".to_string())));
+        for k in [8i32, 16, 24] {
+            ctx.stack.clear();
+            ctx.stack.push(inner.clone());
+            ctx.lift_instruction(&WasmInstr::I32Const(k));
+            ctx.lift_instruction(&WasmInstr::I32Shl);
+            // After the shl alone the value is tracked as a Shl marker, not lost.
+            assert!(
+                matches!(ctx.stack.last(), Some(StackVal::BinOp(_, BinOper::Shl, _))),
+                "shl {k} should track the inner value, got {:?}",
+                ctx.stack.last()
+            );
+            ctx.lift_instruction(&WasmInstr::I32Const(k));
+            ctx.lift_instruction(&WasmInstr::I32ShrS);
+            assert_eq!(ctx.stack.pop(), Some(inner.clone()), "round-trip k={k}");
+        }
+
+        // A mismatched width does NOT round-trip (it is not a sign-extend) → Unknown.
+        ctx.stack.clear();
+        ctx.stack.push(inner.clone());
+        ctx.lift_instruction(&WasmInstr::I32Const(24));
+        ctx.lift_instruction(&WasmInstr::I32Shl);
+        ctx.lift_instruction(&WasmInstr::I32Const(16));
+        ctx.lift_instruction(&WasmInstr::I32ShrS);
+        assert_eq!(
+            ctx.stack.pop(),
+            Some(StackVal::Unknown),
+            "mismatched widths"
+        );
+
+        // A non-sign-extend shift width still degrades to Unknown (unchanged behavior).
+        ctx.stack.clear();
+        ctx.stack.push(inner);
+        ctx.lift_instruction(&WasmInstr::I32Const(5));
+        ctx.lift_instruction(&WasmInstr::I32Shl);
+        assert_eq!(
+            ctx.stack.pop(),
+            Some(StackVal::Unknown),
+            "non-extend width 5"
+        );
     }
 
     #[test]

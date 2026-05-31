@@ -92,5 +92,81 @@ checkbox:
   `ALL_FIXTURES` constant in the same file (30 entries).
 - Snapshots: `crates/soroban-ret/tests/snapshots/`.
 - For **quantitative** accuracy measurement (per-contract scoring against a
-  reference Rust source), see the `soroban-ret-accuracy` crate planned in
-  the `v0.0.3`.
+  reference Rust source), see the `soroban-ret-accuracy` crate
+  (`cargo run -p soroban-ret-accuracy --bin accuracy`).
+
+## Tranche 3: accuracy framework, compile-fidelity & known gaps
+
+### Accuracy measurement (`soroban-ret-accuracy`)
+
+The `soroban-ret-accuracy` crate scores each fixture's decompiled output against
+its canonical SDK source using `syn`-based interface extraction and weighted
+component comparison (types 25 %, signatures 20 %, annotations 15 %, bodies 30 %,
+structure 10 %). Reference sources come from the **`vendor/rs-soroban-sdk`
+submodule pinned to v26.0.1** (commit `f52b6aa…`), the exact SDK version+commit
+every fixture reports in `contractmetav0`.
+
+> **What the score means (and doesn't).** Each component is a *recall* measure:
+> it checks that the decompiled output *contains* the reference's interface and
+> body operation-kinds (e.g. an `if`, a `match`, a `panic`, a `.persistent().set`),
+> not that the logic is semantically equivalent. Extra or wrong operations are not
+> penalized, and a 100 % score is **not** a behavioral-equivalence proof — it means
+> "every operation kind the reference uses is present." The complementary
+> `scripts/check-compilable.sh` gate is the "does it actually build" check.
+
+- `cargo run -p soroban-ret-accuracy --bin accuracy` — table report.
+- `… -- --json > accuracy-baseline.json` — machine-readable baseline.
+- `… -- --against accuracy-baseline.json --tolerance 0.5` — regression gate
+  (exit 1 if any contract drops > 0.5 pp from the committed baseline).
+
+Current status (v26.0.1): **97.4 % overall**, every complexity level meets its
+target (L1 = 100 %, L2 = 100 %, L3 = 93.7 % ≥ 92 %, L4 = 100 %, L5 = 96.6 % ≥ 80 %).
+The v26.0.1 SDK sources are more complex than v25.1.1, so `udt` (76.0), `import_contract`
+(74.3) and `logging` (70.0, release WASM strips `log!`) sit below their individual
+level targets but are absorbed by the level averages; `udt`'s `add` in particular keeps
+its match unrecovered because the UdtEnum discriminant is not extracted from the
+parameter (a documented v26.0.1 lifter gap). The committed baseline is
+`accuracy-baseline.json` at the repo root; refresh it via an explicit PR when output
+changes intentionally.
+
+### Compile-back fidelity (`scripts/check-compilable.sh`)
+
+The accuracy metric is interface/fingerprint-based and does **not** check that
+output compiles. `scripts/check-compilable.sh` decompiles every fixture and runs
+`cargo check --target wasm32v1-none` against `soroban-sdk`. Current status
+(v26.0.1, pin `=26.0.1`): **29/35 non-skipped compile (82 %)**. This is down from
+97 % at v25.1.1: standardizing on the larger v26.0.1 SDK sources newly broke
+compile-back for `constructor`, `import_contract`, `bls`, `bn254`, and `udt` — each
+a distinct v26.0.1 coverage gap (e.g. `import_contract` because `invoke_contract`'s
+signature gained a second generic argument; `constructor` because a body returns
+`()` where `Option<i64>` is expected), not a single shared regression. `liquidity_pool`
+remains the one always-expected failure (no reference source). Two earlier
+compile-fidelity codegen fixes landed in `crates/soroban-ret/src/ir/optimizer.rs`:
+
+- **`remove_val_tag_guards`** strips SDK argument-validation guards of the shape
+  `if v.get_tag() != Tag::X { panic!() }`. The lifter's `ValTag`/`ValTagName`
+  recovery surfaced these, but `Val::get_tag()` and `Tag` are not public
+  `soroban_sdk` API, so they did not compile. The typed parameter already
+  implies the check; the SDK re-inserts the marshalling on rebuild.
+- **Orphan linear-memory marshalling removal** (in `remove_orphan_host_calls`)
+  drops standalone `*_to_linear_memory` / `*_from_linear_memory` host calls
+  (e.g. `map_unpack_to_linear_memory`) whose result is discarded — pure SDK
+  (de)serialization that codegen rendered as non-public `env.map()…` API.
+
+### Known gaps
+
+- **Trait-based contracts decompile to a flat `impl Contract`.** Contracts
+  written with `#[contractimpl(contracttrait)]` / `impl Trait for Contract`
+  (the `contracttrait_*` and `associated_types*` fixtures) carry **no** trait
+  information in the compiled WASM: `contractspecv0` (XDR `ScSpecEntry`) has only
+  `FunctionV0`/`UdtStructV0`/`UdtUnionV0`/`UdtEnumV0`/`UdtErrorEnumV0`/`EventV0`
+  — there is no trait-function entry, and the trait name/membership is erased at
+  compile time (verified: no trait strings in any contracttrait fixture). The
+  decompiler therefore emits a semantically-equivalent flat impl, which compiles
+  and scores 100 % on the accuracy metric. Recovering the original
+  `trait T { … } impl T for Contract` shape is **not possible** from the bytecode
+  alone and is out of scope.
+- **`test_liquidity_pool` does not compile** (the 1/38 compile-back failure):
+  `E0284 type annotations needed` on `.into_val(&env)` calls where the target
+  `Val` type cannot be inferred from context. This is a known type-inference
+  limitation that also affects the upstream `soroban-decompiler` reference repo.

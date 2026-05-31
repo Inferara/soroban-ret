@@ -1,0 +1,22 @@
+# Codecov configuration.
+#
+# CLI entry points (clap argument parsing + path resolution + process exit) are
+# thin wrappers that are exercised end-to-end, not by unit tests. Excluding them
+# keeps patch coverage meaningful for the library/tooling code that actually
+# carries logic, instead of being dominated by an untestable `main`.
+ignore:
+  - "crates/soroban-ret-accuracy/src/bin"
+
+coverage:
+  status:
+    project:
+      default:
+        # Don't fail the whole project on small fluctuations.
+        threshold: 1%
+    patch:
+      default:
+        # New code should be covered to roughly the project's own level. The
+        # accuracy crate is rendering/harness-heavy; a 5% slack absorbs the
+        # genuinely glue-y lines without letting coverage rot.
+        target: 80%
+        threshold: 5%

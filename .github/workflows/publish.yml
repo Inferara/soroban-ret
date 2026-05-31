@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Reference sources for the accuracy harness's end-to-end tests.
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

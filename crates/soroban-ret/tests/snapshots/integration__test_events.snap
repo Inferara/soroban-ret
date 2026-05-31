@@ -1,5 +1,6 @@
 ---
 source: crates/soroban-ret/tests/integration.rs
+assertion_line: 1027
 expression: source
 ---
 #![no_std]
@@ -19,12 +20,6 @@ pub struct Contract;
 #[contractimpl]
 impl Contract {
     pub fn failed_transfer(env: Env, from: Address, to: Address, amount: i128) {
-        if from.get_tag() != Tag::AddressObject {
-            panic!();
-        }
-        if to.get_tag() != Tag::AddressObject {
-            panic!();
-        }
         Transfer {
             from,
             to,
@@ -35,9 +30,6 @@ impl Contract {
         panic!();
     }
     pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
-        if from.get_tag() != Tag::AddressObject {
-            panic!();
-        }
         Transfer {
             from,
             to: to.address(),
