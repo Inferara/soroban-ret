@@ -144,6 +144,20 @@ fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<
         "Optimizer pass: remove_val_tag_guards ({} stmts)",
         stmts.len()
     );
+    // Removing the argument tag-validation guards can expose a now-leading
+    // validation-trap `panic!()` that sat between the guards and the real body.
+    // The SDK (v26+) emits this prologue trap for arguments whose tag check
+    // does not lift to a recognizable `if .get_tag() != Tag::X { panic }` guard
+    // (e.g. the `i128` scalar in `events::failed_transfer`), so it survives
+    // guard removal as a bare panic. Left in place it would make
+    // `remove_dead_code` (below) discard the entire real body as unreachable.
+    // Re-run leading-panic removal here, before dead-code elimination, so the
+    // trap is stripped and the body that follows it survives.
+    let stmts = remove_leading_panic(stmts);
+    log::trace!(
+        "Optimizer pass: remove_leading_panic [post-guard] ({} stmts)",
+        stmts.len()
+    );
     let stmts = invert_guard_clauses(stmts);
     log::trace!(
         "Optimizer pass: invert_guard_clauses ({} stmts)",
@@ -757,6 +771,21 @@ fn collapse_trivial_loops(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                     ))
                 ) && !stmts_contain_break_or_continue(&body)
                 {
+                    cov_mark::hit!(trivial_loop_collapsed);
+                    result.extend(body);
+                    continue;
+                }
+                // `loop { stmts... }` whose body has no back-edge (`continue`) and
+                // no `break` at this loop's level → inline as straight-line code. A
+                // WASM `loop` block only repeats when control explicitly branches
+                // back to its label (lifted to `Continue`); without that it runs
+                // exactly once and falls through. A genuinely repeating loop keeps
+                // its trailing `Continue` (stripped above only when redundant in
+                // Rust's auto-repeat sense), or carries a `Break`/`Continue`, so
+                // those are preserved by the guard. This recovers function bodies
+                // (e.g. SDK v26 wraps `require_auth; invoke` in such a block) that
+                // would otherwise render as a spurious `loop { … }`.
+                if !stmts_contain_break_or_continue(&body) {
                     cov_mark::hit!(trivial_loop_collapsed);
                     result.extend(body);
                     continue;
@@ -6048,9 +6077,12 @@ mod tests {
     }
 
     #[test]
-    fn loop_use_preserved() {
-        // let var_0 = x;  loop { expr(var_0) }  → self-assignment `let x = x` removed,
-        // loop body references NamedLocal("x") which resolves to param x directly.
+    fn backedge_free_loop_inlined_with_name_propagation() {
+        // let var_0 = x;  loop { expr(var_0) }
+        // The `loop` has no back-edge (`continue`) and no `break`, so it is a WASM
+        // `loop` block that runs exactly once and is inlined to straight-line code.
+        // Name propagation still applies: the self-assignment `let x = x` is removed
+        // and the inlined body references `x` directly (no dangling `var_0`).
         let stmts = vec![
             let_var(0, param("x")),
             SorobanStmt::Loop {
@@ -6058,9 +6090,38 @@ mod tests {
             },
         ];
         let out = optimize_stmts(stmts);
-        // The let binding becomes `let x = x` after name propagation and gets removed.
         assert_eq!(out.len(), 1);
-        assert!(matches!(&out[0], SorobanStmt::Loop { .. }));
+        assert!(
+            matches!(&out[0], SorobanStmt::Expr(_)),
+            "back-edge-free loop should inline to its body expression; got: {out:?}"
+        );
+        assert!(
+            !matches!(&out[0], SorobanStmt::Loop { .. }),
+            "loop wrapper should be gone: {out:?}"
+        );
+    }
+
+    #[test]
+    fn loop_with_breaking_condition_preserved() {
+        // A loop that exits via a `break` carries a real back-edge and must be
+        // preserved (only back-edge-free loops inline). The break is inside an
+        // `if` whose condition has a side effect, so the loop is not a trivial
+        // pure-condition loop either.
+        let stmts = vec![SorobanStmt::Loop {
+            body: vec![
+                SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(param("a")))),
+                SorobanStmt::If {
+                    condition: SorobanExpr::Param("cond".to_string()),
+                    then_body: vec![SorobanStmt::Break],
+                    else_body: vec![],
+                },
+            ],
+        }];
+        let out = optimize_stmts(stmts);
+        assert!(
+            matches!(&out[0], SorobanStmt::Loop { .. }),
+            "loop containing a break must be preserved; got: {out:?}"
+        );
     }
 
     #[test]
