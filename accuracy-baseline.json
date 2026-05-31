@@ -97,6 +97,26 @@
           ],
           "operations_missing": [],
           "artifact_count": 0
+        },
+        "safe_add": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "safe_add_two": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 100.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
         }
       }
     },
@@ -209,12 +229,12 @@
     "bls": {
       "name": "bls",
       "level": 5,
-      "types_score": 100.0,
-      "signatures_score": 100.0,
+      "types_score": 90.9,
+      "signatures_score": 82.2,
       "annotations_score": 100.0,
       "bodies_score": 100.0,
       "structure_score": 100.0,
-      "overall_score": 100.0,
+      "overall_score": 94.2,
       "artifact_score": 100.0,
       "functions": {
         "dummy_verify": {
@@ -227,11 +247,26 @@
           "operations_missing": [],
           "artifact_count": 0
         },
+        "fr_vec_get": {
+          "present": true,
+          "signature_score": 50.0,
+          "body_score": 100.0,
+          "param_diffs": [
+            "param 0: values (Vec<Bls12381Fr>) vs values (Vec<Fr>)",
+            "return: Some(\"Bls12381Fr\") vs Some(\"Fr\")"
+          ],
+          "return_type_match": false,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
         "g1_mul": {
           "present": true,
-          "signature_score": 100.0,
+          "signature_score": 75.0,
           "body_score": 100.0,
-          "param_diffs": [],
+          "param_diffs": [
+            "param 1: s (Bls12381Fr) vs s (Fr)"
+          ],
           "return_type_match": true,
           "operations_found": [],
           "operations_missing": [],
@@ -239,9 +274,11 @@
         },
         "g2_mul": {
           "present": true,
-          "signature_score": 100.0,
+          "signature_score": 75.0,
           "body_score": 100.0,
-          "param_diffs": [],
+          "param_diffs": [
+            "param 1: s (Bls12381Fr) vs s (Fr)"
+          ],
           "return_type_match": true,
           "operations_found": [],
           "operations_missing": [],
@@ -253,13 +290,26 @@
       "name": "bn254",
       "level": 5,
       "types_score": 100.0,
-      "signatures_score": 100.0,
+      "signatures_score": 86.7,
       "annotations_score": 100.0,
       "bodies_score": 100.0,
       "structure_score": 100.0,
-      "overall_score": 100.0,
+      "overall_score": 97.3,
       "artifact_score": 100.0,
       "functions": {
+        "fr_vec_get": {
+          "present": true,
+          "signature_score": 50.0,
+          "body_score": 100.0,
+          "param_diffs": [
+            "param 0: values (Vec<Bn254Fr>) vs values (Vec<Fr>)",
+            "return: Some(\"Bn254Fr\") vs Some(\"Fr\")"
+          ],
+          "return_type_match": false,
+          "operations_found": [],
+          "operations_missing": [],
+          "artifact_count": 0
+        },
         "g1_add": {
           "present": true,
           "signature_score": 100.0,
@@ -274,9 +324,11 @@
         },
         "g1_mul": {
           "present": true,
-          "signature_score": 100.0,
+          "signature_score": 75.0,
           "body_score": 100.0,
-          "param_diffs": [],
+          "param_diffs": [
+            "param 1: s (Bn254Fr) vs s (Fr)"
+          ],
           "return_type_match": true,
           "operations_found": [
             "mul"
@@ -302,9 +354,9 @@
       "types_score": 100.0,
       "signatures_score": 100.0,
       "annotations_score": 100.0,
-      "bodies_score": 100.0,
+      "bodies_score": 75.0,
       "structure_score": 100.0,
-      "overall_score": 100.0,
+      "overall_score": 92.5,
       "artifact_score": 100.0,
       "functions": {
         "__constructor": {
@@ -325,16 +377,17 @@
         "get_data": {
           "present": true,
           "signature_score": 100.0,
-          "body_score": 100.0,
+          "body_score": 50.0,
           "param_diffs": [],
           "return_type_match": true,
           "operations_found": [
-            "instance.get",
             "match",
-            "persistent.get",
             "temporary.get"
           ],
-          "operations_missing": [],
+          "operations_missing": [
+            "instance.get",
+            "persistent.get"
+          ],
           "artifact_count": 0
         }
       }
@@ -715,9 +768,9 @@
       "types_score": 100.0,
       "signatures_score": 100.0,
       "annotations_score": 100.0,
-      "bodies_score": 100.0,
+      "bodies_score": 14.3,
       "structure_score": 100.0,
-      "overall_score": 100.0,
+      "overall_score": 74.3,
       "artifact_score": 100.0,
       "functions": {
         "add_with": {
@@ -728,6 +781,34 @@
           "return_type_match": true,
           "operations_found": [],
           "operations_missing": [],
+          "artifact_count": 0
+        },
+        "safe_add_with": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 0.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [
+            "Err",
+            "Ok",
+            "match"
+          ],
+          "artifact_count": 0
+        },
+        "safe_add_with_two": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 0.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [
+            "Err",
+            "Ok",
+            "match"
+          ],
           "artifact_count": 0
         }
       }
@@ -988,22 +1069,48 @@
       "types_score": 100.0,
       "signatures_score": 100.0,
       "annotations_score": 100.0,
-      "bodies_score": 100.0,
+      "bodies_score": 20.0,
       "structure_score": 100.0,
-      "overall_score": 100.0,
+      "overall_score": 76.0,
       "artifact_score": 100.0,
       "functions": {
         "add": {
           "present": true,
           "signature_score": 100.0,
-          "body_score": 100.0,
+          "body_score": 0.0,
           "param_diffs": [],
           "return_type_match": true,
-          "operations_found": [
+          "operations_found": [],
+          "operations_missing": [
             "add",
             "match"
           ],
-          "operations_missing": [],
+          "artifact_count": 0
+        },
+        "recursive": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 0.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [],
+          "operations_missing": [
+            "if"
+          ],
+          "artifact_count": 0
+        },
+        "recursive_enum": {
+          "present": true,
+          "signature_score": 100.0,
+          "body_score": 50.0,
+          "param_diffs": [],
+          "return_type_match": true,
+          "operations_found": [
+            "match"
+          ],
+          "operations_missing": [
+            "Ok"
+          ],
           "artifact_count": 0
         }
       }
@@ -1062,7 +1169,7 @@
     "3": {
       "name": "Complex",
       "target": 92.0,
-      "average": 100.0,
+      "average": 93.7,
       "meets_target": true,
       "count": 5
     },
@@ -1076,10 +1183,10 @@
     "5": {
       "name": "Advanced",
       "target": 80.0,
-      "average": 98.4,
+      "average": 96.6,
       "meets_target": true,
       "count": 19
     }
   },
-  "overall_score": 99.2
+  "overall_score": 97.4
 }

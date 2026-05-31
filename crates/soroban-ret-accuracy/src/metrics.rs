@@ -64,6 +64,15 @@ pub struct AccuracyReport {
     pub contracts: BTreeMap<String, ContractReport>,
     pub levels: BTreeMap<u8, LevelSummary>,
     pub overall_score: f64,
+    /// Number of contracts actually scored. Diagnostic/display only — `#[serde(skip)]`
+    /// keeps it out of the persisted baseline so the `--against` format is unchanged.
+    #[serde(skip)]
+    pub scored_count: usize,
+    /// Names of contracts that were discovered but skipped (no reference source).
+    /// Surfaced so a missing submodule can't silently score a tiny subset and still
+    /// print a high "overall". Display only; not persisted.
+    #[serde(skip)]
+    pub skipped: Vec<String>,
 }
 
 /// Per-contract accuracy report.
@@ -215,10 +224,13 @@ impl AccuracyReport {
             round1(all_scores.iter().sum::<f64>() / all_scores.len() as f64)
         };
 
+        let scored_count = contracts.len();
         AccuracyReport {
             contracts,
             levels: level_summaries,
             overall_score: overall,
+            scored_count,
+            skipped: Vec::new(),
         }
     }
 }

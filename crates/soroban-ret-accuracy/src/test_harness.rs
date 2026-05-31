@@ -135,6 +135,7 @@ pub fn read_original_source(sdk_src_dir: &Path) -> String {
 /// and produces per-function accuracy scores.
 pub fn run_accuracy(contracts: &[ContractEntry], filter: Option<&str>) -> AccuracyReport {
     let mut reports = BTreeMap::new();
+    let mut skipped: Vec<String> = Vec::new();
 
     for entry in contracts {
         // Skip if filtering and not matching
@@ -144,10 +145,15 @@ pub fn run_accuracy(contracts: &[ContractEntry], filter: Option<&str>) -> Accura
             continue;
         }
 
-        // Skip if no SDK source available
+        // Skip if no SDK source available — record it so the caller can tell a
+        // genuine "no reference source" (e.g. liquidity_pool) from a missing
+        // submodule that silently shrank the scored set.
         let sdk_src_dir = match &entry.sdk_src_dir {
             Some(d) => d,
-            None => continue,
+            None => {
+                skipped.push(entry.name.clone());
+                continue;
+            }
         };
 
         // Read original source
@@ -207,5 +213,7 @@ pub fn run_accuracy(contracts: &[ContractEntry], filter: Option<&str>) -> Accura
         );
     }
 
-    AccuracyReport::from_contracts(reports)
+    let mut report = AccuracyReport::from_contracts(reports);
+    report.skipped = skipped;
+    report
 }

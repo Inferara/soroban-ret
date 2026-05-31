@@ -25,7 +25,7 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-soroban-sdk = "=25.3.1"
+soroban-sdk = "=26.0.1"
 
 [lib]
 crate-type = ["cdylib"]

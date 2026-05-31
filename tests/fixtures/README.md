@@ -61,8 +61,8 @@ run `soroban-ret --info <fixture>` to read it back.
 
 The canonical Rust source for every `test_*.wasm` fixture (except the
 `soroban-examples`-origin `test_liquidity_pool.wasm`) is checked out as a git
-submodule at `vendor/rs-soroban-sdk`, pinned to **v25.1.1**
-(commit `94c2a3b…`) — the exact SDK version+commit every fixture reports in its
+submodule at `vendor/rs-soroban-sdk`, pinned to **v26.0.1**
+(commit `f52b6aa…`) — the exact SDK version+commit every fixture reports in its
 `contractmetav0` section. The `soroban-ret-accuracy` harness reads
 `vendor/rs-soroban-sdk/tests/<name>/src/` as the comparison reference. Run
 `git submodule update --init --recursive` after cloning.

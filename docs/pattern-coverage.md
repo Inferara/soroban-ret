@@ -103,25 +103,45 @@ The `soroban-ret-accuracy` crate scores each fixture's decompiled output against
 its canonical SDK source using `syn`-based interface extraction and weighted
 component comparison (types 25 %, signatures 20 %, annotations 15 %, bodies 30 %,
 structure 10 %). Reference sources come from the **`vendor/rs-soroban-sdk`
-submodule pinned to v25.1.1** (commit `94c2a3b…`), the exact SDK version+commit
+submodule pinned to v26.0.1** (commit `f52b6aa…`), the exact SDK version+commit
 every fixture reports in `contractmetav0`.
+
+> **What the score means (and doesn't).** Each component is a *recall* measure:
+> it checks that the decompiled output *contains* the reference's interface and
+> body operation-kinds (e.g. an `if`, a `match`, a `panic`, a `.persistent().set`),
+> not that the logic is semantically equivalent. Extra or wrong operations are not
+> penalized, and a 100 % score is **not** a behavioral-equivalence proof — it means
+> "every operation kind the reference uses is present." The complementary
+> `scripts/check-compilable.sh` gate is the "does it actually build" check.
 
 - `cargo run -p soroban-ret-accuracy --bin accuracy` — table report.
 - `… -- --json > accuracy-baseline.json` — machine-readable baseline.
 - `… -- --against accuracy-baseline.json --tolerance 0.5` — regression gate
   (exit 1 if any contract drops > 0.5 pp from the committed baseline).
 
-Current status: **99.2 % overall**, every complexity level meets its target
-(L1–L4 = 100 %, L5 = 98.4 %). The committed baseline is `accuracy-baseline.json`
-at the repo root; refresh it via an explicit PR when output changes intentionally.
+Current status (v26.0.1): **97.4 % overall**, every complexity level meets its
+target (L1 = 100 %, L2 = 100 %, L3 = 93.7 % ≥ 92 %, L4 = 100 %, L5 = 96.6 % ≥ 80 %).
+The v26.0.1 SDK sources are more complex than v25.1.1, so `udt` (76.0), `import_contract`
+(74.3) and `logging` (70.0, release WASM strips `log!`) sit below their individual
+level targets but are absorbed by the level averages; `udt`'s `add` in particular keeps
+its match unrecovered because the UdtEnum discriminant is not extracted from the
+parameter (a documented v26.0.1 lifter gap). The committed baseline is
+`accuracy-baseline.json` at the repo root; refresh it via an explicit PR when output
+changes intentionally.
 
 ### Compile-back fidelity (`scripts/check-compilable.sh`)
 
 The accuracy metric is interface/fingerprint-based and does **not** check that
 output compiles. `scripts/check-compilable.sh` decompiles every fixture and runs
-`cargo check --target wasm32v1-none` against `soroban-sdk`. Current status:
-**37/38 compile (97 %)**, exceeding the ≥ 95 % target. Two compile-fidelity
-codegen fixes landed in `crates/soroban-ret/src/ir/optimizer.rs`:
+`cargo check --target wasm32v1-none` against `soroban-sdk`. Current status
+(v26.0.1, pin `=26.0.1`): **29/35 non-skipped compile (82 %)**. This is down from
+97 % at v25.1.1: standardizing on the larger v26.0.1 SDK sources newly broke
+compile-back for `constructor`, `import_contract`, `bls`, `bn254`, and `udt` — each
+a distinct v26.0.1 coverage gap (e.g. `import_contract` because `invoke_contract`'s
+signature gained a second generic argument; `constructor` because a body returns
+`()` where `Option<i64>` is expected), not a single shared regression. `liquidity_pool`
+remains the one always-expected failure (no reference source). Two earlier
+compile-fidelity codegen fixes landed in `crates/soroban-ret/src/ir/optimizer.rs`:
 
 - **`remove_val_tag_guards`** strips SDK argument-validation guards of the shape
   `if v.get_tag() != Tag::X { panic!() }`. The lifter's `ValTag`/`ValTagName`

@@ -70,6 +70,17 @@ pub fn render_table(report: &AccuracyReport) -> String {
         "OVERALL AVERAGE ACCURACY: {:.1}%",
         report.overall_score
     );
+    if report.skipped.is_empty() {
+        let _ = writeln!(out, "Scored {} contracts.", report.scored_count);
+    } else {
+        let _ = writeln!(
+            out,
+            "Scored {} contracts, skipped {} for missing reference source: {}",
+            report.scored_count,
+            report.skipped.len(),
+            report.skipped.join(", ")
+        );
+    }
     let _ = writeln!(out, "{}", "=".repeat(80));
 
     out
