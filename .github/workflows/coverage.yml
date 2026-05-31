@@ -14,6 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The accuracy harness reads reference sources from this submodule;
+          # without it the end-to-end coverage tests skip and the accuracy
+          # crate reports near-zero patch coverage.
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

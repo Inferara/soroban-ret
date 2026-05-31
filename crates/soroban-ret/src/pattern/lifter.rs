@@ -3621,14 +3621,6 @@ impl<'a> LiftContext<'a> {
                 pre_ctx.lift_instruction(i);
             }
         }
-        if std::env::var_os("RET_DUMP")
-            .is_some_and(|v| v.to_string_lossy().split(',').any(|t| t.trim() == "scrut"))
-        {
-            eprintln!(
-                "[RET_DUMP scrut] pre_br={pre_br_instrs:?}\n  stack_top={:?}",
-                pre_ctx.stack.last()
-            );
-        }
 
         // Propagate enum match recovery state from the child context.
         // `symbol_index_in_linear_memory` sets these during pre-br lifting.
@@ -3851,27 +3843,6 @@ impl<'a> LiftContext<'a> {
                         }
                     }
                 }
-            }
-
-            if std::env::var_os("RET_DUMP")
-                .is_some_and(|v| v.to_string_lossy().split(',').any(|t| t.trim() == "arms"))
-            {
-                let local_diff: Vec<(usize, &StackVal)> = case_ctx
-                    .locals
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, v)| {
-                        *i >= self.num_wasm_params as usize
-                            && self.locals.get(*i).map(|p| p != *v).unwrap_or(false)
-                    })
-                    .collect();
-                eprintln!(
-                    "[RET_DUMP arms] target={target} discs={discriminants:?} \
-                     stmts={:?} stack_grew={} local_diff={local_diff:?} raw_block={:?}",
-                    case_ctx.stmts,
-                    case_ctx.stack.len() > parent_stack_len,
-                    blocks[target_idx],
-                );
             }
 
             _arm_locals_data.push((
@@ -4220,21 +4191,6 @@ impl<'a> LiftContext<'a> {
             // the LetBinding, causing the return expression to reference
             // the wrong variable.
             self.phi_protected_locals.push(phi_idx as u32);
-        }
-
-        // Optional diagnostics: `RET_DUMP=match` prints the recovered match shape
-        // (scrutinee, phi decision, arms) before the empty-arm filter. Off by default;
-        // compiles to a single cheap env lookup that no-ops when the var is unset.
-        if std::env::var_os("RET_DUMP")
-            .is_some_and(|v| v.to_string_lossy().split(',').any(|t| t.trim() == "match"))
-        {
-            eprintln!(
-                "[RET_DUMP match] scrutinee={scrutinee:?} phi_local={phi_local:?} \
-                 targets={targets:?} default={default_target} blocks={num_blocks}"
-            );
-            for (i, arm) in arms.iter().enumerate() {
-                eprintln!("  arm[{i}] pattern={:?} body={:?}", arm.pattern, arm.body);
-            }
         }
 
         // Filter out empty-body arms (unrecoverable case bodies). An sret/Result

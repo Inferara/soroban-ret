@@ -148,3 +148,117 @@ pub fn render_detail(report: &AccuracyReport, contract_name: &str) -> Option<Str
 
     Some(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::{AccuracyReport, ContractReport, FunctionReport};
+    use std::collections::BTreeMap;
+
+    fn func() -> FunctionReport {
+        FunctionReport {
+            present: true,
+            signature_score: 90.0,
+            body_score: 75.0,
+            param_diffs: vec!["a: u64 vs u32".to_string()],
+            return_type_match: true,
+            operations_found: vec!["add".to_string()],
+            operations_missing: vec!["match".to_string()],
+            artifact_count: 2,
+        }
+    }
+
+    fn contract(name: &str, level: u8, score: f64, artifact: f64, with_fn: bool) -> ContractReport {
+        let mut functions = BTreeMap::new();
+        if with_fn {
+            functions.insert("do_it".to_string(), func());
+        }
+        ContractReport {
+            name: name.to_string(),
+            level,
+            types_score: score,
+            signatures_score: score,
+            annotations_score: score,
+            bodies_score: score,
+            structure_score: score,
+            overall_score: score,
+            artifact_score: artifact,
+            functions,
+            error: None,
+        }
+    }
+
+    fn sample_report() -> AccuracyReport {
+        let mut gamma = ContractReport::error("gamma", "Decompile error: boom".to_string());
+        gamma.level = 3; // keep level 3 deterministic for the BELOW-TARGET assertion
+
+        let mut map = BTreeMap::new();
+        map.insert("alpha".to_string(), contract("alpha", 3, 95.0, 80.0, true));
+        map.insert("beta".to_string(), contract("beta", 3, 50.0, 100.0, false));
+        map.insert(
+            "delta".to_string(),
+            contract("delta", 1, 100.0, 100.0, false),
+        );
+        map.insert("gamma".to_string(), gamma);
+
+        let mut report = AccuracyReport::from_contracts(map);
+        report.skipped = vec!["liquidity_pool".to_string()];
+        report
+    }
+
+    #[test]
+    fn render_table_covers_all_sections() {
+        let t = render_table(&sample_report());
+        assert!(t.contains("alpha") && t.contains("beta") && t.contains("delta"));
+        assert!(t.contains("OVERALL AVERAGE ACCURACY"));
+        assert!(t.contains("Level 1") && t.contains("Level 3"));
+        assert!(t.contains("[OK]"), "level 1 meets target → OK:\n{t}");
+        assert!(
+            t.contains("BELOW TARGET"),
+            "level 3 dragged below target:\n{t}"
+        );
+        assert!(t.contains("* Decompilation errors:"));
+        assert!(t.contains("gamma: Decompile error: boom"));
+        assert!(t.contains("skipped 1 for missing reference source: liquidity_pool"));
+    }
+
+    #[test]
+    fn render_table_scored_line_without_skips() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "alpha".to_string(),
+            contract("alpha", 1, 100.0, 100.0, false),
+        );
+        let t = render_table(&AccuracyReport::from_contracts(map));
+        assert!(t.contains("Scored 1 contracts."), "{t}");
+    }
+
+    #[test]
+    fn render_detail_present_absent_and_missing() {
+        let r = sample_report();
+
+        let d = render_detail(&r, "alpha").expect("alpha exists");
+        assert!(d.contains("Contract: alpha (Level 3)"));
+        assert!(d.contains("Functions:") && d.contains("do_it"));
+        assert!(d.contains("found ops: add"));
+        assert!(d.contains("missing ops: match"));
+        assert!(d.contains("diff: a: u64 vs u32"));
+        assert!(d.contains("artifacts: 2"));
+        assert!(d.contains("Artifacts:"), "artifact_score < 100 line:\n{d}");
+
+        let g = render_detail(&r, "beta").expect("beta exists");
+        assert!(g.contains("(no functions)"));
+
+        assert!(render_detail(&r, "does-not-exist").is_none());
+    }
+
+    #[test]
+    fn render_json_round_trips() {
+        let r = sample_report();
+        let json = render_json(&r);
+        assert!(json.contains("\"overall_score\""));
+        let back: AccuracyReport = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.overall_score, r.overall_score);
+        assert_eq!(back.contracts.len(), r.contracts.len());
+    }
+}
