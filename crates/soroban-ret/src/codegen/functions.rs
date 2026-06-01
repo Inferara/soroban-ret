@@ -423,7 +423,15 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 })
                 .collect();
             let type_param = invoke_type_param(return_type);
-            quote! { env.try_invoke_contract::<#type_param>(&#addr, &#func, vec![&env, #(#arg_exprs),*]) }
+            // v26 `try_invoke_contract::<T, E>` returns
+            // `Result<Result<T, T::Error>, Result<E, InvokeError>>`; flatten it to the
+            // function's declared `Result<T, E>`. `E` is left to inference so it matches
+            // whatever error type the signature declares (contract enum or `soroban_sdk::Error`).
+            quote! {
+                env.try_invoke_contract::<#type_param, _>(&#addr, &#func, vec![&env, #(#arg_exprs),*])
+                    .map(|r| r.unwrap())
+                    .map_err(|e| e.unwrap())
+            }
         }
 
         // Type construction
@@ -1971,7 +1979,12 @@ mod generate_expr_tests {
             return_type: Some("i32".into()),
         };
         let out = collapse(&s(generate_expr(&e)));
-        assert!(out.contains("env . try_invoke_contract :: < i32 >"));
+        // v26: two generic params (`E` inferred) + flatten of the nested Result.
+        assert!(
+            out.contains("env . try_invoke_contract :: < i32 , _ >"),
+            "got: {out}"
+        );
+        assert!(out.contains(". map_err"), "expected nested-Result flatten: {out}");
     }
 
     // ----- Type constructors -----

@@ -302,14 +302,36 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // Stage 4b: Infer return types for cross-contract calls in tail position.
         for func in &mut contract_module.functions {
             if let Some(ret_ty) = &func.return_type {
-                let type_str = spec_type_to_string(ret_ty);
-                if let Some(type_str) = type_str {
-                    cov_mark::hit!(stage_4b_return_type_inferred);
-                    set_invoke_return_type_in_tail(&mut func.body, &type_str, ret_ty);
-                }
+                cov_mark::hit!(stage_4b_return_type_inferred);
+                // `type_str` drives the non-Result `InvokeContract` case; the
+                // `TryInvokeContract` case derives its own ok type from `ret_ty`,
+                // so run the pass even for `Result<..>` returns (where
+                // `spec_type_to_string` yields `None` and the old gate skipped it,
+                // leaving `try_invoke_contract::<Val>` un-inferred).
+                let type_str = spec_type_to_string(ret_ty).unwrap_or_default();
+                set_invoke_return_type_in_tail(&mut func.body, &type_str, ret_ty);
             }
         }
         log::trace!("Pipeline pass: stage_4b return_type_inference");
+
+        // Stage 4b3: a tail `Vec`/`Map` `.get(i)` returns `Option<T>`; when the
+        // enclosing function returns the element type `T` (not `Option`/`Result`/
+        // void), the source wrote `.get(i).unwrap()` and the lifter dropped the
+        // unwrap. Re-attach it so the body type-checks (issues #19/#20: bls/bn254
+        // `fr_vec_get`).
+        for func in &mut contract_module.functions {
+            if let Some(rt) = &func.return_type
+                && !matches!(
+                    rt,
+                    stellar_xdr::curr::ScSpecTypeDef::Option(_)
+                        | stellar_xdr::curr::ScSpecTypeDef::Result(_)
+                        | stellar_xdr::curr::ScSpecTypeDef::Void
+                )
+            {
+                wrap_tail_vec_get_unwrap(&mut func.body);
+            }
+        }
+        log::trace!("Pipeline pass: stage_4b3 vec_get_unwrap");
 
         // Stage 4b2: Replace Void/UnknownVal with None in Option-typed struct/event fields.
         for func in &mut contract_module.functions {
@@ -2078,6 +2100,57 @@ fn spec_type_to_string(spec: &stellar_xdr::curr::ScSpecTypeDef) -> Option<String
 
 /// Set the return_type on InvokeContract/TryInvokeContract expressions in tail position.
 /// Walks the statement tree, only processing the last statement in each body.
+/// Wrap a tail `Vec`/`Map` `.get(i)` (which yields `Option<T>`) in `.unwrap()` so a
+/// function declared to return the element type `T` type-checks. Mirrors the tail
+/// traversal of [`set_invoke_return_type_in_tail`]. The `.get` may be wrapped by a
+/// (lifter-artifact) `ValConvert`/`SretResult`, which codegen renders transparently,
+/// so wrapping the outer expression is sufficient.
+fn wrap_tail_vec_get_unwrap(stmts: &mut [SorobanStmt]) {
+    let Some(last) = stmts.last_mut() else {
+        return;
+    };
+    match last {
+        SorobanStmt::Expr(expr) | SorobanStmt::Return(Some(expr)) => {
+            if expr_is_or_wraps_vec_get(expr) {
+                let inner = std::mem::replace(expr, SorobanExpr::Void);
+                *expr = SorobanExpr::MethodCall {
+                    object: Box::new(inner),
+                    method: "unwrap".to_string(),
+                    args: vec![],
+                };
+            }
+        }
+        SorobanStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            wrap_tail_vec_get_unwrap(then_body);
+            wrap_tail_vec_get_unwrap(else_body);
+        }
+        SorobanStmt::Match { arms, .. } => {
+            for arm in arms {
+                wrap_tail_vec_get_unwrap(&mut arm.body);
+            }
+        }
+        SorobanStmt::Block(body) => wrap_tail_vec_get_unwrap(body),
+        _ => {}
+    }
+}
+
+/// True if `expr` is a `Vec`/`Map` `.get(...)` call, possibly behind a transparent
+/// `ValConvert`/`SretResult` wrapper. (`StorageGet` is a distinct variant, not a
+/// `MethodCall`, so it is unaffected.)
+fn expr_is_or_wraps_vec_get(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::MethodCall { method, .. } => method == "get",
+        SorobanExpr::ValConvert { value, .. } | SorobanExpr::SretResult(value) => {
+            expr_is_or_wraps_vec_get(value)
+        }
+        _ => false,
+    }
+}
+
 fn set_invoke_return_type_in_tail(
     stmts: &mut [SorobanStmt],
     type_str: &str,
