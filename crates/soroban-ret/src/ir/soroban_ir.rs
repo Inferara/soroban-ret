@@ -15,6 +15,9 @@ pub enum SorobanExpr {
     Void,
     /// Rust `None` for Option-typed fields where the decompiled value is Void/unknown.
     None,
+    /// Rust `Some(inner)` for Option-typed values recovered from Option-return
+    /// marshalling (e.g. `if cond { None } else { Some(vec.first_unchecked()) }`).
+    Some(Box<SorobanExpr>),
 
     // Variables
     Param(String),

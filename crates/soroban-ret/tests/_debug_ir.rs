@@ -10,6 +10,12 @@ fn dump_ir() {
         env!("CARGO_MANIFEST_DIR")
     );
     let wasm = std::fs::read(&path).unwrap();
+    #[cfg(feature = "wasmprinter")]
+    if std::env::var("DBG_WAT").is_ok() {
+        let wat = soroban_ret::wasm_to_wat(&wasm).unwrap();
+        eprintln!("{wat}");
+        return;
+    }
     let ir = decompile_to_ir(&wasm).unwrap();
     for f in &ir.contract_module.functions {
         let ContractFn { name, body, .. } = f;

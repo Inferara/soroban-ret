@@ -173,6 +173,9 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         } else {
             None
         };
+        if std::env::var("DBG_PREOPT").map(|v| v.is_empty() || v == func.name).unwrap_or(false) {
+            eprintln!("[DBG_PREOPT] {} pre-opt ({} stmts):\n{:#?}", func.name, func.body.len(), func.body);
+        }
         let optimized = optimize_stmts(std::mem::take(&mut func.body));
         func.body = optimized;
 
@@ -998,6 +1001,7 @@ fn repair_unknown_invoke_functions_in_expr(expr: &mut SorobanExpr, replacement: 
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
         | SorobanExpr::ValTag(inner)
+        | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner) => {
             repair_unknown_invoke_functions_in_expr(inner, replacement);
         }
@@ -1220,6 +1224,7 @@ fn repair_unknown_event_values_in_expr(expr: &mut SorobanExpr, hint: &EventRepai
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
         | SorobanExpr::ValTag(inner)
+        | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner) => {
             repair_unknown_event_values_in_expr(inner, hint);
         }
@@ -1477,6 +1482,7 @@ fn repair_weak_auth_in_expr(expr: &mut SorobanExpr, hint: &AuthRepairHint) {
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
         | SorobanExpr::ValTag(inner)
+        | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner) => repair_weak_auth_in_expr(inner, hint),
         SorobanExpr::PublishEvent { topics, data, .. } => {
             for topic in topics {
@@ -1698,6 +1704,7 @@ fn repair_unknown_storage_keys_in_expr(expr: &mut SorobanExpr, replacement: &Sor
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
         | SorobanExpr::ValTag(inner)
+        | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner) => {
             repair_unknown_storage_keys_in_expr(inner, replacement);
         }
@@ -3088,6 +3095,7 @@ fn score_param_local_base_in_expr(
         | SorobanExpr::PrngReseed(inner)
         | SorobanExpr::PrngBytesNew(inner)
         | SorobanExpr::ValTag(inner)
+        | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner) => {
             score_param_local_base_in_expr(inner, param_count, param_local_base, rebound)
         }
@@ -3580,7 +3588,9 @@ fn expr_uses_env(expr: &SorobanExpr) -> bool {
         SorobanExpr::ValConvert { value, .. } | SorobanExpr::CastAs { value, .. } => {
             expr_uses_env(value)
         }
-        SorobanExpr::ValTag(inner) | SorobanExpr::SretResult(inner) => expr_uses_env(inner),
+        SorobanExpr::ValTag(inner)
+        | SorobanExpr::Some(inner)
+        | SorobanExpr::SretResult(inner) => expr_uses_env(inner),
         SorobanExpr::ContractError { .. } => false,
 
         // Leaves that never emit `env`

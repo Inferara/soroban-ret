@@ -946,7 +946,18 @@ impl<'a> LiftContext<'a> {
                 // already captured. Allowing the write would overwrite LetBinding(N)
                 // with a stale branch-corrupted value, causing the return expression
                 // to reference the wrong variable.
-                if self.phi_protected_locals.contains(idx) {
+                //
+                // EXCEPTION: a write whose value references a phi var (LetBinding)
+                // is the legitimate post-match *composition* — udt::add's final
+                // `a + b`, where each `match` phi-merged into a (reused param)
+                // slot and the tail combines them. The branch-sequential merge
+                // recomputation never references a phi LetBinding (it reads raw
+                // payload locals / constants), so this cleanly distinguishes the
+                // two; let the composition write eager-inline so the return reads
+                // `var_a + var_b`.
+                if self.phi_protected_locals.contains(idx)
+                    && !stack_val_references_letbinding(&val)
+                {
                     return;
                 }
                 // Loop-carried locals: emit `var_idx = <value>` so the loop body
@@ -1001,8 +1012,16 @@ impl<'a> LiftContext<'a> {
                     *self.stack.last_mut().unwrap() = slot;
                     return;
                 }
-                // Skip writes to phi-merge-protected locals (same as LocalSet).
-                if self.phi_protected_locals.contains(idx) {
+                // Skip writes to phi-merge-protected locals (same as LocalSet),
+                // EXCEPT the legitimate post-match composition write whose value
+                // references a phi var (udt::add's `a + b` lands via `local.tee`).
+                if self.phi_protected_locals.contains(idx)
+                    && !self
+                        .stack
+                        .last()
+                        .map(stack_val_references_letbinding)
+                        .unwrap_or(false)
+                {
                     return;
                 }
                 // Loop-carried locals: emit `var_idx = <value>` and keep the
@@ -3086,6 +3105,18 @@ impl<'a> LiftContext<'a> {
                         continue;
                     }
 
+                    // Vec-front `Option` idiom: `if v.is_empty() { None } else
+                    // { Some(v.first_unchecked()) }`. The value-producing `Some`
+                    // branch is the following siblings, which the generic
+                    // block+br_if handler would drop. Consume the rest of this
+                    // block level as the else.
+                    if let Some(if_stmt) =
+                        self.try_recognize_option_front_if(body, &blocks[i + 1..])
+                    {
+                        self.stmts.push(if_stmt);
+                        break;
+                    }
+
                     // Collect all BrIf(0) positions in the body
                     let brif_positions: Vec<usize> = body
                         .iter()
@@ -3587,6 +3618,97 @@ impl<'a> LiftContext<'a> {
         }
     }
 
+    /// Recognize the `Vec`-front `Option` idiom that an `Option<T>`-returning
+    /// function lowers to:
+    ///
+    /// ```ignore
+    /// if v.is_empty() { None } else { Some(v.first_unchecked()) }
+    /// ```
+    ///
+    /// rustc + wasm-opt lower this to a `block { <len-check>; br_if; <None>; br_outer }`
+    /// where the `Some` path is the *following siblings* of the inner block (the
+    /// branch reached when `br_if` fires on the not-empty condition). The generic
+    /// `block + br_if` handler keeps only the fall-through (`None`) side and drops
+    /// the value-producing `Some` else, so this dedicated recognizer reconstructs
+    /// the whole `if`.
+    ///
+    /// `inner` is the inner `Block`'s body; `tail` is the following siblings.
+    /// Gated tightly (Option return + exact block shape + `vec_len` in the
+    /// condition + the `Void`/`None` constant in the fall-through) so it cannot
+    /// fire on unrelated `Option`-returning branches.
+    fn try_recognize_option_front_if(
+        &mut self,
+        inner: &[super::structurize::StructuredBlock],
+        tail: &[super::structurize::StructuredBlock],
+    ) -> Option<SorobanStmt> {
+        use super::structurize::StructuredBlock;
+        use crate::wasm::ir::WasmInstr;
+
+        // Gate: function returns `Option<T>`, and there is a value-producing else.
+        if !matches!(self.return_type, Some(ScSpecTypeDef::Option(_))) || tail.is_empty() {
+            return None;
+        }
+
+        // `inner` must be flat instructions shaped `[<cond..>, BrIf(0), <none..>, Br(K>=1)]`.
+        let instrs: Vec<&WasmInstr> = inner
+            .iter()
+            .map(|b| match b {
+                StructuredBlock::Instruction(i) => Some(i),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let brif_positions: Vec<usize> = instrs
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| matches!(i, WasmInstr::BrIf(0)))
+            .map(|(p, _)| p)
+            .collect();
+        if brif_positions.len() != 1 {
+            return None;
+        }
+        let p = brif_positions[0];
+        if !matches!(instrs.last(), Some(WasmInstr::Br(k)) if *k >= 1) {
+            return None;
+        }
+
+        // The fall-through (cond false) must produce the `Void` Val (tag 2 = `None`).
+        let none_path = &instrs[p + 1..instrs.len() - 1];
+        if !none_path.iter().any(|i| matches!(i, WasmInstr::I64Const(2))) {
+            return None;
+        }
+
+        // Lift the condition and recover the vec it checks the length of.
+        let mut cctx = self.child_context();
+        cctx.lift_structured(&inner[..p]);
+        let cond_top = cctx.stack.last().cloned()?;
+        let cond_expr = {
+            let slots = self.frame_slots.borrow();
+            stack_val_to_expr(&cond_top, self.params, self.registry, Some(&slots))
+        };
+        let vec = find_vec_len_object(&cond_expr)?;
+
+        if std::env::var("DBG_TRACE").is_ok() {
+            eprintln!("[OPTFRONT] cond_expr={cond_expr:?}\n[OPTFRONT] vec={vec:?}");
+        }
+
+        let is_empty = SorobanExpr::MethodCall {
+            object: Box::new(vec.clone()),
+            method: "is_empty".to_string(),
+            args: Vec::new(),
+        };
+        let first = SorobanExpr::MethodCall {
+            object: Box::new(vec),
+            method: "first_unchecked".to_string(),
+            args: Vec::new(),
+        };
+        cov_mark::hit!(option_front_if_recovered);
+        Some(SorobanStmt::If {
+            condition: is_empty,
+            then_body: vec![SorobanStmt::Return(Some(SorobanExpr::None))],
+            else_body: vec![SorobanStmt::Return(Some(SorobanExpr::Some(Box::new(first))))],
+        })
+    }
+
     /// Try to recognize a nested block chain with br_table as a match/switch pattern.
     ///
     /// Pattern: nested Block nodes with BrTable at the innermost level.
@@ -3611,6 +3733,24 @@ impl<'a> LiftContext<'a> {
         // Need at least 1 case body and the innermost should contain BrTable
         if blocks.is_empty() {
             return None;
+        }
+
+        if std::env::var("DBG_TRACE").is_ok() {
+            let summ = |bs: &[StructuredBlock]| -> String {
+                bs.iter()
+                    .map(|b| match b {
+                        StructuredBlock::Block { .. } => "Block".to_string(),
+                        StructuredBlock::Loop { .. } => "Loop".to_string(),
+                        StructuredBlock::IfElse { .. } => "IfElse".to_string(),
+                        StructuredBlock::SafetyNetUnreachable => "SafetyNet".to_string(),
+                        StructuredBlock::Instruction(i) => format!("{i:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            eprintln!("[DBG_TRACE] try_recognize_match: depth={} current=[{}]", blocks.len(), summ(current));
+            let has_brtable = current.iter().any(|b| matches!(b, StructuredBlock::Instruction(crate::wasm::ir::WasmInstr::BrTable { .. })));
+            eprintln!("[DBG_TRACE]   br_table directly in current? {has_brtable}");
         }
 
         // Find BrTable in the innermost block
@@ -3997,11 +4137,25 @@ impl<'a> LiftContext<'a> {
 
         {
             let mut best_candidate: Option<(usize, usize)> = None;
-            for idx in (self.num_wasm_params as usize)..num_locals {
+            for idx in 0..num_locals {
                 let parent_val = match _pre_match_locals.get(idx) {
                     Some(v) => v,
                     None => continue,
                 };
+                // Param slots are normally excluded from phi-merge. But the SDK
+                // reuses a dead param slot as the result accumulator (udt::add:
+                // `let a = match a { … }` writes its result into the slot that
+                // held `b`, after `b` was already destructured). Only consider a
+                // param slot when its pre-match value is a plain constant — the
+                // `match`'s default-arm init (`i64.const 0; local.set 1`) staged
+                // before the dispatch. A slot still flowing the parameter or any
+                // derived value (e.g. constructor's `key.get(0)`) is left alone.
+                // Mirrors the reused-param-slot gate in the Fix-3a recovery above.
+                if idx < self.num_wasm_params as usize
+                    && !matches!(parent_val, StackVal::I64(_) | StackVal::I32(_))
+                {
+                    continue;
+                }
                 let modifying: Vec<&(u32, Vec<usize>, Vec<StackVal>, bool)> = _arm_locals_data
                     .iter()
                     .filter(|(_, _, _, is_escape)| !is_escape)
@@ -4230,7 +4384,20 @@ impl<'a> LiftContext<'a> {
                 || (scrutinee_is_sret && matches!(arm.pattern, MatchPattern::EnumVariant { .. }))
         });
 
+        if std::env::var("DBG_TRACE").is_ok() {
+            eprintln!(
+                "[DBG_TRACE] MATCH RESULT: scrutinee={scrutinee:?} phi_local={phi_local:?} arms={}",
+                arms.len()
+            );
+            for (ai, arm) in arms.iter().enumerate() {
+                eprintln!("[DBG_TRACE]   arm[{ai}] pat={:?} body_len={} body={:?}", arm.pattern, arm.body.len(), arm.body);
+            }
+        }
+
         if arms.is_empty() {
+            if std::env::var("DBG_TRACE").is_ok() {
+                eprintln!("[DBG_TRACE] MATCH DISCARDED: arms empty (scrutinee={scrutinee:?})");
+            }
             return None;
         }
 
@@ -5618,6 +5785,11 @@ fn lift_function_body(
     // Unreachable handler only emits Panic for genuine user panics (issue #11).
     let mut structured = super::structurize::structurize(&func.body);
     super::cfg_analysis::classify_safety_net_unreachables(&mut structured, wasm_module);
+    if let Ok(want) = std::env::var("DBG_STRUCT") {
+        if want.is_empty() || want == func_index.to_string() {
+            eprintln!("[DBG_STRUCT] func {func_index} structured:\n{structured:#?}");
+        }
+    }
     ctx.lift_structured(&structured);
 
     // Remove Return(None) immediately before Panic: the Return is from an inlined
@@ -8860,6 +9032,55 @@ fn is_terminator_stmt(s: &SorobanStmt) -> bool {
         SorobanStmt::Expr(SorobanExpr::Panic | SorobanExpr::PanicWithError(_))
             | SorobanStmt::Return(_)
     )
+}
+
+/// Whether a `StackVal` references a phi-merged `LetBinding` anywhere in its tree.
+/// Distinguishes udt::add's legitimate post-match composition (`var_a + var_b`,
+/// which references the phi `LetBinding`s) from the branch-sequential merge
+/// recomputation the phi-protection guard suppresses (which never does).
+fn stack_val_references_letbinding(v: &StackVal) -> bool {
+    match v {
+        StackVal::LetBinding(_) => true,
+        StackVal::BinOp(a, _, b) | StackVal::Compare(a, _, b) => {
+            stack_val_references_letbinding(a) || stack_val_references_letbinding(b)
+        }
+        StackVal::Eqz(a) => stack_val_references_letbinding(a),
+        _ => false,
+    }
+}
+
+/// Find the receiver object of a `.len()` `MethodCall` anywhere within `expr`.
+/// Used by `try_recognize_option_front_if` to recover the `Vec` whose length the
+/// not-empty condition checks.
+fn find_vec_len_object(expr: &SorobanExpr) -> Option<SorobanExpr> {
+    match expr {
+        SorobanExpr::MethodCall { object, method, .. } if method == "len" => {
+            Some((**object).clone())
+        }
+        SorobanExpr::MethodCall { object, args, .. } => find_vec_len_object(object)
+            .or_else(|| args.iter().find_map(find_vec_len_object)),
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => find_vec_len_object(a).or_else(|| find_vec_len_object(b)),
+        SorobanExpr::Not(e)
+        | SorobanExpr::ValConvert { value: e, .. }
+        | SorobanExpr::CastAs { value: e, .. }
+        | SorobanExpr::ValTag(e)
+        | SorobanExpr::Some(e)
+        | SorobanExpr::SretResult(e) => find_vec_len_object(e),
+        SorobanExpr::FieldAccess { object, .. } => find_vec_len_object(object),
+        _ => None,
+    }
 }
 
 /// A "weak" local is one that carries no meaningful semantic content — it is

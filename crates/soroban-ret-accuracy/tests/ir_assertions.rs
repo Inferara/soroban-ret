@@ -232,7 +232,7 @@ fn one_of_each_expr() -> Vec<SorobanExpr> {
             args: bx(leaf()),
         },
         PublishEvent {
-            event_name: Some("e".to_string()),
+            event_name: Option::Some("e".to_string()),
             topics: vec![leaf()],
             data: bx(leaf()),
         },
@@ -240,7 +240,7 @@ fn one_of_each_expr() -> Vec<SorobanExpr> {
             address: bx(leaf()),
             function: bx(leaf()),
             args: vec![leaf()],
-            return_type: Some("u64".to_string()),
+            return_type: Option::Some("u64".to_string()),
         },
         TryInvokeContract {
             address: bx(leaf()),
@@ -298,6 +298,7 @@ fn one_of_each_expr() -> Vec<SorobanExpr> {
             target_type: "i64".to_string(),
         },
         SretResult(bx(leaf())),
+        Some(bx(leaf())),
         ValTag(bx(leaf())),
         // leaf arm (no sub-expressions)
         UnknownVal,

@@ -195,6 +195,7 @@ pub fn walk_expr(expr: &SorobanExpr, pred: &dyn Fn(&SorobanExpr) -> bool) -> boo
         SorobanExpr::ValConvert { value, .. }
         | SorobanExpr::CastAs { value, .. }
         | SorobanExpr::SretResult(value)
+        | SorobanExpr::Some(value)
         | SorobanExpr::ValTag(value) => walk_expr(value, pred),
 
         // Leaves (no sub-expressions)

@@ -259,6 +259,10 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
         }
         SorobanExpr::Void => quote! { () },
         SorobanExpr::None => quote! { None },
+        SorobanExpr::Some(inner) => {
+            let inner = generate_expr(inner);
+            quote! { Some(#inner) }
+        }
 
         // Variables
         SorobanExpr::Param(name) => {
