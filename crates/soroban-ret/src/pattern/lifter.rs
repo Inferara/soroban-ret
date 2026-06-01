@@ -106,6 +106,26 @@ fn sym_index_local(val: &StackVal) -> Option<u32> {
     }
 }
 
+/// True when a match scrutinee carries no usable discriminant value — either genuinely
+/// unknown, or a *folded discriminant constant* left by a UDT-enum (`union`) dispatch
+/// that didn't go through `symbol_index_in_linear_memory` (e.g. `udt::add`'s 4-way
+/// `match`, where the discriminant collapsed to a large Val literal like `134217736`).
+/// In both cases the real scrutinee is the matched parameter, which the caller recovers
+/// from its declared type. The `>= 64` bound excludes small result-selector indices
+/// (`match <computed int>` br_tables switch on 0..N), so genuine integer matches are
+/// left untouched.
+fn is_recoverable_scrutinee(scrutinee: &SorobanExpr) -> bool {
+    match scrutinee {
+        SorobanExpr::UnknownVal => true,
+        // `udt::add`'s discriminant folds to a seeded `I64(0)` that decodes to
+        // `BoolLiteral(false)`; a genuine bool match is an `if`, never a multi-way
+        // br_table, so a br_table on a bool is always a collapsed discriminant.
+        SorobanExpr::BoolLiteral(_) => true,
+        SorobanExpr::I64Literal(v) => *v >= 64,
+        _ => false,
+    }
+}
+
 /// A small positive constant stride/shift amount (i32 or i64), restricted to a
 /// sane range so an adversarial module cannot synthesize pathological terms.
 fn as_small_stride(val: &StackVal) -> Option<u32> {
@@ -1269,6 +1289,7 @@ impl<'a> LiftContext<'a> {
                             self.wasm_module,
                             self.registry,
                             *target_idx,
+                            self.return_type_udt_name().as_deref(),
                         ) {
                             // Detected a struct construct wrapper (encode + map_new_from_linear_memory).
                             // Build StructConstruct directly from the caller's args, bypassing
@@ -1331,8 +1352,11 @@ impl<'a> LiftContext<'a> {
                                         .wasm_module
                                         .data_sections
                                         .read_string_slice_array(keys_ptr, count)
-                                    && let Some(type_name) =
-                                        find_type_by_field_names(self.registry, &field_names)
+                                    && let Some(type_name) = find_type_by_field_names(
+                                        self.registry,
+                                        &field_names,
+                                        self.return_type_udt_name().as_deref(),
+                                    )
                                 {
                                     // Try reading field values from frame_slots
                                     if let Some(values) =
@@ -1383,7 +1407,7 @@ impl<'a> LiftContext<'a> {
                                         .wasm_module
                                         .data_sections
                                         .read_string_slice_array(keys_ptr, count)
-                                    && find_type_by_field_names(self.registry, &field_names)
+                                    && find_type_by_field_names(self.registry, &field_names, None)
                                         .is_some()
                                 {
                                     let map_expr = stack_val_to_expr(
@@ -3691,9 +3715,12 @@ impl<'a> LiftContext<'a> {
         };
 
         // Recover scrutinee from parameter type when the heuristic found a
-        // matching type but scrutinee is still unknown.
+        // matching type but the scrutinee carries no usable discriminant — either
+        // unknown, or a folded discriminant constant (udt::add; see
+        // `is_recoverable_scrutinee`). Recovering to the `Param` also stops
+        // `fold_constant_matches` from collapsing the match on the stale constant.
         if let Some((ref type_name, _, _)) = int_enum_info
-            && matches!(scrutinee, SorobanExpr::UnknownVal)
+            && is_recoverable_scrutinee(&scrutinee)
         {
             let matching_params: Vec<&str> = self
                 .params
@@ -4390,7 +4417,7 @@ impl<'a> LiftContext<'a> {
                     return Some((tname, ordered, has_data));
                 }
             }
-            if matches!(scrutinee, SorobanExpr::UnknownVal)
+            if is_recoverable_scrutinee(scrutinee)
                 && let Some(spec) = self.registry.unions.get(&tname)
             {
                 let mut variants: Vec<String> = Vec::new();
@@ -5349,8 +5376,27 @@ impl<'a> LiftContext<'a> {
         }
     }
 
-    /// Find a struct type whose field names match exactly.
+    /// The UDT type name of this function's return value, unwrapping `Option<T>` /
+    /// `Result<T, E>` to the inner `T`. Used to disambiguate field-name-identical
+    /// structs (e.g. `UdtRecursive` vs `RecursiveToEnum`, both `{a, b}`).
+    fn return_type_udt_name(&self) -> Option<String> {
+        let mut ty = self.return_type.as_ref()?;
+        loop {
+            match ty {
+                ScSpecTypeDef::Option(o) => ty = o.value_type.as_ref(),
+                ScSpecTypeDef::Result(r) => ty = r.ok_type.as_ref(),
+                _ => break,
+            }
+        }
+        self.registry.resolve_type_name(ty)
+    }
+
+    /// Find a struct type whose field names match exactly. When several structs share
+    /// the same field-name set, prefer the one whose name matches this function's
+    /// return/param UDT type (`return_type_udt_name`); otherwise fall back to the first
+    /// match in declared (BTreeMap) order, preserving prior behavior.
     fn find_struct_by_fields(&self, field_names: &[String]) -> Option<String> {
+        let mut matches: Vec<&String> = Vec::new();
         for (name, spec) in &self.registry.structs {
             let spec_fields: Vec<String> = spec
                 .fields
@@ -5358,10 +5404,17 @@ impl<'a> LiftContext<'a> {
                 .filter_map(|f| f.name.to_utf8_string().ok())
                 .collect();
             if spec_fields == field_names {
-                return Some(name.clone());
+                matches.push(name);
             }
         }
-        None
+        if matches.len() > 1
+            && let Some(hint) = self.return_type_udt_name()
+            && let Some(m) = matches.iter().find(|n| ***n == hint)
+        {
+            cov_mark::hit!(struct_disambiguated_by_return_type);
+            return Some((*m).clone());
+        }
+        matches.first().map(|n| (*n).clone())
     }
 
     /// Find any type (struct, event, or union variant) whose field/param names match.
@@ -6364,7 +6417,7 @@ fn detect_load_struct_wrapper(
         for count in try_counts {
             if let Some(names) = module.data_sections.read_string_slice_array(ptr, count) {
                 if names.len() == count as usize
-                    && find_type_by_field_names(registry, &names).is_some()
+                    && find_type_by_field_names(registry, &names, None).is_some()
                 {
                     found_keys_ptr = Some(ptr);
                     found_count = Some(count);
@@ -6389,7 +6442,7 @@ fn detect_load_struct_wrapper(
         return None;
     }
 
-    let type_name = find_type_by_field_names(registry, &field_names);
+    let type_name = find_type_by_field_names(registry, &field_names, None);
     type_name.as_ref()?;
 
     // Trace the output layout by analyzing stores to the output pointer (local 0).
@@ -6642,7 +6695,7 @@ fn detect_map_unpack_decode_wrapper(
         for count in try_counts {
             if let Some(names) = module.data_sections.read_string_slice_array(ptr, count) {
                 if names.len() == count as usize
-                    && find_type_by_field_names(registry, &names).is_some()
+                    && find_type_by_field_names(registry, &names, None).is_some()
                 {
                     map_unpack_keys_ptr = Some(ptr);
                     map_unpack_count = Some(count);
@@ -6670,7 +6723,7 @@ fn detect_map_unpack_decode_wrapper(
 
     // Only match struct types, NOT union types (which also use map_unpack
     // but for enum variant discrimination, handled by the normal match recovery path).
-    let type_name = find_type_by_field_names(registry, &field_names);
+    let type_name = find_type_by_field_names(registry, &field_names, None);
     type_name.as_ref()?;
 
     // For multi-param wrappers, detect the storage type by scanning for
@@ -6710,6 +6763,7 @@ fn detect_struct_construct_wrapper(
     module: &WasmModule,
     registry: &TypeRegistry,
     func_idx: u32,
+    prefer: Option<&str>,
 ) -> Option<StructConstructWrapperInfo> {
     use crate::wasm::imports::HostModule;
     use crate::wasm::ir::{WasmInstr, WasmType};
@@ -6793,7 +6847,7 @@ fn detect_struct_construct_wrapper(
 
     // Must match a known struct type — skip for unions (enum variant construction
     // uses the same map_new_from_linear_memory but should go through the normal path).
-    let type_name = find_type_by_field_names(registry, &field_names)?;
+    let type_name = find_type_by_field_names(registry, &field_names, prefer)?;
 
     cov_mark::hit!(detect_struct_construct_wrapper_hit);
     Some(StructConstructWrapperInfo {
@@ -6936,8 +6990,13 @@ fn detect_storage_type_in_body(
 }
 
 /// Find a struct/event type name by its field names.
-fn find_type_by_field_names(registry: &TypeRegistry, field_names: &[String]) -> Option<String> {
-    // Check structs
+fn find_type_by_field_names(
+    registry: &TypeRegistry,
+    field_names: &[String],
+    prefer: Option<&str>,
+) -> Option<String> {
+    // Collect every struct whose field-name set matches.
+    let mut matches: Vec<&String> = Vec::new();
     for (name, spec) in &registry.structs {
         let spec_fields: Vec<String> = spec
             .fields
@@ -6945,10 +7004,20 @@ fn find_type_by_field_names(registry: &TypeRegistry, field_names: &[String]) -> 
             .filter_map(|f| f.name.to_utf8_string().ok())
             .collect();
         if spec_fields == *field_names {
-            return Some(name.clone());
+            matches.push(name);
         }
     }
-    None
+    // When the field-name set is ambiguous (e.g. `UdtRecursive` vs `RecursiveToEnum`,
+    // both `{a, b}`), prefer the struct named like the caller's return/param UDT;
+    // otherwise keep first-in-declared-order (prior behavior).
+    if matches.len() > 1
+        && let Some(p) = prefer
+        && let Some(m) = matches.iter().find(|n| **n == p)
+    {
+        cov_mark::hit!(struct_disambiguated_by_return_type);
+        return Some((*m).clone());
+    }
+    matches.first().map(|n| (*n).clone())
 }
 
 /// Info returned by `detect_balance_helper_wrapper`.

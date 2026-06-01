@@ -15,7 +15,7 @@ use crate::ir::optimizer::{
     recover_match_arm_storage_keys, remove_self_assignments,
     replace_void_with_none_in_option_fields,
 };
-use crate::ir::soroban_ir::{MatchPattern, SorobanExpr, SorobanStmt, StorageType};
+use crate::ir::soroban_ir::{MatchArm, MatchPattern, SorobanExpr, SorobanStmt, StorageType};
 use crate::pattern::lift_functions;
 use crate::pattern::lifter::find_identity_passthrough_param;
 use crate::spec::registry::TypeRegistry;
@@ -359,6 +359,18 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
             recover_enum_payload_bindings(&mut func.body);
         }
         log::trace!("Pipeline pass: stage_4b5 recover_enum_payload_bindings");
+
+        // Stage 4b6: recover a `Result<Option<T>, E>`-returning enum dispatch (Fix D,
+        // issue #14, udt `recursive_enum`). The lifter recovers the match and (via 4b5)
+        // the payload binding, but drops the data-less arm(s) (non-exhaustive match),
+        // leaves the surviving arm's tail as a bare `Expr` (so codegen's `Ok(..)` wrap
+        // never fires), and lowers `Map::get` to a `contains_key` probe. Restore the
+        // missing data-less variants as `Ok(None)`, rewrite the tail `contains_key`→`get`,
+        // and mark each arm's tail for `Ok(..)` wrapping.
+        for func in &mut contract_module.functions {
+            recover_result_option_enum_match(&mut func.body, &func.return_type, &registry);
+        }
+        log::trace!("Pipeline pass: stage_4b6 recover_result_option_enum_match");
 
         // Stage 4b2: Replace Void/UnknownVal with None in Option-typed struct/event fields.
         for func in &mut contract_module.functions {
@@ -2608,6 +2620,132 @@ fn recover_enum_payload_bindings(stmts: &mut [SorobanStmt]) {
             _ => {}
         }
     }
+}
+
+/// True when an expression already constructs a `Result`/`Option` value (`Ok`/`Err`/
+/// `Some`/`None` or an error), so codegen's tail `Ok(..)` wrap must NOT be applied again.
+fn expr_is_result_or_option_value(e: &SorobanExpr) -> bool {
+    match e {
+        SorobanExpr::None => true,
+        SorobanExpr::ContractError { .. } | SorobanExpr::ErrorFromCode(_) => true,
+        SorobanExpr::EnumConstruct { variant, .. } => {
+            matches!(variant.as_str(), "Ok" | "Err" | "Some" | "None")
+        }
+        _ => false,
+    }
+}
+
+/// Recover a `Result<Option<T>, E>`-returning enum dispatch (Fix D, issue #14, udt
+/// `recursive_enum`).
+///
+/// After lifting + Fix D1, the match and the data-carrying arm's payload binding are
+/// present, but three defects remain: (a) data-less arm(s) were dropped by arm-retain, so
+/// the match is non-exhaustive; (b) the surviving arm's body is a bare tail `Expr`, and
+/// codegen only `Ok(..)`-wraps `Return` values, so the wrap never fires; and (c) a
+/// `Map::get` was lowered to a `contains_key` probe (a `bool`, not the `Option` the return
+/// type needs). For a tail `match scrut { .. }` over a known union in a `Result<Option<_>,
+/// _>` function, this re-emits the arms in declared order: every declared variant missing
+/// from the match is restored as `=> Ok(None)` (only when it is data-less — we cannot
+/// synthesize a data-carrying body), a tail `contains_key` is rewritten to `get`, and each
+/// arm's tail `Expr(e)` becomes `Return(Some(e))` so codegen renders `Ok(e)`. Bails (no
+/// edit) unless every arm is a single tail `Expr` and every missing variant is data-less.
+fn recover_result_option_enum_match(
+    body: &mut [SorobanStmt],
+    return_type: &Option<ScSpecTypeDef>,
+    registry: &TypeRegistry,
+) {
+    // Gate: function returns `Result<Option<_>, _>`.
+    let Some(ScSpecTypeDef::Result(r)) = return_type else {
+        return;
+    };
+    if !matches!(*r.ok_type, ScSpecTypeDef::Option(_)) {
+        return;
+    }
+    // Operate on a tail `Match` over a known union.
+    let Some(SorobanStmt::Match { arms, .. }) = body.last_mut() else {
+        return;
+    };
+    let Some(union_name) = arms.iter().find_map(|a| match &a.pattern {
+        MatchPattern::EnumVariant { type_name, .. } => Some(type_name.clone()),
+        _ => None,
+    }) else {
+        return;
+    };
+    let Some(union) = registry.get_union(&union_name) else {
+        return;
+    };
+
+    // Declared variant order: (name, has_data).
+    use stellar_xdr::curr::ScSpecUdtUnionCaseV0;
+    let declared: Vec<(String, bool)> = union
+        .cases
+        .iter()
+        .filter_map(|case| match case {
+            ScSpecUdtUnionCaseV0::VoidV0(v) => v.name.to_utf8_string().ok().map(|n| (n, false)),
+            ScSpecUdtUnionCaseV0::TupleV0(t) => t.name.to_utf8_string().ok().map(|n| (n, true)),
+        })
+        .collect();
+    if declared.is_empty() {
+        return;
+    }
+
+    // Bail unless every existing arm is a single tail `Expr` we can normalize.
+    if !arms
+        .iter()
+        .all(|a| matches!(a.body.as_slice(), [SorobanStmt::Expr(_)]))
+    {
+        return;
+    }
+    // Bail if any missing variant is data-carrying — we can only synthesize `Ok(None)`.
+    let covered: std::collections::HashSet<&str> = arms
+        .iter()
+        .filter_map(|a| match &a.pattern {
+            MatchPattern::EnumVariant { variant, .. } => Some(variant.as_str()),
+            _ => None,
+        })
+        .collect();
+    if declared
+        .iter()
+        .any(|(name, has_data)| *has_data && !covered.contains(name.as_str()))
+    {
+        return;
+    }
+
+    // Re-emit arms in declared order.
+    let mut rebuilt: Vec<MatchArm> = Vec::with_capacity(declared.len());
+    for (variant, _has_data) in &declared {
+        if let Some(existing) = arms.iter().find(|a| {
+            matches!(&a.pattern, MatchPattern::EnumVariant { variant: v, .. } if v == variant)
+        }) {
+            let body = match existing.body.first() {
+                Some(SorobanStmt::Expr(e)) if !expr_is_result_or_option_value(e) => {
+                    let mut e = e.clone();
+                    if let SorobanExpr::MethodCall { method, .. } = &mut e
+                        && method == "contains_key"
+                    {
+                        *method = "get".to_string();
+                    }
+                    vec![SorobanStmt::Return(Some(e))]
+                }
+                _ => existing.body.clone(),
+            };
+            rebuilt.push(MatchArm {
+                pattern: existing.pattern.clone(),
+                body,
+            });
+        } else {
+            // Missing data-less variant → `=> Ok(None)`.
+            rebuilt.push(MatchArm {
+                pattern: MatchPattern::EnumVariant {
+                    type_name: union_name.clone(),
+                    variant: variant.clone(),
+                    bindings: Vec::new(),
+                },
+                body: vec![SorobanStmt::Return(Some(SorobanExpr::None))],
+            });
+        }
+    }
+    *arms = rebuilt;
 }
 
 fn set_invoke_return_type_in_tail(

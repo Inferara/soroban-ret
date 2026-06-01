@@ -4619,7 +4619,7 @@ fn recover_keys_in_stmt(stmt: SorobanStmt) -> SorobanStmt {
                 // mentions another param, the lifter most likely lost a key
                 // computed from that other param — substituting the scrutinee
                 // would silently attribute storage to the wrong key.
-                let arms = arms
+                let mut arms: Vec<MatchArm> = arms
                     .into_iter()
                     .map(|arm| {
                         let mentions_other_params =
@@ -4635,6 +4635,10 @@ fn recover_keys_in_stmt(stmt: SorobanStmt) -> SorobanStmt {
                         }
                     })
                     .collect();
+                // A uniform storage-dispatch match (e.g. `constructor::get_data`) may
+                // come back with some arms empty because WASM LTO merged the per-tier
+                // reads — fill them from the surviving arm.
+                fill_empty_storage_dispatch_arms(&mut arms);
                 return SorobanStmt::Match { scrutinee, arms };
             }
             // Recurse into arms even if no substitution
@@ -4663,6 +4667,85 @@ fn recover_keys_in_stmt(stmt: SorobanStmt) -> SorobanStmt {
         },
         SorobanStmt::Block(stmts) => SorobanStmt::Block(recover_match_arm_storage_keys(stmts)),
         other => other,
+    }
+}
+
+/// Fill empty arms of a uniform storage-dispatch match.
+///
+/// `constructor::get_data` lowers to
+/// `match key { DataKey::Persistent(_) => env.storage().persistent().get(&key),
+///              DataKey::Temp(_)       => env.storage().temporary().get(&key),
+///              DataKey::Instance(_)   => env.storage().instance().get(&key) }`,
+/// but WASM LTO merges the three per-tier reads into one site, so the lifter recovers a
+/// `StorageGet` for only one arm; the others come back empty and codegen renders them
+/// `()`, breaking the `Option<i64>` return. When every non-empty arm is a single
+/// `StorageGet`, clone that surviving read into each empty arm, picking the tier from the
+/// arm's enum-variant name so the faithful `persistent()`/`temporary()`/`instance()` is
+/// restored (falling back to the template's tier for an unrecognized name, which still
+/// compiles). `unwrap` follows the template; pipeline stage 4e later normalizes it to
+/// `false` for `Option`-returning functions.
+fn fill_empty_storage_dispatch_arms(arms: &mut [MatchArm]) {
+    // Template: an arm whose body is exactly one `Expr(StorageGet { .. })`.
+    let template = arms.iter().find_map(|arm| match arm.body.as_slice() {
+        [SorobanStmt::Expr(sg @ SorobanExpr::StorageGet { .. })] => Some(sg.clone()),
+        _ => None,
+    });
+    let Some(SorobanExpr::StorageGet {
+        storage_type: tmpl_type,
+        key,
+        unwrap,
+    }) = template
+    else {
+        return;
+    };
+
+    // Only act on a uniform storage-dispatch match: at least one empty arm to fill, and
+    // every non-empty arm is itself a single `StorageGet`. This keeps the rewrite from
+    // touching any match that merely happens to contain a storage read.
+    if !arms.iter().any(|arm| arm.body.is_empty()) {
+        return;
+    }
+    let all_nonempty_are_storage_get = arms.iter().filter(|arm| !arm.body.is_empty()).all(|arm| {
+        matches!(
+            arm.body.as_slice(),
+            [SorobanStmt::Expr(SorobanExpr::StorageGet { .. })]
+        )
+    });
+    if !all_nonempty_are_storage_get {
+        return;
+    }
+
+    for arm in arms.iter_mut() {
+        if !arm.body.is_empty() {
+            continue;
+        }
+        let storage_type = match &arm.pattern {
+            MatchPattern::EnumVariant { variant, .. } => {
+                storage_type_from_variant(variant).unwrap_or(tmpl_type)
+            }
+            _ => tmpl_type,
+        };
+        cov_mark::hit!(storage_dispatch_arm_filled);
+        arm.body = vec![SorobanStmt::Expr(SorobanExpr::StorageGet {
+            storage_type,
+            key: key.clone(),
+            unwrap,
+        })];
+    }
+}
+
+/// Map a storage-key enum variant name to its storage tier, following the
+/// `DataKey::{Persistent,Temp,Instance}` convention.
+fn storage_type_from_variant(variant: &str) -> Option<StorageType> {
+    let v = variant.to_ascii_lowercase();
+    if v.contains("persist") {
+        Some(StorageType::Persistent)
+    } else if v.contains("temp") {
+        Some(StorageType::Temporary)
+    } else if v.contains("instance") {
+        Some(StorageType::Instance)
+    } else {
+        None
     }
 }
 
@@ -7033,5 +7116,82 @@ mod tests {
         assert!(
             matches!(&out[0], SorobanStmt::Return(Some(SorobanExpr::Param(n))) if n == "proof")
         );
+    }
+
+    // ----- Storage-dispatch empty-arm recovery (compile-fidelity, constructor #16) -----
+
+    #[test]
+    fn empty_storage_dispatch_arms_filled() {
+        // `get_data` shape: WASM LTO merged the three per-tier reads so the lifter only
+        // recovered the `Temp` arm; `Persistent`/`Instance` came back empty.
+        fn get(st: StorageType) -> SorobanStmt {
+            SorobanStmt::Expr(SorobanExpr::StorageGet {
+                storage_type: st,
+                key: Box::new(param("key")),
+                unwrap: false,
+            })
+        }
+        fn arm(variant: &str, body: Vec<SorobanStmt>) -> MatchArm {
+            MatchArm {
+                pattern: MatchPattern::EnumVariant {
+                    type_name: "DataKey".to_string(),
+                    variant: variant.to_string(),
+                    bindings: vec!["_".to_string()],
+                },
+                body,
+            }
+        }
+        let stmts = vec![SorobanStmt::Match {
+            scrutinee: param("key"),
+            arms: vec![
+                arm("Persistent", vec![]),
+                arm("Temp", vec![get(StorageType::Temporary)]),
+                arm("Instance", vec![]),
+            ],
+        }];
+
+        let out = recover_match_arm_storage_keys(stmts);
+        let SorobanStmt::Match { arms, .. } = &out[0] else {
+            panic!("expected match, got {out:?}");
+        };
+        // Every arm now reads storage at its own tier, derived from the variant name.
+        let tier = |a: &MatchArm| match a.body.as_slice() {
+            [SorobanStmt::Expr(SorobanExpr::StorageGet { storage_type, .. })] => *storage_type,
+            other => panic!("arm body is not a single StorageGet: {other:?}"),
+        };
+        assert_eq!(tier(&arms[0]), StorageType::Persistent);
+        assert_eq!(tier(&arms[1]), StorageType::Temporary);
+        assert_eq!(tier(&arms[2]), StorageType::Instance);
+    }
+
+    #[test]
+    fn storage_dispatch_fill_skips_non_storage_match() {
+        // A match whose non-empty arms aren't single StorageGets must be left alone.
+        let stmts = vec![SorobanStmt::Match {
+            scrutinee: param("key"),
+            arms: vec![
+                MatchArm {
+                    pattern: MatchPattern::EnumVariant {
+                        type_name: "E".to_string(),
+                        variant: "A".to_string(),
+                        bindings: vec!["_".to_string()],
+                    },
+                    body: vec![],
+                },
+                MatchArm {
+                    pattern: MatchPattern::EnumVariant {
+                        type_name: "E".to_string(),
+                        variant: "B".to_string(),
+                        bindings: vec!["_".to_string()],
+                    },
+                    body: vec![ret(i64_lit(7))],
+                },
+            ],
+        }];
+        let out = recover_match_arm_storage_keys(stmts);
+        let SorobanStmt::Match { arms, .. } = &out[0] else {
+            panic!("expected match");
+        };
+        assert!(arms[0].body.is_empty(), "empty arm should stay empty");
     }
 }
