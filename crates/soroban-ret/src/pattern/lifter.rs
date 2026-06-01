@@ -945,16 +945,9 @@ impl<'a> LiftContext<'a> {
                 // a br_table block chain recomputes the same value the phi-merge
                 // already captured. Allowing the write would overwrite LetBinding(N)
                 // with a stale branch-corrupted value, causing the return expression
-                // to reference the wrong variable.
-                //
-                // EXCEPTION: a write whose value references a phi var (LetBinding)
-                // is the legitimate post-match *composition* — udt::add's final
-                // `a + b`, where each `match` phi-merged into a (reused param)
-                // slot and the tail combines them. The branch-sequential merge
-                // recomputation never references a phi LetBinding (it reads raw
-                // payload locals / constants), so this cleanly distinguishes the
-                // two; let the composition write eager-inline so the return reads
-                // `var_a + var_b`.
+                // to reference the wrong variable. EXCEPTION: a value that
+                // references a phi var is the legitimate post-match composition
+                // (udt::add's `a + b`), so let it write through.
                 if self.phi_protected_locals.contains(idx)
                     && !stack_val_references_letbinding(&val)
                 {
@@ -1013,8 +1006,7 @@ impl<'a> LiftContext<'a> {
                     return;
                 }
                 // Skip writes to phi-merge-protected locals (same as LocalSet),
-                // EXCEPT the legitimate post-match composition write whose value
-                // references a phi var (udt::add's `a + b` lands via `local.tee`).
+                // except the post-match composition write (value references a phi var).
                 if self.phi_protected_locals.contains(idx)
                     && !self
                         .stack
@@ -5792,6 +5784,10 @@ fn lift_function_body(
     }
     ctx.lift_structured(&structured);
 
+    // Re-attribute enum-payload loads hoisted before a `match` dispatch into the
+    // arms (udt::add). Runs over the whole body now that every load is resolved.
+    rebind_hoisted_enum_payload_body(&mut ctx.stmts);
+
     // Remove Return(None) immediately before Panic: the Return is from an inlined
     // body's WASM return instruction, not a meaningful Rust return statement. Without
     // this, remove_dead_code truncates the Panic as unreachable code after return.
@@ -9034,10 +9030,237 @@ fn is_terminator_stmt(s: &SorobanStmt) -> bool {
     )
 }
 
+/// Body-level re-attribution of an enum scrutinee's hoisted payload field-loads.
+///
+/// Runs after lifting (so every `<enum_param>.<field>` load is resolved — unlike
+/// the per-match recognition, where the scrutinee's loads may still be unresolved)
+/// and before optimization. For each `Match` over a `Param` enum scrutinee, binds
+/// each data-carrying arm's payload to `v0` and rewrites the arm's reads of the
+/// hoisted `let var_N = <param>.<field>` (which surface as `Local(N)`) into
+/// `v0.<field>`. The now-dead hoisted `let`s are left for the optimizer's
+/// unused-let removal.
+fn rebind_hoisted_enum_payload_body(stmts: &mut [SorobanStmt]) {
+    // Collect hoisted payload loads: WASM local index N -> (enum param, field).
+    let mut load_of: std::collections::HashMap<u32, (String, String)> =
+        std::collections::HashMap::new();
+    for s in stmts.iter() {
+        if let SorobanStmt::Let {
+            name,
+            value: SorobanExpr::FieldAccess { object, field },
+            ..
+        } = s
+            && let SorobanExpr::Param(p) = object.as_ref()
+            && let Some(idx) = name
+                .strip_prefix("var_")
+                .and_then(|n| n.parse::<u32>().ok())
+        {
+            load_of.insert(idx, (p.clone(), field.clone()));
+        }
+    }
+    if load_of.is_empty() {
+        return;
+    }
+    for s in stmts.iter_mut() {
+        rebind_enum_payload_in_stmt(s, &load_of);
+    }
+}
+
+fn rebind_enum_payload_in_stmt(
+    s: &mut SorobanStmt,
+    load_of: &std::collections::HashMap<u32, (String, String)>,
+) {
+    match s {
+        SorobanStmt::Match { scrutinee, arms } => {
+            let scrut_param = match scrutinee {
+                SorobanExpr::Param(p) => Some(p.clone()),
+                _ => None,
+            };
+            let field_of: std::collections::HashMap<u32, String> = scrut_param
+                .as_ref()
+                .map(|p| {
+                    load_of
+                        .iter()
+                        .filter(|(_, (pp, _))| pp == p)
+                        .map(|(n, (_, f))| (*n, f.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for arm in arms.iter_mut() {
+                // Recurse into nested matches first.
+                for st in arm.body.iter_mut() {
+                    rebind_enum_payload_in_stmt(st, load_of);
+                }
+                if !field_of.is_empty()
+                    && let MatchPattern::EnumVariant { bindings, .. } = &mut arm.pattern
+                    && bindings.len() == 1
+                    && bindings[0] == "_"
+                {
+                    let mut consumed = std::collections::HashSet::new();
+                    let mut bound = false;
+                    for st in arm.body.iter_mut() {
+                        rewrite_local_payload_in_stmt(
+                            st,
+                            &field_of,
+                            "v0",
+                            &mut consumed,
+                            &mut bound,
+                        );
+                    }
+                    if bound {
+                        bindings[0] = "v0".to_string();
+                    }
+                }
+            }
+        }
+        SorobanStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for st in then_body.iter_mut().chain(else_body.iter_mut()) {
+                rebind_enum_payload_in_stmt(st, load_of);
+            }
+        }
+        SorobanStmt::For { body, .. }
+        | SorobanStmt::Loop { body }
+        | SorobanStmt::Block(body) => {
+            for st in body.iter_mut() {
+                rebind_enum_payload_in_stmt(st, load_of);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite `Local(n)` reads of a hoisted enum-payload load (`field_of[n]`) into
+/// `<binding>.<field>` within a statement tree. Used by `rebind_hoisted_enum_payload_body`.
+fn rewrite_local_payload_in_stmt(
+    st: &mut SorobanStmt,
+    field_of: &std::collections::HashMap<u32, String>,
+    binding: &str,
+    consumed: &mut std::collections::HashSet<u32>,
+    bound: &mut bool,
+) {
+    match st {
+        SorobanStmt::Expr(e)
+        | SorobanStmt::Let { value: e, .. }
+        | SorobanStmt::Assign { value: e, .. }
+        | SorobanStmt::Return(Some(e)) => {
+            rewrite_local_payload_in_expr(e, field_of, binding, consumed, bound)
+        }
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            rewrite_local_payload_in_expr(condition, field_of, binding, consumed, bound);
+            for s in then_body.iter_mut().chain(else_body.iter_mut()) {
+                rewrite_local_payload_in_stmt(s, field_of, binding, consumed, bound);
+            }
+        }
+        SorobanStmt::Match { arms, .. } => {
+            for arm in arms.iter_mut() {
+                for s in arm.body.iter_mut() {
+                    rewrite_local_payload_in_stmt(s, field_of, binding, consumed, bound);
+                }
+            }
+        }
+        SorobanStmt::For {
+            start, end, body, ..
+        } => {
+            rewrite_local_payload_in_expr(start, field_of, binding, consumed, bound);
+            rewrite_local_payload_in_expr(end, field_of, binding, consumed, bound);
+            for s in body.iter_mut() {
+                rewrite_local_payload_in_stmt(s, field_of, binding, consumed, bound);
+            }
+        }
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+            for s in body.iter_mut() {
+                rewrite_local_payload_in_stmt(s, field_of, binding, consumed, bound);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_local_payload_in_expr(
+    e: &mut SorobanExpr,
+    field_of: &std::collections::HashMap<u32, String>,
+    binding: &str,
+    consumed: &mut std::collections::HashSet<u32>,
+    bound: &mut bool,
+) {
+    if let SorobanExpr::Local(n) = e {
+        if let Some(field) = field_of.get(n) {
+            consumed.insert(*n);
+            *bound = true;
+            *e = SorobanExpr::FieldAccess {
+                object: Box::new(SorobanExpr::NamedLocal(binding.to_string())),
+                field: field.clone(),
+            };
+        }
+        return;
+    }
+    let mut rec = |x: &mut SorobanExpr| {
+        rewrite_local_payload_in_expr(x, field_of, binding, consumed, bound)
+    };
+    match e {
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => {
+            rec(a);
+            rec(b);
+        }
+        SorobanExpr::Not(x)
+        | SorobanExpr::SretResult(x)
+        | SorobanExpr::ValTag(x)
+        | SorobanExpr::Some(x)
+        | SorobanExpr::ErrorFromCode(x)
+        | SorobanExpr::PanicWithError(x) => rec(x),
+        SorobanExpr::ValConvert { value, .. } | SorobanExpr::CastAs { value, .. } => rec(value),
+        SorobanExpr::FieldAccess { object, .. } => rec(object),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            rec(object);
+            for a in args.iter_mut() {
+                rec(a);
+            }
+        }
+        SorobanExpr::TupleConstruct(xs) | SorobanExpr::VecConstruct(xs) => {
+            for x in xs.iter_mut() {
+                rec(x);
+            }
+        }
+        SorobanExpr::EnumConstruct { fields, .. } => {
+            for x in fields.iter_mut() {
+                rec(x);
+            }
+        }
+        SorobanExpr::StructConstruct { fields, .. } => {
+            for (_, x) in fields.iter_mut() {
+                rec(x);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Whether a `StackVal` references a phi-merged `LetBinding` anywhere in its tree.
-/// Distinguishes udt::add's legitimate post-match composition (`var_a + var_b`,
-/// which references the phi `LetBinding`s) from the branch-sequential merge
-/// recomputation the phi-protection guard suppresses (which never does).
+/// Lets udt::add's post-match composition (`var_a + var_b`) write through the
+/// phi-protection guard (which otherwise drops the final `a + b`). NOTE: this is
+/// the partial composition recovery — it also captures UdtD's arm-local tail
+/// (`tup.0 + sum`) that the structurizer leaves in a shared merge block, so the
+/// final sum still carries a spurious term until that block is attributed to the
+/// arm (the same shared-block work the fold reconstruction needs).
 fn stack_val_references_letbinding(v: &StackVal) -> bool {
     match v {
         StackVal::LetBinding(_) => true,
