@@ -333,6 +333,33 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         }
         log::trace!("Pipeline pass: stage_4b3 vec_get_unwrap");
 
+        // Stage 4b4: recover misrouted crypto struct-field arguments (issue #19,
+        // bls `dummy_verify`). A reused WASM local can alias both a struct field
+        // (`proof.fp2`) and an unrelated scratch value — the BLS scalar-field
+        // modulus, materialized as `u256_val_from_be_bytes(bytes_new_from_linear_
+        // memory(addr, 32))`. The lifter names both bindings `var_N`, so the
+        // optimizer's dead-store + single-use inlining can substitute the modulus
+        // into `map_fp2_to_g2(..)`, emitting the non-existent `env.buf()` and
+        // failing to compile. Rewrite such a misrouted argument back to the
+        // matching struct-param field. See `recover_crypto_field_args`.
+        for func in &mut contract_module.functions {
+            recover_crypto_field_args(&mut func.body, &func.params, &registry);
+        }
+        log::trace!("Pipeline pass: stage_4b4 recover_crypto_field_args");
+
+        // Stage 4b5: bind data-carrying match-arm payloads (Fix D1, issue #14, udt). A
+        // Soroban enum with data is a 2-element Vec `[discriminant, payload]`, so an arm
+        // reads the variant's data via `<scrutinee>.get(1)`. The lifter leaves such arms
+        // with a `_` binding and the body referencing the raw `scrutinee.get(1)` (a type
+        // error — the scrutinee is the enum, not its payload). Post-optimization (so
+        // transient payload reads that the optimizer strips, e.g. constructor's
+        // `key.get(1)`, are already gone), give the arm a real binding and rewrite its
+        // surviving payload reads to it: `Variant(v0) => ... v0 ...`.
+        for func in &mut contract_module.functions {
+            recover_enum_payload_bindings(&mut func.body);
+        }
+        log::trace!("Pipeline pass: stage_4b5 recover_enum_payload_bindings");
+
         // Stage 4b2: Replace Void/UnknownVal with None in Option-typed struct/event fields.
         for func in &mut contract_module.functions {
             func.body =
@@ -2148,6 +2175,438 @@ fn expr_is_or_wraps_vec_get(expr: &SorobanExpr) -> bool {
             expr_is_or_wraps_vec_get(value)
         }
         _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4b4: recover misrouted crypto struct-field arguments (issue #19, bls)
+//
+// Root cause: a single WASM local is reused for two distinct host-call results —
+// a struct field (e.g. `proof.fp2`, a `BytesN<96>`) and the BLS scalar-field
+// modulus (a 32-byte `u256_val_from_be_bytes(bytes_new_from_linear_memory(addr,32))`
+// used to reduce the `Bls12381Fr` field). The lifter binds both to `var_N`, so the
+// optimizer's dead-store removal + single-use inlining drops the field binding and
+// inlines the modulus into the crypto call — `map_fp2_to_g2(<modulus>)` — which
+// renders the non-existent `env.buf()` and fails to compile.
+//
+// A full fix is SSA-versioning of reused locals (deep, high-regression-risk). This
+// is a narrow, registry-aware heuristic instead: it only fires for a known
+// single-argument bls12_381 `map_*` host method whose argument is (or wraps) a raw
+// `bytes_new_from_linear_memory` read, and rewrites it to the struct-param field
+// uniquely identified by the method's expected byte width and the fact that the
+// field is never otherwise referenced in the body. When the field is ambiguous it
+// leaves the call unchanged rather than guess.
+
+/// Expected input byte-width of the single-argument bls12_381 `map_*` host
+/// functions whose struct-field argument a reused-local alias can misroute.
+/// Returns `None` for methods this pass does not touch.
+fn bls_map_input_size(method: &str) -> Option<u32> {
+    match method {
+        "map_fp_to_g1" => Some(48),  // Bls12381Fp  = BytesN<48>
+        "map_fp2_to_g2" => Some(96), // Bls12381Fp2 = BytesN<96>
+        _ => None,
+    }
+}
+
+/// True if `expr` is (or transparently wraps) a raw `bytes_new_from_linear_memory`
+/// read — the signature of the misrouted BLS modulus that displaced a struct field.
+fn is_linear_mem_read(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::RawHostCall { function, .. } => function == "bytes_new_from_linear_memory",
+        SorobanExpr::ValConvert { value, .. } | SorobanExpr::CastAs { value, .. } => {
+            is_linear_mem_read(value)
+        }
+        _ => false,
+    }
+}
+
+/// Byte width of a crypto-aliasable struct field type (`BytesN<n>` or `U256`).
+fn crypto_field_width(ty: &ScSpecTypeDef) -> Option<u32> {
+    match ty {
+        ScSpecTypeDef::BytesN(b) => Some(b.n),
+        ScSpecTypeDef::U256 => Some(32),
+        _ => None,
+    }
+}
+
+/// Immutable sub-expressions of a `SorobanExpr` for the compound variants that can
+/// carry a crypto-call argument or a field reference. Mirrors
+/// `optimizer::expr_children`; variants without relevant sub-expressions yield none.
+fn child_exprs(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
+    match expr {
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => vec![a.as_ref(), b.as_ref()],
+        SorobanExpr::Not(a) | SorobanExpr::PanicWithError(a) | SorobanExpr::RequireAuth(a) => {
+            vec![a.as_ref()]
+        }
+        SorobanExpr::ValConvert { value, .. }
+        | SorobanExpr::CastAs { value, .. }
+        | SorobanExpr::SretResult(value) => vec![value.as_ref()],
+        SorobanExpr::MethodCall { object, args, .. } => {
+            let mut c = vec![object.as_ref()];
+            c.extend(args.iter());
+            c
+        }
+        SorobanExpr::StorageGet { key, .. }
+        | SorobanExpr::StorageHas { key, .. }
+        | SorobanExpr::StorageRemove { key, .. } => vec![key.as_ref()],
+        SorobanExpr::StorageSet { key, value, .. } => vec![key.as_ref(), value.as_ref()],
+        SorobanExpr::FieldAccess { object, .. } => vec![object.as_ref()],
+        SorobanExpr::TupleConstruct(fields) | SorobanExpr::VecConstruct(fields) => {
+            fields.iter().collect()
+        }
+        SorobanExpr::StructConstruct { fields, .. } => fields.iter().map(|(_, v)| v).collect(),
+        SorobanExpr::RawHostCall { args, .. } => args.iter().collect(),
+        _ => vec![],
+    }
+}
+
+/// Mutable counterpart of [`child_exprs`].
+fn child_exprs_mut(expr: &mut SorobanExpr) -> Vec<&mut SorobanExpr> {
+    match expr {
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => vec![a.as_mut(), b.as_mut()],
+        SorobanExpr::Not(a) | SorobanExpr::PanicWithError(a) | SorobanExpr::RequireAuth(a) => {
+            vec![a.as_mut()]
+        }
+        SorobanExpr::ValConvert { value, .. }
+        | SorobanExpr::CastAs { value, .. }
+        | SorobanExpr::SretResult(value) => vec![value.as_mut()],
+        SorobanExpr::MethodCall { object, args, .. } => {
+            let mut c = vec![object.as_mut()];
+            c.extend(args.iter_mut());
+            c
+        }
+        SorobanExpr::StorageGet { key, .. }
+        | SorobanExpr::StorageHas { key, .. }
+        | SorobanExpr::StorageRemove { key, .. } => vec![key.as_mut()],
+        SorobanExpr::StorageSet { key, value, .. } => vec![key.as_mut(), value.as_mut()],
+        SorobanExpr::FieldAccess { object, .. } => vec![object.as_mut()],
+        SorobanExpr::TupleConstruct(fields) | SorobanExpr::VecConstruct(fields) => {
+            fields.iter_mut().collect()
+        }
+        SorobanExpr::StructConstruct { fields, .. } => {
+            fields.iter_mut().map(|(_, v)| v).collect()
+        }
+        SorobanExpr::RawHostCall { args, .. } => args.iter_mut().collect(),
+        _ => vec![],
+    }
+}
+
+/// Visit every `SorobanExpr` node (recursively) in a statement list.
+fn walk_exprs(stmts: &[SorobanStmt], f: &mut dyn FnMut(&SorobanExpr)) {
+    fn visit(e: &SorobanExpr, f: &mut dyn FnMut(&SorobanExpr)) {
+        f(e);
+        for c in child_exprs(e) {
+            visit(c, f);
+        }
+    }
+    for s in stmts {
+        match s {
+            SorobanStmt::Expr(e)
+            | SorobanStmt::Return(Some(e))
+            | SorobanStmt::Let { value: e, .. }
+            | SorobanStmt::Assign { value: e, .. } => visit(e, f),
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                visit(condition, f);
+                walk_exprs(then_body, f);
+                walk_exprs(else_body, f);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                visit(scrutinee, f);
+                for a in arms {
+                    walk_exprs(&a.body, f);
+                }
+            }
+            SorobanStmt::For {
+                start, end, body, ..
+            } => {
+                visit(start, f);
+                visit(end, f);
+                walk_exprs(body, f);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => walk_exprs(body, f),
+            _ => {}
+        }
+    }
+}
+
+/// Rewrite a misrouted crypto argument inside one expression tree, consuming a
+/// matching entry from `unconsumed` so a field is never reused across calls.
+fn rewrite_crypto_args_expr(expr: &mut SorobanExpr, param: &str, unconsumed: &mut Vec<(String, u32)>) {
+    for child in child_exprs_mut(expr) {
+        rewrite_crypto_args_expr(child, param, unconsumed);
+    }
+    if let SorobanExpr::MethodCall { method, args, .. } = expr
+        && let Some(size) = bls_map_input_size(method)
+    {
+        for arg in args.iter_mut() {
+            if !is_linear_mem_read(arg) {
+                continue;
+            }
+            let matching: Vec<usize> = unconsumed
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, w))| *w == size)
+                .map(|(i, _)| i)
+                .collect();
+            if matching.len() == 1 {
+                let (field, _) = unconsumed.remove(matching[0]);
+                *arg = SorobanExpr::FieldAccess {
+                    object: Box::new(SorobanExpr::Param(param.to_string())),
+                    field,
+                };
+            }
+        }
+    }
+}
+
+/// Recurse [`rewrite_crypto_args_expr`] through a statement list.
+fn rewrite_crypto_args_stmts(
+    stmts: &mut [SorobanStmt],
+    param: &str,
+    unconsumed: &mut Vec<(String, u32)>,
+) {
+    for s in stmts {
+        match s {
+            SorobanStmt::Expr(e)
+            | SorobanStmt::Return(Some(e))
+            | SorobanStmt::Let { value: e, .. }
+            | SorobanStmt::Assign { value: e, .. } => rewrite_crypto_args_expr(e, param, unconsumed),
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                rewrite_crypto_args_expr(condition, param, unconsumed);
+                rewrite_crypto_args_stmts(then_body, param, unconsumed);
+                rewrite_crypto_args_stmts(else_body, param, unconsumed);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                rewrite_crypto_args_expr(scrutinee, param, unconsumed);
+                for a in arms {
+                    rewrite_crypto_args_stmts(&mut a.body, param, unconsumed);
+                }
+            }
+            SorobanStmt::For {
+                start, end, body, ..
+            } => {
+                rewrite_crypto_args_expr(start, param, unconsumed);
+                rewrite_crypto_args_expr(end, param, unconsumed);
+                rewrite_crypto_args_stmts(body, param, unconsumed);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                rewrite_crypto_args_stmts(body, param, unconsumed)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// See the Stage 4b4 comment at the call site. Rewrites a misrouted
+/// `bytes_new_from_linear_memory` argument of a bls12_381 `map_*` call back to the
+/// struct-param field it should have referenced.
+fn recover_crypto_field_args(body: &mut [SorobanStmt], params: &[FnParam], registry: &TypeRegistry) {
+    // Find the unique struct parameter that has crypto-aliasable fields. Bail on
+    // zero or more than one — the heuristic only disambiguates within one struct.
+    let mut struct_param: Option<(String, Vec<(String, u32)>)> = None;
+    for p in params {
+        let ScSpecTypeDef::Udt(udt) = &p.type_def else {
+            continue;
+        };
+        let Ok(tname) = udt.name.to_utf8_string() else {
+            continue;
+        };
+        let Some(spec) = registry.get_struct(&tname) else {
+            continue;
+        };
+        let fields: Vec<(String, u32)> = spec
+            .fields
+            .iter()
+            .filter_map(|f| Some((f.name.to_utf8_string().ok()?, crypto_field_width(&f.type_)?)))
+            .collect();
+        if fields.is_empty() {
+            continue;
+        }
+        if struct_param.is_some() {
+            return; // ambiguous: more than one crypto struct param
+        }
+        struct_param = Some((p.name.clone(), fields));
+    }
+    let Some((param_name, crypto_fields)) = struct_param else {
+        return;
+    };
+
+    // Fast exit unless a misrouted crypto argument is actually present.
+    let mut has_misrouted = false;
+    walk_exprs(body, &mut |e| {
+        if let SorobanExpr::MethodCall { method, args, .. } = e
+            && bls_map_input_size(method).is_some()
+            && args.iter().any(is_linear_mem_read)
+        {
+            has_misrouted = true;
+        }
+    });
+    if !has_misrouted {
+        return;
+    }
+
+    // Crypto fields already referenced as `param.field` are not candidates.
+    let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    walk_exprs(body, &mut |e| {
+        if let SorobanExpr::FieldAccess { object, field } = e
+            && matches!(object.as_ref(), SorobanExpr::Param(p) if *p == param_name)
+        {
+            consumed.insert(field.clone());
+        }
+    });
+    let mut unconsumed: Vec<(String, u32)> = crypto_fields
+        .into_iter()
+        .filter(|(n, _)| !consumed.contains(n))
+        .collect();
+
+    rewrite_crypto_args_stmts(body, &param_name, &mut unconsumed);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4b5: bind data-carrying match-arm payloads (Fix D1)
+// ---------------------------------------------------------------------------
+
+/// Rewrite every `<scrutinee>.get(1)` payload read in `expr` to `NamedLocal(binding)`.
+fn rebind_payload_get_expr(
+    expr: &mut SorobanExpr,
+    scrutinee: &SorobanExpr,
+    binding: &str,
+    changed: &mut bool,
+) {
+    if matches!(expr,
+        SorobanExpr::MethodCall { object, method, args }
+            if method == "get"
+                && args.len() == 1
+                && matches!(&args[0], SorobanExpr::U32Literal(1))
+                && object.as_ref() == scrutinee)
+    {
+        *expr = SorobanExpr::NamedLocal(binding.to_string());
+        *changed = true;
+        return;
+    }
+    for child in child_exprs_mut(expr) {
+        rebind_payload_get_expr(child, scrutinee, binding, changed);
+    }
+}
+
+/// Recurse [`rebind_payload_get_expr`] through a statement list.
+fn rebind_payload_get_stmts(
+    stmts: &mut [SorobanStmt],
+    scrutinee: &SorobanExpr,
+    binding: &str,
+    changed: &mut bool,
+) {
+    for s in stmts {
+        match s {
+            SorobanStmt::Expr(e)
+            | SorobanStmt::Return(Some(e))
+            | SorobanStmt::Let { value: e, .. }
+            | SorobanStmt::Assign { value: e, .. } => {
+                rebind_payload_get_expr(e, scrutinee, binding, changed)
+            }
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                rebind_payload_get_expr(condition, scrutinee, binding, changed);
+                rebind_payload_get_stmts(then_body, scrutinee, binding, changed);
+                rebind_payload_get_stmts(else_body, scrutinee, binding, changed);
+            }
+            SorobanStmt::Match {
+                scrutinee: sc,
+                arms,
+            } => {
+                rebind_payload_get_expr(sc, scrutinee, binding, changed);
+                for a in arms {
+                    rebind_payload_get_stmts(&mut a.body, scrutinee, binding, changed);
+                }
+            }
+            SorobanStmt::For {
+                start, end, body, ..
+            } => {
+                rebind_payload_get_expr(start, scrutinee, binding, changed);
+                rebind_payload_get_expr(end, scrutinee, binding, changed);
+                rebind_payload_get_stmts(body, scrutinee, binding, changed);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                rebind_payload_get_stmts(body, scrutinee, binding, changed)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walk every `Match` in `stmts`; for each data-carrying enum-variant arm (lifter marks
+/// these with a single `_` binding) whose body still reads the payload via
+/// `<scrutinee>.get(1)`, name the binding `v0` and rewrite those reads to it. Arms whose
+/// payload is unused keep `_`. Recurses into nested control flow.
+fn recover_enum_payload_bindings(stmts: &mut [SorobanStmt]) {
+    for s in stmts {
+        match s {
+            SorobanStmt::Match { scrutinee, arms } => {
+                let scrut = scrutinee.clone();
+                for arm in arms.iter_mut() {
+                    // Handle nested matches (with their own scrutinees) first.
+                    recover_enum_payload_bindings(&mut arm.body);
+                    if let MatchPattern::EnumVariant { bindings, .. } = &mut arm.pattern
+                        && bindings.len() == 1
+                        && bindings[0] == "_"
+                    {
+                        let name = "v0".to_string();
+                        let mut changed = false;
+                        rebind_payload_get_stmts(&mut arm.body, &scrut, &name, &mut changed);
+                        if changed {
+                            bindings[0] = name;
+                        }
+                    }
+                }
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                recover_enum_payload_bindings(then_body);
+                recover_enum_payload_bindings(else_body);
+            }
+            SorobanStmt::For { body, .. }
+            | SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body) => recover_enum_payload_bindings(body),
+            _ => {}
+        }
     }
 }
 
