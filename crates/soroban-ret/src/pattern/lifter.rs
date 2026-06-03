@@ -5788,6 +5788,10 @@ fn lift_function_body(
     // arms (udt::add). Runs over the whole body now that every load is resolved.
     rebind_hoisted_enum_payload_body(&mut ctx.stmts);
 
+    // Recover the SDK `Vec<i64>` fold idiom in a tuple-payload `match` arm
+    // (udt::add UdtD) BEFORE the optimizer deletes the constant-folded loop.
+    recover_vec_iter_fold(&mut ctx.stmts, registry);
+
     // Remove Return(None) immediately before Panic: the Return is from an inlined
     // body's WASM return instruction, not a meaningful Rust return statement. Without
     // this, remove_dead_code truncates the Panic as unreachable code after return.
@@ -9028,6 +9032,163 @@ fn is_terminator_stmt(s: &SorobanStmt) -> bool {
         SorobanStmt::Expr(SorobanExpr::Panic | SorobanExpr::PanicWithError(_))
             | SorobanStmt::Return(_)
     )
+}
+
+/// Pre-optimization recovery of the SDK `Vec<i64>` fold idiom inside a
+/// tuple-payload `match` arm (udt::add UdtD).
+///
+/// The arm lifts as `[Expr(<recv>.len()), Loop { … <recv>.get(0) … }]` where
+/// `<recv>` is the `Vec` field of the variant's tuple payload. The loop's guards
+/// constant-fold, so the optimizer (`remove_spurious_len` + `collapse_trivial_loops`)
+/// would delete the whole skeleton and lose the fold. Replace the arm body with a
+/// single `Assign{ <phi var>, tup.<scalar> + VecTryIterFold{ tup.<vec>, 0 } }`,
+/// which survives the optimizer and collapses to `let x = match …` in codegen
+/// (`try_combine_let_match`).
+///
+/// Narrowly gated (see [`try_rewrite_vec_fold_arm`]) so it cannot touch other
+/// fixtures: constructor's storage-dispatch `match` has no loop, and the
+/// memory-copy / counted loops match raw load/store offsets, never `len`/`get`
+/// on an identical `FieldAccess` receiver inside an `EnumVariant` arm.
+fn recover_vec_iter_fold(stmts: &mut [SorobanStmt], registry: &TypeRegistry) {
+    for s in stmts.iter_mut() {
+        match s {
+            SorobanStmt::Match { arms, .. } => {
+                // The phi accumulator target is shared by the data-carrying arms
+                // (e.g. `var_1`); read it from any sibling arm's `Assign`.
+                let phi_target = arms.iter().find_map(|a| {
+                    a.body.iter().find_map(|st| match st {
+                        SorobanStmt::Assign { target, .. } => Some(target.clone()),
+                        _ => None,
+                    })
+                });
+                for arm in arms.iter_mut() {
+                    if let Some(ref phi) = phi_target {
+                        try_rewrite_vec_fold_arm(arm, phi, registry);
+                    }
+                    recover_vec_iter_fold(&mut arm.body, registry);
+                }
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                recover_vec_iter_fold(then_body, registry);
+                recover_vec_iter_fold(else_body, registry);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                recover_vec_iter_fold(body, registry);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// If `arm` is the `Vec`-fold skeleton (see [`recover_vec_iter_fold`]), replace
+/// its body with `Assign{ phi, tup.<scalar> + VecTryIterFold{ tup.<vec>, 0 } }`
+/// and rename its payload binding to `tup`. Returns whether it rewrote the arm.
+fn try_rewrite_vec_fold_arm(arm: &mut MatchArm, phi: &str, registry: &TypeRegistry) -> bool {
+    // Inspect immutably first, collect the tuple indices, then mutate.
+    let (scalar_idx, vec_idx) = {
+        let (type_name, variant, binding) = match &arm.pattern {
+            MatchPattern::EnumVariant {
+                type_name,
+                variant,
+                bindings,
+            } if bindings.len() == 1 => (type_name, variant, &bindings[0]),
+            _ => return false,
+        };
+        if arm.body.len() != 2 {
+            return false;
+        }
+        // body[0] = `Expr(<recv>.len())`
+        let recv = match &arm.body[0] {
+            SorobanStmt::Expr(SorobanExpr::MethodCall {
+                object,
+                method,
+                args,
+            }) if method == "len" && args.is_empty() => object.as_ref(),
+            _ => return false,
+        };
+        // recv must be `<binding>.<field>` (the Vec field of the tuple payload).
+        match recv {
+            SorobanExpr::FieldAccess { object, .. } => match object.as_ref() {
+                SorobanExpr::NamedLocal(n) if n == binding => {}
+                _ => return false,
+            },
+            _ => return false,
+        }
+        // body[1] = `Loop` whose body iterates `<recv>.get(..)` on the same receiver.
+        let loop_body = match &arm.body[1] {
+            SorobanStmt::Loop { body } => body,
+            _ => return false,
+        };
+        let has_get = loop_body.iter().any(|st| {
+            matches!(
+                st,
+                SorobanStmt::Expr(SorobanExpr::MethodCall { object, method, .. })
+                    if method == "get" && object.as_ref() == recv
+            )
+        });
+        if !has_get {
+            return false;
+        }
+        match tuple_fold_indices(registry, type_name, variant) {
+            Some(idxs) => idxs,
+            None => return false,
+        }
+    };
+
+    // Mutate: rename the binding to `tup`, replace the body with the recovered fold.
+    if let MatchPattern::EnumVariant { bindings, .. } = &mut arm.pattern {
+        bindings[0] = "tup".to_string();
+    }
+    let tup_field = |i: usize| SorobanExpr::FieldAccess {
+        object: Box::new(SorobanExpr::NamedLocal("tup".to_string())),
+        field: i.to_string(),
+    };
+    let value = SorobanExpr::Add(
+        Box::new(tup_field(scalar_idx)),
+        Box::new(SorobanExpr::VecTryIterFold {
+            vec: Box::new(tup_field(vec_idx)),
+            init: Box::new(SorobanExpr::I64Literal(0)),
+        }),
+    );
+    arm.body = vec![SorobanStmt::Assign {
+        target: phi.to_string(),
+        value,
+    }];
+    cov_mark::hit!(vec_iter_fold_recovered);
+    true
+}
+
+/// For a union `variant` whose payload is a 2-field tuple struct `(i64, Vec<_>)`,
+/// return `(scalar_index, vec_index)`. `None` if the payload is not that shape.
+fn tuple_fold_indices(
+    registry: &TypeRegistry,
+    union_name: &str,
+    variant: &str,
+) -> Option<(usize, usize)> {
+    let payload = registry.find_variant_data_type(union_name, variant)?;
+    let udt_name = registry.resolve_type_name(&payload)?;
+    let spec = registry.get_struct(&udt_name)?;
+    if spec.fields.len() != 2 {
+        return None;
+    }
+    let mut scalar_idx = None;
+    let mut vec_idx = None;
+    for (i, f) in spec.fields.iter().enumerate() {
+        // Tuple struct: field names are numeric ("0", "1", …).
+        if f.name.to_utf8_string().ok()?.parse::<usize>().is_err() {
+            return None;
+        }
+        match &f.type_ {
+            ScSpecTypeDef::Vec(_) => vec_idx = Some(i),
+            ScSpecTypeDef::I64 => scalar_idx = Some(i),
+            _ => return None,
+        }
+    }
+    Some((scalar_idx?, vec_idx?))
 }
 
 /// Body-level re-attribution of an enum scrutinee's hoisted payload field-loads.

@@ -336,6 +336,17 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         }
         log::trace!("Pipeline pass: stage_4b3 vec_get_unwrap");
 
+        // Stage 4b3b: strip a leaked tuple-scalar term from a fold-bearing match
+        // composition (udt::add). `recover_vec_iter_fold` moves UdtD's `tup.0`
+        // into the arm, but wasm-opt's hoisted copy of that scalar still lands in
+        // the post-match return as `Add(Add(<scrutinee>.field, a), b)` (rendered
+        // `a.a + a + b`). Drop the leaked `<scrutinee param>.field` term so the
+        // return is the faithful `a + b` (issue #14, udt).
+        for func in &mut contract_module.functions {
+            strip_leaked_fold_scalar(&mut func.body);
+        }
+        log::trace!("Pipeline pass: stage_4b3b strip_leaked_fold_scalar");
+
         // Stage 4b4: recover misrouted crypto struct-field arguments (issue #19,
         // bls `dummy_verify`). A reused WASM local can alias both a struct field
         // (`proof.fp2`) and an unrelated scratch value — the BLS scalar-field
@@ -1047,6 +1058,10 @@ fn repair_unknown_invoke_functions_in_expr(expr: &mut SorobanExpr, replacement: 
                 repair_unknown_invoke_functions_in_expr(arg, replacement);
             }
         }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            repair_unknown_invoke_functions_in_expr(vec, replacement);
+            repair_unknown_invoke_functions_in_expr(init, replacement);
+        }
         SorobanExpr::CryptoEd25519Verify {
             public_key,
             message,
@@ -1281,6 +1296,10 @@ fn repair_unknown_event_values_in_expr(expr: &mut SorobanExpr, hint: &EventRepai
             for arg in args {
                 repair_unknown_event_values_in_expr(arg, hint);
             }
+        }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            repair_unknown_event_values_in_expr(vec, hint);
+            repair_unknown_event_values_in_expr(init, hint);
         }
         SorobanExpr::CryptoEd25519Verify {
             public_key,
@@ -1533,6 +1552,10 @@ fn repair_weak_auth_in_expr(expr: &mut SorobanExpr, hint: &AuthRepairHint) {
                 repair_weak_auth_in_expr(arg, hint);
             }
         }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            repair_weak_auth_in_expr(vec, hint);
+            repair_weak_auth_in_expr(init, hint);
+        }
         SorobanExpr::CryptoEd25519Verify {
             public_key,
             message,
@@ -1767,6 +1790,10 @@ fn repair_unknown_storage_keys_in_expr(expr: &mut SorobanExpr, replacement: &Sor
             for arg in args {
                 repair_unknown_storage_keys_in_expr(arg, replacement);
             }
+        }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            repair_unknown_storage_keys_in_expr(vec, replacement);
+            repair_unknown_storage_keys_in_expr(init, replacement);
         }
         SorobanExpr::CryptoEd25519Verify {
             public_key,
@@ -2193,6 +2220,115 @@ fn expr_is_or_wraps_vec_get(expr: &SorobanExpr) -> bool {
         SorobanExpr::ValConvert { value, .. } | SorobanExpr::SretResult(value) => {
             expr_is_or_wraps_vec_get(value)
         }
+        _ => false,
+    }
+}
+
+/// Stage 4b3b (issue #14, udt::add): drop a leaked tuple-scalar term from the
+/// tail return of a fold-bearing function. `recover_vec_iter_fold` places UdtD's
+/// `tup.0 + fold` inside the match arm, but wasm-opt also hoisted a copy of that
+/// scalar and added it in the post-match composition, so the optimized return is
+/// `Add(Add(<scrutinee>.field, a), b)` (renders `a.a + a + b`). Strip the leading
+/// `<scrutinee param>.field` so the return is the faithful `a + b`.
+///
+/// Tightly gated: fires only when the body has a fold-bearing match arm and the
+/// leaked term is a `FieldAccess` on a *fold-match scrutinee param* — so it never
+/// touches a legitimate `param.field + …` in any other function.
+fn strip_leaked_fold_scalar(body: &mut [SorobanStmt]) {
+    let scrutinees = fold_match_scrutinee_params(body);
+    if scrutinees.is_empty() {
+        return;
+    }
+    let Some(last) = body.last_mut() else {
+        return;
+    };
+    let expr = match last {
+        SorobanStmt::Return(Some(e)) | SorobanStmt::Expr(e) => e,
+        _ => return,
+    };
+    // Descend through transparent codegen wrappers to the composition `Add`.
+    let mut cur = expr;
+    while let SorobanExpr::ValConvert { value, .. } | SorobanExpr::SretResult(value) = cur {
+        cur = value;
+    }
+    strip_leftmost_scrutinee_field(cur, &scrutinees);
+}
+
+/// Remove the leftmost leaf of a left-associated `Add` chain when it is a
+/// `FieldAccess` on one of `scrutinees`. `((leak + x) + y)` → `(x + y)`.
+fn strip_leftmost_scrutinee_field(expr: &mut SorobanExpr, scrutinees: &[String]) -> bool {
+    if let SorobanExpr::Add(l, r) = expr {
+        if is_scrutinee_field(l, scrutinees) {
+            let rhs = std::mem::replace(r.as_mut(), SorobanExpr::Void);
+            *expr = rhs;
+            return true;
+        }
+        return strip_leftmost_scrutinee_field(l, scrutinees);
+    }
+    false
+}
+
+/// `expr` is `<param>.<field>` where `<param>` is one of `scrutinees`.
+fn is_scrutinee_field(expr: &SorobanExpr, scrutinees: &[String]) -> bool {
+    matches!(
+        expr,
+        SorobanExpr::FieldAccess { object, .. }
+            if matches!(object.as_ref(), SorobanExpr::Param(p) if scrutinees.contains(p))
+    )
+}
+
+/// Param names that are the scrutinee of a `Match` containing a `VecTryIterFold`
+/// arm (i.e. a fold that `recover_vec_iter_fold` synthesized).
+fn fold_match_scrutinee_params(stmts: &[SorobanStmt]) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_fold_scrutinees(stmts, &mut out);
+    out
+}
+
+fn collect_fold_scrutinees(stmts: &[SorobanStmt], out: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            SorobanStmt::Match { scrutinee, arms } => {
+                if let SorobanExpr::Param(p) = scrutinee
+                    && arms.iter().any(|a| a.body.iter().any(stmt_contains_vec_fold))
+                {
+                    out.push(p.clone());
+                }
+                for a in arms {
+                    collect_fold_scrutinees(&a.body, out);
+                }
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_fold_scrutinees(then_body, out);
+                collect_fold_scrutinees(else_body, out);
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::For { body, .. }
+            | SorobanStmt::Block(body) => collect_fold_scrutinees(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn stmt_contains_vec_fold(s: &SorobanStmt) -> bool {
+    match s {
+        SorobanStmt::Assign { value, .. }
+        | SorobanStmt::Expr(value)
+        | SorobanStmt::Let { value, .. } => expr_contains_vec_fold(value),
+        SorobanStmt::Return(Some(e)) => expr_contains_vec_fold(e),
+        _ => false,
+    }
+}
+
+fn expr_contains_vec_fold(e: &SorobanExpr) -> bool {
+    match e {
+        SorobanExpr::VecTryIterFold { .. } => true,
+        SorobanExpr::Add(a, b) => expr_contains_vec_fold(a) || expr_contains_vec_fold(b),
+        SorobanExpr::FieldAccess { object, .. } => expr_contains_vec_fold(object),
         _ => false,
     }
 }
@@ -3115,6 +3251,17 @@ fn score_param_local_base_in_expr(
             }
             score
         }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            let mut score =
+                score_param_local_base_in_expr(vec, param_count, param_local_base, rebound);
+            score.merge(score_param_local_base_in_expr(
+                init,
+                param_count,
+                param_local_base,
+                rebound,
+            ));
+            score
+        }
         SorobanExpr::StorageGet { key, .. }
         | SorobanExpr::StorageHas { key, .. }
         | SorobanExpr::StorageRemove { key, .. } => {
@@ -3578,6 +3725,7 @@ fn expr_uses_env(expr: &SorobanExpr) -> bool {
         SorobanExpr::MethodCall { object, args, .. } => {
             expr_uses_env(object) || args.iter().any(expr_uses_env)
         }
+        SorobanExpr::VecTryIterFold { vec, init } => expr_uses_env(vec) || expr_uses_env(init),
         SorobanExpr::StructConstruct { fields, .. } => fields.iter().any(|(_, v)| expr_uses_env(v)),
         SorobanExpr::EnumConstruct { fields, .. } => fields.iter().any(expr_uses_env),
         SorobanExpr::TupleConstruct(elems) => elems.iter().any(expr_uses_env),

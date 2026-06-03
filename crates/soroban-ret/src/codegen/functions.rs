@@ -719,6 +719,21 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 }
             }
         }
+
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            let v = generate_expr(vec);
+            // Emit the fold init as a suffixed `0i64` to match the SDK source
+            // (the closure's accumulator type is i64). Only this call site is
+            // suffixed; global `I64Literal` rendering stays unsuffixed.
+            let i = match init.as_ref() {
+                SorobanExpr::I64Literal(n) => {
+                    let lit = proc_macro2::Literal::i64_suffixed(*n);
+                    quote! { #lit }
+                }
+                other => generate_expr(other),
+            };
+            quote! { #v.try_iter().fold(#i, |sum, i| sum + i.unwrap()) }
+        }
     }
 }
 

@@ -165,6 +165,9 @@ pub fn walk_expr(expr: &SorobanExpr, pred: &dyn Fn(&SorobanExpr) -> bool) -> boo
         SorobanExpr::MethodCall { object, args, .. } => {
             walk_expr(object, pred) || args.iter().any(|a| walk_expr(a, pred))
         }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            walk_expr(vec, pred) || walk_expr(init, pred)
+        }
 
         // Crypto (multi-arg)
         SorobanExpr::CryptoEd25519Verify {

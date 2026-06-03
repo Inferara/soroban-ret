@@ -1512,6 +1512,7 @@ fn expr_contains(haystack: &SorobanExpr, needle: &SorobanExpr) -> bool {
 
         // Object + args
         SorobanExpr::MethodCall { object, args, .. } => c(object) || cv(args),
+        SorobanExpr::VecTryIterFold { vec, init } => c(vec) || c(init),
         SorobanExpr::InvokeContract {
             address,
             function,
@@ -3494,6 +3495,10 @@ fn invalidate_seen_gets_for_expr(
                 invalidate_seen_gets_for_expr(a, seen_gets);
             }
         }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            invalidate_seen_gets_for_expr(vec, seen_gets);
+            invalidate_seen_gets_for_expr(init, seen_gets);
+        }
         SorobanExpr::PublishEvent { topics, data, .. } => {
             for t in topics {
                 invalidate_seen_gets_for_expr(t, seen_gets);
@@ -4897,6 +4902,10 @@ fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
         SorobanExpr::MethodCall { object, args, .. } => {
             expr_mentions_other_params(object, excluded)
                 || args.iter().any(|a| expr_mentions_other_params(a, excluded))
+        }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            expr_mentions_other_params(vec, excluded)
+                || expr_mentions_other_params(init, excluded)
         }
         SorobanExpr::StorageGet { key, .. }
         | SorobanExpr::StorageHas { key, .. }

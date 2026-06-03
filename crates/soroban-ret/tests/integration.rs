@@ -247,6 +247,22 @@ fn test_decompile_udt() {
     assert!(source.contains("pub enum UdtEnum"), "missing UdtEnum");
     assert!(source.contains("pub enum UdtEnum2"), "missing UdtEnum2");
     assert!(source.contains("contracttype"), "missing contracttype");
+    // Regression guard for #14: `add`'s UdtD arm must recover the Vec-fold idiom
+    // (VecTryIterFold / recover_vec_iter_fold pass), and the post-match
+    // composition must be the faithful `a + b` — not the spurious `a.a + a + b`
+    // that wasm-opt's hoisted `tup.0` leaks into the return.
+    assert_in_fn(
+        &source,
+        "fn add",
+        &[
+            "tup.0 + tup.1.try_iter().fold(0i64, |sum, i| sum + i.unwrap())",
+            "a + b",
+        ],
+    );
+    assert!(
+        !source.contains("a.a + a + b"),
+        "regressed: spurious a.a leak in udt::add (#14)"
+    );
     assert!(!source.contains("todo!("), "unexpected todo! artifact");
 }
 
@@ -364,6 +380,18 @@ fn test_decompile_constructor() {
     let source = decompile(wasm).expect("decompilation failed");
     assert!(source.contains("__constructor"), "missing constructor");
     assert!(source.contains("pub enum DataKey"), "missing DataKey type");
+    // Regression guard for #16: the storage-dispatch match arms must be filled
+    // (each tier's StorageGet), not recovered as `()`. Fixed by dd80099's
+    // fill_empty_storage_dispatch_arms. The match returns Option<i64>.
+    assert_in_fn(
+        &source,
+        "fn get_data",
+        &[
+            "DataKey::Persistent(_) => env.storage().persistent().get(&key)",
+            "DataKey::Temp(_) => env.storage().temporary().get(&key)",
+            "DataKey::Instance(_) => env.storage().instance().get(&key)",
+        ],
+    );
     assert!(!source.contains("todo!("), "unexpected todo! artifact");
 }
 
@@ -483,6 +511,24 @@ fn test_decompile_import_contract() {
     );
     assert!(source.contains("x: u64"), "missing x parameter");
     assert!(source.contains("y: u64"), "missing y parameter");
+    // Regression guards for #15 (SDK v26.0.1 invoke_contract codegen):
+    // - infallible call carries the return-type generic `::<u64>`
+    // - fallible call uses the two-generic `::<u64, _>` form with the inner
+    //   Result unwrapped via `.map(|r| r.unwrap()).map_err(|e| e.unwrap())`.
+    assert_in_fn(
+        &source,
+        "fn add_with",
+        &["env.invoke_contract::<u64>("],
+    );
+    assert_in_fn(
+        &source,
+        "fn safe_add_with",
+        &[
+            "env.try_invoke_contract::<u64, _>(",
+            ".map(|r| r.unwrap())",
+            ".map_err(|e| e.unwrap())",
+        ],
+    );
 }
 
 #[test]
@@ -638,11 +684,28 @@ fn test_decompile_bls() {
         source.contains("env.crypto().bls12_381()"),
         "missing crypto().bls12_381() dispatch"
     );
+    // Regression guard for #19 defect 1 (shared with #20): Vec::get must keep
+    // its .unwrap() panic-guard so the Option<Bls12381Fr> result type-checks
+    // against the element return type. Fixed by the wrap_tail_vec_get_unwrap
+    // pipeline pass (pipeline.rs).
+    assert_in_fn(&source, "fn fr_vec_get", &["values.get(index).unwrap()"]);
+    // Regression guard for #19 defect 2: the proof.fp2 struct-field argument must
+    // be recovered (not a raw linear-memory load). Fixed by the Stage 4b4
+    // struct-field re-attribution pass (pipeline.rs).
+    assert_in_fn(&source, "fn dummy_verify", &["map_fp2_to_g2(&proof.fp2)"]);
     // Negative: no decompiler artifacts.
     assert!(!source.contains("todo!("), "unexpected todo! artifact");
     assert!(
         !source.contains("RawHostCall"),
         "unexpected RawHostCall artifact"
+    );
+    assert!(
+        !source.contains("env.buf("),
+        "regressed: bogus env.buf() artifact (#19 defect 2)"
+    );
+    assert!(
+        !source.contains("bytes_new_from_linear_memory"),
+        "regressed: raw linear-memory load leaked into output (#19 defect 2)"
     );
 }
 
@@ -662,6 +725,10 @@ fn test_decompile_bn254() {
         source.contains("env.crypto().bn254()"),
         "missing crypto().bn254() dispatch"
     );
+    // Regression guard for #20: Vec::get must keep its .unwrap() panic-guard so
+    // the Option<Fr> result type-checks against the Fr return type. Fixed by the
+    // wrap_tail_vec_get_unwrap pipeline pass (pipeline.rs).
+    assert_in_fn(&source, "fn fr_vec_get", &["values.get(index).unwrap()"]);
     assert!(!source.contains("todo!("), "unexpected todo! artifact");
     assert!(
         !source.contains("RawHostCall"),
