@@ -173,8 +173,16 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         } else {
             None
         };
-        if std::env::var("DBG_PREOPT").map(|v| v.is_empty() || v == func.name).unwrap_or(false) {
-            eprintln!("[DBG_PREOPT] {} pre-opt ({} stmts):\n{:#?}", func.name, func.body.len(), func.body);
+        if std::env::var("DBG_PREOPT")
+            .map(|v| v.is_empty() || v == func.name)
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[DBG_PREOPT] {} pre-opt ({} stmts):\n{:#?}",
+                func.name,
+                func.body.len(),
+                func.body
+            );
         }
         let optimized = optimize_stmts(std::mem::take(&mut func.body));
         func.body = optimized;
@@ -2183,15 +2191,15 @@ fn wrap_tail_vec_get_unwrap(stmts: &mut [SorobanStmt]) {
         return;
     };
     match last {
-        SorobanStmt::Expr(expr) | SorobanStmt::Return(Some(expr)) => {
-            if expr_is_or_wraps_vec_get(expr) {
-                let inner = std::mem::replace(expr, SorobanExpr::Void);
-                *expr = SorobanExpr::MethodCall {
-                    object: Box::new(inner),
-                    method: "unwrap".to_string(),
-                    args: vec![],
-                };
-            }
+        SorobanStmt::Expr(expr) | SorobanStmt::Return(Some(expr))
+            if expr_is_or_wraps_vec_get(expr) =>
+        {
+            let inner = std::mem::replace(expr, SorobanExpr::Void);
+            *expr = SorobanExpr::MethodCall {
+                object: Box::new(inner),
+                method: "unwrap".to_string(),
+                args: vec![],
+            };
         }
         SorobanStmt::If {
             then_body,
@@ -2290,7 +2298,9 @@ fn collect_fold_scrutinees(stmts: &[SorobanStmt], out: &mut Vec<String>) {
         match s {
             SorobanStmt::Match { scrutinee, arms } => {
                 if let SorobanExpr::Param(p) = scrutinee
-                    && arms.iter().any(|a| a.body.iter().any(stmt_contains_vec_fold))
+                    && arms
+                        .iter()
+                        .any(|a| a.body.iter().any(stmt_contains_vec_fold))
                 {
                     out.push(p.clone());
                 }
@@ -2462,9 +2472,7 @@ fn child_exprs_mut(expr: &mut SorobanExpr) -> Vec<&mut SorobanExpr> {
         SorobanExpr::TupleConstruct(fields) | SorobanExpr::VecConstruct(fields) => {
             fields.iter_mut().collect()
         }
-        SorobanExpr::StructConstruct { fields, .. } => {
-            fields.iter_mut().map(|(_, v)| v).collect()
-        }
+        SorobanExpr::StructConstruct { fields, .. } => fields.iter_mut().map(|(_, v)| v).collect(),
         SorobanExpr::RawHostCall { args, .. } => args.iter_mut().collect(),
         _ => vec![],
     }
@@ -2514,7 +2522,11 @@ fn walk_exprs(stmts: &[SorobanStmt], f: &mut dyn FnMut(&SorobanExpr)) {
 
 /// Rewrite a misrouted crypto argument inside one expression tree, consuming a
 /// matching entry from `unconsumed` so a field is never reused across calls.
-fn rewrite_crypto_args_expr(expr: &mut SorobanExpr, param: &str, unconsumed: &mut Vec<(String, u32)>) {
+fn rewrite_crypto_args_expr(
+    expr: &mut SorobanExpr,
+    param: &str,
+    unconsumed: &mut Vec<(String, u32)>,
+) {
     for child in child_exprs_mut(expr) {
         rewrite_crypto_args_expr(child, param, unconsumed);
     }
@@ -2553,7 +2565,9 @@ fn rewrite_crypto_args_stmts(
             SorobanStmt::Expr(e)
             | SorobanStmt::Return(Some(e))
             | SorobanStmt::Let { value: e, .. }
-            | SorobanStmt::Assign { value: e, .. } => rewrite_crypto_args_expr(e, param, unconsumed),
+            | SorobanStmt::Assign { value: e, .. } => {
+                rewrite_crypto_args_expr(e, param, unconsumed)
+            }
             SorobanStmt::If {
                 condition,
                 then_body,
@@ -2587,7 +2601,11 @@ fn rewrite_crypto_args_stmts(
 /// See the Stage 4b4 comment at the call site. Rewrites a misrouted
 /// `bytes_new_from_linear_memory` argument of a bls12_381 `map_*` call back to the
 /// struct-param field it should have referenced.
-fn recover_crypto_field_args(body: &mut [SorobanStmt], params: &[FnParam], registry: &TypeRegistry) {
+fn recover_crypto_field_args(
+    body: &mut [SorobanStmt],
+    params: &[FnParam],
+    registry: &TypeRegistry,
+) {
     // Find the unique struct parameter that has crypto-aliasable fields. Bail on
     // zero or more than one — the heuristic only disambiguates within one struct.
     let mut struct_param: Option<(String, Vec<(String, u32)>)> = None;
@@ -2857,9 +2875,9 @@ fn recover_result_option_enum_match(
     // Re-emit arms in declared order.
     let mut rebuilt: Vec<MatchArm> = Vec::with_capacity(declared.len());
     for (variant, _has_data) in &declared {
-        if let Some(existing) = arms.iter().find(|a| {
-            matches!(&a.pattern, MatchPattern::EnumVariant { variant: v, .. } if v == variant)
-        }) {
+        if let Some(existing) = arms.iter().find(
+            |a| matches!(&a.pattern, MatchPattern::EnumVariant { variant: v, .. } if v == variant),
+        ) {
             let body = match existing.body.first() {
                 Some(SorobanStmt::Expr(e)) if !expr_is_result_or_option_value(e) => {
                     let mut e = e.clone();
@@ -3736,9 +3754,9 @@ fn expr_uses_env(expr: &SorobanExpr) -> bool {
         SorobanExpr::ValConvert { value, .. } | SorobanExpr::CastAs { value, .. } => {
             expr_uses_env(value)
         }
-        SorobanExpr::ValTag(inner)
-        | SorobanExpr::Some(inner)
-        | SorobanExpr::SretResult(inner) => expr_uses_env(inner),
+        SorobanExpr::ValTag(inner) | SorobanExpr::Some(inner) | SorobanExpr::SretResult(inner) => {
+            expr_uses_env(inner)
+        }
         SorobanExpr::ContractError { .. } => false,
 
         // Leaves that never emit `env`

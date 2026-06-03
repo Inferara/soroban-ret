@@ -33,7 +33,10 @@ fn compile_back_meets_floor() {
     }
 
     // CARGO_MANIFEST_DIR is crates/soroban-ret; the script lives at the repo root.
-    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/check-compilable.sh");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/check-compilable.sh"
+    );
     let output = Command::new("bash")
         .arg(script)
         .output()

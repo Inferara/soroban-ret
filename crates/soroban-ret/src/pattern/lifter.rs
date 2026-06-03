@@ -948,8 +948,7 @@ impl<'a> LiftContext<'a> {
                 // to reference the wrong variable. EXCEPTION: a value that
                 // references a phi var is the legitimate post-match composition
                 // (udt::add's `a + b`), so let it write through.
-                if self.phi_protected_locals.contains(idx)
-                    && !stack_val_references_letbinding(&val)
+                if self.phi_protected_locals.contains(idx) && !stack_val_references_letbinding(&val)
                 {
                     return;
                 }
@@ -3665,7 +3664,10 @@ impl<'a> LiftContext<'a> {
 
         // The fall-through (cond false) must produce the `Void` Val (tag 2 = `None`).
         let none_path = &instrs[p + 1..instrs.len() - 1];
-        if !none_path.iter().any(|i| matches!(i, WasmInstr::I64Const(2))) {
+        if !none_path
+            .iter()
+            .any(|i| matches!(i, WasmInstr::I64Const(2)))
+        {
             return None;
         }
 
@@ -3697,7 +3699,9 @@ impl<'a> LiftContext<'a> {
         Some(SorobanStmt::If {
             condition: is_empty,
             then_body: vec![SorobanStmt::Return(Some(SorobanExpr::None))],
-            else_body: vec![SorobanStmt::Return(Some(SorobanExpr::Some(Box::new(first))))],
+            else_body: vec![SorobanStmt::Return(Some(SorobanExpr::Some(Box::new(
+                first,
+            ))))],
         })
     }
 
@@ -3740,8 +3744,17 @@ impl<'a> LiftContext<'a> {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            eprintln!("[DBG_TRACE] try_recognize_match: depth={} current=[{}]", blocks.len(), summ(current));
-            let has_brtable = current.iter().any(|b| matches!(b, StructuredBlock::Instruction(crate::wasm::ir::WasmInstr::BrTable { .. })));
+            eprintln!(
+                "[DBG_TRACE] try_recognize_match: depth={} current=[{}]",
+                blocks.len(),
+                summ(current)
+            );
+            let has_brtable = current.iter().any(|b| {
+                matches!(
+                    b,
+                    StructuredBlock::Instruction(crate::wasm::ir::WasmInstr::BrTable { .. })
+                )
+            });
             eprintln!("[DBG_TRACE]   br_table directly in current? {has_brtable}");
         }
 
@@ -4382,7 +4395,12 @@ impl<'a> LiftContext<'a> {
                 arms.len()
             );
             for (ai, arm) in arms.iter().enumerate() {
-                eprintln!("[DBG_TRACE]   arm[{ai}] pat={:?} body_len={} body={:?}", arm.pattern, arm.body.len(), arm.body);
+                eprintln!(
+                    "[DBG_TRACE]   arm[{ai}] pat={:?} body_len={} body={:?}",
+                    arm.pattern,
+                    arm.body.len(),
+                    arm.body
+                );
             }
         }
 
@@ -5781,10 +5799,10 @@ fn lift_function_body(
     // tail into a nested `if cond { panic_with_error!(…) }` (see
     // `recover_fail_with_error_branches`).
     recover_fail_with_error_branches(&mut structured, wasm_module);
-    if let Ok(want) = std::env::var("DBG_STRUCT") {
-        if want.is_empty() || want == func_index.to_string() {
-            eprintln!("[DBG_STRUCT] func {func_index} structured:\n{structured:#?}");
-        }
+    if let Ok(want) = std::env::var("DBG_STRUCT")
+        && (want.is_empty() || want == func_index.to_string())
+    {
+        eprintln!("[DBG_STRUCT] func {func_index} structured:\n{structured:#?}");
     }
     ctx.lift_structured(&structured);
 
@@ -9291,9 +9309,7 @@ fn rebind_enum_payload_in_stmt(
                 rebind_enum_payload_in_stmt(st, load_of);
             }
         }
-        SorobanStmt::For { body, .. }
-        | SorobanStmt::Loop { body }
-        | SorobanStmt::Block(body) => {
+        SorobanStmt::For { body, .. } | SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
             for st in body.iter_mut() {
                 rebind_enum_payload_in_stmt(st, load_of);
             }
@@ -9371,9 +9387,8 @@ fn rewrite_local_payload_in_expr(
         }
         return;
     }
-    let mut rec = |x: &mut SorobanExpr| {
-        rewrite_local_payload_in_expr(x, field_of, binding, consumed, bound)
-    };
+    let mut rec =
+        |x: &mut SorobanExpr| rewrite_local_payload_in_expr(x, field_of, binding, consumed, bound);
     match e {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
@@ -9450,8 +9465,9 @@ fn find_vec_len_object(expr: &SorobanExpr) -> Option<SorobanExpr> {
         SorobanExpr::MethodCall { object, method, .. } if method == "len" => {
             Some((**object).clone())
         }
-        SorobanExpr::MethodCall { object, args, .. } => find_vec_len_object(object)
-            .or_else(|| args.iter().find_map(find_vec_len_object)),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            find_vec_len_object(object).or_else(|| args.iter().find_map(find_vec_len_object))
+        }
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
@@ -11758,9 +11774,9 @@ mod tests {
                         let here = matches!(
                             then_body.last(),
                             Some(StructuredBlock::Instruction(WasmInstr::Unreachable))
-                        ) && then_body.iter().any(|n| {
-                            matches!(n, StructuredBlock::Instruction(WasmInstr::Call(_)))
-                        });
+                        ) && then_body
+                            .iter()
+                            .any(|n| matches!(n, StructuredBlock::Instruction(WasmInstr::Call(_))));
                         here as usize + count_recovered(then_body) + count_recovered(else_body)
                     }
                     StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
@@ -11771,7 +11787,11 @@ mod tests {
                 .sum()
         }
 
-        assert_eq!(count_brif(&tree, 0), 1, "expected one depth-0 br_if pre-pass");
+        assert_eq!(
+            count_brif(&tree, 0),
+            1,
+            "expected one depth-0 br_if pre-pass"
+        );
         recover_fail_with_error_branches(&mut tree, &module);
         assert_eq!(
             count_brif(&tree, 0),

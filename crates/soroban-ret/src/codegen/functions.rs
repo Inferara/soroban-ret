@@ -2003,7 +2003,10 @@ mod generate_expr_tests {
             out.contains("env . try_invoke_contract :: < i32 , _ >"),
             "got: {out}"
         );
-        assert!(out.contains(". map_err"), "expected nested-Result flatten: {out}");
+        assert!(
+            out.contains(". map_err"),
+            "expected nested-Result flatten: {out}"
+        );
     }
 
     // ----- Type constructors -----

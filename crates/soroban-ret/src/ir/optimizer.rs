@@ -4977,8 +4977,7 @@ fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
                 || args.iter().any(|a| expr_mentions_other_params(a, excluded))
         }
         SorobanExpr::VecTryIterFold { vec, init } => {
-            expr_mentions_other_params(vec, excluded)
-                || expr_mentions_other_params(init, excluded)
+            expr_mentions_other_params(vec, excluded) || expr_mentions_other_params(init, excluded)
         }
         SorobanExpr::StorageGet { key, .. }
         | SorobanExpr::StorageHas { key, .. }
@@ -6399,9 +6398,9 @@ mod tests {
         // whole tail must be scanned — both panics are dropped.
         let stmts = vec![
             SorobanStmt::Expr(SorobanExpr::Panic),
-            SorobanStmt::Expr(SorobanExpr::PanicWithError(Box::new(SorobanExpr::I64Literal(
-                2002,
-            )))),
+            SorobanStmt::Expr(SorobanExpr::PanicWithError(Box::new(
+                SorobanExpr::I64Literal(2002),
+            ))),
             let_var(2, param("x")),
             ret(local(2)),
         ];
@@ -6488,10 +6487,8 @@ mod tests {
         ];
         let out = optimize_stmts(stmts);
         assert!(
-            out.iter().any(|s| matches!(
-                s,
-                SorobanStmt::Expr(SorobanExpr::StorageRemove { .. })
-            )),
+            out.iter()
+                .any(|s| matches!(s, SorobanStmt::Expr(SorobanExpr::StorageRemove { .. }))),
             "real continuation dropped"
         );
         assert!(

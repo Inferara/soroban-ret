@@ -515,11 +515,7 @@ fn test_decompile_import_contract() {
     // - infallible call carries the return-type generic `::<u64>`
     // - fallible call uses the two-generic `::<u64, _>` form with the inner
     //   Result unwrapped via `.map(|r| r.unwrap()).map_err(|e| e.unwrap())`.
-    assert_in_fn(
-        &source,
-        "fn add_with",
-        &["env.invoke_contract::<u64>("],
-    );
+    assert_in_fn(&source, "fn add_with", &["env.invoke_contract::<u64>("]);
     assert_in_fn(
         &source,
         "fn safe_add_with",
