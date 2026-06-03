@@ -229,6 +229,15 @@ pub enum SorobanExpr {
         value: Box<SorobanExpr>,
         target_type: String,
     },
+
+    // `<vec>.try_iter().fold(<init>, |sum, i| sum + i.unwrap())` — the SDK's
+    // overflow-checked sum over a `Vec<i64>`. Recovered from the `vec_len`-seeded
+    // iterator loop (udt::add UdtD arm). The closure body is a fixed idiom; only
+    // the receiver and the fold init vary.
+    VecTryIterFold {
+        vec: Box<SorobanExpr>,
+        init: Box<SorobanExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -163,6 +163,17 @@ fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<
         "Optimizer pass: invert_guard_clauses ({} stmts)",
         stmts.len()
     );
+    // Issue #12: an inlined VOID validation helper leaks its `fail_with_error;
+    // unreachable` error exits as stray standalone top-level panics between the
+    // validation guard and the real body. Drop them before `remove_dead_code`,
+    // which would otherwise treat the first as a terminator and truncate the
+    // function's live continuation. Runs after guard inversion (so the panic is
+    // genuinely standalone) and before dead-code elimination.
+    let stmts = drop_stray_panic_before_continuation(stmts);
+    log::trace!(
+        "Optimizer pass: drop_stray_panic_before_continuation ({} stmts)",
+        stmts.len()
+    );
     let stmts = remove_dead_code(stmts);
     log::trace!("Optimizer pass: remove_dead_code ({} stmts)", stmts.len());
     let stmts = collapse_trivial_loops(stmts);
@@ -1512,6 +1523,7 @@ fn expr_contains(haystack: &SorobanExpr, needle: &SorobanExpr) -> bool {
 
         // Object + args
         SorobanExpr::MethodCall { object, args, .. } => c(object) || cv(args),
+        SorobanExpr::VecTryIterFold { vec, init } => c(vec) || c(init),
         SorobanExpr::InvokeContract {
             address,
             function,
@@ -2205,6 +2217,68 @@ fn is_strong_terminator_stmt(stmt: &SorobanStmt) -> bool {
                     .all(|arm| arm.body.iter().any(is_strong_terminator_stmt))
         }
         _ => false,
+    }
+}
+
+/// Issue #12 backstop: drop a STRAY standalone top-level panic that is followed
+/// by real continuation, so `remove_dead_code` does not discard the live body.
+///
+/// An inlined VOID validation helper (e.g. aquarius `estimate_swap`'s token-sort
+/// check) lifts its `fail_with_error; unreachable` error exits to standalone
+/// `Expr(PanicWithError)` / `Expr(Panic)` statements that splice into the
+/// caller's top level. They sit *between* the validation guard and the real
+/// logic, so `remove_dead_code` treats the first as a strong terminator and
+/// drops the rest of the function (the issue-#12 truncation).
+///
+/// Codegen cannot legally emit code after a `-> !` panic, so such a stray panic
+/// is a pure artifact: remove only that statement and keep the continuation.
+/// TOP-LEVEL ONLY — a panic nested inside an if/match arm is a real conditional
+/// error exit and is left untouched (the truncation is exclusively top-level,
+/// since `remove_dead_code` only breaks on top-level strong terminators).
+fn drop_stray_panic_before_continuation(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    let len = stmts.len();
+    if len < 2 {
+        return stmts;
+    }
+    // suffix_has_real[i] = does any stmt at index >= i carry real continuation?
+    // The two strays are consecutive, so a stray panic's live continuation can
+    // sit *past* the next stray panic — scan the whole tail, not just i+1.
+    let mut suffix_has_real = vec![false; len + 1];
+    for i in (0..len).rev() {
+        suffix_has_real[i] = suffix_has_real[i + 1] || stmt_is_real_continuation(&stmts[i]);
+    }
+    let mut result = Vec::with_capacity(len);
+    for (i, stmt) in stmts.into_iter().enumerate() {
+        let is_standalone_panic = matches!(
+            &stmt,
+            SorobanStmt::Expr(SorobanExpr::Panic | SorobanExpr::PanicWithError(_))
+        );
+        if is_standalone_panic && suffix_has_real[i + 1] {
+            cov_mark::hit!(stray_panic_before_continuation_dropped);
+            continue;
+        }
+        result.push(stmt);
+    }
+    result
+}
+
+/// A statement that represents live work the function must perform. Used by
+/// [`drop_stray_panic_before_continuation`] to decide that a preceding standalone
+/// top-level panic is a stray inlined-helper artifact rather than a real
+/// terminator. Bindings, assignments, returns, and control flow are always live;
+/// a bare `Expr` counts only when it has an observable side effect (a host call).
+fn stmt_is_real_continuation(stmt: &SorobanStmt) -> bool {
+    match stmt {
+        SorobanStmt::Let { .. }
+        | SorobanStmt::Assign { .. }
+        | SorobanStmt::Return(_)
+        | SorobanStmt::If { .. }
+        | SorobanStmt::Match { .. }
+        | SorobanStmt::Loop { .. }
+        | SorobanStmt::For { .. }
+        | SorobanStmt::Block(_) => true,
+        SorobanStmt::Expr(e) => expr_has_side_effects(e),
+        SorobanStmt::Comment(_) | SorobanStmt::Break | SorobanStmt::Continue => false,
     }
 }
 
@@ -3493,6 +3567,10 @@ fn invalidate_seen_gets_for_expr(
             for a in args {
                 invalidate_seen_gets_for_expr(a, seen_gets);
             }
+        }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            invalidate_seen_gets_for_expr(vec, seen_gets);
+            invalidate_seen_gets_for_expr(init, seen_gets);
         }
         SorobanExpr::PublishEvent { topics, data, .. } => {
             for t in topics {
@@ -4898,6 +4976,9 @@ fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
             expr_mentions_other_params(object, excluded)
                 || args.iter().any(|a| expr_mentions_other_params(a, excluded))
         }
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            expr_mentions_other_params(vec, excluded) || expr_mentions_other_params(init, excluded)
+        }
         SorobanExpr::StorageGet { key, .. }
         | SorobanExpr::StorageHas { key, .. }
         | SorobanExpr::StorageRemove { key, .. } => expr_mentions_other_params(key, excluded),
@@ -5419,61 +5500,48 @@ fn collect_used_names(stmts: &[SorobanStmt], names: &mut std::collections::HashS
 fn deshadow_variable_names(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     use std::collections::{HashMap, HashSet};
 
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut renames: HashMap<String, String> = HashMap::new();
-
-    // Collect parameter names as already-seen (they can't be renamed)
-    // Parameters appear as Param("name") in expressions but not as Let bindings,
-    // so they don't need de-shadowing themselves.
-
-    // First pass: detect shadowed Let bindings
+    // Pre-collect every top-level binding name so a generated `_N` suffix never
+    // collides with a name defined *elsewhere* in the body. Without this a
+    // lifter-produced `var_2_5_4_3` could collide with a generated
+    // `var_2_5_4_3` candidate and get re-suffixed on every fixpoint iteration —
+    // a non-idempotency that the issue #12 body recovery exposed.
+    let mut used: HashSet<String> = HashSet::new();
     for stmt in &stmts {
-        if let SorobanStmt::Let { name, .. } = stmt
-            && !seen.insert(name.clone())
-        {
-            // Name collision — find a unique suffix
-            let mut suffix = 2u32;
-            loop {
-                let candidate = format!("{}_{}", name, suffix);
-                if !seen.contains(&candidate) {
-                    seen.insert(candidate.clone());
-                    renames.insert(name.clone(), candidate);
-                    break;
-                }
-                suffix += 1;
-            }
+        if let SorobanStmt::Let { name, .. } = stmt {
+            used.insert(name.clone());
         }
     }
 
-    if renames.is_empty() {
-        return stmts;
-    }
-
-    // Second pass: apply renames, but only to statements AFTER the first definition.
-    // Walk forward: once we see the first Let with the original name, skip it.
-    // When we see the second Let with the same name, rename it and all subsequent
-    // references.
-    let mut first_seen: HashSet<String> = HashSet::new();
-    let mut active_renames: HashMap<String, String> = HashMap::new();
+    // Single forward pass: the first binding of a name keeps it; every later
+    // shadow gets its own fresh, globally-unique name (each occurrence distinct —
+    // the old name→single-rename map collapsed 3+ shadows onto one name, which
+    // re-shadowed and oscillated). `active` rewrites downstream references.
+    let mut bound_once: HashSet<String> = HashSet::new();
+    let mut active: HashMap<String, String> = HashMap::new();
     stmts
         .into_iter()
         .map(|stmt| {
-            if let SorobanStmt::Let { ref name, .. } = stmt
-                && renames.contains_key(name)
-            {
-                if first_seen.contains(name) {
-                    // This is the shadowed (second+) definition — rename it
-                    let new_name = renames.get(name).unwrap().clone();
-                    active_renames.insert(name.clone(), new_name.clone());
-                    let stmt = rename_in_stmt(stmt, &active_renames);
-                    return stmt;
+            if let SorobanStmt::Let { ref name, .. } = stmt {
+                if bound_once.contains(name) {
+                    let base = name.clone();
+                    let mut suffix = 2u32;
+                    let mut candidate = format!("{}_{}", base, suffix);
+                    while used.contains(&candidate) {
+                        suffix += 1;
+                        candidate = format!("{}_{}", base, suffix);
+                    }
+                    used.insert(candidate.clone());
+                    active.insert(base, candidate);
+                    // Applies the new rename to this Let's binding name (and any
+                    // earlier active renames to its value).
+                    return rename_in_stmt(stmt, &active);
                 }
-                first_seen.insert(name.clone());
+                bound_once.insert(name.clone());
             }
-            if active_renames.is_empty() {
+            if active.is_empty() {
                 stmt
             } else {
-                rename_in_stmt(stmt, &active_renames)
+                rename_in_stmt(stmt, &active)
             }
         })
         .collect()
@@ -6297,6 +6365,137 @@ mod tests {
         let out = optimize_stmts(stmts);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], SorobanStmt::Expr(SorobanExpr::Panic)));
+    }
+
+    // ----- Stray leaked panic removal (issue #12) -----
+
+    #[test]
+    fn drop_stray_panic_keeps_host_call_continuation() {
+        // var_0 = seed; panic!(); storage_remove(key);  →  drop the mid-body
+        // stray panic, keep the continuation. (Non-leading, so this exercises the
+        // issue #12 backstop rather than remove_leading_panic.)
+        let stmts = vec![
+            let_var(0, param("seed")),
+            SorobanStmt::Expr(SorobanExpr::Panic),
+            SorobanStmt::Expr(SorobanExpr::StorageRemove {
+                storage_type: StorageType::Persistent,
+                key: Box::new(param("key")),
+            }),
+        ];
+        let out = drop_stray_panic_before_continuation(stmts);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[0], SorobanStmt::Let { .. }));
+        assert!(matches!(
+            &out[1],
+            SorobanStmt::Expr(SorobanExpr::StorageRemove { .. })
+        ));
+    }
+
+    #[test]
+    fn drop_stray_panic_two_consecutive_before_real_body() {
+        // The estimate_swap shape: [Panic, PanicWithError, Let, Return]. The
+        // first stray's live continuation sits *past* the second stray, so the
+        // whole tail must be scanned — both panics are dropped.
+        let stmts = vec![
+            SorobanStmt::Expr(SorobanExpr::Panic),
+            SorobanStmt::Expr(SorobanExpr::PanicWithError(Box::new(
+                SorobanExpr::I64Literal(2002),
+            ))),
+            let_var(2, param("x")),
+            ret(local(2)),
+        ];
+        let out = drop_stray_panic_before_continuation(stmts);
+        assert_eq!(out.len(), 2, "both stray panics dropped");
+        assert!(matches!(&out[0], SorobanStmt::Let { .. }));
+        assert!(matches!(&out[1], SorobanStmt::Return(_)));
+    }
+
+    #[test]
+    fn drop_stray_panic_preserves_lone_terminal_panic() {
+        let stmts = vec![SorobanStmt::Expr(SorobanExpr::Panic)];
+        let out = drop_stray_panic_before_continuation(stmts);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], SorobanStmt::Expr(SorobanExpr::Panic)));
+    }
+
+    #[test]
+    fn drop_stray_panic_ignores_nested_panic() {
+        // `if c { panic!() }` is a real conditional error exit — top-level-only
+        // scope must leave it untouched even when real work follows.
+        let stmts = vec![
+            SorobanStmt::If {
+                condition: param("c"),
+                then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+                else_body: vec![],
+            },
+            let_var(0, param("x")),
+        ];
+        let out = drop_stray_panic_before_continuation(stmts);
+        assert_eq!(out.len(), 2);
+        if let SorobanStmt::If { then_body, .. } = &out[0] {
+            assert_eq!(then_body.len(), 1);
+            assert!(matches!(
+                &then_body[0],
+                SorobanStmt::Expr(SorobanExpr::Panic)
+            ));
+        } else {
+            panic!("Expected If preserved");
+        }
+    }
+
+    #[test]
+    fn drop_stray_panic_preserves_terminal_panic_after_real_work() {
+        // publish(&env); panic!()  — the `failed_transfer` shape: the panic is
+        // terminal (nothing after) so it is the function's genuine divergence.
+        let stmts = vec![
+            SorobanStmt::Expr(SorobanExpr::PublishEvent {
+                event_name: None,
+                topics: vec![],
+                data: Box::new(SorobanExpr::Void),
+            }),
+            SorobanStmt::Expr(SorobanExpr::Panic),
+        ];
+        let out = drop_stray_panic_before_continuation(stmts);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(&out[1], SorobanStmt::Expr(SorobanExpr::Panic)));
+    }
+
+    #[test]
+    fn drop_stray_panic_preserves_when_tail_has_no_real_continuation() {
+        // panic!(); <pure expr>; continue;  — the tail carries no real work, so
+        // the panic is a genuine terminator and is preserved.
+        let stmts = vec![
+            SorobanStmt::Expr(SorobanExpr::Panic),
+            SorobanStmt::Expr(param("pure")),
+            SorobanStmt::Continue,
+        ];
+        let out = drop_stray_panic_before_continuation(stmts);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(&out[0], SorobanStmt::Expr(SorobanExpr::Panic)));
+    }
+
+    #[test]
+    fn pipeline_recovers_body_after_stray_panic() {
+        // End-to-end: a stray panic between real work must not truncate the body.
+        let stmts = vec![
+            SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(param("user")))),
+            SorobanStmt::Expr(SorobanExpr::Panic),
+            SorobanStmt::Expr(SorobanExpr::StorageRemove {
+                storage_type: StorageType::Persistent,
+                key: Box::new(param("key")),
+            }),
+        ];
+        let out = optimize_stmts(stmts);
+        assert!(
+            out.iter()
+                .any(|s| matches!(s, SorobanStmt::Expr(SorobanExpr::StorageRemove { .. }))),
+            "real continuation dropped"
+        );
+        assert!(
+            !out.iter()
+                .any(|s| matches!(s, SorobanStmt::Expr(SorobanExpr::Panic))),
+            "stray panic not removed"
+        );
     }
 
     // ----- Bool comparison folding -----

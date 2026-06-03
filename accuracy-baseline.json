@@ -354,9 +354,9 @@
       "types_score": 100.0,
       "signatures_score": 100.0,
       "annotations_score": 100.0,
-      "bodies_score": 75.0,
+      "bodies_score": 100.0,
       "structure_score": 100.0,
-      "overall_score": 92.5,
+      "overall_score": 100.0,
       "artifact_score": 100.0,
       "functions": {
         "__constructor": {
@@ -377,17 +377,16 @@
         "get_data": {
           "present": true,
           "signature_score": 100.0,
-          "body_score": 50.0,
+          "body_score": 100.0,
           "param_diffs": [],
           "return_type_match": true,
           "operations_found": [
+            "instance.get",
             "match",
+            "persistent.get",
             "temporary.get"
           ],
-          "operations_missing": [
-            "instance.get",
-            "persistent.get"
-          ],
+          "operations_missing": [],
           "artifact_count": 0
         }
       }
@@ -1069,48 +1068,47 @@
       "types_score": 100.0,
       "signatures_score": 100.0,
       "annotations_score": 100.0,
-      "bodies_score": 20.0,
+      "bodies_score": 100.0,
       "structure_score": 100.0,
-      "overall_score": 76.0,
+      "overall_score": 100.0,
       "artifact_score": 100.0,
       "functions": {
         "add": {
           "present": true,
           "signature_score": 100.0,
-          "body_score": 0.0,
+          "body_score": 100.0,
           "param_diffs": [],
           "return_type_match": true,
-          "operations_found": [],
-          "operations_missing": [
+          "operations_found": [
             "add",
             "match"
           ],
+          "operations_missing": [],
           "artifact_count": 0
         },
         "recursive": {
           "present": true,
           "signature_score": 100.0,
-          "body_score": 0.0,
+          "body_score": 100.0,
           "param_diffs": [],
           "return_type_match": true,
-          "operations_found": [],
-          "operations_missing": [
+          "operations_found": [
             "if"
           ],
+          "operations_missing": [],
           "artifact_count": 0
         },
         "recursive_enum": {
           "present": true,
           "signature_score": 100.0,
-          "body_score": 50.0,
+          "body_score": 100.0,
           "param_diffs": [],
           "return_type_match": true,
           "operations_found": [
+            "Ok",
             "match"
           ],
-          "operations_missing": [
-            "Ok"
-          ],
+          "operations_missing": [],
           "artifact_count": 0
         }
       }
@@ -1169,7 +1167,7 @@
     "3": {
       "name": "Complex",
       "target": 92.0,
-      "average": 93.7,
+      "average": 100.0,
       "meets_target": true,
       "count": 5
     },
@@ -1188,5 +1186,5 @@
       "count": 19
     }
   },
-  "overall_score": 97.4
+  "overall_score": 98.3
 }

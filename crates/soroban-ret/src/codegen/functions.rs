@@ -719,6 +719,21 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 }
             }
         }
+
+        SorobanExpr::VecTryIterFold { vec, init } => {
+            let v = generate_expr(vec);
+            // Emit the fold init as a suffixed `0i64` to match the SDK source
+            // (the closure's accumulator type is i64). Only this call site is
+            // suffixed; global `I64Literal` rendering stays unsuffixed.
+            let i = match init.as_ref() {
+                SorobanExpr::I64Literal(n) => {
+                    let lit = proc_macro2::Literal::i64_suffixed(*n);
+                    quote! { #lit }
+                }
+                other => generate_expr(other),
+            };
+            quote! { #v.try_iter().fold(#i, |sum, i| sum + i.unwrap()) }
+        }
     }
 }
 
@@ -1988,7 +2003,10 @@ mod generate_expr_tests {
             out.contains("env . try_invoke_contract :: < i32 , _ >"),
             "got: {out}"
         );
-        assert!(out.contains(". map_err"), "expected nested-Result flatten: {out}");
+        assert!(
+            out.contains(". map_err"),
+            "expected nested-Result flatten: {out}"
+        );
     }
 
     // ----- Type constructors -----

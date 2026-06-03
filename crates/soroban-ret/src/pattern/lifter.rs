@@ -948,8 +948,7 @@ impl<'a> LiftContext<'a> {
                 // to reference the wrong variable. EXCEPTION: a value that
                 // references a phi var is the legitimate post-match composition
                 // (udt::add's `a + b`), so let it write through.
-                if self.phi_protected_locals.contains(idx)
-                    && !stack_val_references_letbinding(&val)
+                if self.phi_protected_locals.contains(idx) && !stack_val_references_letbinding(&val)
                 {
                     return;
                 }
@@ -3665,7 +3664,10 @@ impl<'a> LiftContext<'a> {
 
         // The fall-through (cond false) must produce the `Void` Val (tag 2 = `None`).
         let none_path = &instrs[p + 1..instrs.len() - 1];
-        if !none_path.iter().any(|i| matches!(i, WasmInstr::I64Const(2))) {
+        if !none_path
+            .iter()
+            .any(|i| matches!(i, WasmInstr::I64Const(2)))
+        {
             return None;
         }
 
@@ -3697,7 +3699,9 @@ impl<'a> LiftContext<'a> {
         Some(SorobanStmt::If {
             condition: is_empty,
             then_body: vec![SorobanStmt::Return(Some(SorobanExpr::None))],
-            else_body: vec![SorobanStmt::Return(Some(SorobanExpr::Some(Box::new(first))))],
+            else_body: vec![SorobanStmt::Return(Some(SorobanExpr::Some(Box::new(
+                first,
+            ))))],
         })
     }
 
@@ -3740,8 +3744,17 @@ impl<'a> LiftContext<'a> {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            eprintln!("[DBG_TRACE] try_recognize_match: depth={} current=[{}]", blocks.len(), summ(current));
-            let has_brtable = current.iter().any(|b| matches!(b, StructuredBlock::Instruction(crate::wasm::ir::WasmInstr::BrTable { .. })));
+            eprintln!(
+                "[DBG_TRACE] try_recognize_match: depth={} current=[{}]",
+                blocks.len(),
+                summ(current)
+            );
+            let has_brtable = current.iter().any(|b| {
+                matches!(
+                    b,
+                    StructuredBlock::Instruction(crate::wasm::ir::WasmInstr::BrTable { .. })
+                )
+            });
             eprintln!("[DBG_TRACE]   br_table directly in current? {has_brtable}");
         }
 
@@ -4382,7 +4395,12 @@ impl<'a> LiftContext<'a> {
                 arms.len()
             );
             for (ai, arm) in arms.iter().enumerate() {
-                eprintln!("[DBG_TRACE]   arm[{ai}] pat={:?} body_len={} body={:?}", arm.pattern, arm.body.len(), arm.body);
+                eprintln!(
+                    "[DBG_TRACE]   arm[{ai}] pat={:?} body_len={} body={:?}",
+                    arm.pattern,
+                    arm.body.len(),
+                    arm.body
+                );
             }
         }
 
@@ -5777,16 +5795,24 @@ fn lift_function_body(
     // Unreachable handler only emits Panic for genuine user panics (issue #11).
     let mut structured = super::structurize::structurize(&func.body);
     super::cfg_analysis::classify_safety_net_unreachables(&mut structured, wasm_module);
-    if let Ok(want) = std::env::var("DBG_STRUCT") {
-        if want.is_empty() || want == func_index.to_string() {
-            eprintln!("[DBG_STRUCT] func {func_index} structured:\n{structured:#?}");
-        }
+    // Layer B (issue #12): rewrite multi-level `br_if` to a `fail_with_error`
+    // tail into a nested `if cond { panic_with_error!(…) }` (see
+    // `recover_fail_with_error_branches`).
+    recover_fail_with_error_branches(&mut structured, wasm_module);
+    if let Ok(want) = std::env::var("DBG_STRUCT")
+        && (want.is_empty() || want == func_index.to_string())
+    {
+        eprintln!("[DBG_STRUCT] func {func_index} structured:\n{structured:#?}");
     }
     ctx.lift_structured(&structured);
 
     // Re-attribute enum-payload loads hoisted before a `match` dispatch into the
     // arms (udt::add). Runs over the whole body now that every load is resolved.
     rebind_hoisted_enum_payload_body(&mut ctx.stmts);
+
+    // Recover the SDK `Vec<i64>` fold idiom in a tuple-payload `match` arm
+    // (udt::add UdtD) BEFORE the optimizer deletes the constant-folded loop.
+    recover_vec_iter_fold(&mut ctx.stmts, registry);
 
     // Remove Return(None) immediately before Panic: the Return is from an inlined
     // body's WASM return instruction, not a meaningful Rust return statement. Without
@@ -5980,6 +6006,11 @@ fn lift_inline_call(
     // otherwise splice into the caller's top level and trip remove_dead_code.
     let mut structured = super::structurize::structurize(&func.body);
     super::cfg_analysis::classify_safety_net_unreachables(&mut structured, wasm_module);
+    // Layer B (issue #12): nest multi-level `br_if` to a `fail_with_error` tail
+    // as `if cond { panic_with_error!(…) }` so the contract error survives
+    // inlining instead of leaking as a stray (see
+    // `recover_fail_with_error_branches`).
+    recover_fail_with_error_branches(&mut structured, wasm_module);
     ctx.lift_structured(&structured);
 
     if !ctx.found_host_calls {
@@ -9030,6 +9061,163 @@ fn is_terminator_stmt(s: &SorobanStmt) -> bool {
     )
 }
 
+/// Pre-optimization recovery of the SDK `Vec<i64>` fold idiom inside a
+/// tuple-payload `match` arm (udt::add UdtD).
+///
+/// The arm lifts as `[Expr(<recv>.len()), Loop { … <recv>.get(0) … }]` where
+/// `<recv>` is the `Vec` field of the variant's tuple payload. The loop's guards
+/// constant-fold, so the optimizer (`remove_spurious_len` + `collapse_trivial_loops`)
+/// would delete the whole skeleton and lose the fold. Replace the arm body with a
+/// single `Assign{ <phi var>, tup.<scalar> + VecTryIterFold{ tup.<vec>, 0 } }`,
+/// which survives the optimizer and collapses to `let x = match …` in codegen
+/// (`try_combine_let_match`).
+///
+/// Narrowly gated (see [`try_rewrite_vec_fold_arm`]) so it cannot touch other
+/// fixtures: constructor's storage-dispatch `match` has no loop, and the
+/// memory-copy / counted loops match raw load/store offsets, never `len`/`get`
+/// on an identical `FieldAccess` receiver inside an `EnumVariant` arm.
+fn recover_vec_iter_fold(stmts: &mut [SorobanStmt], registry: &TypeRegistry) {
+    for s in stmts.iter_mut() {
+        match s {
+            SorobanStmt::Match { arms, .. } => {
+                // The phi accumulator target is shared by the data-carrying arms
+                // (e.g. `var_1`); read it from any sibling arm's `Assign`.
+                let phi_target = arms.iter().find_map(|a| {
+                    a.body.iter().find_map(|st| match st {
+                        SorobanStmt::Assign { target, .. } => Some(target.clone()),
+                        _ => None,
+                    })
+                });
+                for arm in arms.iter_mut() {
+                    if let Some(ref phi) = phi_target {
+                        try_rewrite_vec_fold_arm(arm, phi, registry);
+                    }
+                    recover_vec_iter_fold(&mut arm.body, registry);
+                }
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                recover_vec_iter_fold(then_body, registry);
+                recover_vec_iter_fold(else_body, registry);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                recover_vec_iter_fold(body, registry);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// If `arm` is the `Vec`-fold skeleton (see [`recover_vec_iter_fold`]), replace
+/// its body with `Assign{ phi, tup.<scalar> + VecTryIterFold{ tup.<vec>, 0 } }`
+/// and rename its payload binding to `tup`. Returns whether it rewrote the arm.
+fn try_rewrite_vec_fold_arm(arm: &mut MatchArm, phi: &str, registry: &TypeRegistry) -> bool {
+    // Inspect immutably first, collect the tuple indices, then mutate.
+    let (scalar_idx, vec_idx) = {
+        let (type_name, variant, binding) = match &arm.pattern {
+            MatchPattern::EnumVariant {
+                type_name,
+                variant,
+                bindings,
+            } if bindings.len() == 1 => (type_name, variant, &bindings[0]),
+            _ => return false,
+        };
+        if arm.body.len() != 2 {
+            return false;
+        }
+        // body[0] = `Expr(<recv>.len())`
+        let recv = match &arm.body[0] {
+            SorobanStmt::Expr(SorobanExpr::MethodCall {
+                object,
+                method,
+                args,
+            }) if method == "len" && args.is_empty() => object.as_ref(),
+            _ => return false,
+        };
+        // recv must be `<binding>.<field>` (the Vec field of the tuple payload).
+        match recv {
+            SorobanExpr::FieldAccess { object, .. } => match object.as_ref() {
+                SorobanExpr::NamedLocal(n) if n == binding => {}
+                _ => return false,
+            },
+            _ => return false,
+        }
+        // body[1] = `Loop` whose body iterates `<recv>.get(..)` on the same receiver.
+        let loop_body = match &arm.body[1] {
+            SorobanStmt::Loop { body } => body,
+            _ => return false,
+        };
+        let has_get = loop_body.iter().any(|st| {
+            matches!(
+                st,
+                SorobanStmt::Expr(SorobanExpr::MethodCall { object, method, .. })
+                    if method == "get" && object.as_ref() == recv
+            )
+        });
+        if !has_get {
+            return false;
+        }
+        match tuple_fold_indices(registry, type_name, variant) {
+            Some(idxs) => idxs,
+            None => return false,
+        }
+    };
+
+    // Mutate: rename the binding to `tup`, replace the body with the recovered fold.
+    if let MatchPattern::EnumVariant { bindings, .. } = &mut arm.pattern {
+        bindings[0] = "tup".to_string();
+    }
+    let tup_field = |i: usize| SorobanExpr::FieldAccess {
+        object: Box::new(SorobanExpr::NamedLocal("tup".to_string())),
+        field: i.to_string(),
+    };
+    let value = SorobanExpr::Add(
+        Box::new(tup_field(scalar_idx)),
+        Box::new(SorobanExpr::VecTryIterFold {
+            vec: Box::new(tup_field(vec_idx)),
+            init: Box::new(SorobanExpr::I64Literal(0)),
+        }),
+    );
+    arm.body = vec![SorobanStmt::Assign {
+        target: phi.to_string(),
+        value,
+    }];
+    cov_mark::hit!(vec_iter_fold_recovered);
+    true
+}
+
+/// For a union `variant` whose payload is a 2-field tuple struct `(i64, Vec<_>)`,
+/// return `(scalar_index, vec_index)`. `None` if the payload is not that shape.
+fn tuple_fold_indices(
+    registry: &TypeRegistry,
+    union_name: &str,
+    variant: &str,
+) -> Option<(usize, usize)> {
+    let payload = registry.find_variant_data_type(union_name, variant)?;
+    let udt_name = registry.resolve_type_name(&payload)?;
+    let spec = registry.get_struct(&udt_name)?;
+    if spec.fields.len() != 2 {
+        return None;
+    }
+    let mut scalar_idx = None;
+    let mut vec_idx = None;
+    for (i, f) in spec.fields.iter().enumerate() {
+        // Tuple struct: field names are numeric ("0", "1", …).
+        if f.name.to_utf8_string().ok()?.parse::<usize>().is_err() {
+            return None;
+        }
+        match &f.type_ {
+            ScSpecTypeDef::Vec(_) => vec_idx = Some(i),
+            ScSpecTypeDef::I64 => scalar_idx = Some(i),
+            _ => return None,
+        }
+    }
+    Some((scalar_idx?, vec_idx?))
+}
+
 /// Body-level re-attribution of an enum scrutinee's hoisted payload field-loads.
 ///
 /// Runs after lifting (so every `<enum_param>.<field>` load is resolved — unlike
@@ -9121,9 +9309,7 @@ fn rebind_enum_payload_in_stmt(
                 rebind_enum_payload_in_stmt(st, load_of);
             }
         }
-        SorobanStmt::For { body, .. }
-        | SorobanStmt::Loop { body }
-        | SorobanStmt::Block(body) => {
+        SorobanStmt::For { body, .. } | SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
             for st in body.iter_mut() {
                 rebind_enum_payload_in_stmt(st, load_of);
             }
@@ -9201,9 +9387,8 @@ fn rewrite_local_payload_in_expr(
         }
         return;
     }
-    let mut rec = |x: &mut SorobanExpr| {
-        rewrite_local_payload_in_expr(x, field_of, binding, consumed, bound)
-    };
+    let mut rec =
+        |x: &mut SorobanExpr| rewrite_local_payload_in_expr(x, field_of, binding, consumed, bound);
     match e {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
@@ -9280,8 +9465,9 @@ fn find_vec_len_object(expr: &SorobanExpr) -> Option<SorobanExpr> {
         SorobanExpr::MethodCall { object, method, .. } if method == "len" => {
             Some((**object).clone())
         }
-        SorobanExpr::MethodCall { object, args, .. } => find_vec_len_object(object)
-            .or_else(|| args.iter().find_map(find_vec_len_object)),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            find_vec_len_object(object).or_else(|| args.iter().find_map(find_vec_len_object))
+        }
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
@@ -9687,6 +9873,170 @@ fn extract_data_strings(module: &WasmModule, func_idx: u32) -> Vec<String> {
     }
 
     strings
+}
+
+/// Branch-exit target for [`recover_fail_with_error_branches`], indexed by WASM
+/// branch depth: the innermost enclosing control structure is the last element
+/// of the `enclosing` stack (depth 0), the next out is depth 1, and so on.
+enum BranchExitTarget {
+    /// `br`/`br_if` to this depth is a loop back-edge (continue) — never an
+    /// error exit, so never recovered.
+    LoopContinue,
+    /// `br`/`br_if` to this depth exits to a short, flat, diverging tail that
+    /// calls `fail_with_error` (a contract-error panic). Holds the cloned tail
+    /// instructions, inlined at the branch site.
+    FailWithError(Vec<super::structurize::StructuredBlock>),
+    /// Any other exit (normal continuation, bare trap, nested control flow):
+    /// left to the existing break/continue lifting.
+    Plain,
+}
+
+/// Is `tail` a short, flat, diverging error path that reports a contract error
+/// via `fail_with_error`? This is the body of a validation guard's panic
+/// branch — `i64.const <error>; call $fail_with_error; unreachable` — and
+/// branching to it is semantically `if cond { panic_with_error!(…) }`.
+///
+/// Gated tightly: no nested control flow, ends in `unreachable` (raw or the
+/// issue-#11 safety-net reclassification), short (a real tail is 1–4 nodes),
+/// and contains a direct `fail_with_error` wrapper call. The `fail_with_error`
+/// requirement is the load-bearing gate — it fires only on genuine contract
+/// error reporting, never on SDK dispatch preambles or compiler safety nets.
+fn is_fail_with_error_tail(
+    tail: &[super::structurize::StructuredBlock],
+    module: &WasmModule,
+) -> bool {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr;
+
+    const MAX_TAIL_LEN: usize = 6;
+    if tail.is_empty() || tail.len() > MAX_TAIL_LEN {
+        return false;
+    }
+    // The tail must end in a divergence (raw `unreachable` or its safety-net form).
+    if !matches!(
+        tail.last(),
+        Some(StructuredBlock::Instruction(WasmInstr::Unreachable))
+            | Some(StructuredBlock::SafetyNetUnreachable)
+    ) {
+        return false;
+    }
+    // Every node must be a plain instruction (or the safety-net marker): nested
+    // control flow would risk inlining real continuation code, not just a trap.
+    let mut has_fail_with_error = false;
+    for sb in tail {
+        match sb {
+            StructuredBlock::SafetyNetUnreachable => {}
+            StructuredBlock::Instruction(WasmInstr::Call(idx))
+                if function_calls_host(module, *idx, HostModule::Context, "fail_with_error") =>
+            {
+                has_fail_with_error = true;
+            }
+            StructuredBlock::Instruction(_) => {}
+            _ => return false,
+        }
+    }
+    has_fail_with_error
+}
+
+/// Layer B (issue #12): recover validation panics dropped by multi-level
+/// branches. A `br_if k` whose depth-`k` target is a `fail_with_error` tail
+/// (see [`is_fail_with_error_tail`]) is the WASM lowering of
+/// `if cond { panic_with_error!(…) }`, but the flat lifter loses the
+/// association — the condition surfaces as `if cond { break }` inside a loop
+/// while the panic leaks out as a sibling stray (later dropped by the
+/// optimizer), so the specific contract error is lost.
+///
+/// This pure pre-pass over the structured tree rewrites each such `br_if k`
+/// into an inline `IfElse { then: <tail> }`. The condition is already on the
+/// stack and `br_if`/`if` both pop one i32 with the same true-polarity, so the
+/// existing `IfElse` lifting reproduces the nested `panic_with_error!`. The
+/// now-unreachable original tail is left in place and dropped downstream by the
+/// optimizer's stray-panic pass, exactly as before.
+///
+/// Scope is deliberately narrow: only `BrIf` (not unconditional `Br`), only
+/// `fail_with_error` tails. Every other branch keeps its current break/continue
+/// lifting byte-for-byte.
+fn recover_fail_with_error_branches(
+    blocks: &mut [super::structurize::StructuredBlock],
+    module: &WasmModule,
+) {
+    rewrite_branch_seq(blocks, &mut Vec::new(), module);
+}
+
+fn rewrite_branch_seq(
+    blocks: &mut [super::structurize::StructuredBlock],
+    enclosing: &mut Vec<BranchExitTarget>,
+    module: &WasmModule,
+) {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::{BlockType, WasmInstr};
+
+    let n = blocks.len();
+
+    // Phase 1 — classify each child's branch-exit target from its following
+    // siblings. Done up front (read-only) so the Phase 2 rewrites below cannot
+    // perturb the classification.
+    let mut child_targets: Vec<Option<BranchExitTarget>> = Vec::with_capacity(n);
+    for (i, child) in blocks.iter().enumerate() {
+        let t = match child {
+            StructuredBlock::Loop { .. } => Some(BranchExitTarget::LoopContinue),
+            StructuredBlock::Block { .. } | StructuredBlock::IfElse { .. } => {
+                if is_fail_with_error_tail(&blocks[i + 1..], module) {
+                    Some(BranchExitTarget::FailWithError(blocks[i + 1..].to_vec()))
+                } else {
+                    Some(BranchExitTarget::Plain)
+                }
+            }
+            _ => None,
+        };
+        child_targets.push(t);
+    }
+
+    // Phase 2 — rewrite branch instructions at THIS level. Each rewrite is 1:1
+    // (one `BrIf` node becomes one `IfElse` node), preserving indices so
+    // `child_targets` stays aligned for Phase 3.
+    for block in blocks.iter_mut() {
+        if let StructuredBlock::Instruction(WasmInstr::BrIf(k)) = block {
+            let depth = *k as usize;
+            if depth < enclosing.len()
+                && let BranchExitTarget::FailWithError(tail) =
+                    &enclosing[enclosing.len() - 1 - depth]
+            {
+                cov_mark::hit!(layer_b_brif_to_fail_with_error);
+                *block = StructuredBlock::IfElse {
+                    block_type: BlockType::Empty,
+                    then_body: tail.clone(),
+                    else_body: Vec::new(),
+                };
+            }
+        }
+    }
+
+    // Phase 3 — recurse into children, extending the enclosing stack by one
+    // entry per nested control structure (matching WASM branch-depth counting).
+    for i in 0..n {
+        let Some(target) = child_targets[i].take() else {
+            continue;
+        };
+        match &mut blocks[i] {
+            StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+                enclosing.push(target);
+                rewrite_branch_seq(body, enclosing, module);
+                enclosing.pop();
+            }
+            StructuredBlock::IfElse {
+                then_body,
+                else_body,
+                ..
+            } => {
+                enclosing.push(target);
+                rewrite_branch_seq(then_body, enclosing, module);
+                rewrite_branch_seq(else_body, enclosing, module);
+                enclosing.pop();
+            }
+            _ => {}
+        }
+    }
 }
 
 fn is_guard_error_path(remaining: &[super::structurize::StructuredBlock]) -> bool {
@@ -11341,6 +11691,168 @@ mod tests {
                 Box::new(SorobanExpr::I64Literal(10)),
                 Box::new(SorobanExpr::Param("len".to_string())),
             )
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Layer B (issue #12): multi-level `br_if` to a `fail_with_error` tail
+    // recovers as a nested `if cond { panic_with_error!(…) }`.
+    // ---------------------------------------------------------------------
+
+    /// Build a module with a `fail_with_error` import (`x.5`), a thin wrapper
+    /// that calls it (mirroring aquarius `call 80`), and a validation function
+    /// whose inner block reaches the wrapper tail via a `br_if 0`, while a
+    /// sibling `br_if 1` exits to a non-error (empty) tail.
+    #[cfg(test)]
+    fn fail_with_error_validate_module() -> crate::wasm::WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "x" "5" (func $fail (param i64) (result i64)))
+                (func $wrap (param i64)
+                    local.get 0
+                    call $fail
+                    drop)
+                (func $validate (param i64)
+                    block            ;; @1
+                        block        ;; @2
+                            local.get 0
+                            i64.const 100
+                            i64.gt_s
+                            br_if 1   ;; depth 1 -> exits @1 -> empty tail (plain)
+                            local.get 0
+                            i64.eqz
+                            br_if 0   ;; depth 0 -> exits @2 -> wrapper tail (fail_with_error)
+                        end
+                        i64.const 999
+                        call $wrap
+                        unreachable  ;; @2 exit tail: contract-error panic
+                    end))
+            "#,
+        )
+        .expect("wat parses");
+        crate::wasm::WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn layer_b_rewrites_brif_to_fail_with_error_tail() {
+        use super::super::structurize::StructuredBlock;
+        use crate::wasm::ir::WasmInstr;
+
+        let module = fail_with_error_validate_module();
+        // $validate is the second defined function (index 2: import 0, wrap 1).
+        let validate = module.get_function(2).expect("validate present");
+        let mut tree = super::super::structurize::structurize(&validate.body);
+
+        // Sanity: before the pass, the depth-1 branch is a raw `BrIf(1)`.
+        fn count_brif(blocks: &[StructuredBlock], depth: u32) -> usize {
+            blocks
+                .iter()
+                .map(|b| match b {
+                    StructuredBlock::Instruction(WasmInstr::BrIf(k)) if *k == depth => 1,
+                    StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+                        count_brif(body, depth)
+                    }
+                    StructuredBlock::IfElse {
+                        then_body,
+                        else_body,
+                        ..
+                    } => count_brif(then_body, depth) + count_brif(else_body, depth),
+                    _ => 0,
+                })
+                .sum()
+        }
+        // Count IfElse nodes whose then-body is a fail_with_error tail.
+        fn count_recovered(blocks: &[StructuredBlock]) -> usize {
+            blocks
+                .iter()
+                .map(|b| match b {
+                    StructuredBlock::IfElse {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        let here = matches!(
+                            then_body.last(),
+                            Some(StructuredBlock::Instruction(WasmInstr::Unreachable))
+                        ) && then_body
+                            .iter()
+                            .any(|n| matches!(n, StructuredBlock::Instruction(WasmInstr::Call(_))));
+                        here as usize + count_recovered(then_body) + count_recovered(else_body)
+                    }
+                    StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+                        count_recovered(body)
+                    }
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        assert_eq!(
+            count_brif(&tree, 0),
+            1,
+            "expected one depth-0 br_if pre-pass"
+        );
+        recover_fail_with_error_branches(&mut tree, &module);
+        assert_eq!(
+            count_brif(&tree, 0),
+            0,
+            "the depth-0 br_if to the fail_with_error tail should be rewritten away"
+        );
+        assert_eq!(
+            count_recovered(&tree),
+            1,
+            "exactly one IfElse wrapping the fail_with_error tail should be synthesized"
+        );
+        // The depth-1 br_if to the plain (empty) `@1` exit must be left untouched.
+        assert_eq!(
+            count_brif(&tree, 1),
+            1,
+            "the depth-1 br_if to a non-error exit must be preserved as-is"
+        );
+    }
+
+    #[test]
+    fn layer_b_ignores_non_fail_with_error_tails() {
+        use super::super::structurize::StructuredBlock;
+        use crate::wasm::ir::WasmInstr;
+
+        // A function whose only block exit is a bare `unreachable` (no
+        // fail_with_error): the pass must NOT rewrite the br_if (we deliberately
+        // scope out bare traps to avoid panic-ifying compiler safety nets).
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $f (param i64)
+                    block
+                        local.get 0
+                        i64.const 1
+                        i64.eq
+                        br_if 0
+                        local.get 0
+                        drop
+                    end
+                    unreachable))
+            "#,
+        )
+        .expect("wat parses");
+        let module = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        let validate = module.get_function(0).expect("present");
+        let mut tree = super::super::structurize::structurize(&validate.body);
+        let before = format!("{tree:?}");
+        recover_fail_with_error_branches(&mut tree, &module);
+        assert_eq!(
+            before,
+            format!("{tree:?}"),
+            "bare-trap exits must be left byte-identical"
+        );
+        assert!(
+            tree.iter().any(|b| matches!(
+                b,
+                StructuredBlock::Block { body, .. } if body.iter().any(|n| matches!(
+                    n,
+                    StructuredBlock::Instruction(WasmInstr::BrIf(0))
+                ))
+            )),
+            "the br_if should still be present and unrewritten"
         );
     }
 }
