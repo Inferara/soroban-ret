@@ -947,14 +947,12 @@ fn test_all_fixtures_decompile() {
 }
 
 // Fixtures with a known, tracked `todo!("unknown value")` gap that is NOT a
-// truncation artifact. test_liquidity_pool: recovering the full deposit/withdraw
-// bodies (issue #12) surfaces the contract's i128 share-math, which the lifter
-// does not yet reconstruct from the stripped 128-bit soft-arithmetic intrinsics
-// (signed negate/abs → __multi3 → long-division, with operands already
-// limb-decomposed at every intrinsic call). Clean reconstruction needs symbolic
-// 128-bit abstract interpretation — a separate feature tracked apart from #12.
-// All OTHER artifact checks (host-call, var_N) still apply to these fixtures.
-const KNOWN_I128_TODO_FIXTURES: &[&str] = &["test_liquidity_pool"];
+// truncation artifact. test_liquidity_pool's i128 share-math is now reconstructed
+// (the soft-arith multiply/divide helpers are classified and lowered to clean
+// `Mul`/`Div`, operands rebuilt from their limb pairs, and the carry/borrow-flag
+// leaks dropped), so it no longer needs an exemption — the list is empty and every
+// fixture is held to the full no-artifact bar.
+const KNOWN_I128_TODO_FIXTURES: &[&str] = &[];
 
 #[test]
 fn test_all_fixtures_no_artifacts() {
@@ -969,6 +967,14 @@ fn test_all_fixtures_no_artifacts() {
         assert!(
             !source.contains("todo!(\"host call"),
             "{name} has unresolved host call artifact"
+        );
+        // No fixture should fall back to a whole-empty-body placeholder. This guards
+        // the enum-variants identity round-trip recovery (the data-carrying-enum
+        // `fn f(v: E) -> E` decode→match→re-encode that previously stripped to an
+        // empty body); applies to every fixture, including the known-i128 one.
+        assert!(
+            !source.contains("todo!(\"decompiled function body\")"),
+            "{name} has an empty-body todo!(\"decompiled function body\") artifact"
         );
         // Check for unresolved var_N temporary names. Skipped for the known i128
         // fixtures: the unreconstructed share-math leaves intermediate `var_N`
@@ -1087,6 +1093,16 @@ fn _dump_test_fuzz_run() {
 // elsewhere typically EXPOSES previously-hidden code that contains more
 // `todo!()` placeholders, so the number can go up while decompilation quality
 // improves. Compare against the body shape (see _dump_*) when interpreting.
+//
+// Phase-3 baseline (constant-`br_table` dispatch folding landed): aquarius 726,
+// blend 74 — down from aquarius 1118 after `fold_constant_matches` learned to
+// evaluate mixed-literal-type constant selectors (`i64(2) - i32(1)`) via
+// `const_eval_i128`, collapsing inlined storage-key builders to their single
+// live arm. The remaining tail is the hard class: host-call results / frame-slot
+// values the lifter degrades to `UnknownVal` across control-flow boundaries
+// (~252 in guards, ~171 in runtime-discriminant dispatches, ~28 loop-carry
+// inits). Recovering those needs lifter SSA/loop-carry propagation, not an
+// optimizer rewrite.
 #[test]
 #[ignore]
 fn _count_aquarius_blend_todos() {

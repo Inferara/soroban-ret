@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use crate::codegen::module::{assemble_generic_module, assemble_module, format_source};
 use crate::ir::optimizer::{
-    optimize_stmts, optimize_stmts_preserve_host_calls, propagate_variable_names,
-    recover_match_arm_storage_keys, remove_self_assignments,
+    drop_void_unknown_value_return_guards, optimize_stmts, optimize_stmts_preserve_host_calls,
+    propagate_variable_names, recover_match_arm_storage_keys, remove_self_assignments,
     replace_void_with_none_in_option_fields,
 };
 use crate::ir::soroban_ir::{MatchArm, MatchPattern, SorobanExpr, SorobanStmt, StorageType};
@@ -184,8 +184,31 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
                 func.body
             );
         }
+        // Data-carrying-enum identity round-trip (`fn f(v: E) -> E { v }`): the SDK's
+        // decode→match→re-encode lifts to a `Match` over `v` with degenerate per-variant
+        // arms that the optimizer would strip to an empty body → `todo!`. Recognize it
+        // here (pre-optimization, while the match is intact) and collapse to the faithful
+        // `v` so the identity survives. See `is_enum_identity_roundtrip` for the gating.
+        if let Some(ret_ty) = &func.return_type
+            && let Some(param_name) = find_identity_passthrough_param(&func.params, ret_ty)
+            && is_enum_identity_roundtrip(&func.body, &param_name)
+        {
+            cov_mark::hit!(enum_identity_roundtrip);
+            func.body = vec![SorobanStmt::Return(Some(SorobanExpr::Param(param_name)))];
+        }
+
         let optimized = optimize_stmts(std::mem::take(&mut func.body));
         func.body = optimized;
+
+        // Void functions: drop SDK Val-decode dispatch husks (`if <lost-tag> {
+        // return <int> }`) that inlining a non-void decoder leaves behind. The
+        // value-return is invalid in a void context (codegen drops it → a stray
+        // `if todo!() == 1114112 {}`); when the condition is itself `UnknownVal`
+        // the guard is a pure artifact. Gated on void return type here so the
+        // pass never touches a real value-returning decoder.
+        if func.return_type.is_none() {
+            func.body = drop_void_unknown_value_return_guards(std::mem::take(&mut func.body));
+        }
 
         // When optimization empties a function body that had host calls,
         // re-optimize preserving orphan host calls so users see
@@ -609,6 +632,27 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
             }
         }
         log::trace!("Pipeline pass: stage_4p2 convert_vec_to_tuple_return");
+
+        // Stage 4p3: Type the operands of recovered i128 share-math. Cross-contract
+        // calls (`balance(...)`) and storage gets otherwise default to
+        // `soroban_sdk::Val`, which doesn't type-check in `balance - amount`. Pass 1
+        // retypes invokes and inline gets per function while collecting the storage
+        // keys read as i128; pass 2 types every get of those keys across all
+        // functions (so a tuple-returning `get_rsrvs` or a dead `let reserve_a` whose
+        // slot is i128 elsewhere is typed too).
+        let mut i128_keys: Vec<SorobanExpr> = Vec::new();
+        for func in &mut contract_module.functions {
+            let used = coerce_i128_invoke_types(&mut func.body, &func.params);
+            for key in used.keys {
+                if !i128_keys.contains(&key) {
+                    i128_keys.push(key);
+                }
+            }
+        }
+        for func in &mut contract_module.functions {
+            type_i128_key_gets(&mut func.body, &i128_keys);
+        }
+        log::trace!("Pipeline pass: stage_4p3 coerce_i128_invoke_types");
 
         // Stage 4q: Replace incomplete struct reconstructions with parameter references.
         for func in &mut contract_module.functions {
@@ -2033,6 +2077,158 @@ fn is_identity_bool_literal(expr: &SorobanExpr, ret_ty: &stellar_xdr::curr::ScSp
             stellar_xdr::curr::ScSpecTypeDef::Bool
         )
     )
+}
+
+/// Detect a data-carrying-enum identity round-trip — `fn f(v: E) -> E { v }` where
+/// `E` is a `#[contracttype]` enum with data-carrying variants.
+///
+/// The SDK lowers such a function to: decode `v` (Val-tag guard, `len`, `get(0)`
+/// discriminant), then a `match v { … }` whose arms each merely re-encode the *same*
+/// variant they matched (e.g. arm `VarB` reads `v.get(1)` and rebuilds `VarB`). The
+/// lifter recovers this as a `Match` over `Param(v)` with degenerate per-variant arm
+/// skeletons; the optimizer then strips the no-effect arms, leaving an empty body that
+/// codegen renders as `todo!("decompiled function body")` (see codegen/module.rs). The
+/// unit-enum / struct / scalar round-trips already collapse via the existing identity
+/// passes; only the data-carrying-enum match shape slips through.
+///
+/// This recognizes the round-trip (before optimization, where the match is still
+/// present) and lets the caller collapse it to the faithful `Return(Param(v))`.
+///
+/// Gated tightly so it cannot fire on a real enum-*transforming* function: the body
+/// must be nothing but decode preamble plus one `match` over `v`, every statement and
+/// arm body must be side-effect-free and read only `v` (no storage/event/invoke/auth,
+/// no other parameter), and each arm may only re-encode its *own* variant (a foreign
+/// `SymbolLiteral`/`EnumConstruct` — i.e. a permutation/transform — disqualifies it).
+fn is_enum_identity_roundtrip(body: &[SorobanStmt], param: &str) -> bool {
+    let mut arms_seen: Option<&[MatchArm]> = None;
+    for stmt in body {
+        match stmt {
+            SorobanStmt::Match { scrutinee, arms } => {
+                if arms_seen.is_some() {
+                    return false; // more than one match → not a simple round-trip
+                }
+                if !matches!(scrutinee, SorobanExpr::Param(p) if p == param) {
+                    return false; // dispatch must be on the passthrough param
+                }
+                arms_seen = Some(arms);
+            }
+            other if enum_roundtrip_stmt_is_benign(other, param, None) => {}
+            _ => return false,
+        }
+    }
+    let Some(arms) = arms_seen else {
+        return false; // no match → handled by the other identity passes
+    };
+    !arms.is_empty()
+        && arms.iter().all(|arm| match &arm.pattern {
+            // An enum-variant arm may re-encode only its own variant.
+            MatchPattern::EnumVariant { variant, .. } => arm
+                .body
+                .iter()
+                .all(|s| enum_roundtrip_stmt_is_benign(s, param, Some(variant))),
+            // A catch-all arm must be benign with no variant re-encode at all.
+            MatchPattern::Wildcard => arm
+                .body
+                .iter()
+                .all(|s| enum_roundtrip_stmt_is_benign(s, param, None)),
+            // A literal-dispatch match is an integer switch, not an enum round-trip.
+            MatchPattern::Literal(_) => false,
+        })
+}
+
+/// A statement is "benign" for [`is_enum_identity_roundtrip`] if it only decodes/reads
+/// the passthrough param `v` and re-encodes the allowed `variant` (if any) — no writes,
+/// no host side effects. `variant == Some(v)` permits `SymbolLiteral(v)`/`EnumConstruct`
+/// of variant `v` only; `None` permits no variant re-encode.
+fn enum_roundtrip_stmt_is_benign(stmt: &SorobanStmt, param: &str, variant: Option<&str>) -> bool {
+    match stmt {
+        // A validation guard: `if <read-only cond> { panic } ` with no else.
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            enum_roundtrip_expr_is_readonly(condition, param, variant)
+                && else_body.is_empty()
+                && then_body.iter().all(|t| {
+                    matches!(
+                        t,
+                        SorobanStmt::Expr(SorobanExpr::Panic | SorobanExpr::PanicWithError(_))
+                    )
+                })
+        }
+        SorobanStmt::Let { value, .. } => enum_roundtrip_expr_is_readonly(value, param, variant),
+        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => {
+            enum_roundtrip_expr_is_readonly(e, param, variant)
+        }
+        SorobanStmt::Return(None) | SorobanStmt::Break | SorobanStmt::Continue => true,
+        SorobanStmt::Comment(_) => true,
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => body
+            .iter()
+            .all(|s| enum_roundtrip_stmt_is_benign(s, param, variant)),
+        // Assign (write), nested Match, and For are not part of a pure round-trip.
+        _ => false,
+    }
+}
+
+/// An expression is "read-only" for the enum round-trip if it is built only from
+/// literals, reads of the passthrough param `v`, Val-tag inspection, and (when
+/// `variant` is `Some`) a re-encode of *that* variant. Any storage/event/invoke/auth/
+/// crypto op, any other parameter, or any foreign variant symbol returns false.
+fn enum_roundtrip_expr_is_readonly(expr: &SorobanExpr, param: &str, variant: Option<&str>) -> bool {
+    use SorobanExpr::*;
+    // Free-function calls coerce `&Box<SorobanExpr>` → `&SorobanExpr` at the arg position.
+    let recs = |es: &[SorobanExpr]| {
+        es.iter()
+            .all(|e| enum_roundtrip_expr_is_readonly(e, param, variant))
+    };
+    match expr {
+        U32Literal(_) | I32Literal(_) | U64Literal(_) | I64Literal(_) | U128Literal(_)
+        | I128Literal(_) | BoolLiteral(_) | StringLiteral(_) | BytesLiteral(_) | Void | None
+        | Env | ValTagName(_) => true,
+        Param(p) => p == param,
+        SymbolLiteral(s) => variant == Option::Some(s.as_str()),
+        Some(inner) | Not(inner) | ValTag(inner) => {
+            enum_roundtrip_expr_is_readonly(inner, param, variant)
+        }
+        Add(a, b)
+        | Sub(a, b)
+        | Mul(a, b)
+        | Div(a, b)
+        | Rem(a, b)
+        | Eq(a, b)
+        | Ne(a, b)
+        | Lt(a, b)
+        | Le(a, b)
+        | Gt(a, b)
+        | Ge(a, b)
+        | And(a, b)
+        | Or(a, b) => {
+            enum_roundtrip_expr_is_readonly(a, param, variant)
+                && enum_roundtrip_expr_is_readonly(b, param, variant)
+        }
+        ValConvert { value, .. } | FieldAccess { object: value, .. } => {
+            enum_roundtrip_expr_is_readonly(value, param, variant)
+        }
+        MethodCall {
+            object,
+            method,
+            args,
+        } => {
+            matches!(
+                method.as_str(),
+                "get" | "len" | "first_unchecked" | "first" | "last" | "is_empty"
+            ) && enum_roundtrip_expr_is_readonly(object, param, variant)
+                && recs(args)
+        }
+        EnumConstruct {
+            variant: v, fields, ..
+        } => variant == Option::Some(v.as_str()) && recs(fields),
+        TupleConstruct(es) | VecConstruct(es) => recs(es),
+        // Everything else (storage/event/invoke/auth/crypto/struct-construct/…) has an
+        // effect or escapes the param — not a pure read-only round-trip.
+        _ => false,
+    }
 }
 
 /// Run wasm-opt (binaryen) on the WASM binary via the system `wasm-opt` command.
@@ -5810,17 +6006,245 @@ fn fix_bool_literal_expr(e: &mut SorobanExpr) {
 /// declares a tuple return type, convert the tail VecConstruct to TupleConstruct
 /// by stripping the leading `Env` element.
 fn convert_vec_to_tuple_return(stmts: &mut [SorobanStmt], expected_elements: usize) {
-    // Check the last statement for a VecConstruct in return or tail position
-    if let Some(last) = stmts.last_mut() {
-        match last {
-            SorobanStmt::Return(Some(expr)) => {
-                convert_vec_expr_to_tuple(expr, expected_elements);
+    // Convert every explicit `return vec![..]` — the return is not always the last
+    // statement (a trailing dead `panic!()` from the WASM `unreachable` can follow
+    // it), so scan rather than only checking the tail.
+    for stmt in stmts.iter_mut() {
+        if let SorobanStmt::Return(Some(expr)) = stmt {
+            convert_vec_expr_to_tuple(expr, expected_elements);
+        }
+    }
+    // Also handle a tail-position implicit return (`vec![..]` as the last expr).
+    if let Some(SorobanStmt::Expr(expr)) = stmts.last_mut() {
+        convert_vec_expr_to_tuple(expr, expected_elements);
+    }
+}
+
+/// Type the operands that participate in i128/u128 arithmetic. Recovered share-math
+/// otherwise leaves values defaulting to `soroban_sdk::Val`, which doesn't type-check:
+///   - an untyped `invoke_contract` (a token `balance(...)`) → `return_type = i128`;
+///   - a storage get inline in the arithmetic → wrapped so codegen emits a
+///     `get::<_, i128>` turbofish (Rust won't infer the generic value type);
+///   - a `let` binding whose value is a storage get and whose name feeds i128
+///     arithmetic → its value is likewise typed, so the binding is `i128`.
+fn coerce_i128_invoke_types(stmts: &mut [SorobanStmt], params: &[FnParam]) -> I128Use {
+    // Retype invokes and inline-arithmetic gets, collecting the storage keys read as
+    // i128 (the caller types every get of those keys, including in other functions).
+    let mut used = I128Use::default();
+    coerce_i128_collect(stmts, params, &mut used);
+    used
+}
+
+/// What a function's i128 arithmetic depends on, gathered to type the storage gets
+/// that feed it.
+#[derive(Default)]
+struct I128Use {
+    /// Names of locals referenced as i128 operands.
+    #[allow(dead_code)]
+    locals: std::collections::HashSet<String>,
+    /// Storage keys read as i128 (e.g. `DataKey::ReserveA`).
+    keys: Vec<SorobanExpr>,
+}
+
+fn coerce_i128_collect(stmts: &mut [SorobanStmt], params: &[FnParam], used: &mut I128Use) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => {
+                coerce_i128_invoke_in_expr(e, params, used)
             }
-            SorobanStmt::Expr(expr) => {
-                convert_vec_expr_to_tuple(expr, expected_elements);
+            SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+                coerce_i128_invoke_in_expr(value, params, used)
             }
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                coerce_i128_invoke_in_expr(condition, params, used);
+                coerce_i128_collect(then_body, params, used);
+                coerce_i128_collect(else_body, params, used);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                coerce_i128_invoke_in_expr(scrutinee, params, used);
+                for arm in arms {
+                    coerce_i128_collect(&mut arm.body, params, used);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => coerce_i128_collect(body, params, used),
             _ => {}
         }
+    }
+}
+
+/// Wrap every storage get of a known-i128 key (collected from i128 arithmetic) so
+/// codegen emits a `get::<_, i128>` turbofish. A get's generic value type is not
+/// inferred from a tuple return or a `let` binding alone, so this types the reads
+/// that arithmetic didn't already reach (`get_rsrvs`, dead `let reserve_a`, …).
+fn type_i128_key_gets(stmts: &mut [SorobanStmt], keys: &[SorobanExpr]) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => {
+                type_i128_key_gets_in_expr(e, keys)
+            }
+            SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+                type_i128_key_gets_in_expr(value, keys)
+            }
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                type_i128_key_gets_in_expr(condition, keys);
+                type_i128_key_gets(then_body, keys);
+                type_i128_key_gets(else_body, keys);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                type_i128_key_gets_in_expr(scrutinee, keys);
+                for arm in arms {
+                    type_i128_key_gets(&mut arm.body, keys);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => type_i128_key_gets(body, keys),
+            _ => {}
+        }
+    }
+}
+
+fn type_i128_key_gets_in_expr(e: &mut SorobanExpr, keys: &[SorobanExpr]) {
+    // A bare get of an i128 key → wrap it (don't recurse into the new wrapper).
+    if let SorobanExpr::StorageGet { key, .. } = e
+        && keys.contains(&**key)
+    {
+        let inner = std::mem::replace(e, SorobanExpr::Void);
+        *e = SorobanExpr::CastAs {
+            value: Box::new(inner),
+            target_type: "i128".to_string(),
+        };
+        return;
+    }
+    // An already-typed get → leave as-is (avoid double-wrapping).
+    if let SorobanExpr::CastAs { value, .. } = e
+        && matches!(value.as_ref(), SorobanExpr::StorageGet { .. })
+    {
+        return;
+    }
+    match e {
+        SorobanExpr::InvokeContract { address, args, .. }
+        | SorobanExpr::TryInvokeContract { address, args, .. } => {
+            type_i128_key_gets_in_expr(address, keys);
+            for a in args.iter_mut() {
+                type_i128_key_gets_in_expr(a, keys);
+            }
+        }
+        _ => {
+            for c in child_exprs_mut(e) {
+                type_i128_key_gets_in_expr(c, keys);
+            }
+        }
+    }
+}
+
+fn coerce_i128_invoke_in_expr(e: &mut SorobanExpr, params: &[FnParam], used: &mut I128Use) {
+    // Recurse into every child first — including `invoke_contract` args, which the
+    // shared `child_exprs_mut` walker skips but which hold the share-math (e.g. a
+    // `(amount * total / reserve).into_val()` transfer argument).
+    match e {
+        SorobanExpr::InvokeContract { address, args, .. }
+        | SorobanExpr::TryInvokeContract { address, args, .. } => {
+            coerce_i128_invoke_in_expr(address, params, used);
+            for a in args.iter_mut() {
+                coerce_i128_invoke_in_expr(a, params, used);
+            }
+        }
+        _ => {
+            for c in child_exprs_mut(e) {
+                coerce_i128_invoke_in_expr(c, params, used);
+            }
+        }
+    }
+    // After recursion, if this node is i128 arithmetic, type its operands i128.
+    if matches!(
+        e,
+        SorobanExpr::Add(..)
+            | SorobanExpr::Sub(..)
+            | SorobanExpr::Mul(..)
+            | SorobanExpr::Div(..)
+            | SorobanExpr::Rem(..)
+    ) && expr_is_i128(e, params)
+    {
+        force_i128_deep(e, used);
+    }
+}
+
+/// True when `e` is statically known to be 128-bit: a 128-bit literal, a 128-bit
+/// parameter, an `invoke_contract` already typed 128-bit, or arithmetic with such
+/// an operand.
+fn expr_is_i128(e: &SorobanExpr, params: &[FnParam]) -> bool {
+    match e {
+        SorobanExpr::I128Literal(_) | SorobanExpr::U128Literal(_) => true,
+        SorobanExpr::Param(n) => params.iter().any(|p| {
+            p.name == *n && matches!(p.type_def, ScSpecTypeDef::I128 | ScSpecTypeDef::U128)
+        }),
+        SorobanExpr::InvokeContract {
+            return_type: Some(t),
+            ..
+        }
+        | SorobanExpr::TryInvokeContract {
+            return_type: Some(t),
+            ..
+        } => t == "i128" || t == "u128",
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b) => expr_is_i128(a, params) || expr_is_i128(b, params),
+        _ => false,
+    }
+}
+
+/// Type every operand within an i128 arithmetic subtree as `i128`, and record the
+/// names of local references so their `let` bindings can be typed too. Only recurses
+/// through arithmetic nodes — a nested non-arithmetic child keeps its own type.
+/// Untyped `invoke_contract`s get `return_type = i128`; storage gets (whose generic
+/// value type Rust will not infer from arithmetic alone) get wrapped so codegen can
+/// emit a `get::<_, i128>` turbofish.
+fn force_i128_deep(e: &mut SorobanExpr, used: &mut I128Use) {
+    match e {
+        SorobanExpr::InvokeContract { return_type, .. }
+        | SorobanExpr::TryInvokeContract { return_type, .. }
+            if return_type.is_none() =>
+        {
+            *return_type = Some("i128".to_string());
+        }
+        SorobanExpr::StorageGet { key, .. } => {
+            used.keys.push((**key).clone());
+            let inner = std::mem::replace(e, SorobanExpr::Void);
+            *e = SorobanExpr::CastAs {
+                value: Box::new(inner),
+                target_type: "i128".to_string(),
+            };
+        }
+        // Record locals used in i128 arithmetic so `type_i128_let_bindings` can type
+        // their `let name = <storage get>` declarations.
+        SorobanExpr::NamedLocal(name) => {
+            used.locals.insert(name.clone());
+        }
+        SorobanExpr::Local(idx) => {
+            used.locals.insert(format!("var_{idx}"));
+        }
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b) => {
+            force_i128_deep(a, used);
+            force_i128_deep(b, used);
+        }
+        _ => {}
     }
 }
 
@@ -7327,6 +7751,55 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::ScSpecTypeDef;
 
+    #[test]
+    fn convert_vec_to_tuple_return_handles_return_before_trailing_stmt() {
+        // A tuple return is not always the last statement — a dead `panic!()` from
+        // the WASM `unreachable` can follow it. The conversion must still fire.
+        let mut body = vec![
+            SorobanStmt::Return(Some(SorobanExpr::VecConstruct(vec![
+                SorobanExpr::Env,
+                SorobanExpr::I128Literal(1),
+                SorobanExpr::I128Literal(2),
+            ]))),
+            SorobanStmt::Expr(SorobanExpr::Panic),
+        ];
+        convert_vec_to_tuple_return(&mut body, 2);
+        match &body[0] {
+            SorobanStmt::Return(Some(SorobanExpr::TupleConstruct(items))) => {
+                assert_eq!(items.len(), 2, "(i128, i128) return becomes a 2-tuple");
+            }
+            other => panic!("expected a tuple return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coerce_i128_invoke_types_retypes_call_in_subtraction() {
+        // `balance() - amount` where `balance` is an untyped cross-contract call:
+        // the call must be retyped `i128` so `Val - i128` becomes `i128 - i128`.
+        let params = vec![FnParam {
+            name: "amount".to_string(),
+            type_def: ScSpecTypeDef::I128,
+        }];
+        let invoke = SorobanExpr::InvokeContract {
+            address: Box::new(SorobanExpr::Param("token".to_string())),
+            function: Box::new(SorobanExpr::SymbolLiteral("balance".to_string())),
+            args: vec![],
+            return_type: None,
+        };
+        let mut body = vec![SorobanStmt::Expr(SorobanExpr::Sub(
+            Box::new(invoke),
+            Box::new(SorobanExpr::Param("amount".to_string())),
+        ))];
+        let _ = coerce_i128_invoke_types(&mut body, &params);
+        match &body[0] {
+            SorobanStmt::Expr(SorobanExpr::Sub(a, _)) => assert!(
+                matches!(a.as_ref(), SorobanExpr::InvokeContract { return_type: Some(t), .. } if t == "i128"),
+                "the balance() call should be typed i128, got {a:?}"
+            ),
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
     fn storage_hints(function_name: &str, keys: Vec<HintValue>) -> DecompileHints {
         DecompileHints::with_functions(vec![crate::FunctionHints::with_storage(
             function_name,
@@ -8727,5 +9200,132 @@ mod tests {
         let rebound = std::collections::HashSet::new();
         let score = score_param_local_base_in_expr(&tag(), 0, 0, &rebound);
         assert_eq!(score.total_hits, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 1: data-carrying-enum identity round-trip recognition.
+    // ---------------------------------------------------------------------
+
+    fn enum_arm(variant: &str, body: Vec<SorobanStmt>) -> MatchArm {
+        MatchArm {
+            pattern: MatchPattern::EnumVariant {
+                type_name: "E".into(),
+                variant: variant.into(),
+                bindings: vec![],
+            },
+            body,
+        }
+    }
+
+    /// The aquarius-style decode→match→re-encode identity shape: each arm reads `v`
+    /// and re-encodes only its own variant. Must be recognized as identity.
+    #[test]
+    fn enum_identity_roundtrip_accepts_self_reencode() {
+        let body = vec![
+            // decode preamble: tag guard + len + discriminant read
+            SorobanStmt::If {
+                condition: SorobanExpr::Ne(
+                    Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param(
+                        "v".into(),
+                    )))),
+                    Box::new(SorobanExpr::ValTagName("VecObject".into())),
+                ),
+                then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+                else_body: vec![],
+            },
+            SorobanStmt::Expr(SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::Param("v".into())),
+                method: "get".into(),
+                args: vec![SorobanExpr::U32Literal(0)],
+            }),
+            SorobanStmt::Match {
+                scrutinee: SorobanExpr::Param("v".into()),
+                arms: vec![
+                    enum_arm(
+                        "VarA",
+                        vec![SorobanStmt::Expr(SorobanExpr::SymbolLiteral("VarA".into()))],
+                    ),
+                    enum_arm(
+                        "VarB",
+                        vec![
+                            SorobanStmt::Let {
+                                name: "x".into(),
+                                mutable: false,
+                                value: SorobanExpr::FieldAccess {
+                                    object: Box::new(SorobanExpr::MethodCall {
+                                        object: Box::new(SorobanExpr::Param("v".into())),
+                                        method: "get".into(),
+                                        args: vec![SorobanExpr::U32Literal(1)],
+                                    }),
+                                    field: "a".into(),
+                                },
+                            },
+                            SorobanStmt::Expr(SorobanExpr::SymbolLiteral("VarB".into())),
+                        ],
+                    ),
+                ],
+            },
+        ];
+        assert!(is_enum_identity_roundtrip(&body, "v"));
+    }
+
+    /// A permutation `match v { VarA => VarB, .. }` re-encodes a FOREIGN variant — it
+    /// is NOT an identity and must be rejected (so it is not collapsed to `v`).
+    #[test]
+    fn enum_identity_roundtrip_rejects_foreign_variant_reencode() {
+        let body = vec![SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("v".into()),
+            arms: vec![enum_arm(
+                "VarA",
+                // arm VarA re-encodes VarB → transform, not identity
+                vec![SorobanStmt::Expr(SorobanExpr::SymbolLiteral("VarB".into()))],
+            )],
+        }];
+        assert!(!is_enum_identity_roundtrip(&body, "v"));
+    }
+
+    /// An arm with a side effect (storage write) or that reads another parameter is
+    /// real logic, not a round-trip — must be rejected.
+    #[test]
+    fn enum_identity_roundtrip_rejects_side_effects_and_foreign_param() {
+        let with_store = vec![SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("v".into()),
+            arms: vec![enum_arm(
+                "VarA",
+                vec![SorobanStmt::Expr(SorobanExpr::StorageSet {
+                    storage_type: StorageType::Persistent,
+                    key: Box::new(SorobanExpr::SymbolLiteral("k".into())),
+                    value: Box::new(SorobanExpr::Param("v".into())),
+                })],
+            )],
+        }];
+        assert!(!is_enum_identity_roundtrip(&with_store, "v"));
+
+        let foreign_param = vec![SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("v".into()),
+            arms: vec![enum_arm(
+                "VarA",
+                vec![SorobanStmt::Expr(SorobanExpr::Param("other".into()))],
+            )],
+        }];
+        assert!(!is_enum_identity_roundtrip(&foreign_param, "v"));
+    }
+
+    /// No match (the other identity passes handle empty / single-get bodies), or a
+    /// scrutinee that isn't the passthrough param → not this recognizer's job.
+    #[test]
+    fn enum_identity_roundtrip_rejects_non_match_and_wrong_scrutinee() {
+        assert!(!is_enum_identity_roundtrip(
+            &[SorobanStmt::Return(Some(SorobanExpr::Param("v".into())))],
+            "v"
+        ));
+        let wrong_scrutinee = vec![SorobanStmt::Match {
+            scrutinee: SorobanExpr::Param("w".into()),
+            arms: vec![enum_arm(
+                "VarA",
+                vec![SorobanStmt::Expr(SorobanExpr::SymbolLiteral("VarA".into()))],
+            )],
+        }];
+        assert!(!is_enum_identity_roundtrip(&wrong_scrutinee, "v"));
     }
 }

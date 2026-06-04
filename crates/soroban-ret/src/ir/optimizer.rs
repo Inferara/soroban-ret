@@ -1692,7 +1692,19 @@ fn fold_constant_matches(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                     });
                     continue;
                 }
-                if let Some(scrutinee_val) = as_literal_i128(&scrutinee) {
+                // Evaluate the scrutinee. For non-enum dispatch (the inlined
+                // `br_table` vec-builders in aquarius/blend, whose arms are all
+                // `Literal` patterns), fold constant *arithmetic* selectors like
+                // `i64(2) - i32(1)` that `fold_expr`'s same-type arms leave intact.
+                // For enum dispatch keep the conservative bare-literal evaluation —
+                // an enum scrutinee is a runtime discriminant, never a folded const,
+                // so never strip its arms on a fabricated constant.
+                let scrutinee_eval = if has_enum_arm {
+                    as_literal_i128(&scrutinee)
+                } else {
+                    const_eval_i128(&scrutinee)
+                };
+                if let Some(scrutinee_val) = scrutinee_eval {
                     // Find the arm whose literal pattern matches the scrutinee
                     let matching_arm = arms.iter().position(|arm| {
                         if let MatchPattern::Literal(ref lit) = arm.pattern {
@@ -2548,6 +2560,83 @@ fn remove_val_tag_guards_nested(stmt: SorobanStmt) -> SorobanStmt {
     }
 }
 
+/// Drop SDK Val-decode dispatch husks left behind in **void** functions.
+///
+/// Inlining a non-void decoder (e.g. a `Symbol`→index ladder) into a void caller
+/// leaves `if <lost-tag-check> { return <int> }` fragments. In a void function the
+/// value-return is invalid, so codegen drops it — the guard renders as
+/// `if todo!() == 1114112 {}` (1114112 = `0x110000`, the scval `Symbol` tag). When
+/// the condition is itself an `UnknownVal` (the lifter lost the decoded tag, so the
+/// branch is unrepresentable — it would `todo!()`-panic if reached) the whole guard
+/// is a pure artifact; remove it so it does not surface as a stray `todo!()`.
+///
+/// The CALLER must gate on void return type (`func.return_type.is_none()`). Within
+/// that, this fires only when ALL hold: the `then` body is exactly one value-return
+/// (`Return(Some(_))`), there is no `else`, and the condition contains an
+/// `UnknownVal`. A legitimate void early-return is `Return(None)`; a real guard has
+/// a representable condition — neither matches, so genuine control flow is kept.
+pub fn drop_void_unknown_value_return_guards(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    stmts
+        .into_iter()
+        .filter_map(|stmt| match stmt {
+            SorobanStmt::If {
+                ref condition,
+                ref then_body,
+                ref else_body,
+            } if else_body.is_empty()
+                && matches!(then_body.as_slice(), [SorobanStmt::Return(Some(_))])
+                && expr_contains(condition, &SorobanExpr::UnknownVal) =>
+            {
+                cov_mark::hit!(void_unknown_return_guard_dropped);
+                None
+            }
+            other => Some(drop_void_unknown_value_return_guards_nested(other)),
+        })
+        .collect()
+}
+
+fn drop_void_unknown_value_return_guards_nested(stmt: SorobanStmt) -> SorobanStmt {
+    match stmt {
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => SorobanStmt::If {
+            condition,
+            then_body: drop_void_unknown_value_return_guards(then_body),
+            else_body: drop_void_unknown_value_return_guards(else_body),
+        },
+        SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+            scrutinee,
+            arms: arms
+                .into_iter()
+                .map(|arm| MatchArm {
+                    pattern: arm.pattern,
+                    body: drop_void_unknown_value_return_guards(arm.body),
+                })
+                .collect(),
+        },
+        SorobanStmt::Loop { body } => SorobanStmt::Loop {
+            body: drop_void_unknown_value_return_guards(body),
+        },
+        SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body,
+        } => SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body: drop_void_unknown_value_return_guards(body),
+        },
+        SorobanStmt::Block(body) => SorobanStmt::Block(drop_void_unknown_value_return_guards(body)),
+        other => other,
+    }
+}
+
 /// Fold constant expressions
 fn fold_constants(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     stmts.into_iter().map(fold_stmt).collect()
@@ -2597,6 +2686,22 @@ fn fold_stmt(stmt: SorobanStmt) -> SorobanStmt {
     }
 }
 
+/// True for an integer comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`). When such a
+/// bool appears as an operand of integer `+`/`-`, it is a carry/borrow bit from a
+/// two-i64-limb i128 add/subtract leaking into the recomposed 128-bit value — the
+/// SDK's soft-arith lowering. It can never legitimately be added to an integer.
+fn is_carry_borrow_flag(e: &SorobanExpr) -> bool {
+    matches!(
+        e,
+        SorobanExpr::Lt(..)
+            | SorobanExpr::Le(..)
+            | SorobanExpr::Gt(..)
+            | SorobanExpr::Ge(..)
+            | SorobanExpr::Eq(..)
+            | SorobanExpr::Ne(..)
+    )
+}
+
 fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
     match expr {
         SorobanExpr::Add(a, b) => {
@@ -2618,6 +2723,14 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
                 // Algebraic identity: x + 0 → x, 0 + x → x
                 _ if is_zero_literal(&b) => a,
                 _ if is_zero_literal(&a) => b,
+                // Drop a leaked carry flag: `x + (lo < other)` is the carry bit of a
+                // two-limb i128 add bleeding into the recomposed value. Adding a bool
+                // to an integer never type-checks, so the comparison is always a
+                // soft-arith artifact — recover the clean `x`. Require the other
+                // operand to be a non-comparison so the `(a > b) - (a < b)` ordering
+                // idiom (both operands comparisons) is left for its own recognizer.
+                _ if is_carry_borrow_flag(&b) && !is_carry_borrow_flag(&a) => a,
+                _ if is_carry_borrow_flag(&a) && !is_carry_borrow_flag(&b) => b,
                 _ => SorobanExpr::Add(Box::new(a), Box::new(b)),
             }
         }
@@ -2639,6 +2752,11 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
                 }
                 // Algebraic identity: x - 0 → x
                 _ if is_zero_literal(&b) => a,
+                // Drop a leaked borrow flag: `x - (lo < other)` is the borrow bit of a
+                // two-limb i128 subtraction bleeding into the recomposed value (same
+                // rationale as the carry case in `Add`). The non-comparison guard on
+                // `a` preserves the `(a > b) - (a < b)` ordering idiom.
+                _ if is_carry_borrow_flag(&b) && !is_carry_borrow_flag(&a) => a,
                 _ => SorobanExpr::Sub(Box::new(a), Box::new(b)),
             }
         }
@@ -3431,6 +3549,47 @@ fn as_literal_i128(e: &SorobanExpr) -> Option<i128> {
         // ContractError with error_code is a constant expression (used as br_table
         // index in enum dispatch, not a real error)
         SorobanExpr::ContractError { error_code, .. } => Some(*error_code as i128),
+        _ => None,
+    }
+}
+
+/// Evaluate a *fully constant* integer expression to its `i128` value.
+///
+/// Extends [`as_literal_i128`] (which only recognizes leaf literals) by folding
+/// constant arithmetic — `2 - 1`, `(3 * 4) + 5`, … — but **only when every leaf
+/// is a literal**. Returns `None` the instant a non-literal leaf is reached
+/// (`UnknownVal`, a `Param`, a host call, …), so a runtime selector such as
+/// `Sub(UnknownVal, 1)` is never mistaken for a constant.
+///
+/// Used to fold inlined `br_table` dispatches whose discriminant the lifter
+/// resolved to a constant of *mixed* literal types (e.g. `i64(2) - i32(1)`),
+/// which `fold_expr`'s same-type-only arithmetic arms leave intact. A match on a
+/// genuine constant takes exactly one arm, so collapsing to it is faithful.
+fn const_eval_i128(e: &SorobanExpr) -> Option<i128> {
+    // Leaf literals (and the transparent wrappers `as_literal_i128` peels).
+    if let Some(v) = as_literal_i128(e) {
+        return Some(v);
+    }
+    match e {
+        SorobanExpr::Add(a, b) => const_eval_i128(a)?.checked_add(const_eval_i128(b)?),
+        SorobanExpr::Sub(a, b) => const_eval_i128(a)?.checked_sub(const_eval_i128(b)?),
+        SorobanExpr::Mul(a, b) => const_eval_i128(a)?.checked_mul(const_eval_i128(b)?),
+        SorobanExpr::Div(a, b) => {
+            let d = const_eval_i128(b)?;
+            if d == 0 {
+                None
+            } else {
+                const_eval_i128(a)?.checked_div(d)
+            }
+        }
+        SorobanExpr::Rem(a, b) => {
+            let d = const_eval_i128(b)?;
+            if d == 0 {
+                None
+            } else {
+                const_eval_i128(a)?.checked_rem(d)
+            }
+        }
         _ => None,
     }
 }
@@ -6094,6 +6253,51 @@ mod tests {
     use super::*;
     use crate::ir::soroban_ir::StorageType;
 
+    #[test]
+    fn fold_drops_leaked_borrow_and_carry_flags() {
+        // `total_shares - (a < b)` is a two-limb i128 borrow bit leaking into the
+        // recomposed value; recover the clean `total_shares`.
+        let borrow = SorobanExpr::Sub(
+            Box::new(SorobanExpr::Param("total_shares".into())),
+            Box::new(SorobanExpr::Lt(
+                Box::new(SorobanExpr::Param("a".into())),
+                Box::new(SorobanExpr::Param("b".into())),
+            )),
+        );
+        assert_eq!(fold_expr(borrow), SorobanExpr::Param("total_shares".into()));
+        // `x + (lo != 0)` — the carry case.
+        let carry = SorobanExpr::Add(
+            Box::new(SorobanExpr::Param("x".into())),
+            Box::new(SorobanExpr::Ne(
+                Box::new(SorobanExpr::Param("lo".into())),
+                Box::new(SorobanExpr::I64Literal(0)),
+            )),
+        );
+        assert_eq!(fold_expr(carry), SorobanExpr::Param("x".into()));
+    }
+
+    #[test]
+    fn fold_preserves_comparison_minus_comparison_ordering_idiom() {
+        // `(a > b) - (a < b)` is the `cmp` ordering idiom, NOT a borrow leak — both
+        // operands are comparisons, so neither may be dropped (a later pass folds it
+        // to `a < b`). Dropping one here regressed `test_fuzz` to `(a > b) < 0`.
+        let cmp = SorobanExpr::Sub(
+            Box::new(SorobanExpr::Gt(
+                Box::new(SorobanExpr::Param("a".into())),
+                Box::new(SorobanExpr::Param("b".into())),
+            )),
+            Box::new(SorobanExpr::Lt(
+                Box::new(SorobanExpr::Param("a".into())),
+                Box::new(SorobanExpr::Param("b".into())),
+            )),
+        );
+        assert_eq!(
+            fold_expr(cmp.clone()),
+            cmp,
+            "ordering idiom must be preserved"
+        );
+    }
+
     fn param(name: &str) -> SorobanExpr {
         SorobanExpr::Param(name.to_string())
     }
@@ -7000,6 +7204,124 @@ mod tests {
                 SorobanStmt::Return(Some(SorobanExpr::U32Literal(7)))
             ),
             "expected literal-1 arm to fold; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fold_constant_matches_folds_mixed_type_arithmetic_scrutinee() {
+        // The aquarius/blend inlined `br_table` key-builders arrive with a
+        // *constant* discriminant of mixed literal types, e.g. `i64(2) - i32(1)`,
+        // which `fold_expr`'s same-type-only arithmetic arms leave intact as
+        // `match 2 - 1 { ... }`. `const_eval_i128` evaluates the selector so the
+        // dispatch collapses to its single live arm — discarding the dozens of
+        // dead `vec![&env, todo!()]` arms that dominated the todo count.
+        let arms = vec![
+            MatchArm {
+                pattern: MatchPattern::Literal(SorobanExpr::U32Literal(0)),
+                body: vec![ret(SorobanExpr::U32Literal(999))],
+            },
+            MatchArm {
+                pattern: MatchPattern::Literal(SorobanExpr::U32Literal(1)),
+                body: vec![ret(SorobanExpr::U32Literal(7))],
+            },
+            MatchArm {
+                pattern: MatchPattern::Literal(SorobanExpr::U32Literal(2)),
+                body: vec![ret(SorobanExpr::U32Literal(8))],
+            },
+        ];
+        let stmts = vec![SorobanStmt::Match {
+            scrutinee: SorobanExpr::Sub(
+                Box::new(SorobanExpr::I64Literal(2)),
+                Box::new(SorobanExpr::I32Literal(1)),
+            ),
+            arms,
+        }];
+        let out = optimize_stmts(stmts);
+        assert!(
+            matches!(
+                &out[0],
+                SorobanStmt::Return(Some(SorobanExpr::U32Literal(7)))
+            ),
+            "expected `2 - 1` to select arm 1; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fold_constant_matches_keeps_runtime_unknown_scrutinee() {
+        // A genuine runtime selector — `UnknownVal - 1`, the lifter's marker for a
+        // discriminant it could not track — must NEVER be folded: picking an
+        // arbitrary arm would fabricate wrong code. `const_eval_i128` returns
+        // `None` the instant it hits a non-literal leaf, so the match survives.
+        let arms = vec![
+            MatchArm {
+                pattern: MatchPattern::Literal(SorobanExpr::U32Literal(0)),
+                body: vec![ret(SorobanExpr::U32Literal(999))],
+            },
+            MatchArm {
+                pattern: MatchPattern::Literal(SorobanExpr::U32Literal(1)),
+                body: vec![ret(SorobanExpr::U32Literal(7))],
+            },
+        ];
+        let stmts = vec![SorobanStmt::Match {
+            scrutinee: SorobanExpr::Sub(
+                Box::new(SorobanExpr::UnknownVal),
+                Box::new(SorobanExpr::I32Literal(1)),
+            ),
+            arms,
+        }];
+        let out = optimize_stmts(stmts);
+        assert!(
+            matches!(&out[0], SorobanStmt::Match { arms, .. } if arms.len() == 2),
+            "expected runtime-unknown match to survive intact; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn void_guard_drops_unknown_value_return_husk() {
+        // `if todo!() == 1114112 { return 0 }` in a void fn: an inlined Symbol→index
+        // decoder husk. The value-return is dropped by codegen and the condition is
+        // an `UnknownVal` (unrepresentable), so the whole guard is a pure artifact.
+        let stmts = vec![SorobanStmt::If {
+            condition: SorobanExpr::Eq(
+                Box::new(SorobanExpr::UnknownVal),
+                Box::new(SorobanExpr::I32Literal(1114112)),
+            ),
+            then_body: vec![SorobanStmt::Return(Some(SorobanExpr::I32Literal(0)))],
+            else_body: Vec::new(),
+        }];
+        let out = drop_void_unknown_value_return_guards(stmts);
+        assert!(
+            out.is_empty(),
+            "expected void decode husk to be dropped; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn void_guard_keeps_real_guards_and_void_early_returns() {
+        // Must NOT fire on: (a) a representable condition (real control flow), or
+        // (b) a bare `return;` (`Return(None)` — a legitimate void early-return).
+        let real_guard = SorobanStmt::If {
+            condition: SorobanExpr::Gt(
+                Box::new(SorobanExpr::Param("x".into())),
+                Box::new(SorobanExpr::U32Literal(5)),
+            ),
+            then_body: vec![SorobanStmt::Return(Some(SorobanExpr::U32Literal(0)))],
+            else_body: Vec::new(),
+        };
+        let void_early_return = SorobanStmt::If {
+            condition: SorobanExpr::Eq(
+                Box::new(SorobanExpr::UnknownVal),
+                Box::new(SorobanExpr::I32Literal(1114112)),
+            ),
+            then_body: vec![SorobanStmt::Return(None)],
+            else_body: Vec::new(),
+        };
+        let stmts = vec![real_guard, void_early_return];
+        let out = drop_void_unknown_value_return_guards(stmts.clone());
+        assert_eq!(
+            format!("{out:?}"),
+            format!("{stmts:?}"),
+            "real guard / bare early-return must be preserved"
         );
     }
 

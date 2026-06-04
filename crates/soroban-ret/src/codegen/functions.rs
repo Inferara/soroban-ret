@@ -702,6 +702,32 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             quote! { #val }
         }
 
+        // A storage get typed for i128/u128 arithmetic: emit a `get::<_, T>`
+        // turbofish rather than an `as` cast — the get's generic value type cannot
+        // be `as`-cast and Rust will not infer it from the surrounding arithmetic.
+        SorobanExpr::CastAs { value, target_type }
+            if matches!(value.as_ref(), SorobanExpr::StorageGet { .. })
+                && syn::parse_str::<syn::Type>(target_type).is_ok() =>
+        {
+            if let SorobanExpr::StorageGet {
+                storage_type,
+                key,
+                unwrap,
+            } = value.as_ref()
+            {
+                let key = generate_expr(key);
+                let storage = storage_method(*storage_type);
+                let ty: syn::Type = syn::parse_str(target_type).expect("checked by guard");
+                if *unwrap {
+                    quote! { env.storage().#storage().get::<_, #ty>(&#key).unwrap() }
+                } else {
+                    quote! { env.storage().#storage().get::<_, #ty>(&#key) }
+                }
+            } else {
+                unreachable!("guarded by matches! on StorageGet")
+            }
+        }
+
         SorobanExpr::CastAs { value, target_type } => {
             let val = generate_expr(value);
             // `target_type` originates from spec/IR strings and is not guaranteed
