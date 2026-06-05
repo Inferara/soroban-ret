@@ -105,6 +105,11 @@ fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<
         "Optimizer pass: remove_leading_panic ({} stmts)",
         stmts.len()
     );
+    let stmts = recover_discarded_len_into_consumer(stmts);
+    log::trace!(
+        "Optimizer pass: recover_discarded_len_into_consumer ({} stmts)",
+        stmts.len()
+    );
     let stmts = remove_spurious_len(stmts, false);
     log::trace!(
         "Optimizer pass: remove_spurious_len ({} stmts)",
@@ -620,6 +625,232 @@ fn remove_spurious_len(stmts: Vec<SorobanStmt>, nested: bool) -> Vec<SorobanStmt
             }
             other => result.push(other),
         }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Recover a discarded pure `.len()` into the next statement's starved consumer
+// ---------------------------------------------------------------------------
+
+/// Count `UnknownVal` leaves anywhere within `e`.
+fn count_unknown_vals(e: &SorobanExpr) -> usize {
+    let here = usize::from(matches!(e, SorobanExpr::UnknownVal));
+    here + expr_children(e)
+        .iter()
+        .map(|c| count_unknown_vals(c))
+        .sum::<usize>()
+}
+
+/// Replace the (assumed unique) `UnknownVal` leaf in `e` with `repl`, returning
+/// `(rebuilt, replaced)`. Only rebuilds the expression shapes that appear in
+/// conditions / arithmetic operands (comparisons, logical, arithmetic, `Not`,
+/// transparent casts); any other shape yields `replaced == false` so the caller
+/// conservatively skips the recovery.
+fn replace_sole_unknown(e: SorobanExpr, repl: &SorobanExpr) -> (SorobanExpr, bool) {
+    // Try to replace in the first child that contains an UnknownVal; rebuild.
+    macro_rules! bin {
+        ($a:expr, $b:expr, $ctor:path) => {{
+            let a = *$a;
+            let b = *$b;
+            if count_unknown_vals(&a) > 0 {
+                let (na, r) = replace_sole_unknown(a, repl);
+                ($ctor(Box::new(na), Box::new(b)), r)
+            } else {
+                let (nb, r) = replace_sole_unknown(b, repl);
+                ($ctor(Box::new(a), Box::new(nb)), r)
+            }
+        }};
+    }
+    match e {
+        SorobanExpr::UnknownVal => (repl.clone(), true),
+        SorobanExpr::Not(a) => {
+            let (na, r) = replace_sole_unknown(*a, repl);
+            (SorobanExpr::Not(Box::new(na)), r)
+        }
+        SorobanExpr::Eq(a, b) => bin!(a, b, SorobanExpr::Eq),
+        SorobanExpr::Ne(a, b) => bin!(a, b, SorobanExpr::Ne),
+        SorobanExpr::Lt(a, b) => bin!(a, b, SorobanExpr::Lt),
+        SorobanExpr::Le(a, b) => bin!(a, b, SorobanExpr::Le),
+        SorobanExpr::Gt(a, b) => bin!(a, b, SorobanExpr::Gt),
+        SorobanExpr::Ge(a, b) => bin!(a, b, SorobanExpr::Ge),
+        SorobanExpr::And(a, b) => bin!(a, b, SorobanExpr::And),
+        SorobanExpr::Or(a, b) => bin!(a, b, SorobanExpr::Or),
+        SorobanExpr::Add(a, b) => bin!(a, b, SorobanExpr::Add),
+        SorobanExpr::Sub(a, b) => bin!(a, b, SorobanExpr::Sub),
+        SorobanExpr::Mul(a, b) => bin!(a, b, SorobanExpr::Mul),
+        SorobanExpr::Div(a, b) => bin!(a, b, SorobanExpr::Div),
+        SorobanExpr::Rem(a, b) => bin!(a, b, SorobanExpr::Rem),
+        SorobanExpr::ValConvert { value, target_type } => {
+            let (nv, r) = replace_sole_unknown(*value, repl);
+            (
+                SorobanExpr::ValConvert {
+                    value: Box::new(nv),
+                    target_type,
+                },
+                r,
+            )
+        }
+        SorobanExpr::CastAs { value, target_type } => {
+            let (nv, r) = replace_sole_unknown(*value, repl);
+            (
+                SorobanExpr::CastAs {
+                    value: Box::new(nv),
+                    target_type,
+                },
+                r,
+            )
+        }
+        other => (other, false),
+    }
+}
+
+/// True for a side-effect-free object a pure `.len()` can be re-evaluated against:
+/// a parameter / local / named-local reference, or a field access reaching one.
+/// Excludes anything that could carry a side effect (host calls, storage, …).
+fn is_pure_len_object(e: &SorobanExpr) -> bool {
+    match e {
+        SorobanExpr::Param(_) | SorobanExpr::Local(_) | SorobanExpr::NamedLocal(_) => true,
+        SorobanExpr::FieldAccess { object, .. } => is_pure_len_object(object),
+        _ => false,
+    }
+}
+
+/// If `stmt` is a discarded pure `.len()` call (`Expr(obj.len())` with a
+/// side-effect-free object), return that expression.
+fn discarded_pure_len(stmt: &SorobanStmt) -> Option<&SorobanExpr> {
+    match stmt {
+        SorobanStmt::Expr(
+            e @ SorobanExpr::MethodCall {
+                object,
+                method,
+                args,
+            },
+        ) if method == "len" && args.is_empty() && is_pure_len_object(object) => Some(e),
+        _ => None,
+    }
+}
+
+/// The single "consuming position" of a statement — the condition of an `If`, or
+/// the value of a `Let`/`Assign`/`Return`/`Expr`. Returns the rebuilt statement
+/// with its consuming expression's sole `UnknownVal` replaced by `repl`, or
+/// `None` if that position does not contain exactly one `UnknownVal` (or the
+/// replace could not be applied to its shape).
+fn fill_sole_unknown_in_consumer(stmt: &SorobanStmt, repl: &SorobanExpr) -> Option<SorobanStmt> {
+    fn try_fill(target: &SorobanExpr, repl: &SorobanExpr) -> Option<SorobanExpr> {
+        if count_unknown_vals(target) != 1 {
+            return None;
+        }
+        let (rebuilt, replaced) = replace_sole_unknown(target.clone(), repl);
+        replaced.then_some(rebuilt)
+    }
+    match stmt {
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => Some(SorobanStmt::If {
+            condition: try_fill(condition, repl)?,
+            then_body: then_body.clone(),
+            else_body: else_body.clone(),
+        }),
+        SorobanStmt::Let {
+            name,
+            mutable,
+            value,
+        } => Some(SorobanStmt::Let {
+            name: name.clone(),
+            mutable: *mutable,
+            value: try_fill(value, repl)?,
+        }),
+        SorobanStmt::Assign { target, value } => Some(SorobanStmt::Assign {
+            target: target.clone(),
+            value: try_fill(value, repl)?,
+        }),
+        SorobanStmt::Return(Some(e)) => Some(SorobanStmt::Return(Some(try_fill(e, repl)?))),
+        SorobanStmt::Expr(e) => Some(SorobanStmt::Expr(try_fill(e, repl)?)),
+        _ => None,
+    }
+}
+
+/// Recover a discarded pure `.len()` whose value the lifter lost to `UnknownVal`
+/// in the immediately-following statement's consuming position.
+///
+/// The lifter computes `vec.len()` (pushing the result), but a structured
+/// control-flow boundary flushes it as a discarded `Expr` statement and the
+/// consuming comparison underflows to `UnknownVal`
+/// (`Expr(tokens.len()); if UnknownVal != 0 { … }`). When a discarded pure
+/// `.len()` is directly followed by a statement whose condition/value contains
+/// **exactly one** `UnknownVal`, substitute the len into that slot and drop the
+/// now-consumed `Expr`.
+///
+/// Safe because `.len()` is pure and idempotent (re-evaluating it is
+/// side-effect-free), and the WASM adjacency — value computed, then immediately
+/// consumed by the next instruction — makes the linkage near-certain. The
+/// exactly-one-`UnknownVal` gate keeps the target unambiguous; any other shape is
+/// left untouched.
+fn recover_discarded_len_into_consumer(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    // Recurse into child bodies first so inner adjacent pairs are handled too.
+    let stmts: Vec<SorobanStmt> = stmts
+        .into_iter()
+        .map(|s| match s {
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => SorobanStmt::If {
+                condition,
+                then_body: recover_discarded_len_into_consumer(then_body),
+                else_body: recover_discarded_len_into_consumer(else_body),
+            },
+            SorobanStmt::Loop { body } => SorobanStmt::Loop {
+                body: recover_discarded_len_into_consumer(body),
+            },
+            SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body: recover_discarded_len_into_consumer(body),
+            },
+            SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+                scrutinee,
+                arms: arms
+                    .into_iter()
+                    .map(|arm| MatchArm {
+                        pattern: arm.pattern,
+                        body: recover_discarded_len_into_consumer(arm.body),
+                    })
+                    .collect(),
+            },
+            SorobanStmt::Block(body) => {
+                SorobanStmt::Block(recover_discarded_len_into_consumer(body))
+            }
+            other => other,
+        })
+        .collect();
+
+    // Adjacent-pair pass at this level.
+    let mut result: Vec<SorobanStmt> = Vec::with_capacity(stmts.len());
+    let mut k = 0;
+    while k < stmts.len() {
+        if k + 1 < stmts.len()
+            && let Some(len_expr) = discarded_pure_len(&stmts[k])
+            && let Some(new_next) = fill_sole_unknown_in_consumer(&stmts[k + 1], len_expr)
+        {
+            cov_mark::hit!(discarded_len_recovered);
+            result.push(new_next);
+            k += 2;
+            continue;
+        }
+        result.push(stmts[k].clone());
+        k += 1;
     }
     result
 }
@@ -7322,6 +7553,91 @@ mod tests {
             format!("{out:?}"),
             format!("{stmts:?}"),
             "real guard / bare early-return must be preserved"
+        );
+    }
+
+    #[test]
+    fn recover_discarded_len_fills_next_condition() {
+        // `Expr(tokens.len()); if UnknownVal != 0 { .. }` — the lifter lost the
+        // len result across a block boundary. Recover it into the lone UnknownVal
+        // → `if tokens.len() != 0 { .. }`, dropping the now-consumed Expr.
+        let len_call = SorobanExpr::MethodCall {
+            object: Box::new(SorobanExpr::Param("tokens".into())),
+            method: "len".into(),
+            args: vec![],
+        };
+        let stmts = vec![
+            SorobanStmt::Expr(len_call.clone()),
+            SorobanStmt::If {
+                condition: SorobanExpr::Ne(
+                    Box::new(SorobanExpr::UnknownVal),
+                    Box::new(SorobanExpr::I32Literal(0)),
+                ),
+                then_body: vec![SorobanStmt::Break],
+                else_body: vec![],
+            },
+        ];
+        let out = recover_discarded_len_into_consumer(stmts);
+        assert_eq!(out.len(), 1, "the discarded Expr(len) should be consumed");
+        match &out[0] {
+            SorobanStmt::If { condition, .. } => assert_eq!(
+                condition,
+                &SorobanExpr::Ne(Box::new(len_call), Box::new(SorobanExpr::I32Literal(0))),
+                "len should fill the lone UnknownVal"
+            ),
+            other => panic!("expected If; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recover_discarded_len_skips_ambiguous_and_impure() {
+        // (a) Two UnknownVals in the consumer → ambiguous → no recovery.
+        let len_call = SorobanExpr::MethodCall {
+            object: Box::new(SorobanExpr::Param("tokens".into())),
+            method: "len".into(),
+            args: vec![],
+        };
+        let two_unknowns = vec![
+            SorobanStmt::Expr(len_call.clone()),
+            SorobanStmt::If {
+                condition: SorobanExpr::Lt(
+                    Box::new(SorobanExpr::UnknownVal),
+                    Box::new(SorobanExpr::UnknownVal),
+                ),
+                then_body: vec![SorobanStmt::Break],
+                else_body: vec![],
+            },
+        ];
+        assert_eq!(
+            recover_discarded_len_into_consumer(two_unknowns.clone()).len(),
+            2,
+            "ambiguous (2 UnknownVals) consumer must be left intact"
+        );
+
+        // (b) Impure len object (a host call) → never moved.
+        let impure = vec![
+            SorobanStmt::Expr(SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::RawHostCall {
+                    module: "x".into(),
+                    function: "y".into(),
+                    args: vec![],
+                }),
+                method: "len".into(),
+                args: vec![],
+            }),
+            SorobanStmt::If {
+                condition: SorobanExpr::Ne(
+                    Box::new(SorobanExpr::UnknownVal),
+                    Box::new(SorobanExpr::I32Literal(0)),
+                ),
+                then_body: vec![SorobanStmt::Break],
+                else_body: vec![],
+            },
+        ];
+        assert_eq!(
+            recover_discarded_len_into_consumer(impure).len(),
+            2,
+            "impure .len() object must not be moved into the consumer"
         );
     }
 
