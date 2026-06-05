@@ -1044,6 +1044,59 @@ fn aquarius_estimate_swap_recovers_tokens_not_sorted_guard() {
     );
 }
 
+#[test]
+fn aquarius_recovers_descriptor_pointer_datakey_storage_keys() {
+    // Long-symbol storage keys built via a constant descriptor-pointer chain
+    // (`126 → 270 → 66 → 64 → encoder`): the `(i32 desc_ptr) -> i64` key
+    // constructor reads a 1-byte enum discriminant from static data and builds the
+    // key Symbol. Previously these accessors degraded to `get(&todo!())` because the
+    // recovered symbol never reached the storage op; now the constructor resolves the
+    // variant name from its own ordered string table, indexed by the discriminant.
+    let wasm = include_bytes!("../../../tests/fixtures/aquarius.wasm");
+    let src = decompile(wasm).expect("aquarius.wasm should decompile");
+
+    let start = src
+        .find("fn get_conc_pool_payment_amount")
+        .expect("get_conc_pool_payment_amount should be emitted");
+    let after = &src[start..];
+    // Extract exactly the function body by matching braces.
+    let brace_start = after.find('{').expect("no { after fn get_conc");
+    let mut depth = 0i32;
+    let mut end = brace_start;
+    for (i, c) in after[brace_start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = brace_start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[..end];
+    assert!(
+        body.contains(r#"Symbol::new(&env, "InitConcentratedPoolPaymentAmt")"#),
+        "get_conc should recover the long-symbol DataKey, got:\n{body}"
+    );
+    assert!(
+        !body.contains("todo!"),
+        "get_conc should have no todo! after key recovery, got:\n{body}"
+    );
+
+    // Sibling accessors through the same constructor resolve their own discriminants.
+    assert!(
+        src.contains(r#"Symbol::new(&env, "InitPoolPaymentToken")"#),
+        "get_init_pool_payment_token should recover its key symbol"
+    );
+    assert!(
+        src.contains(r#"Symbol::new(&env, "InitStablePoolPaymentAmount")"#),
+        "get_stable_pool_payment_amount should recover its key symbol"
+    );
+}
+
 // TODO(#11): inspection harness for the still-truncated `estimate_swap` case.
 // The locus-1 CFG-of-safety-net-unreachable fix landed but does not address
 // estimate_swap, whose truncation is driven by a top-level `PanicWithError`

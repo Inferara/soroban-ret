@@ -790,6 +790,111 @@ impl<'a> LiftContext<'a> {
         Some(true)
     }
 
+    /// Lower a `Symbol`-from-linear-memory builder call to the recovered symbol.
+    ///
+    /// `Call(builder)[result_ptr, str_ptr, str_len]` where `str_ptr`/`str_len` are
+    /// constants reads the static UTF-8 string at `(str_ptr, str_len)` and writes
+    /// `Symbol::new(name)` to the builder's result pointer — the `Ok` symbol at
+    /// `result_ptr + 8`, the `0` discriminant at `result_ptr + 0` — so the caller's
+    /// `i32.load 0; br_if` (error check) and `i64.load 8` (symbol) recover the key.
+    /// Mirrors how `symbol_new_from_linear_memory` is already lifted, but reaches it
+    /// when the encoder sits past the inlining depth limit (the inlined
+    /// `DataKey::into_val` dispatch). Returns `None` (falls back to inlining) unless
+    /// the builder is recognized, both string args are constants, the bytes decode to
+    /// a plausible symbol name, and the result pointer is a static frame slot.
+    fn try_lower_symbol_builder(&mut self, target_idx: u32, args: &[StackVal]) -> Option<bool> {
+        if !is_symbol_from_lm_builder(self.wasm_module, target_idx) {
+            return None;
+        }
+        let str_ptr = to_u64(args.get(1)?)? as u32;
+        let str_len = to_u64(args.get(2)?)? as u32;
+        let name = self
+            .wasm_module
+            .data_sections
+            .read_string(str_ptr, str_len)?;
+        // A Soroban symbol is `[a-zA-Z0-9_]+`; reject anything else so we never
+        // fabricate a symbol from a misclassified builder or stray constant args.
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        let StackVal::FrameSlot(id, base) = args.first()? else {
+            return None;
+        };
+        if !base.is_static() {
+            return None;
+        }
+        let symbol = StackVal::HostCallResult(Box::new(SorobanExpr::SymbolLiteral(name)));
+        self.store_frame_slot(*id, base.base + 8, symbol);
+        self.store_frame_slot(*id, base.base, StackVal::I32(0));
+        self.found_host_calls = true;
+        Some(true)
+    }
+
+    /// Recover a `DataKey` storage key built from a *constant descriptor pointer*.
+    ///
+    /// Some SDK key accessors don't pass an immediate variant index to the key
+    /// constructor (the `did_key_construct` path); instead they pass a pointer
+    /// to a 1-byte enum-discriminant segment in the data section, and the
+    /// `(i32 desc_ptr) -> i64` constructor reads the discriminant and `br_table`s
+    /// over it to build the key `Symbol`. That dispatch chain
+    /// (`126 → 270 → 66 → 64 → 134 → encoder` in aquarius) is inlined and
+    /// constant-folded correctly, but the recovered symbol lands in a dead `var_N`
+    /// binding while the key the storage op reads degrades to `UnknownVal` — so the
+    /// accessor renders `get(&todo!())`.
+    ///
+    /// When the constructor's arg is a constant pointer `P` into the data section,
+    /// read the discriminant `D = data[P]` and resolve the variant name directly
+    /// from the constructor's own ordered `(ptr, len)` string table (the arms appear
+    /// in discriminant order, so the table is indexed by `D`). Push
+    /// `vec![&env, Symbol::new(&env, name)]` as the constructor's result, so the
+    /// whole downstream chain (and any `.get/.has/.set/.remove`) resolves through
+    /// the existing dataflow.
+    ///
+    /// Tightly gated so it can only fire on a genuine symbol-key constructor with a
+    /// readable static discriminant resolving to a valid symbol name — otherwise it
+    /// returns `false` and the call falls through to normal inlining (`todo!`,
+    /// never a fabricated value).
+    fn try_push_descriptor_key(&mut self, target_idx: u32, first_arg_i32: Option<i32>) -> bool {
+        use crate::wasm::ir::WasmType;
+        let Some(ptr) = first_arg_i32 else {
+            return false;
+        };
+        if ptr <= 1024 {
+            return false; // not a data-section pointer
+        }
+        let Some(ft) = self.wasm_module.get_func_type(target_idx) else {
+            return false;
+        };
+        if ft.params.as_slice() != [WasmType::I32] || ft.results.as_slice() != [WasmType::I64] {
+            return false;
+        }
+        if !func_reaches_symbol_encoder(self.wasm_module, target_idx, 0) {
+            return false;
+        }
+        // The descriptor pointer addresses a 1-byte enum discriminant (win #4's
+        // zero-extend reads the byte-or-0 of the covering segment); require the
+        // address to lie in real static data so we never resolve runtime memory.
+        let disc = self
+            .wasm_module
+            .data_sections
+            .read_bytes_zero_extended(ptr as u32, 1)
+            .map(|b| b[0] as usize);
+        let Some(d) = disc else {
+            return false;
+        };
+        let strings = extract_data_strings(self.wasm_module, target_idx);
+        let Some(name) = strings.get(d) else {
+            return false;
+        };
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        self.stack.push(StackVal::HostCallResult(Box::new(
+            SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral(name.clone())]),
+        )));
+        true
+    }
+
     /// A dynamic (loop-indexed) write `frame[base + coeff*i]` may land on any
     /// static slot whose offset is `>= base` and congruent to `base` modulo
     /// `coeff`. Since the analyzer doesn't know the loop bound, conservatively
@@ -1349,6 +1454,12 @@ impl<'a> LiftContext<'a> {
                     } else {
                         false
                     };
+
+                    // Constant *descriptor-pointer* DataKey constructor: the variant
+                    // index is a pointer to a 1-byte discriminant in static data
+                    // rather than an immediate (the `did_key_construct` case above).
+                    let did_key_construct = did_key_construct
+                        || self.try_push_descriptor_key(*target_idx, first_arg_i32);
 
                     // Sign-check-and-panic: functions like check_nonnegative_amount
                     // that compare a parameter against 0 and panic if negative.
@@ -2185,6 +2296,14 @@ impl<'a> LiftContext<'a> {
                             // and write the result (as limb pair) back to the result
                             // pointer's frame slot, so chained helpers compose instead
                             // of inlining into limb-soup `todo!`s.
+                            handled
+                        } else if let Some(handled) =
+                            self.try_lower_symbol_builder(*target_idx, &args)
+                        {
+                            // `Symbol::new(&env, "literal")` builder whose encoder sits
+                            // past the inline depth limit: recover the symbol from the
+                            // static `(ptr, len)` string args and write it to the result
+                            // pointer, instead of degrading to `todo!`.
                             handled
                         } else if self.inline_depth < MAX_INLINE_CALL_DEPTH {
                             // Check if this is a load-struct wrapper BEFORE inlining.
@@ -6478,6 +6597,72 @@ fn is_two_i128_operand_helper(module: &WasmModule, func_idx: u32) -> bool {
 /// Classify `func_idx` as an i128 multiply/divide soft-arith helper, recursing one
 /// level into a signed wrapper that delegates to an unsigned core. Returns the
 /// operation and the operand/result arg layout, or `None` if it is not one.
+/// True if `func` is the Soroban small-symbol encoder: its body compares input
+/// bytes against the `_` / `0` / `A` / `a` boundaries (95 / 48 / 65 / 97) of the
+/// 6-bit symbol character packing. The four constants together are a near-unique
+/// signature — no unrelated code compares bytes against exactly that set.
+fn is_small_symbol_encoder(func: &crate::wasm::ir::WasmFunction) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    let (mut underscore, mut digit0, mut upper_a, mut lower_a) = (false, false, false, false);
+    for ins in &func.body {
+        if let WasmInstr::I32Const(c) = ins {
+            match *c {
+                95 => underscore = true,
+                48 => digit0 = true,
+                65 => upper_a = true,
+                97 => lower_a = true,
+                _ => {}
+            }
+        }
+    }
+    underscore && digit0 && upper_a && lower_a
+}
+
+/// True if `func_idx` builds a `Symbol` from a static `(str_ptr, str_len)` slice —
+/// signature `(i32 result_ptr, i32 str_ptr, i32 str_len) -> ()` whose body
+/// transitively (≤2 call levels) reaches the small-symbol encoder.
+///
+/// The SDK's `Symbol::new(&env, "literal")` lowers to such a wrapper; with the
+/// `DataKey::into_val` dispatch deeply inlined, the encoder itself sits past
+/// `MAX_INLINE_CALL_DEPTH`, so the wrapper's result degrades to `UnknownVal`. The
+/// decompiled effect is `Symbol::new(read_string(str_ptr, str_len))` written via
+/// `result_ptr` — recovered directly in `try_lower_symbol_builder`.
+fn is_symbol_from_lm_builder(module: &WasmModule, func_idx: u32) -> bool {
+    use crate::wasm::ir::WasmType;
+    let Some(ft) = module.get_func_type(func_idx) else {
+        return false;
+    };
+    if ft.params.as_slice() != [WasmType::I32, WasmType::I32, WasmType::I32]
+        || !ft.results.is_empty()
+    {
+        return false;
+    }
+    func_reaches_symbol_encoder(module, func_idx, 0)
+}
+
+/// True if `idx` transitively (≤3 call levels) reaches the Soroban symbol encoder:
+/// either the host `symbol_new_from_linear_memory` import (the long-symbol path,
+/// more than 9 chars) or the inline small-symbol encoder (the short path). A
+/// near-unique signature of code that builds a `Symbol` from a static `(ptr, len)`.
+fn func_reaches_symbol_encoder(module: &WasmModule, idx: u32, depth: u32) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    if depth > 3 {
+        return false;
+    }
+    if let Some(hf) = module.imports.get_by_index(idx) {
+        return hf.module == HostModule::Buf && hf.name == "symbol_new_from_linear_memory";
+    }
+    let Some(func) = module.get_function(idx) else {
+        return false;
+    };
+    if is_small_symbol_encoder(func) {
+        return true;
+    }
+    func.body
+        .iter()
+        .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_symbol_encoder(module, *t, depth + 1)))
+}
+
 fn detect_i128_intrinsic(module: &WasmModule, func_idx: u32) -> Option<I128Intrinsic> {
     detect_i128_intrinsic_inner(module, func_idx, 0)
 }
@@ -12225,6 +12410,44 @@ mod tests {
         assert!(
             detect_i128_intrinsic(&m, 2).is_none(),
             "a same-signature non-arithmetic function is not a helper"
+        );
+    }
+
+    #[test]
+    fn is_symbol_from_lm_builder_classifies_wrappers() {
+        // $enc = the small-symbol encoder (carries the _/0/A/a byte boundaries).
+        // $wrap = the (result_ptr, str_ptr, str_len) builder that calls it.
+        // $other = a same-shape function that does NOT reach an encoder.
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $enc (param i32 i32 i32)
+                    i32.const 95 drop
+                    i32.const 48 drop
+                    i32.const 65 drop
+                    i32.const 97 drop)
+                (func $wrap (param i32 i32 i32)
+                    local.get 0 local.get 1 local.get 2 call $enc)
+                (func $other (param i32 i32 i32)
+                    local.get 0 i32.const 1 i32.store)
+                (func $wrong_sig (param i32 i64)
+                    local.get 0 call $enc))
+            "#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        // $enc itself is the encoder, but its signature gates it out as a *builder*.
+        assert!(is_small_symbol_encoder(m.get_function(0).unwrap()));
+        assert!(
+            is_symbol_from_lm_builder(&m, 1),
+            "the 3-i32 wrapper that reaches the encoder is a builder"
+        );
+        assert!(
+            !is_symbol_from_lm_builder(&m, 2),
+            "a 3-i32 function that never reaches an encoder is not a builder"
+        );
+        assert!(
+            !is_symbol_from_lm_builder(&m, 3),
+            "wrong signature is not a builder even if it reaches the encoder"
         );
     }
 
