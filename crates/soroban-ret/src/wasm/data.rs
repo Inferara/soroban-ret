@@ -44,6 +44,45 @@ impl DataSection {
         None
     }
 
+    /// Read `len` bytes at `offset`, modelling WASM zero-initialized linear
+    /// memory: each byte is taken from the data segment that covers it, or `0`
+    /// when no segment does.
+    ///
+    /// Unlike [`read_bytes`](Self::read_bytes) (which requires the entire range to
+    /// sit inside a single segment), this completes accesses that straddle a
+    /// segment's end — the common case being a wide load (`i32.load`, 4 bytes) of a
+    /// 1-byte static enum discriminant, whose upper bytes are zero-initialized
+    /// memory. Returns `None` unless `offset` itself lies within a known segment,
+    /// so only genuine static-data addresses resolve — never arbitrary (possibly
+    /// runtime-written) memory.
+    pub fn read_bytes_zero_extended(&self, offset: u32, len: u32) -> Option<Vec<u8>> {
+        let start = offset as u64;
+        let end = start.checked_add(len as u64)?;
+        // Require the start address to lie in a real data segment.
+        let start_in_segment = self.segments.iter().any(|seg| {
+            let s = seg.offset as u64;
+            let e = s.saturating_add(seg.data.len() as u64);
+            start >= s && start < e
+        });
+        if !start_in_segment {
+            return None;
+        }
+        let mut out = vec![0u8; len as usize];
+        for seg in &self.segments {
+            let s = seg.offset as u64;
+            let e = s.saturating_add(seg.data.len() as u64);
+            // Overlap of [start, end) with this segment [s, e).
+            let lo = start.max(s);
+            let hi = end.min(e);
+            if lo < hi {
+                for addr in lo..hi {
+                    out[(addr - start) as usize] = seg.data[(addr - s) as usize];
+                }
+            }
+        }
+        Some(out)
+    }
+
     /// Read a UTF-8 string at a memory offset.
     pub fn read_string(&self, offset: u32, len: u32) -> Option<String> {
         let bytes = self.read_bytes(offset, len)?;
@@ -198,6 +237,32 @@ mod tests {
         let mut ds = DataSection::new();
         ds.add(0, b"hello world".to_vec());
         assert_eq!(ds.read_string(0, 5), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_read_bytes_zero_extended() {
+        let mut ds = DataSection::new();
+        // A 1-byte enum-discriminant segment (the aquarius case): a wide i32.load
+        // must read the byte plus 3 zero-initialized bytes.
+        ds.add(1000, vec![10]);
+        assert_eq!(
+            ds.read_bytes_zero_extended(1000, 4),
+            Some(vec![10, 0, 0, 0]),
+            "wide load of a 1-byte segment zero-extends"
+        );
+        // Within-segment read is unaffected.
+        ds.add(2000, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ds.read_bytes_zero_extended(2000, 4), Some(vec![1, 2, 3, 4]));
+        // Start address not in any segment → None (never resolves arbitrary memory).
+        assert_eq!(ds.read_bytes_zero_extended(5000, 4), None);
+        // A read straddling two segments with a gap reads each byte's segment-or-0.
+        let mut ds2 = DataSection::new();
+        ds2.add(0, vec![0xAA]); // byte 0
+        ds2.add(2, vec![0xBB]); // byte 2 (byte 1 is an uninitialized gap → 0)
+        assert_eq!(
+            ds2.read_bytes_zero_extended(0, 4),
+            Some(vec![0xAA, 0x00, 0xBB, 0x00])
+        );
     }
 
     #[test]

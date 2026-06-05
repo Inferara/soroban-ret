@@ -2875,48 +2875,46 @@ impl<'a> LiftContext<'a> {
                         _ => StackVal::Unknown,
                     }
                 } else if let Some(const_addr) = to_u64(&addr) {
-                    // Try reading from WASM data segments for constant addresses
+                    // Try reading from WASM data segments for constant addresses.
+                    // Zero-extend per WASM zero-initialized memory: a wide load of a
+                    // narrow static value (e.g. `i32.load` of a 1-byte enum
+                    // discriminant) reads the byte plus zero-initialized upper bytes.
                     let byte_addr = const_addr as u32 + *off;
-                    match instr {
-                        WasmInstr::I32Load(_) => self
-                            .wasm_module
+                    let rd = |n: u32| {
+                        self.wasm_module
                             .data_sections
-                            .read_bytes(byte_addr, 4)
-                            .and_then(|b| b.try_into().ok())
+                            .read_bytes_zero_extended(byte_addr, n)
+                    };
+                    match instr {
+                        WasmInstr::I32Load(_) => rd(4)
+                            .and_then(|b| b.as_slice().try_into().ok())
                             .map(|b| StackVal::I32(i32::from_le_bytes(b)))
                             .unwrap_or(StackVal::Unknown),
-                        WasmInstr::I64Load(_) => self
-                            .wasm_module
-                            .data_sections
-                            .read_bytes(byte_addr, 8)
-                            .and_then(|b| b.try_into().ok())
+                        WasmInstr::I64Load(_) => rd(8)
+                            .and_then(|b| b.as_slice().try_into().ok())
                             .map(|b| StackVal::I64(i64::from_le_bytes(b)))
                             .unwrap_or(StackVal::Unknown),
-                        WasmInstr::I32Load8U(_) => self
-                            .wasm_module
-                            .data_sections
-                            .read_bytes(byte_addr, 1)
+                        WasmInstr::I32Load8U(_) | WasmInstr::I64Load8U(_) => rd(1)
                             .map(|b| StackVal::I32(b[0] as i32))
                             .unwrap_or(StackVal::Unknown),
-                        WasmInstr::I32Load8S(_) => self
-                            .wasm_module
-                            .data_sections
-                            .read_bytes(byte_addr, 1)
+                        WasmInstr::I32Load8S(_) | WasmInstr::I64Load8S(_) => rd(1)
                             .map(|b| StackVal::I32(b[0] as i8 as i32))
                             .unwrap_or(StackVal::Unknown),
-                        WasmInstr::I32Load16U(_) => self
-                            .wasm_module
-                            .data_sections
-                            .read_bytes(byte_addr, 2)
-                            .and_then(|b| b.try_into().ok())
+                        WasmInstr::I32Load16U(_) | WasmInstr::I64Load16U(_) => rd(2)
+                            .and_then(|b| b.as_slice().try_into().ok())
                             .map(|b| StackVal::I32(u16::from_le_bytes(b) as i32))
                             .unwrap_or(StackVal::Unknown),
-                        WasmInstr::I32Load16S(_) => self
-                            .wasm_module
-                            .data_sections
-                            .read_bytes(byte_addr, 2)
-                            .and_then(|b| b.try_into().ok())
+                        WasmInstr::I32Load16S(_) | WasmInstr::I64Load16S(_) => rd(2)
+                            .and_then(|b| b.as_slice().try_into().ok())
                             .map(|b| StackVal::I32(i16::from_le_bytes(b) as i32))
+                            .unwrap_or(StackVal::Unknown),
+                        WasmInstr::I64Load32U(_) => rd(4)
+                            .and_then(|b| b.as_slice().try_into().ok())
+                            .map(|b| StackVal::I64(u32::from_le_bytes(b) as i64))
+                            .unwrap_or(StackVal::Unknown),
+                        WasmInstr::I64Load32S(_) => rd(4)
+                            .and_then(|b| b.as_slice().try_into().ok())
+                            .map(|b| StackVal::I64(i32::from_le_bytes(b) as i64))
                             .unwrap_or(StackVal::Unknown),
                         _ => StackVal::Unknown,
                     }

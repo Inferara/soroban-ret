@@ -718,6 +718,14 @@ fn is_pure_len_object(e: &SorobanExpr) -> bool {
 
 /// If `stmt` is a discarded pure `.len()` call (`Expr(obj.len())` with a
 /// side-effect-free object), return that expression.
+///
+/// Restricted to `.len()` deliberately. `.len()` returns a count that is compared
+/// directly, so substituting it for the lost consumer value is faithful. By
+/// contrast `.get(i)` returns an *element* that the SDK frequently tag-extracts or
+/// unwraps before comparing — the lost intermediate (e.g. `Ne(UnknownVal, 77)`,
+/// where 77 is an ScVal type tag) is a derivation of the element, NOT the element
+/// itself, so recovering the raw `.get(i)` fabricates a wrong condition
+/// (`tokens.get(1) != 77`). Correctness over count: only `.len()` qualifies.
 fn discarded_pure_len(stmt: &SorobanStmt) -> Option<&SorobanExpr> {
     match stmt {
         SorobanStmt::Expr(
