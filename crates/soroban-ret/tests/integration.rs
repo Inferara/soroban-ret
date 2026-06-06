@@ -1045,6 +1045,58 @@ fn aquarius_estimate_swap_recovers_tokens_not_sorted_guard() {
 }
 
 #[test]
+fn aquarius_recovers_tokens_sorted_validation_loop() {
+    // The router's sorted+unique token validation is inlined into ~27 accessors and
+    // lifts to a structurally-mangled loop (lost induction/bound, unconditional
+    // mid-loop break) leaving ~4 todo!() each. Its intent is recovered from the
+    // unique TokensNotSorted + DuplicatesNotAllowed error-code pair, and lifted to a
+    // clean `for i in 1..tokens.len() { ... }`.
+    let wasm = include_bytes!("../../../tests/fixtures/aquarius.wasm");
+    let src = decompile(wasm).expect("aquarius.wasm should decompile");
+
+    let start = src
+        .find("fn get_total_outstanding_reward")
+        .expect("get_total_outstanding_reward should be emitted");
+    let after = &src[start..];
+    let brace_start = after.find('{').expect("no { after fn");
+    let mut depth = 0i32;
+    let mut end = brace_start;
+    for (i, c) in after[brace_start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = brace_start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[..end];
+    assert!(
+        body.contains("for i in 1..tokens.len()"),
+        "validation should lift to a clean for-loop, got:\n{body}"
+    );
+    assert!(
+        body.contains("TokensNotSorted") && body.contains("DuplicatesNotAllowed"),
+        "recovered validation must keep both panic conditions, got:\n{body}"
+    );
+    // The mangled loop's todo!()s (induction/bound) must be gone from the validation.
+    let val_start = body
+        .find("for i in 1..tokens.len()")
+        .expect("for-loop present");
+    let val = &body[val_start..];
+    let val_end = val.find("env.bytes_new").unwrap_or(val.len());
+    assert!(
+        !val[..val_end].contains("todo!"),
+        "recovered validation loop must have no todo!, got:\n{}",
+        &val[..val_end]
+    );
+}
+
+#[test]
 fn aquarius_recovers_descriptor_pointer_datakey_storage_keys() {
     // Long-symbol storage keys built via a constant descriptor-pointer chain
     // (`126 → 270 → 66 → 64 → encoder`): the `(i32 desc_ptr) -> i64` key

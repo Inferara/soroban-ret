@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use crate::codegen::module::{assemble_generic_module, assemble_module, format_source};
 use crate::ir::optimizer::{
     drop_void_unknown_value_return_guards, optimize_stmts, optimize_stmts_preserve_host_calls,
-    propagate_variable_names, recover_match_arm_storage_keys, remove_self_assignments,
-    replace_void_with_none_in_option_fields,
+    propagate_variable_names, recover_match_arm_storage_keys, recover_tokens_sorted_validation,
+    remove_self_assignments, replace_void_with_none_in_option_fields,
 };
 use crate::ir::soroban_ir::{MatchArm, MatchPattern, SorobanExpr, SorobanStmt, StorageType};
 use crate::pattern::lift_functions;
@@ -196,6 +196,14 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
             cov_mark::hit!(enum_identity_roundtrip);
             func.body = vec![SorobanStmt::Return(Some(SorobanExpr::Param(param_name)))];
         }
+
+        // Router token-list validation: recognize the SDK's sorted+unique token
+        // check (inlined into ~27 accessors) — whose loop lifts mangled (lost
+        // induction/bound, unconditional mid-loop break) — by its unique
+        // `TokensNotSorted` + `DuplicatesNotAllowed` error-code pair, and lift it
+        // to the faithful `for i in 1..tokens.len() { … }`. Run pre-optimization
+        // while the mangled loop and the recovered error codes are both intact.
+        func.body = recover_tokens_sorted_validation(std::mem::take(&mut func.body));
 
         let optimized = optimize_stmts(std::mem::take(&mut func.body));
         func.body = optimized;

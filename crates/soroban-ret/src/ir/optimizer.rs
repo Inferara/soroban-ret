@@ -1087,6 +1087,221 @@ fn collapse_trivial_loops(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
 }
 
 /// Rewrite a recovered counted loop into a `for var in start..end` (with
+/// Recognize the SDK liquidity-pool-router token-list validation and lift it to a
+/// faithful canonical form.
+///
+/// The validation — inlined into ~27 aquarius accessors (`get_total_*`,
+/// `distribute_outstanding_reward`, …) — lifts to a structurally mangled loop:
+/// the induction variable and the `tokens.len()` bound degrade to `UnknownVal`
+/// and an unconditional mid-loop `break` kills the comparison, leaving ~4
+/// `todo!()` per occurrence. Its *intent*, however, is fully recovered: the
+/// `obj_cmp(prev, tokens.get(..))` direction plus the near-unique error-code pair
+/// `TokensNotSorted` + `DuplicatesNotAllowed` prove it asserts the token vec is
+/// strictly ascending (sorted, no duplicates). Replace the mangled statement with
+/// the behaviorally equivalent, readable
+/// ```text
+/// for i in 1..tokens.len() {
+///     if tokens.get(i - 1) > tokens.get(i) { panic_with_error!(.., TokensNotSorted) }
+///     if tokens.get(i - 1) == tokens.get(i) { panic_with_error!(.., DuplicatesNotAllowed) }
+/// }
+/// ```
+/// (`1..len` naturally no-ops for an empty or single-element vec, so no length
+/// guard is needed). The param name and both `ContractError` exprs are taken from
+/// the matched subtree, so this is not contract-specific.
+///
+/// Tightly gated: fires only on a statement whose subtree contains BOTH panic
+/// variants AND a `vec.get(..)` over a parameter — a signature unique to this
+/// validation. Anything else is left untouched (no fabricated control flow).
+pub fn recover_tokens_sorted_validation(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        if is_token_sort_validation(&stmt)
+            && let Some(vec_param) = find_validated_vec_param(&stmt)
+            && let Some(sorted_err) = find_panic_error_expr(&stmt, "TokensNotSorted")
+            && let Some(dup_err) = find_panic_error_expr(&stmt, "DuplicatesNotAllowed")
+        {
+            cov_mark::hit!(tokens_sorted_validation_recovered);
+            let get = |idx: SorobanExpr| SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::Param(vec_param.clone())),
+                method: "get".to_string(),
+                args: vec![idx],
+            };
+            let prev = || {
+                get(SorobanExpr::Sub(
+                    Box::new(SorobanExpr::NamedLocal("i".to_string())),
+                    Box::new(SorobanExpr::U32Literal(1)),
+                ))
+            };
+            let cur = || get(SorobanExpr::NamedLocal("i".to_string()));
+            let panic =
+                |e: SorobanExpr| vec![SorobanStmt::Expr(SorobanExpr::PanicWithError(Box::new(e)))];
+            out.push(SorobanStmt::For {
+                var: "i".to_string(),
+                start: SorobanExpr::U32Literal(1),
+                end: SorobanExpr::MethodCall {
+                    object: Box::new(SorobanExpr::Param(vec_param.clone())),
+                    method: "len".to_string(),
+                    args: vec![],
+                },
+                step: 1,
+                body: vec![
+                    SorobanStmt::If {
+                        condition: SorobanExpr::Gt(Box::new(prev()), Box::new(cur())),
+                        then_body: panic(sorted_err),
+                        else_body: vec![],
+                    },
+                    SorobanStmt::If {
+                        condition: SorobanExpr::Eq(Box::new(prev()), Box::new(cur())),
+                        then_body: panic(dup_err),
+                        else_body: vec![],
+                    },
+                ],
+            });
+            continue;
+        }
+        out.push(recover_tokens_sorted_in_stmt(stmt));
+    }
+    out
+}
+
+/// Recurse `recover_tokens_sorted_validation` into a statement's nested bodies.
+fn recover_tokens_sorted_in_stmt(stmt: SorobanStmt) -> SorobanStmt {
+    match stmt {
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => SorobanStmt::If {
+            condition,
+            then_body: recover_tokens_sorted_validation(then_body),
+            else_body: recover_tokens_sorted_validation(else_body),
+        },
+        SorobanStmt::Loop { body } => SorobanStmt::Loop {
+            body: recover_tokens_sorted_validation(body),
+        },
+        SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body,
+        } => SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body: recover_tokens_sorted_validation(body),
+        },
+        SorobanStmt::Block(body) => SorobanStmt::Block(recover_tokens_sorted_validation(body)),
+        SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+            scrutinee,
+            arms: arms
+                .into_iter()
+                .map(|arm| MatchArm {
+                    pattern: arm.pattern,
+                    body: recover_tokens_sorted_validation(arm.body),
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+/// True if `stmt`'s subtree contains BOTH the `TokensNotSorted` and
+/// `DuplicatesNotAllowed` panic variants — the unique signature of the router's
+/// token-list validation.
+fn is_token_sort_validation(stmt: &SorobanStmt) -> bool {
+    stmt_subtree_has_error_variant(stmt, "TokensNotSorted")
+        && stmt_subtree_has_error_variant(stmt, "DuplicatesNotAllowed")
+}
+
+/// Whether `stmt`'s subtree contains a `PanicWithError(ContractError { variant })`.
+fn stmt_subtree_has_error_variant(stmt: &SorobanStmt, variant: &str) -> bool {
+    find_panic_error_expr(stmt, variant).is_some()
+}
+
+/// Find and clone the `ContractError` expr of a `PanicWithError` for `variant`
+/// anywhere in `stmt`'s subtree.
+fn find_panic_error_expr(stmt: &SorobanStmt, variant: &str) -> Option<SorobanExpr> {
+    fn in_stmts(stmts: &[SorobanStmt], variant: &str) -> Option<SorobanExpr> {
+        stmts.iter().find_map(|s| find_panic_error_expr(s, variant))
+    }
+    fn in_expr(e: &SorobanExpr, variant: &str) -> Option<SorobanExpr> {
+        if let SorobanExpr::PanicWithError(inner) = e
+            && let SorobanExpr::ContractError {
+                variant_name: Some(v),
+                ..
+            } = inner.as_ref()
+            && v == variant
+        {
+            return Some(inner.as_ref().clone());
+        }
+        None
+    }
+    match stmt {
+        SorobanStmt::Expr(e) => in_expr(e, variant),
+        SorobanStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => in_stmts(then_body, variant).or_else(|| in_stmts(else_body, variant)),
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => in_stmts(body, variant),
+        SorobanStmt::For { body, .. } => in_stmts(body, variant),
+        SorobanStmt::Match { arms, .. } => arms.iter().find_map(|a| in_stmts(&a.body, variant)),
+        _ => None,
+    }
+}
+
+/// Find the parameter name of the vec being validated, from the first
+/// `MethodCall { object: Param(p), method: "get", .. }` in `stmt`'s subtree.
+fn find_validated_vec_param(stmt: &SorobanStmt) -> Option<String> {
+    fn in_stmts(stmts: &[SorobanStmt]) -> Option<String> {
+        stmts.iter().find_map(find_validated_vec_param)
+    }
+    fn in_expr(e: &SorobanExpr) -> Option<String> {
+        match e {
+            SorobanExpr::MethodCall {
+                object,
+                method,
+                args,
+            } => {
+                if method == "get"
+                    && let SorobanExpr::Param(p) = object.as_ref()
+                {
+                    return Some(p.clone());
+                }
+                in_expr(object).or_else(|| args.iter().find_map(in_expr))
+            }
+            SorobanExpr::Gt(a, b)
+            | SorobanExpr::Lt(a, b)
+            | SorobanExpr::Ge(a, b)
+            | SorobanExpr::Le(a, b)
+            | SorobanExpr::Eq(a, b)
+            | SorobanExpr::Ne(a, b)
+            | SorobanExpr::Sub(a, b)
+            | SorobanExpr::Add(a, b) => in_expr(a).or_else(|| in_expr(b)),
+            SorobanExpr::Not(a) => in_expr(a),
+            SorobanExpr::RawHostCall { args, .. } => args.iter().find_map(in_expr),
+            _ => None,
+        }
+    }
+    match stmt {
+        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => in_expr(e),
+        SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => in_expr(value),
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => in_expr(condition)
+            .or_else(|| in_stmts(then_body))
+            .or_else(|| in_stmts(else_body)),
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => in_stmts(body),
+        SorobanStmt::For { body, .. } => in_stmts(body),
+        SorobanStmt::Match { arms, .. } => arms.iter().find_map(|a| in_stmts(&a.body)),
+        _ => None,
+    }
+}
+
 /// `.step_by` for non-unit steps) when its induction variable is dead after the
 /// loop — `for` scopes the counter, so it must not be read afterward.
 ///
@@ -7812,6 +8027,82 @@ mod tests {
     }
 
     // ----- for-loop recovery (issue #6, Step 2) -----------------------
+
+    fn contract_err(variant: &str, code: u32) -> SorobanExpr {
+        SorobanExpr::PanicWithError(Box::new(SorobanExpr::ContractError {
+            error_code: code,
+            error_type: Some("RouterError".into()),
+            variant_name: Some(variant.into()),
+        }))
+    }
+
+    fn vec_get(p: &str, idx: SorobanExpr) -> SorobanExpr {
+        SorobanExpr::MethodCall {
+            object: Box::new(SorobanExpr::Param(p.into())),
+            method: "get".into(),
+            args: vec![idx],
+        }
+    }
+
+    /// A mangled validation block carrying BOTH `TokensNotSorted` and
+    /// `DuplicatesNotAllowed` over `tokens.get(..)` lifts to a clean
+    /// `for i in 1..tokens.len()` with no `todo!`.
+    #[test]
+    fn recover_tokens_sorted_validation_fires_on_both_error_codes() {
+        cov_mark::check!(tokens_sorted_validation_recovered);
+        let mangled = SorobanStmt::If {
+            condition: SorobanExpr::Ne(
+                Box::new(SorobanExpr::UnknownVal),
+                Box::new(SorobanExpr::I32Literal(0)),
+            ),
+            then_body: vec![
+                SorobanStmt::Loop {
+                    body: vec![
+                        SorobanStmt::Expr(vec_get("tokens", SorobanExpr::U32Literal(1))),
+                        SorobanStmt::If {
+                            condition: SorobanExpr::Gt(
+                                Box::new(SorobanExpr::Local(3)),
+                                Box::new(vec_get("tokens", SorobanExpr::U32Literal(1))),
+                            ),
+                            then_body: vec![SorobanStmt::Expr(contract_err(
+                                "TokensNotSorted",
+                                2002,
+                            ))],
+                            else_body: vec![],
+                        },
+                    ],
+                },
+                SorobanStmt::Expr(contract_err("DuplicatesNotAllowed", 315)),
+            ],
+            else_body: vec![],
+        };
+        let out = recover_tokens_sorted_validation(vec![mangled]);
+        assert!(
+            matches!(out.first(), Some(SorobanStmt::For { var, .. }) if var == "i"),
+            "expected a recovered for-loop, got {out:?}"
+        );
+        if let Some(SorobanStmt::For { start, end, .. }) = out.first() {
+            assert!(matches!(start, SorobanExpr::U32Literal(1)));
+            assert!(matches!(end, SorobanExpr::MethodCall { method, .. } if method == "len"));
+        }
+    }
+
+    /// Gating: a loop with only ONE of the two error codes is NOT a token-sort
+    /// validation and must be left untouched (never fabricate a sorted+unique check).
+    #[test]
+    fn recover_tokens_sorted_validation_skips_single_error_code() {
+        let only_sorted = SorobanStmt::Loop {
+            body: vec![
+                SorobanStmt::Expr(vec_get("tokens", SorobanExpr::U32Literal(0))),
+                SorobanStmt::Expr(contract_err("TokensNotSorted", 2002)),
+            ],
+        };
+        let out = recover_tokens_sorted_validation(vec![only_sorted.clone()]);
+        assert!(
+            matches!(out.first(), Some(SorobanStmt::Loop { .. })),
+            "must not rewrite a loop missing DuplicatesNotAllowed, got {out:?}"
+        );
+    }
 
     /// `let mut var_0 = 0; loop { if var_0 == 5 { break } acc; var_0 += 1 }`
     /// with the counter dead afterward becomes `for var_0 in 0..5 { acc }`,
