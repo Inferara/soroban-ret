@@ -144,6 +144,16 @@ fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<
         "Optimizer pass: remove_duplicate_exprs ({} stmts)",
         stmts.len()
     );
+    // Recover the generic return type of a cross-contract `invoke_contract` from
+    // the SDK's `Val -> T` type-assertion husk that immediately follows it
+    // (`if result.get_tag() != Tag::I128Object { panic!() }`), which the lifter
+    // left as `if todo!() != 69 { panic!() }`. Run before `remove_val_tag_guards`
+    // strips that husk so the tag is still available to read the type from.
+    let stmts = recover_invoke_return_types(stmts);
+    log::trace!(
+        "Optimizer pass: recover_invoke_return_types ({} stmts)",
+        stmts.len()
+    );
     let stmts = remove_val_tag_guards(stmts);
     log::trace!(
         "Optimizer pass: remove_val_tag_guards ({} stmts)",
@@ -2942,6 +2952,21 @@ fn remove_val_tag_guards(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             {
                 None
             }
+            // SDK `Val -> T` type-assertion husk whose tag-of operand collapsed to
+            // `UnknownVal` (rendered `if todo!() != 69 { panic!() }`): the operand
+            // is unrecovered but the constant is a genuine non-boolean `Val` type
+            // tag and the body is a bare `panic!()`, so it is unambiguously the
+            // inlined type check, not user logic. Drop it.
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } if else_body.is_empty()
+                && is_unknown_val_type_tag_assert(&condition)
+                && is_bare_panic_body(&then_body) =>
+            {
+                None
+            }
             other => Some(remove_val_tag_guards_nested(other)),
         })
         .collect()
@@ -2970,6 +2995,168 @@ fn is_panic_body(body: &[SorobanStmt]) -> bool {
             SorobanExpr::Panic | SorobanExpr::PanicWithError(_)
         ))
     )
+}
+
+/// True when a guard body is a bare `panic!()` (no error code). The SDK's
+/// `Val -> T` runtime type check traps with a plain `panic!()`/`unreachable`;
+/// user code raises a `panic_with_error!`, so requiring the bare form keeps the
+/// husk recognizer from swallowing genuine error guards.
+fn is_bare_panic_body(body: &[SorobanStmt]) -> bool {
+    matches!(body.first(), Some(SorobanStmt::Expr(SorobanExpr::Panic)))
+}
+
+/// A genuine `Val` *type* tag — the small-value tags (`U32`..`SymbolSmall`) and
+/// the object tags (`U64Object`..`MuxedAddressObject`). Excludes the ambiguous
+/// `False`/`True`/`Void`/`Error` tags (0..=3), whose small constants routinely
+/// appear in real comparisons and must not be mistaken for type checks.
+fn is_genuine_val_type_tag(tag: i64) -> bool {
+    matches!(tag, 4..=14 | 64..=78)
+}
+
+/// The concrete Rust type the SDK decodes a `Val` type tag into, when it is
+/// unambiguous from the tag alone. Aggregate/parametric tags (Vec/Map/Bytes,
+/// U256/I256, Timepoint/Duration) return `None`: their element type or length is
+/// not recoverable from the tag, so the invoke stays `Val`-typed.
+fn val_tag_rust_type(tag: i64) -> Option<&'static str> {
+    Some(match tag {
+        4 => "u32",
+        5 => "i32",
+        6 | 64 => "u64",
+        7 | 65 => "i64",
+        10 | 68 => "u128",
+        11 | 69 => "i128",
+        14 | 74 => "Symbol",
+        73 => "String",
+        77 => "Address",
+        _ => return None,
+    })
+}
+
+/// True when `expr` compares an unrecovered `UnknownVal` against a genuine `Val`
+/// type-tag constant (either operand order, optionally negated) — the shape the
+/// SDK's inlined `Val -> T` type assertion lifts to when its tag-of operand was
+/// lost. Returns the tag via [`unknown_val_type_tag_assert_tag`] for callers
+/// that need the tag itself.
+fn is_unknown_val_type_tag_assert(expr: &SorobanExpr) -> bool {
+    unknown_val_type_tag_assert_tag(expr).is_some()
+}
+
+/// The type tag from an `UnknownVal <cmp> <type-tag>` assertion, or `None`.
+fn unknown_val_type_tag_assert_tag(expr: &SorobanExpr) -> Option<i64> {
+    let (a, b) = match expr {
+        SorobanExpr::Not(inner) => return unknown_val_type_tag_assert_tag(inner),
+        SorobanExpr::Eq(a, b) | SorobanExpr::Ne(a, b) => (a.as_ref(), b.as_ref()),
+        _ => return None,
+    };
+    let tag = match (a, b) {
+        (SorobanExpr::UnknownVal, other) | (other, SorobanExpr::UnknownVal) => expr_as_int(other)?,
+        _ => return None,
+    };
+    is_genuine_val_type_tag(tag).then_some(tag)
+}
+
+/// Recover the generic return type of an `invoke_contract` whose result feeds
+/// directly into the SDK's `Val -> T` type-assertion husk on the next statement.
+///
+/// The lifter leaves the assertion as `if todo!() <cmp> <tag> { panic!() }` with
+/// the tag-of operand collapsed to `UnknownVal`, but the constant tag still names
+/// the type the SDK decoded the result into. When that type is unambiguous we set
+/// it as the invoke's `return_type` (so codegen emits `invoke_contract::<i128>`
+/// rather than `::<Val>`); the husk itself is dropped afterwards by
+/// `remove_val_tag_guards`. Only fires when the husk is the immediately following
+/// statement, matching the SDK's emit order, and never overwrites an already
+/// recovered return type.
+fn recover_invoke_return_types(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    let mut stmts: Vec<SorobanStmt> = stmts
+        .into_iter()
+        .map(recover_invoke_return_types_nested)
+        .collect();
+    for i in 0..stmts.len().saturating_sub(1) {
+        let Some(tag) = stmt_as_type_tag_husk(&stmts[i + 1]) else {
+            continue;
+        };
+        let Some(ty) = val_tag_rust_type(tag) else {
+            continue;
+        };
+        if let Some(rt) = stmt_invoke_return_type_mut(&mut stmts[i])
+            && rt.is_none()
+        {
+            *rt = Some(ty.to_string());
+        }
+    }
+    stmts
+}
+
+/// The type tag of a bare-`panic!()` `UnknownVal <cmp> <type-tag>` husk statement.
+fn stmt_as_type_tag_husk(stmt: &SorobanStmt) -> Option<i64> {
+    match stmt {
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } if else_body.is_empty() && is_bare_panic_body(then_body) => {
+            unknown_val_type_tag_assert_tag(condition)
+        }
+        _ => None,
+    }
+}
+
+/// A mutable handle to the `return_type` of an `invoke_contract` directly held by
+/// a statement (bare expression, `let`, or assignment), or `None`.
+fn stmt_invoke_return_type_mut(stmt: &mut SorobanStmt) -> Option<&mut Option<String>> {
+    let expr = match stmt {
+        SorobanStmt::Expr(e)
+        | SorobanStmt::Let { value: e, .. }
+        | SorobanStmt::Assign { value: e, .. } => e,
+        _ => return None,
+    };
+    match expr {
+        SorobanExpr::InvokeContract { return_type, .. }
+        | SorobanExpr::TryInvokeContract { return_type, .. } => Some(return_type),
+        _ => None,
+    }
+}
+
+fn recover_invoke_return_types_nested(stmt: SorobanStmt) -> SorobanStmt {
+    match stmt {
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => SorobanStmt::If {
+            condition,
+            then_body: recover_invoke_return_types(then_body),
+            else_body: recover_invoke_return_types(else_body),
+        },
+        SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+            scrutinee,
+            arms: arms
+                .into_iter()
+                .map(|arm| MatchArm {
+                    pattern: arm.pattern,
+                    body: recover_invoke_return_types(arm.body),
+                })
+                .collect(),
+        },
+        SorobanStmt::Loop { body } => SorobanStmt::Loop {
+            body: recover_invoke_return_types(body),
+        },
+        SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body,
+        } => SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body: recover_invoke_return_types(body),
+        },
+        SorobanStmt::Block(body) => SorobanStmt::Block(recover_invoke_return_types(body)),
+        other => other,
+    }
 }
 
 fn remove_val_tag_guards_nested(stmt: SorobanStmt) -> SorobanStmt {
@@ -8332,5 +8519,130 @@ mod tests {
             panic!("expected match");
         };
         assert!(arms[0].body.is_empty(), "empty arm should stay empty");
+    }
+
+    // ----- Invoke return-type recovery + Val type-tag assertion husk drop -----
+
+    fn unknown_tag_husk(op_eq: bool, tag: u32, error: bool) -> SorobanStmt {
+        let cond = Box::new(SorobanExpr::UnknownVal);
+        let lit = Box::new(SorobanExpr::U32Literal(tag));
+        let condition = if op_eq {
+            SorobanExpr::Eq(cond, lit)
+        } else {
+            SorobanExpr::Ne(cond, lit)
+        };
+        let panic = if error {
+            SorobanExpr::PanicWithError(Box::new(SorobanExpr::U32Literal(7)))
+        } else {
+            SorobanExpr::Panic
+        };
+        SorobanStmt::If {
+            condition,
+            then_body: vec![SorobanStmt::Expr(panic)],
+            else_body: vec![],
+        }
+    }
+
+    fn bare_invoke() -> SorobanExpr {
+        SorobanExpr::InvokeContract {
+            address: Box::new(SorobanExpr::UnknownVal),
+            function: Box::new(SorobanExpr::SymbolLiteral("get_x".to_string())),
+            args: vec![],
+            return_type: None,
+        }
+    }
+
+    #[test]
+    fn invoke_return_type_recovered_from_i128_tag_husk() {
+        // `invoke(...); if todo!() != 69 { panic!() }` → `invoke::<i128>(...)`,
+        // and the type-assertion husk is then stripped.
+        let stmts = vec![
+            SorobanStmt::Expr(bare_invoke()),
+            unknown_tag_husk(false, 69, false),
+        ];
+        let typed = recover_invoke_return_types(stmts);
+        match &typed[0] {
+            SorobanStmt::Expr(SorobanExpr::InvokeContract { return_type, .. }) => {
+                assert_eq!(return_type.as_deref(), Some("i128"));
+            }
+            other => panic!("expected typed invoke, got {other:?}"),
+        }
+        let dropped = remove_val_tag_guards(typed);
+        assert_eq!(
+            dropped.len(),
+            1,
+            "type-assert husk not dropped: {dropped:?}"
+        );
+    }
+
+    #[test]
+    fn invoke_return_type_recovered_through_let_binding() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "balance".to_string(),
+                mutable: true,
+                value: bare_invoke(),
+            },
+            unknown_tag_husk(false, 6, false),
+        ];
+        let typed = recover_invoke_return_types(stmts);
+        match &typed[0] {
+            SorobanStmt::Let {
+                value: SorobanExpr::InvokeContract { return_type, .. },
+                ..
+            } => assert_eq!(return_type.as_deref(), Some("u64")),
+            other => panic!("expected typed let-invoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_tag_drops_husk_but_leaves_invoke_untyped() {
+        // VecObject (75) has no recoverable element type: drop the husk but keep
+        // the invoke `Val`-typed rather than guess.
+        let stmts = vec![
+            SorobanStmt::Expr(bare_invoke()),
+            unknown_tag_husk(false, 75, false),
+        ];
+        let typed = recover_invoke_return_types(stmts);
+        match &typed[0] {
+            SorobanStmt::Expr(SorobanExpr::InvokeContract { return_type, .. }) => {
+                assert!(return_type.is_none(), "aggregate tag must not set a type");
+            }
+            other => panic!("expected invoke, got {other:?}"),
+        }
+        let dropped = remove_val_tag_guards(typed);
+        assert_eq!(
+            dropped.len(),
+            1,
+            "aggregate-tag husk not dropped: {dropped:?}"
+        );
+    }
+
+    #[test]
+    fn type_tag_husk_dropped_without_preceding_invoke() {
+        // The husk is droppable on its own (e.g. after `ledger().timestamp()`).
+        let out = remove_val_tag_guards(vec![unknown_tag_husk(false, 69, false)]);
+        assert!(
+            out.is_empty(),
+            "standalone type-tag husk not dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_and_nontag_husks_are_kept() {
+        // Tag::True (1), Tag::Void (2), Tag::False (0) and non-tag 24 are NOT
+        // dropped — dropping them would be a wrong recovery, not noise removal.
+        for (op_eq, tag) in [(true, 1u32), (false, 2), (true, 0), (true, 24)] {
+            let out = remove_val_tag_guards(vec![unknown_tag_husk(op_eq, tag, false)]);
+            assert_eq!(out.len(), 1, "husk for tag {tag} was wrongly dropped");
+        }
+    }
+
+    #[test]
+    fn type_tag_guard_with_error_body_is_kept() {
+        // A `panic_with_error!` body is user logic, never the SDK type check —
+        // keep it even though the constant is a genuine type tag.
+        let out = remove_val_tag_guards(vec![unknown_tag_husk(false, 69, true)]);
+        assert_eq!(out.len(), 1, "error guard must not be dropped: {out:?}");
     }
 }

@@ -1097,6 +1097,56 @@ fn aquarius_recovers_tokens_sorted_validation_loop() {
 }
 
 #[test]
+fn aquarius_recovers_invoke_return_types_and_drops_tag_assert_husks() {
+    // A cross-contract `invoke_contract` whose result feeds the SDK's `Val -> T`
+    // type assertion lifts as `invoke::<Val>(...); if todo!() != 69 { panic!() }`.
+    // The tag (69 = I128Object) names the return type, so the invoke is typed
+    // `::<i128>` and the husk is dropped — but only genuine type tags in bare-
+    // panic assertion form; ambiguous tags (Tag::True == 1) stay untouched.
+    let wasm = include_bytes!("../../../tests/fixtures/aquarius.wasm");
+    let src = decompile(wasm).expect("aquarius.wasm should decompile");
+
+    let start = src
+        .find("fn get_total_outstanding_reward")
+        .expect("get_total_outstanding_reward should be emitted");
+    let after = &src[start..];
+    let brace_start = after.find('{').expect("no { after fn");
+    let mut depth = 0i32;
+    let mut end = brace_start;
+    for (i, c) in after[brace_start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = brace_start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[..end];
+
+    // The balance invoke's I128Object assertion recovers an `i128` return type.
+    assert!(
+        body.contains("invoke_contract::<i128>"),
+        "i128 invoke return type should be recovered, got:\n{body}"
+    );
+    // The bare-panic type-tag assertion husks (I128Object / VecObject) are gone.
+    assert!(
+        !body.contains("!= 69 {") && !body.contains("!= 75 {"),
+        "SDK Val->T type-assertion husks should be dropped, got:\n{body}"
+    );
+    // ...but the ambiguous `== 1` guard (Tag::True, not a type assertion) stays:
+    // dropping it would be a wrong recovery, not noise removal.
+    assert!(
+        body.contains("== 1 {"),
+        "ambiguous non-type-tag guards must be preserved, got:\n{body}"
+    );
+}
+
+#[test]
 fn aquarius_recovers_descriptor_pointer_datakey_storage_keys() {
     // Long-symbol storage keys built via a constant descriptor-pointer chain
     // (`126 → 270 → 66 → 64 → encoder`): the `(i32 desc_ptr) -> i64` key
