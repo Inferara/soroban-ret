@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/soroban-ret",
     "crates/soroban-ret-accuracy",
+    "crates/soroban-ret-bench",
     "crates/soroban-ret-cli",
 ]
 

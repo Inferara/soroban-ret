@@ -1,0 +1,27 @@
+[package]
+name = "soroban-ret-bench"
+description = "Reference-free restoration benchmark for the soroban-ret decompiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+publish = false
+
+[lib]
+name = "soroban_ret_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+soroban-ret = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }

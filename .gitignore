@@ -13,6 +13,11 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Local benchmark run output (the committed result is benchmark-data/baseline.json)
+/benchmark-report.html
+/benchmark-results.json
+/benchmark-summary.md
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
@@ -20,6 +25,6 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-!.github
-
 .*/
+# Keep tracking workflow/config files under .github (must come after `.*/`).
+!.github/
