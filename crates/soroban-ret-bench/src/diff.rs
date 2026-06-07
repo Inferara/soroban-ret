@@ -91,6 +91,13 @@ pub fn diff(report: &BenchReport, baseline: &Baseline, tolerance: f64) -> DiffRe
         let b = base.get(f).copied();
         let (delta, verdict) = match (c, b) {
             (Some(c), Some(b)) => {
+                // `restoration_pct` is quantized to 0.1 pp at source
+                // (metrics.rs), so the true delta is a multiple of 0.1 and
+                // rounding here only strips float noise from `c - b`.
+                // Classifying the unrounded difference would flip
+                // exactly-at-tolerance deltas nondeterministically (e.g.
+                // 0.4 - 0.3 = 0.10000000000000003 > 0.1 → false Improved).
+                // Pinned by tests/diff.rs.
                 let d = round(c - b, 1);
                 let v = classify(d, tolerance);
                 match v {
@@ -113,6 +120,8 @@ pub fn diff(report: &BenchReport, baseline: &Baseline, tolerance: f64) -> DiffRe
         });
     }
 
+    // Same float-noise rationale as the per-contract deltas above: overall
+    // restoration is 1-dp quantized at source, round before classifying.
     let overall_delta = round(report.overall_restoration - baseline.overall_restoration, 1);
     DiffReport {
         overall_current: report.overall_restoration,
