@@ -24,7 +24,7 @@ if [ ! -d "$CORPUS" ]; then
 fi
 
 echo "Building soroban-ret-bench (release)..."
-cargo build --release -p soroban-ret-bench
+cargo build --release -p soroban-ret-bench --locked
 
 echo "Benchmarking corpus: $CORPUS"
 ./target/release/bench --corpus "$CORPUS" --update-baseline

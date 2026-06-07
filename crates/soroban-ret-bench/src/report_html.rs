@@ -417,7 +417,9 @@ fn delta_span(v: Verdict, delta: f64) -> (&'static str, String) {
     match v {
         Verdict::Improved => ("up", format!("▲ +{delta:.1}")),
         Verdict::Reduced => ("down", format!("▼ {delta:.1}")),
-        Verdict::NoChange => ("flat", "= 0.0".to_string()),
+        // Within tolerance but not necessarily zero — show the real delta like
+        // the Markdown summary does.
+        Verdict::NoChange => ("flat", format!("= {delta:+.1}")),
         Verdict::New => ("flat", "✚ new".to_string()),
         Verdict::Removed => ("flat", "✖ removed".to_string()),
     }

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use crate::diff::DiffReport;
+use crate::diff::{DiffReport, Verdict};
 use crate::metrics::BenchReport;
 
 /// Marker line so the CI step can find/replace its sticky PR comment.
@@ -75,6 +75,11 @@ pub fn render(report: &BenchReport, diff: Option<&DiffReport>) -> String {
         };
         if diff.is_some() {
             let dcell = match deltas.get(c.file.as_str()) {
+                // New/Removed have no meaningful delta; label them like the HTML report.
+                Some(d) if d.verdict == Verdict::New => format!("{} new", d.verdict.arrow()),
+                Some(d) if d.verdict == Verdict::Removed => {
+                    format!("{} removed", d.verdict.arrow())
+                }
                 Some(d) => format!("{} {:+.1}", d.verdict.arrow(), d.delta),
                 None => "—".to_string(),
             };
