@@ -11,7 +11,8 @@ env:
 jobs:
   # Report-only: renders the per-contract restoration table + improved/reduced/
   # no-change verdict to the job summary and a sticky PR comment, and uploads the
-  # full HTML report as an artifact. Never fails the check.
+  # full HTML report as an artifact. Benchmark regressions never fail the check
+  # (build or runtime errors still do).
   benchmark:
     name: Restoration benchmark
     runs-on: ubuntu-latest

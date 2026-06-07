@@ -34,7 +34,7 @@ struct Cli {
     #[arg(long)]
     markdown: bool,
     /// Verdict tolerance in percentage points.
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(long, default_value_t = 0.1, value_parser = parse_tolerance)]
     tolerance: f64,
     /// Write the trimmed baseline to `<corpus>/../baseline.json`.
     #[arg(long)]
@@ -111,6 +111,16 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Tolerance must be a sane percentage-point value; a negative tolerance would
+/// make `classify()` call nearly every delta improved/reduced.
+fn parse_tolerance(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !(0.0..=100.0).contains(&v) {
+        return Err("must be between 0 and 100 percentage points".into());
+    }
+    Ok(v)
 }
 
 fn write_file(path: &Path, contents: &str) -> std::io::Result<()> {

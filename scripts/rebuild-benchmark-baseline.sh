@@ -17,6 +17,15 @@ set -euo pipefail
 # every push).
 cd "$(dirname "$0")/.."
 CORPUS="${1:-benchmark-data/mainnet}"
+CORPUS="${CORPUS#./}"
+
+case "$CORPUS" in
+    /*)
+        echo "error: corpus path must be relative to the repo root (the committed" >&2
+        echo "baseline's 'corpus' field must be stable across machines): $CORPUS" >&2
+        exit 2
+        ;;
+esac
 
 if [ ! -d "$CORPUS" ]; then
     echo "error: corpus dir not found: $CORPUS" >&2

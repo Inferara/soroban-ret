@@ -68,8 +68,11 @@ function sortTable(tbl,col){
   t.setAttribute('data-dir-'+col,dir===1?'asc':'desc');
   rows.sort(function(a,b){
     var x=a.cells[col],y=b.cells[col],
-        xv=x.dataset.val!==undefined?parseFloat(x.dataset.val):x.textContent.toLowerCase(),
-        yv=y.dataset.val!==undefined?parseFloat(y.dataset.val):y.textContent.toLowerCase();
+        xs=x.dataset.val!==undefined?x.dataset.val:x.textContent.toLowerCase(),
+        ys=y.dataset.val!==undefined?y.dataset.val:y.textContent.toLowerCase(),
+        xn=parseFloat(xs),yn=parseFloat(ys),
+        num=!isNaN(xn)&&!isNaN(yn),
+        xv=num?xn:xs,yv=num?yn:ys;
     if(xv<yv)return -dir; if(xv>yv)return dir; return 0;
   });
   rows.forEach(function(r){tb.appendChild(r)});
