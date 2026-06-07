@@ -57,3 +57,29 @@ All 24 binaries decompile without error:
 ```bash
 for f in benchmark-data/mainnet/*.wasm; do target/release/soroban-ret "$f" >/dev/null || echo "FAIL $f"; done
 ```
+
+## Restoration benchmark
+
+This corpus drives `soroban-ret-bench` — a **reference-free** benchmark (mainnet
+binaries have no original source). For each contract it computes a *restoration
+%* = the mean per-exported-function recovery (concrete Rust vs. `todo!()` /
+unknown markers), plus artifact counts and Stage-1 disassembly time.
+
+```bash
+# Table to stdout for the default corpus (benchmark-data/mainnet):
+cargo run -p soroban-ret-bench
+
+# Full self-contained HTML dashboard + JSON, diffed against the committed baseline:
+cargo run -p soroban-ret-bench -- \
+  --against benchmark-data/baseline.json \
+  --html benchmark-report.html --json benchmark-results.json
+```
+
+`baseline.json` (one directory up) is the committed snapshot every PR is diffed
+against to mark **improved / reduced / no-change**; the `Benchmark` GitHub
+Action posts that table on each PR and refreshes the baseline on merge to
+`main`. Regenerate it manually with `scripts/rebuild-benchmark-baseline.sh`.
+
+The headline % is deliberately graded per function, so a large body with a few
+`todo!()`s still scores high — watch the **Artifacts** column for the sharper,
+per-`todo!()` development signal.

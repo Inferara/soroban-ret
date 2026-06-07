@@ -1115,6 +1115,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "soroban-ret-bench"
+version = "0.0.2"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "soroban-ret",
+]
+
+[[package]]
 name = "soroban-ret-cli"
 version = "0.0.2"
 dependencies = [
