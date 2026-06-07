@@ -63,7 +63,9 @@ jobs:
             const marker = '<!-- soroban-ret-bench -->';
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
-            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            // Paginate: the marker comment may not be on the first page once the
+            // PR accumulates >30 comments.
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
             const existing = comments.find(c => c.body && c.body.includes(marker));
             if (existing) {
               await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });

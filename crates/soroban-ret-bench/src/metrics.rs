@@ -691,8 +691,16 @@ pub fn run(corpus: &Path) -> std::io::Result<BenchReport> {
     };
 
     Ok(BenchReport {
-        corpus: corpus.display().to_string(),
+        corpus: normalize_corpus_path(corpus),
         overall_restoration: overall,
         contracts,
     })
+}
+
+/// The corpus string is committed inside `baseline.json`; keep it stable across
+/// platforms and input spelling (Windows separators, trailing slash, `./`).
+fn normalize_corpus_path(corpus: &Path) -> String {
+    let s = corpus.display().to_string().replace('\\', "/");
+    let s = s.trim_end_matches('/');
+    s.strip_prefix("./").unwrap_or(s).to_string()
 }
