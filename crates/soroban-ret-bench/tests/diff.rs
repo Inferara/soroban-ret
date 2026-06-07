@@ -7,7 +7,7 @@
 //! above 0.1 (e.g. `0.4 - 0.3 = 0.10000000000000003`), which would flip an
 //! at-tolerance NoChange into a false Improved/Reduced.
 
-use soroban_ret_bench::diff::{diff, Verdict};
+use soroban_ret_bench::diff::{Verdict, diff};
 use soroban_ret_bench::metrics::{
     ArtifactCounts, Baseline, BaselineContract, BenchReport, ContractBench,
 };
