@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 90.4,
+  "overall_restoration": 90.8,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -29,24 +29,24 @@
     {
       "file": "arb-bot-contract-CCBVCCNP.wasm",
       "entity": "ARB Bot Contract",
-      "restoration_pct": 86.7,
+      "restoration_pct": 94.7,
       "spec_functions": 5,
-      "fn_clean": 1,
-      "fn_partial": 4,
+      "fn_clean": 3,
+      "fn_partial": 2,
       "fn_logic_lost": 0,
-      "artifacts_total": 15,
+      "artifacts_total": 12,
       "wasm_size": 7083,
       "error": null
     },
     {
       "file": "band-protocol-CCQXWMZV.wasm",
       "entity": "Band Protocol",
-      "restoration_pct": 73.9,
+      "restoration_pct": 75.9,
       "spec_functions": 15,
       "fn_clean": 1,
       "fn_partial": 14,
       "fn_logic_lost": 0,
-      "artifacts_total": 145,
+      "artifacts_total": 138,
       "wasm_size": 13616,
       "error": null
     },
