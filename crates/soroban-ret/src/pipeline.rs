@@ -17,7 +17,9 @@ use crate::ir::optimizer::{
 };
 use crate::ir::soroban_ir::{MatchArm, MatchPattern, SorobanExpr, SorobanStmt, StorageType};
 use crate::pattern::lift_functions;
-use crate::pattern::lifter::find_identity_passthrough_param;
+use crate::pattern::lifter::{
+    find_identity_passthrough_param, is_panic_guard_shell, stmts_contain_unknown,
+};
 use crate::spec::registry::TypeRegistry;
 use crate::wasm::WasmModule;
 use crate::wasm::imports::HostModule;
@@ -334,6 +336,24 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
                     func.body.push(SorobanStmt::Expr(SorobanExpr::Panic));
                 }
             }
+        }
+
+        // All-or-nothing for value-returning reconstructions: a body that — after
+        // optimization and trailing-panic handling — is *entirely* validation-guard
+        // panics (`if cond { panic!() }` with no value path) is the misleading shell
+        // a checked-i128 library fn collapses to when its arithmetic didn't compose.
+        // It cannot type-check as the value it returns, and the reference-free metric
+        // would score it as clean — emit an honest stub instead. Gated on a
+        // deceptively-clean body (no `todo!`) and an actual `if` guard, so it never
+        // touches an honest partial or a bare diverging `panic!()` getter.
+        if func
+            .return_type
+            .as_ref()
+            .is_some_and(|t| !matches!(t, ScSpecTypeDef::Void))
+            && is_panic_guard_shell(&func.body)
+            && !stmts_contain_unknown(&func.body)
+        {
+            func.body.clear();
         }
     }
 

@@ -764,21 +764,28 @@ impl<'a> LiftContext<'a> {
             I128Op::Div => SorobanExpr::Div(Box::new(a_expr), Box::new(b_expr)),
         };
         let result = StackVal::HostCallResult(Box::new(result_expr));
-        // Write the result back to every result-pointer frame slot, as a limb pair.
+        // Write the result back to every result-pointer frame slot, as a limb pair,
+        // at the helper's own result layout (`intr.res_*_off`): unchecked helpers
+        // write `{lo@0, hi@8}`; checked `Result<i128,E>` helpers write `{lo@8, hi@16}`
+        // with the success/Err discriminant at `+0`. The discriminant slot is left
+        // unmodeled (Unknown) on purpose — its success polarity is inconsistent
+        // across helpers (some write `0` on Ok, some `1`); an Unknown branch
+        // condition is resolved by `fold_checked_result_branch` selecting the
+        // value-producing arm, so we recover the value without guessing the polarity.
         for arg in args {
             if let StackVal::FrameSlot(id, base) = arg
                 && base.is_static()
             {
                 let mut slots = self.frame_slots.borrow_mut();
                 slots.insert(
-                    (*id, base.base),
+                    (*id, base.base + intr.res_lo_off),
                     StackVal::I128Limb {
                         value: Box::new(result.clone()),
                         hi: false,
                     },
                 );
                 slots.insert(
-                    (*id, base.base + 8),
+                    (*id, base.base + intr.res_hi_off),
                     StackVal::I128Limb {
                         value: Box::new(result.clone()),
                         hi: true,
@@ -786,6 +793,95 @@ impl<'a> LiftContext<'a> {
                 );
             }
         }
+        self.found_host_calls = true;
+        Some(true)
+    }
+
+    /// If the i128 result limbs at `(id, base)` are fully recovered — both limbs
+    /// are `I128Limb`s wrapping a clean arithmetic expression (no `UnknownVal`) —
+    /// return their `(lo_off, hi_off)`. Checks both the unchecked (`lo@0, hi@8`)
+    /// and checked (`lo@8, hi@16`) result layouts; `None` if neither is clean.
+    /// Gate for the checked-arith husk drop.
+    fn clean_i128_result_layout(&self, id: u32, base: i32) -> Option<(i32, i32)> {
+        let slots = self.frame_slots.borrow();
+        let clean_pair = |lo_off: i32, hi_off: i32| {
+            matches!(
+                slots.get(&(id, base + lo_off)),
+                Some(StackVal::I128Limb { value, hi: false }) if limb_value_clean(value)
+            ) && matches!(
+                slots.get(&(id, base + hi_off)),
+                Some(StackVal::I128Limb { value, hi: true }) if limb_value_clean(value)
+            )
+        };
+        if clean_pair(8, 16) {
+            Some((8, 16))
+        } else if clean_pair(0, 8) {
+            Some((0, 8))
+        } else {
+            None
+        }
+    }
+
+    /// Recognize the SDK `Result<i128,E>::unwrap`-and-pack helper and return the
+    /// recovered i128 value directly, instead of inlining its multi-level
+    /// discriminant-check + `obj_from_i128_pieces` chain (which underflows to
+    /// `todo!` four or five inline levels deep). The helper `(i32 ptr, ..) -> i64`
+    /// reads a `Result<i128,E>` at `ptr` (disc@0, value@8/16) and returns the value
+    /// packed as a host `Val`, panicking on `Err`; it is identified by transitively
+    /// reaching `obj_from_i128_pieces`. When `ptr` is a frame slot already holding a
+    /// fully-recovered i128 — left there by a checked-arith composite whose husks
+    /// were dropped — return that value. Faithful: the happy-path result, with the
+    /// unwrap's `Err` panic dropped, and gated on a clean i128 so it can only fire
+    /// when the value was genuinely reconstructed.
+    fn try_lower_result_unwrap_pack(
+        &mut self,
+        target_idx: u32,
+        args: &[StackVal],
+        num_results: usize,
+    ) -> Option<bool> {
+        use crate::wasm::ir::WasmType;
+        if num_results != 1 {
+            return None;
+        }
+        let ft = self.wasm_module.get_func_type(target_idx)?;
+        if ft.params.first() != Some(&WasmType::I32) || ft.results.as_slice() != [WasmType::I64] {
+            return None;
+        }
+        if !(func_reaches_host(
+            self.wasm_module,
+            target_idx,
+            HostModule::Int,
+            "obj_from_i128_pieces",
+            0,
+        ) || func_reaches_host(
+            self.wasm_module,
+            target_idx,
+            HostModule::Int,
+            "obj_from_u128_pieces",
+            0,
+        )) {
+            return None;
+        }
+        let StackVal::FrameSlot(id, base) = args.first()? else {
+            return None;
+        };
+        if !base.is_static() {
+            return None;
+        }
+        let (id, base) = (*id, base.base);
+        // The Result's i128 value lives at ptr+8 / ptr+16 (after the discriminant
+        // at +0). Only fire when both limbs are a fully-recovered i128.
+        if self.clean_i128_result_layout(id, base) != Some((8, 16)) {
+            return None;
+        }
+        let value = {
+            let slots = self.frame_slots.borrow();
+            match slots.get(&(id, base + 8)) {
+                Some(StackVal::I128Limb { value, .. }) => (**value).clone(),
+                _ => return None,
+            }
+        };
+        self.stack.push(value);
         self.found_host_calls = true;
         Some(true)
     }
@@ -2297,6 +2393,14 @@ impl<'a> LiftContext<'a> {
                             // pointer's frame slot, so chained helpers compose instead
                             // of inlining into limb-soup `todo!`s.
                             handled
+                        } else if let Some(handled) = self
+                            .try_lower_result_unwrap_pack(*target_idx, &args, num_results)
+                        {
+                            // `Result<i128,E>::unwrap`-and-pack helper consuming a
+                            // frame slot that already holds a reconstructed i128
+                            // (from a checked-arith composite): return that value
+                            // directly instead of inlining the deep unwrap chain.
+                            handled
                         } else if let Some(handled) =
                             self.try_lower_symbol_builder(*target_idx, &args)
                         {
@@ -2397,7 +2501,39 @@ impl<'a> LiftContext<'a> {
                                 self.seed_sret_success_status(id, base, *target_idx);
                             }
                             if let Some((inlined_stmts, return_expr)) = inline_result.content {
-                                self.stmts.extend(inlined_stmts);
+                                // Checked-arith composite husk drop (all-or-nothing): a void
+                                // helper (e.g. Soroswap's `quote`/`get_amount_*` checked-i128
+                                // math) whose only meaningful effect is the i128 result it left
+                                // in the output frame slot, and whose inlined body is pure
+                                // arithmetic + error-path husks (Result-discriminant guards,
+                                // overflow panics — no storage/event/auth/invoke side effects),
+                                // faithfully reduces to just that value. Drop the husks so the
+                                // caller's pack/return reads a clean expression instead of a
+                                // control-flow-soup body. Fires only when the result slot holds
+                                // a fully-recovered i128 (no `UnknownVal`) AND nothing real was
+                                // dropped, so it can never emit a misleading partial.
+                                let result_layout = output_frame_slot
+                                    .filter(|_| num_results == 0)
+                                    .and_then(|(id, base)| self.clean_i128_result_layout(id, base));
+                                let dropped_husks = result_layout.is_some()
+                                    && stmts_are_pure_arith_husks(&inlined_stmts);
+                                if dropped_husks {
+                                    // For the checked `Result<i128,E>` layout, seed the
+                                    // output discriminant `Ok(0)` so the consuming
+                                    // `Result::unwrap` (e.g. Soroswap's `call 98`) folds
+                                    // to its value-producing arm instead of emitting the
+                                    // Err husk. The composite writes `0` on success, which
+                                    // matches the unwrap's `if disc != 0 { Err }` guard.
+                                    if let (Some((id, base)), Some((8, _))) =
+                                        (output_frame_slot, result_layout)
+                                    {
+                                        self.frame_slots
+                                            .borrow_mut()
+                                            .insert((id, base), StackVal::I64(0));
+                                    }
+                                } else {
+                                    self.stmts.extend(inlined_stmts);
+                                }
                                 if num_results > 0 {
                                     let rv = return_expr
                                         .map(|e| StackVal::HostCallResult(Box::new(e)))
@@ -6135,9 +6271,238 @@ fn lift_function_body(
         }
     }
 
+    // All-or-nothing for value-returning reconstructions: when no return value was
+    // recovered anywhere — no `Return(Some)` and no value-producing tail — the body
+    // is an incomplete reconstruction (a validation-guard / husk shell whose real
+    // result was lost, e.g. a checked-i128 library fn whose arithmetic didn't fully
+    // compose). Such a body can't type-check as the value-returning function it
+    // belongs to, and the reference-free metric would score it as clean. Emit an
+    // honest stub (empty body → `todo!`) instead of the misleading partial.
     LiftBodyResult {
         stmts: ctx.stmts,
         found_host_calls,
+    }
+}
+
+/// True if the whole body is validation-guard panics with no value-producing
+/// statement — every statement is either a bare `panic!()`/`panic_with_error!()`
+/// or an `if cond { <panic-guard> }` with an empty `else` — **and at least one is
+/// an `if` guard**. A value-returning function with such a body has no return
+/// path; it is the misleading shell a checked-i128 library function collapses to
+/// when its arithmetic didn't compose (`if amount_in != 0 { panic!() }`). The
+/// `if`-guard requirement excludes a lone `{ panic!() }` body, which compiles
+/// (a diverging getter), so this only touches the partials we introduce, not
+/// pre-existing bare-panic reconstructions.
+pub(crate) fn is_panic_guard_shell(stmts: &[SorobanStmt]) -> bool {
+    !stmts.is_empty()
+        && stmts.iter().all(stmt_is_panic_guard)
+        && stmts.iter().any(|s| matches!(s, SorobanStmt::If { .. }))
+}
+
+fn stmt_is_panic_guard(stmt: &SorobanStmt) -> bool {
+    match stmt {
+        SorobanStmt::Expr(SorobanExpr::Panic | SorobanExpr::PanicWithError(_)) => true,
+        SorobanStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            else_body.is_empty()
+                && !then_body.is_empty()
+                && then_body.iter().all(stmt_is_panic_guard)
+        }
+        _ => false,
+    }
+}
+
+/// True if any statement (transitively) contains an unrecovered marker —
+/// `UnknownVal` / `CyclicSlot` / `RawHostCall`, each of which renders as a
+/// `todo!`. Used to keep the all-or-nothing stub from touching honest partials.
+pub(crate) fn stmts_contain_unknown(stmts: &[SorobanStmt]) -> bool {
+    stmts.iter().any(stmt_contains_unknown)
+}
+
+fn stmt_contains_unknown(stmt: &SorobanStmt) -> bool {
+    match stmt {
+        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => expr_contains_unknown(e),
+        SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+            expr_contains_unknown(value)
+        }
+        SorobanStmt::Return(None)
+        | SorobanStmt::Break
+        | SorobanStmt::Continue
+        | SorobanStmt::Comment(_) => false,
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            expr_contains_unknown(condition)
+                || stmts_contain_unknown(then_body)
+                || stmts_contain_unknown(else_body)
+        }
+        SorobanStmt::Match { scrutinee, arms } => {
+            expr_contains_unknown(scrutinee)
+                || arms.iter().any(|a| stmts_contain_unknown(&a.body))
+        }
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => stmts_contain_unknown(body),
+        SorobanStmt::For {
+            start, end, body, ..
+        } => {
+            expr_contains_unknown(start)
+                || expr_contains_unknown(end)
+                || stmts_contain_unknown(body)
+        }
+    }
+}
+
+/// True if `expr` (transitively) contains an unrecovered marker. Exhaustive on
+/// purpose so a new `SorobanExpr` variant forces a decision here rather than
+/// silently reading as "clean".
+fn expr_contains_unknown(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::UnknownVal | SorobanExpr::CyclicSlot { .. } | SorobanExpr::RawHostCall { .. } => {
+            true
+        }
+        // Leaves with no expression children.
+        SorobanExpr::U32Literal(_)
+        | SorobanExpr::I32Literal(_)
+        | SorobanExpr::U64Literal(_)
+        | SorobanExpr::I64Literal(_)
+        | SorobanExpr::U128Literal(_)
+        | SorobanExpr::I128Literal(_)
+        | SorobanExpr::BoolLiteral(_)
+        | SorobanExpr::SymbolLiteral(_)
+        | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
+        | SorobanExpr::Void
+        | SorobanExpr::None
+        | SorobanExpr::Param(_)
+        | SorobanExpr::Local(_)
+        | SorobanExpr::NamedLocal(_)
+        | SorobanExpr::Env
+        | SorobanExpr::ContractError { .. }
+        | SorobanExpr::Panic
+        | SorobanExpr::LedgerSequence
+        | SorobanExpr::LedgerTimestamp
+        | SorobanExpr::LedgerNetworkId
+        | SorobanExpr::CurrentContractAddress
+        | SorobanExpr::MaxLiveUntilLedger
+        | SorobanExpr::CollectionNew(_)
+        | SorobanExpr::ValTagName(_) => false,
+        // Single child.
+        SorobanExpr::Some(b)
+        | SorobanExpr::Not(b)
+        | SorobanExpr::RequireAuth(b)
+        | SorobanExpr::AuthorizeAsCurrContract(b)
+        | SorobanExpr::ErrorFromCode(b)
+        | SorobanExpr::PanicWithError(b)
+        | SorobanExpr::CryptoSha256(b)
+        | SorobanExpr::CryptoKeccak256(b)
+        | SorobanExpr::PrngReseed(b)
+        | SorobanExpr::PrngBytesNew(b)
+        | SorobanExpr::PrngVecShuffle(b)
+        | SorobanExpr::StrkeyToAddress(b)
+        | SorobanExpr::AddressToStrkey(b)
+        | SorobanExpr::SretResult(b)
+        | SorobanExpr::ValTag(b)
+        | SorobanExpr::ValConvert { value: b, .. }
+        | SorobanExpr::CastAs { value: b, .. } => expr_contains_unknown(b),
+        // Two children.
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b)
+        | SorobanExpr::RequireAuthForArgs {
+            address: a,
+            args: b,
+        }
+        | SorobanExpr::ExtendInstanceAndCodeTtl {
+            threshold: a,
+            extend_to: b,
+        }
+        | SorobanExpr::VecTryIterFold { vec: a, init: b } => {
+            expr_contains_unknown(a) || expr_contains_unknown(b)
+        }
+        SorobanExpr::StorageGet { key, .. }
+        | SorobanExpr::StorageHas { key, .. }
+        | SorobanExpr::StorageRemove { key, .. } => expr_contains_unknown(key),
+        SorobanExpr::StorageSet { key, value, .. } => {
+            expr_contains_unknown(key) || expr_contains_unknown(value)
+        }
+        SorobanExpr::StorageExtendTtl {
+            key,
+            threshold,
+            extend_to,
+            ..
+        } => {
+            expr_contains_unknown(key)
+                || expr_contains_unknown(threshold)
+                || expr_contains_unknown(extend_to)
+        }
+        SorobanExpr::PublishEvent { topics, data, .. } => {
+            topics.iter().any(expr_contains_unknown) || expr_contains_unknown(data)
+        }
+        SorobanExpr::InvokeContract {
+            address,
+            function,
+            args,
+            ..
+        }
+        | SorobanExpr::TryInvokeContract {
+            address,
+            function,
+            args,
+            ..
+        } => {
+            expr_contains_unknown(address)
+                || expr_contains_unknown(function)
+                || args.iter().any(expr_contains_unknown)
+        }
+        SorobanExpr::StructConstruct { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_contains_unknown(v))
+        }
+        SorobanExpr::EnumConstruct { fields, .. } => fields.iter().any(expr_contains_unknown),
+        SorobanExpr::TupleConstruct(items)
+        | SorobanExpr::VecConstruct(items)
+        | SorobanExpr::Log(items) => items.iter().any(expr_contains_unknown),
+        SorobanExpr::MapConstruct(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_contains_unknown(k) || expr_contains_unknown(v)),
+        SorobanExpr::FieldAccess { object, .. } => expr_contains_unknown(object),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            expr_contains_unknown(object) || args.iter().any(expr_contains_unknown)
+        }
+        SorobanExpr::CryptoEd25519Verify {
+            public_key,
+            message,
+            signature,
+        } => {
+            expr_contains_unknown(public_key)
+                || expr_contains_unknown(message)
+                || expr_contains_unknown(signature)
+        }
+        SorobanExpr::CryptoSecp256k1Recover {
+            msg_digest,
+            signature,
+            recovery_id,
+        } => {
+            expr_contains_unknown(msg_digest)
+                || expr_contains_unknown(signature)
+                || expr_contains_unknown(recovery_id)
+        }
+        SorobanExpr::PrngU64InRange { low, high } => {
+            expr_contains_unknown(low) || expr_contains_unknown(high)
+        }
     }
 }
 
@@ -6533,6 +6898,11 @@ struct I128Intrinsic {
     a_hi: usize,
     b_lo: usize,
     b_hi: usize,
+    /// Result-limb byte offsets from the output pointer. Unchecked helpers write
+    /// the value directly (`lo@0, hi@8`); checked (`Result<i128,E>`-returning)
+    /// helpers reserve `+0` for the status discriminant (`lo@8, hi@16`).
+    res_lo_off: i32,
+    res_hi_off: i32,
 }
 
 /// Count occurrences of selected opcodes in a function body (a coarse fingerprint).
@@ -6663,6 +7033,59 @@ fn func_reaches_symbol_encoder(module: &WasmModule, idx: u32, depth: u32) -> boo
         .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_symbol_encoder(module, *t, depth + 1)))
 }
 
+/// True if `idx` transitively (≤2 call levels) reaches the host function
+/// `host_module::name`. The generic sibling of `func_reaches_symbol_encoder`.
+fn func_reaches_host(
+    module: &WasmModule,
+    idx: u32,
+    host_module: HostModule,
+    name: &str,
+    depth: u32,
+) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    if depth > 2 {
+        return false;
+    }
+    if let Some(hf) = module.imports.get_by_index(idx) {
+        return hf.module == host_module && hf.name == name;
+    }
+    let Some(func) = module.get_function(idx) else {
+        return false;
+    };
+    func.body
+        .iter()
+        .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_host(module, *t, host_module, name, depth + 1)))
+}
+
+/// Where an i128 soft-arith helper writes its result limbs relative to the output
+/// pointer (param 0). Unchecked helpers (the SDK's inline soft-arith) write the
+/// value directly as `{lo@0, hi@8}`; checked (`Result<i128,E>`-returning) helpers
+/// — used by SDK consumers like Soroswap that call `checked_mul`/`checked_div` —
+/// reserve `+0` for the status discriminant and write `{lo@8, hi@16}`. Detected by
+/// whether the body computes the `param0 + 16` store address
+/// (`local.get 0; i32.const 16; i32.add`): only the 24-byte checked layout
+/// addresses `+16`; the 16-byte unchecked layout never does, and a multiply leaf
+/// that surfaces overflow through a separate `i32` flag pointer writes its hi limb
+/// at `+8`, so it stays unchecked.
+fn i128_result_offsets(func: &crate::wasm::ir::WasmFunction) -> (i32, i32) {
+    use crate::wasm::ir::WasmInstr;
+    let checked = func.body.windows(3).any(|w| {
+        matches!(
+            w,
+            [
+                WasmInstr::LocalGet(0),
+                WasmInstr::I32Const(16),
+                WasmInstr::I32Add
+            ]
+        )
+    });
+    if checked {
+        (8, 16)
+    } else {
+        (0, 8)
+    }
+}
+
 fn detect_i128_intrinsic(module: &WasmModule, func_idx: u32) -> Option<I128Intrinsic> {
     detect_i128_intrinsic_inner(module, func_idx, 0)
 }
@@ -6677,20 +7100,28 @@ fn detect_i128_intrinsic_inner(
     }
     let func = module.get_function(func_idx)?;
     let fp = opcode_counts(func);
+    let (res_lo_off, res_hi_off) = i128_result_offsets(func);
     let layout = |op: I128Op| I128Intrinsic {
         op,
         a_lo: 1,
         a_hi: 2,
         b_lo: 3,
         b_hi: 4,
+        res_lo_off,
+        res_hi_off,
     };
 
     // Leaf unsigned multiply: schoolbook 32-bit limb products, two stores, no calls.
     if fp.calls.is_empty() && fp.mul >= 5 && fp.store >= 2 && fp.div == 0 {
         return Some(layout(I128Op::Mul));
     }
-    // Leaf / near-leaf unsigned divide: a long-division `I64DivU` core.
-    if fp.div >= 1 && fp.mul <= 6 {
+    // Leaf / near-leaf unsigned divide: any inline `I64DivU`/`I64DivS` marks a
+    // division core. A 128-bit multiply never divides (branches 1 and 3 require
+    // `div == 0`), so a 64-bit division op uniquely identifies a divide — including
+    // a Knuth long-division core whose quotient estimation legitimately contains
+    // several `i64.mul` (the real mainnet core has mul == 7, which the old
+    // `mul <= 6` cap wrongly rejected).
+    if fp.div >= 1 {
         return Some(layout(I128Op::Div));
     }
     // Widening / fixed-point multiply (6-param, delegates the limb products to a
@@ -10816,6 +11247,132 @@ fn stack_val_contains_unknown(val: &StackVal) -> bool {
     }
 }
 
+/// True when an `I128Limb`'s wrapped value is a fully-recovered arithmetic
+/// expression — a `HostCallResult` over a clean `Add`/`Sub`/`Mul`/`Div`/`Rem`
+/// tree of params/locals/literals, with no `UnknownVal`. Used to confirm a
+/// checked-arith composite produced a real value before its husks are dropped.
+fn limb_value_clean(value: &StackVal) -> bool {
+    matches!(value, StackVal::HostCallResult(expr) if expr_is_clean_arith(expr))
+}
+
+fn expr_is_clean_arith(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b) => expr_is_clean_arith(a) && expr_is_clean_arith(b),
+        SorobanExpr::CastAs { value, .. } | SorobanExpr::ValConvert { value, .. } => {
+            expr_is_clean_arith(value)
+        }
+        SorobanExpr::Param(_)
+        | SorobanExpr::Local(_)
+        | SorobanExpr::NamedLocal(_)
+        | SorobanExpr::I128Literal(_)
+        | SorobanExpr::U128Literal(_)
+        | SorobanExpr::I64Literal(_)
+        | SorobanExpr::U64Literal(_)
+        | SorobanExpr::I32Literal(_)
+        | SorobanExpr::U32Literal(_) => true,
+        _ => false,
+    }
+}
+
+/// True if every statement is a pure-arithmetic "husk" — none performs a real
+/// side effect (storage write, event, auth, cross-contract invoke, prng, log).
+/// Error-path panics, arithmetic, and control flow are allowed: they are the
+/// Result-discriminant guards a checked-arith composite collapses to once its
+/// happy-path value is recovered into the frame slot. Conservative — an
+/// unrecognized effect keeps the statements (no drop).
+fn stmts_are_pure_arith_husks(stmts: &[SorobanStmt]) -> bool {
+    stmts.iter().all(stmt_is_pure_arith_husk)
+}
+
+fn stmt_is_pure_arith_husk(stmt: &SorobanStmt) -> bool {
+    match stmt {
+        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => !expr_has_effect(e),
+        SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+            !expr_has_effect(value)
+        }
+        SorobanStmt::Return(None)
+        | SorobanStmt::Break
+        | SorobanStmt::Continue
+        | SorobanStmt::Comment(_) => true,
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            !expr_has_effect(condition)
+                && stmts_are_pure_arith_husks(then_body)
+                && stmts_are_pure_arith_husks(else_body)
+        }
+        SorobanStmt::Match { scrutinee, arms } => {
+            !expr_has_effect(scrutinee)
+                && arms.iter().all(|a| stmts_are_pure_arith_husks(&a.body))
+        }
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => stmts_are_pure_arith_husks(body),
+        SorobanStmt::For {
+            start, end, body, ..
+        } => !expr_has_effect(start) && !expr_has_effect(end) && stmts_are_pure_arith_husks(body),
+    }
+}
+
+/// True if `expr` (transitively) performs a state-changing side effect that must
+/// not be silently dropped. Storage *reads* and arithmetic are effect-free.
+fn expr_has_effect(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::StorageSet { .. }
+        | SorobanExpr::StorageRemove { .. }
+        | SorobanExpr::StorageExtendTtl { .. }
+        | SorobanExpr::ExtendInstanceAndCodeTtl { .. }
+        | SorobanExpr::PublishEvent { .. }
+        | SorobanExpr::RequireAuth(_)
+        | SorobanExpr::RequireAuthForArgs { .. }
+        | SorobanExpr::AuthorizeAsCurrContract(_)
+        | SorobanExpr::InvokeContract { .. }
+        | SorobanExpr::TryInvokeContract { .. }
+        | SorobanExpr::Log(_)
+        | SorobanExpr::PrngReseed(_)
+        | SorobanExpr::PrngBytesNew(_)
+        | SorobanExpr::PrngVecShuffle(_)
+        | SorobanExpr::PrngU64InRange { .. } => true,
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => expr_has_effect(a) || expr_has_effect(b),
+        SorobanExpr::Not(a)
+        | SorobanExpr::Some(a)
+        | SorobanExpr::PanicWithError(a)
+        | SorobanExpr::ErrorFromCode(a)
+        | SorobanExpr::CastAs { value: a, .. }
+        | SorobanExpr::ValConvert { value: a, .. } => expr_has_effect(a),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            expr_has_effect(object) || args.iter().any(expr_has_effect)
+        }
+        SorobanExpr::FieldAccess { object, .. } => expr_has_effect(object),
+        SorobanExpr::TupleConstruct(items) | SorobanExpr::VecConstruct(items) => {
+            items.iter().any(expr_has_effect)
+        }
+        SorobanExpr::StructConstruct { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_has_effect(v))
+        }
+        SorobanExpr::EnumConstruct { fields, .. } => fields.iter().any(expr_has_effect),
+        // Storage reads (`StorageGet`/`StorageHas`) are idempotent; all remaining
+        // variants are leaves or pure projections.
+        _ => false,
+    }
+}
+
 /// True if `val` is a Soroban Val tag comparison: `(v & 0xFF) <cmp> TAG`.
 ///
 /// These are the SDK's argument type-validation checks. A multi-guard validation
@@ -12411,6 +12968,98 @@ mod tests {
             detect_i128_intrinsic(&m, 2).is_none(),
             "a same-signature non-arithmetic function is not a helper"
         );
+    }
+
+    #[test]
+    fn div_core_with_many_muls_still_classifies() {
+        // The real mainnet 128-bit division core uses several `i64.mul` for quotient
+        // estimation (Knuth long division). The old `mul <= 6` cap rejected it; an
+        // inline division op alone must mark a divide.
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $div_heavy (param i32 i64 i64 i64 i64)
+                    local.get 0
+                    local.get 1 local.get 3 i64.mul
+                    local.get 1 local.get 4 i64.mul i64.add
+                    local.get 2 local.get 3 i64.mul i64.add
+                    local.get 2 local.get 4 i64.mul i64.add
+                    local.get 1 local.get 3 i64.mul i64.add
+                    local.get 2 local.get 4 i64.mul i64.add
+                    local.get 1 local.get 4 i64.mul i64.add
+                    local.get 3 i64.div_u
+                    i64.store))
+            "#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        assert_eq!(
+            detect_i128_intrinsic(&m, 0).map(|i| i.op),
+            Some(I128Op::Div),
+            "div core with 7 muls classifies as divide"
+        );
+    }
+
+    #[test]
+    fn i128_result_offsets_detects_checked_layout() {
+        // Unchecked helpers write the value as `{lo@0, hi@8}`; checked
+        // `Result<i128,E>` helpers reserve `+0` for the discriminant and address
+        // `param0 + 16` for the hi limb.
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $unchecked (param i32 i64 i64)
+                    local.get 0 local.get 1 i64.store
+                    local.get 0 local.get 2 i64.store offset=8)
+                (func $checked (param i32 i64 i64)
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 i64.store offset=8
+                    local.get 0 i32.const 16 i32.add local.get 2 i64.store))
+            "#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        assert_eq!(
+            i128_result_offsets(m.get_function(0).unwrap()),
+            (0, 8),
+            "unchecked layout"
+        );
+        assert_eq!(
+            i128_result_offsets(m.get_function(1).unwrap()),
+            (8, 16),
+            "checked Result layout"
+        );
+    }
+
+    #[test]
+    fn panic_guard_shell_and_unknown_detection() {
+        use crate::ir::{SorobanExpr, SorobanStmt};
+        let guard = SorobanStmt::If {
+            condition: SorobanExpr::Ne(
+                Box::new(SorobanExpr::Param("amount_in".into())),
+                Box::new(SorobanExpr::I128Literal(0)),
+            ),
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+            else_body: vec![],
+        };
+        // `if cond { panic!() }` with no value path is the misleading shell.
+        assert!(is_panic_guard_shell(std::slice::from_ref(&guard)));
+        // A bare `panic!()` (no `if`) is NOT a shell — it compiles as a diverging
+        // getter and must be preserved.
+        assert!(!is_panic_guard_shell(&[SorobanStmt::Expr(
+            SorobanExpr::Panic
+        )]));
+        // A value-producing tail is not a shell.
+        assert!(!is_panic_guard_shell(&[SorobanStmt::Return(Some(
+            SorobanExpr::Param("x".into())
+        ))]));
+        // The clean guard carries no `todo!`; an `UnknownVal` condition is an honest
+        // partial that must not be stubbed.
+        assert!(!stmts_contain_unknown(std::slice::from_ref(&guard)));
+        let dirty = SorobanStmt::If {
+            condition: SorobanExpr::UnknownVal,
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+            else_body: vec![],
+        };
+        assert!(stmts_contain_unknown(std::slice::from_ref(&dirty)));
     }
 
     #[test]
