@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 91.3,
+  "overall_restoration": 92.1,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -245,12 +245,12 @@
     {
       "file": "soroswap-CAG5LRYQ.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 66.1,
+      "restoration_pct": 85.9,
       "spec_functions": 20,
-      "fn_clean": 4,
+      "fn_clean": 8,
       "fn_partial": 11,
-      "fn_logic_lost": 5,
-      "artifacts_total": 96,
+      "fn_logic_lost": 1,
+      "artifacts_total": 90,
       "wasm_size": 34253,
       "error": null
     },

@@ -762,6 +762,21 @@ impl<'a> LiftContext<'a> {
         let result_expr = match intr.op {
             I128Op::Mul => SorobanExpr::Mul(Box::new(a_expr), Box::new(b_expr)),
             I128Op::Div => SorobanExpr::Div(Box::new(a_expr), Box::new(b_expr)),
+            // `a / b + (a % b != 0) as i128`: truncating quotient plus 1 when the
+            // division is inexact (the round-up wrapper's verified semantics).
+            I128Op::DivCeil => SorobanExpr::Add(
+                Box::new(SorobanExpr::Div(
+                    Box::new(a_expr.clone()),
+                    Box::new(b_expr.clone()),
+                )),
+                Box::new(SorobanExpr::CastAs {
+                    value: Box::new(SorobanExpr::Ne(
+                        Box::new(SorobanExpr::Rem(Box::new(a_expr), Box::new(b_expr))),
+                        Box::new(SorobanExpr::I128Literal(0)),
+                    )),
+                    target_type: "i128".to_string(),
+                }),
+            ),
         };
         let result = StackVal::HostCallResult(Box::new(result_expr));
         // Write the result back to every result-pointer frame slot, as a limb pair,
@@ -797,25 +812,39 @@ impl<'a> LiftContext<'a> {
         Some(true)
     }
 
-    /// If the i128 result limbs at `(id, base)` are fully recovered — both limbs
-    /// are `I128Limb`s wrapping a clean arithmetic expression (no `UnknownVal`) —
-    /// return their `(lo_off, hi_off)`. Checks both the unchecked (`lo@0, hi@8`)
-    /// and checked (`lo@8, hi@16`) result layouts; `None` if neither is clean.
-    /// Gate for the checked-arith husk drop.
-    fn clean_i128_result_layout(&self, id: u32, base: i32) -> Option<(i32, i32)> {
-        let slots = self.frame_slots.borrow();
-        let clean_pair = |lo_off: i32, hi_off: i32| {
-            matches!(
-                slots.get(&(id, base + lo_off)),
-                Some(StackVal::I128Limb { value, hi: false }) if limb_value_clean(value)
-            ) && matches!(
-                slots.get(&(id, base + hi_off)),
-                Some(StackVal::I128Limb { value, hi: true }) if limb_value_clean(value)
+    /// Reconstruct a fully-clean i128 from the two result-limb slots at
+    /// `(id, base+lo_off)` / `(base+hi_off)` as a clean-arith expression, or `None`
+    /// if a slot is missing or the value isn't fully recovered. Accepts not only a
+    /// direct `I128Limb` pair but also an open-coded add/sub of recovered limbs (via
+    /// `reconstruct_i128_operand`) — e.g. the `+ 1` Soroswap's `get_amount_in`
+    /// applies to its rounded quotient before storing the result.
+    fn recover_clean_i128(&self, id: u32, base: i32, lo_off: i32, hi_off: i32) -> Option<SorobanExpr> {
+        let (lo, hi) = {
+            let slots = self.frame_slots.borrow();
+            (
+                slots.get(&(id, base + lo_off))?.clone(),
+                slots.get(&(id, base + hi_off))?.clone(),
             )
         };
-        if clean_pair(8, 16) {
+        let (val, clean) = reconstruct_i128_operand(&lo, &hi)?;
+        if !clean {
+            return None;
+        }
+        let expr = {
+            let slots = self.frame_slots.borrow();
+            stack_val_to_expr(&val, self.params, self.registry, Some(&slots))
+        };
+        expr_is_clean_arith(&expr).then_some(expr)
+    }
+
+    /// If the i128 result limbs at `(id, base)` are fully recovered to a clean
+    /// arithmetic value (no `UnknownVal`), return their `(lo_off, hi_off)`. Checks
+    /// both the unchecked (`lo@0, hi@8`) and checked (`lo@8, hi@16`) result layouts;
+    /// `None` if neither is clean. Gate for the checked-arith husk drop.
+    fn clean_i128_result_layout(&self, id: u32, base: i32) -> Option<(i32, i32)> {
+        if self.recover_clean_i128(id, base, 8, 16).is_some() {
             Some((8, 16))
-        } else if clean_pair(0, 8) {
+        } else if self.recover_clean_i128(id, base, 0, 8).is_some() {
             Some((0, 8))
         } else {
             None
@@ -870,18 +899,9 @@ impl<'a> LiftContext<'a> {
         }
         let (id, base) = (*id, base.base);
         // The Result's i128 value lives at ptr+8 / ptr+16 (after the discriminant
-        // at +0). Only fire when both limbs are a fully-recovered i128.
-        if self.clean_i128_result_layout(id, base) != Some((8, 16)) {
-            return None;
-        }
-        let value = {
-            let slots = self.frame_slots.borrow();
-            match slots.get(&(id, base + 8)) {
-                Some(StackVal::I128Limb { value, .. }) => (**value).clone(),
-                _ => return None,
-            }
-        };
-        self.stack.push(value);
+        // at +0). Only fire when both limbs reconstruct to a fully-recovered i128.
+        let value = self.recover_clean_i128(id, base, 8, 16)?;
+        self.stack.push(StackVal::HostCallResult(Box::new(value)));
         self.found_host_calls = true;
         Some(true)
     }
@@ -6886,6 +6906,9 @@ fn try_extract_param_from_stack_val(val: &StackVal) -> Option<SorobanExpr> {
 enum I128Op {
     Mul,
     Div,
+    /// Truncating divide that adds 1 to the quotient when the remainder is
+    /// nonzero — `a / b + (a % b != 0) as i128`. Soroswap's fee `div_ceil`.
+    DivCeil,
 }
 
 /// A classified i128 soft-arith helper: the operation plus the arg indices of
@@ -7144,7 +7167,41 @@ fn detect_i128_intrinsic_inner(
         let core = detect_i128_intrinsic_inner(module, fp.calls[0], depth + 1)?;
         return Some(layout(core.op));
     }
+    // Round-up-on-inexact divide wrapper (e.g. Soroswap's fee `div_ceil`): no
+    // direct mul/div of its own, delegates the truncating division to a Div core,
+    // then adds 1 to the quotient whenever the remainder is nonzero. Empirically
+    // (executed under wasmi) it computes `a / b + (a % b != 0) as i128` over the
+    // full signed domain — NOT a sign-aware ceiling. Distinguished from a plain
+    // signed-div wrapper by the post-division `+1` increment idiom.
+    if fp.div == 0
+        && fp.mul == 0
+        && fp.calls.iter().any(|&t| {
+            matches!(
+                detect_i128_intrinsic_inner(module, t, depth + 1).map(|i| i.op),
+                Some(I128Op::Div)
+            )
+        })
+        && has_inexact_increment(func)
+    {
+        return Some(layout(I128Op::DivCeil));
+    }
     None
+}
+
+/// True if the body contains the "+1 when the division was inexact" idiom that
+/// marks a round-up divide wrapper: a remainder-zero test (`i64.or; i64.eqz`,
+/// combining the two remainder limbs) AND a literal-`1` increment of the
+/// quotient (`i64.const 1; i64.add`). A plain truncating-div wrapper has neither.
+fn has_inexact_increment(func: &crate::wasm::ir::WasmFunction) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    let body = &func.body;
+    let has_increment = body
+        .windows(2)
+        .any(|w| matches!(w, [WasmInstr::I64Const(1), WasmInstr::I64Add]));
+    let has_remainder_test = body
+        .windows(2)
+        .any(|w| matches!(w, [WasmInstr::I64Or, WasmInstr::I64Eqz]));
+    has_increment && has_remainder_test
 }
 
 /// Rebuild a whole 128-bit operand from its two i64 limb args. Returns the value
@@ -7189,8 +7246,126 @@ fn reconstruct_i128_operand(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, b
         // the operand is that whole value; the degraded high arg is the junk hi word.
         // Best-effort — only trustworthy when paired with a limb-tracked operand.
         (lo, h) if is_whole_i128_value(lo) && !is_clean_hi_limb(h) => Some((lo.clone(), false)),
-        _ => None,
+        // Open-coded i128 add/sub (carry/borrow limb chains the SDK emits inline
+        // rather than via a helper call).
+        _ => reconstruct_i128_addsub(lo, hi),
     }
+}
+
+/// Recognize the open-coded i128 add/sub limb idiom — the two's-complement
+/// carry/borrow chains the SDK emits inline (no helper call) — and rebuild the
+/// whole 128-bit value as `Add`/`Sub` of its recursively-reconstructed operands.
+///
+/// Borrow-subtract `A - B`:
+///   lo = A_lo - B_lo
+///   hi = (A_hi - B_hi) - (A_lo <u B_lo)            // the borrow
+/// Carry-add `A + B`:
+///   lo = A_lo + B_lo
+///   hi = (lo <u addend_lo) + (B_hi + A_hi)         // the carry; operand order varies
+///
+/// Strictly structural: the borrow/carry comparison must reference the SAME limb
+/// sub-expressions as the `lo` computation, and BOTH operands must reconstruct
+/// cleanly. So it can only fire on a genuine 128-bit add/sub — never on the
+/// `0 - x` negations the signed mul/div wrappers emit (whose hi limb is
+/// `0 - (x_hi + (x_lo != 0))`, matching neither shape).
+fn reconstruct_i128_addsub(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bool)> {
+    // --- Borrow-subtract: lo = A_lo - B_lo, hi = (A_hi - B_hi) - (A_lo <u B_lo) ---
+    if let StackVal::BinOp(a_lo, BinOper::Sub, b_lo) = lo
+        && let StackVal::BinOp(hi_diff, BinOper::Sub, borrow) = hi
+        && let StackVal::BinOp(a_hi, BinOper::Sub, b_hi) = &**hi_diff
+        && is_unsigned_lt(borrow, a_lo, b_lo)
+    {
+        let (a, a_clean) = reconstruct_i128_operand(a_lo, a_hi)?;
+        let (b, b_clean) = reconstruct_i128_operand(b_lo, b_hi)?;
+        return (a_clean && b_clean)
+            .then(|| (StackVal::BinOp(Box::new(a), BinOper::Sub, Box::new(b)), true));
+    }
+    // --- Add of a clean value and a small positive constant K (K fits the low
+    //     limb, K_hi = 0): lo = A_lo + K ; hi = A_hi + carry, where the carry is
+    //     `(A_lo + K) <u K` — which the compiler folds to `Eqz(lo)` when K == 1.
+    //     Soroswap's `get_amount_in` applies this `+ 1` to its rounded quotient. ---
+    if let StackVal::BinOp(a_lo, BinOper::Add, k) = lo
+        && let StackVal::I64(kv) = &**k
+        && *kv > 0
+        && let StackVal::BinOp(s1, BinOper::Add, s2) = hi
+    {
+        let is_const_carry = |c: &StackVal| match c {
+            StackVal::Eqz(inner) => *kv == 1 && **inner == *lo,
+            _ => is_unsigned_lt(c, lo, k),
+        };
+        let a_hi = if is_const_carry(s2) {
+            Some(&**s1)
+        } else if is_const_carry(s1) {
+            Some(&**s2)
+        } else {
+            None
+        };
+        if let Some(a_hi) = a_hi {
+            let (a, a_clean) = reconstruct_i128_operand(a_lo, a_hi)?;
+            return a_clean.then(|| {
+                (
+                    StackVal::BinOp(
+                        Box::new(a),
+                        BinOper::Add,
+                        Box::new(StackVal::HostCallResult(Box::new(SorobanExpr::I128Literal(
+                            *kv as i128,
+                        )))),
+                    ),
+                    true,
+                )
+            });
+        }
+        return None;
+    }
+    // --- Carry-add: lo = A_lo + B_lo, hi = (lo <u addend_lo) + (B_hi + A_hi) ---
+    if let StackVal::BinOp(x_lo, BinOper::Add, y_lo) = lo
+        && let StackVal::BinOp(s1, BinOper::Add, s2) = hi
+    {
+        // One summand of `hi` is the carry `(lo <u addend_lo)`, the other is the
+        // hi-limb sum `Add(_, _)`.
+        let (carry, hi_sum) = match (is_carry(s1, lo, x_lo, y_lo), is_carry(s2, lo, x_lo, y_lo)) {
+            (true, false) => (true, s2),
+            (false, true) => (true, s1),
+            _ => return None,
+        };
+        if !carry {
+            return None;
+        }
+        let StackVal::BinOp(p_hi, BinOper::Add, q_hi) = &**hi_sum else {
+            return None;
+        };
+        // Pair each low limb with its matching high limb (addition is commutative,
+        // so try both pairings and accept the one where both operands reconstruct).
+        for (xh, yh) in [(p_hi, q_hi), (q_hi, p_hi)] {
+            if let (Some((a, a_clean)), Some((b, b_clean))) = (
+                reconstruct_i128_operand(x_lo, xh),
+                reconstruct_i128_operand(y_lo, yh),
+            ) && a_clean
+                && b_clean
+            {
+                return Some((StackVal::BinOp(Box::new(a), BinOper::Add, Box::new(b)), true));
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// True if `e` computes the unsigned comparison `x <u y`. The compiler emits this
+/// borrow/carry bit either way around — `x <u y` directly or its mirror `y >u x` —
+/// so accept both spellings.
+fn is_unsigned_lt(e: &StackVal, x: &StackVal, y: &StackVal) -> bool {
+    match e {
+        StackVal::Compare(l, CmpOp::LtU, r) => **l == *x && **r == *y,
+        StackVal::Compare(l, CmpOp::GtU, r) => **l == *y && **r == *x,
+        _ => false,
+    }
+}
+
+/// True if `e` is the add carry bit `sum_lo <u addend_lo` — the comparison of the
+/// freshly-computed low sum against one of the two addends' low limbs.
+fn is_carry(e: &StackVal, sum_lo: &StackVal, x_lo: &StackVal, y_lo: &StackVal) -> bool {
+    is_unsigned_lt(e, sum_lo, x_lo) || is_unsigned_lt(e, sum_lo, y_lo)
 }
 
 /// True for a `StackVal` that already represents a complete 128-bit value (not a
@@ -11247,21 +11422,17 @@ fn stack_val_contains_unknown(val: &StackVal) -> bool {
     }
 }
 
-/// True when an `I128Limb`'s wrapped value is a fully-recovered arithmetic
-/// expression — a `HostCallResult` over a clean `Add`/`Sub`/`Mul`/`Div`/`Rem`
-/// tree of params/locals/literals, with no `UnknownVal`. Used to confirm a
-/// checked-arith composite produced a real value before its husks are dropped.
-fn limb_value_clean(value: &StackVal) -> bool {
-    matches!(value, StackVal::HostCallResult(expr) if expr_is_clean_arith(expr))
-}
-
 fn expr_is_clean_arith(expr: &SorobanExpr) -> bool {
     match expr {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
         | SorobanExpr::Div(a, b)
-        | SorobanExpr::Rem(a, b) => expr_is_clean_arith(a) && expr_is_clean_arith(b),
+        | SorobanExpr::Rem(a, b)
+        // Comparisons appear in the round-up divide's `(a % b != 0)` inexact term;
+        // they are pure and operate over clean-arith operands.
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b) => expr_is_clean_arith(a) && expr_is_clean_arith(b),
         SorobanExpr::CastAs { value, .. } | SorobanExpr::ValConvert { value, .. } => {
             expr_is_clean_arith(value)
         }
@@ -13060,6 +13231,149 @@ mod tests {
             else_body: vec![],
         };
         assert!(stmts_contain_unknown(std::slice::from_ref(&dirty)));
+    }
+
+    #[test]
+    fn divceil_classifies_round_up_wrapper() {
+        // $core has an inline divide → classifies as Div. $ceil delegates to $core
+        // and carries the inexact-increment idiom (`i64.or; i64.eqz` remainder test
+        // + `i64.const 1; i64.add` quotient bump) → DivCeil. $plain forwards to the
+        // div core but has no increment → not classified (the increment is required).
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $core (param i32 i64 i64 i64 i64)
+                    local.get 0 local.get 1 local.get 3 i64.div_u i64.store)
+                (func $ceil (param i32 i64 i64 i64 i64)
+                    local.get 0 local.get 1 local.get 2 local.get 3 local.get 4 call $core
+                    local.get 1 local.get 2 i64.or i64.eqz drop
+                    local.get 1 i64.const 1 i64.add drop)
+                (func $plain (param i32 i64 i64 i64 i64)
+                    local.get 0 local.get 1 local.get 2 local.get 3 local.get 4 call $core))
+            "#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        assert_eq!(detect_i128_intrinsic(&m, 0).map(|i| i.op), Some(I128Op::Div));
+        assert_eq!(
+            detect_i128_intrinsic(&m, 1).map(|i| i.op),
+            Some(I128Op::DivCeil),
+            "div core + inexact increment classifies as DivCeil"
+        );
+        assert_eq!(
+            detect_i128_intrinsic(&m, 2).map(|i| i.op),
+            None,
+            "a plain forwarder without the increment is not a DivCeil"
+        );
+    }
+
+    #[test]
+    fn reconstruct_i128_inline_borrow_sub_and_carry_add() {
+        // Clean limb pairs for two whole 128-bit operands x and y.
+        let lo = |n: &str| StackVal::I128Limb {
+            value: Box::new(StackVal::Param(n.into())),
+            hi: false,
+        };
+        let hi = |n: &str| StackVal::I128Limb {
+            value: Box::new(StackVal::Param(n.into())),
+            hi: true,
+        };
+        let cmp = |a: StackVal, op: CmpOp, b: StackVal| StackVal::Compare(Box::new(a), op, Box::new(b));
+        let bin = |a: StackVal, op: BinOper, b: StackVal| StackVal::BinOp(Box::new(a), op, Box::new(b));
+
+        // x - y:  lo = x.lo - y.lo ; hi = (x.hi - y.hi) - (x.lo <u y.lo)
+        let sub_lo = bin(lo("x"), BinOper::Sub, lo("y"));
+        let sub_hi = bin(
+            bin(hi("x"), BinOper::Sub, hi("y")),
+            BinOper::Sub,
+            cmp(lo("x"), CmpOp::LtU, lo("y")),
+        );
+        assert_eq!(
+            reconstruct_i128_operand(&sub_lo, &sub_hi),
+            Some((
+                bin(StackVal::Param("x".into()), BinOper::Sub, StackVal::Param("y".into())),
+                true
+            )),
+            "borrow-subtract limb pair rebuilds as x - y"
+        );
+
+        // x + y:  lo = x.lo + y.lo ; hi = (lo <u y.lo) + (y.hi + x.hi)
+        let add_lo = bin(lo("x"), BinOper::Add, lo("y"));
+        let add_hi = bin(
+            cmp(add_lo.clone(), CmpOp::LtU, lo("y")),
+            BinOper::Add,
+            bin(hi("y"), BinOper::Add, hi("x")),
+        );
+        assert_eq!(
+            reconstruct_i128_operand(&add_lo, &add_hi),
+            Some((
+                bin(StackVal::Param("x".into()), BinOper::Add, StackVal::Param("y".into())),
+                true
+            )),
+            "carry-add limb pair rebuilds as x + y"
+        );
+
+        // A two's-complement negation `0 - y` (the signed-wrapper abs idiom) must NOT
+        // be mistaken for a 128-bit subtract: its hi limb is `0 - (y.hi + (y.lo != 0))`,
+        // whose left operand is `0`, not a `Sub`.
+        let neg_lo = bin(StackVal::I64(0), BinOper::Sub, lo("y"));
+        let neg_hi = bin(
+            StackVal::I64(0),
+            BinOper::Sub,
+            bin(hi("y"), BinOper::Add, cmp(lo("y"), CmpOp::Ne, StackVal::I64(0))),
+        );
+        assert_eq!(
+            reconstruct_i128_operand(&neg_lo, &neg_hi),
+            None,
+            "a 0 - y negation is not a 128-bit subtract"
+        );
+    }
+
+    #[test]
+    fn reconstruct_i128_gtu_borrow_and_const_increment() {
+        use crate::ir::SorobanExpr;
+        let lo = |n: &str| StackVal::I128Limb {
+            value: Box::new(StackVal::Param(n.into())),
+            hi: false,
+        };
+        let hi = |n: &str| StackVal::I128Limb {
+            value: Box::new(StackVal::Param(n.into())),
+            hi: true,
+        };
+        let cmp = |a: StackVal, op: CmpOp, b: StackVal| StackVal::Compare(Box::new(a), op, Box::new(b));
+        let bin = |a: StackVal, op: BinOper, b: StackVal| StackVal::BinOp(Box::new(a), op, Box::new(b));
+
+        // x - y with the borrow written as the mirror `y.lo >u x.lo` (GtU form) —
+        // equivalent to `x.lo <u y.lo`. Soroswap's get_amount_in emits this spelling.
+        let sub_lo = bin(lo("x"), BinOper::Sub, lo("y"));
+        let sub_hi = bin(
+            bin(hi("x"), BinOper::Sub, hi("y")),
+            BinOper::Sub,
+            cmp(lo("y"), CmpOp::GtU, lo("x")),
+        );
+        assert_eq!(
+            reconstruct_i128_operand(&sub_lo, &sub_hi),
+            Some((
+                bin(StackVal::Param("x".into()), BinOper::Sub, StackVal::Param("y".into())),
+                true
+            )),
+            "GtU-form borrow still rebuilds x - y"
+        );
+
+        // q + 1: lo = q.lo + 1 ; hi = q.hi + (q.lo + 1 == 0)  [Eqz carry for +1].
+        let inc_lo = bin(lo("q"), BinOper::Add, StackVal::I64(1));
+        let inc_hi = bin(hi("q"), BinOper::Add, StackVal::Eqz(Box::new(inc_lo.clone())));
+        assert_eq!(
+            reconstruct_i128_operand(&inc_lo, &inc_hi),
+            Some((
+                bin(
+                    StackVal::Param("q".into()),
+                    BinOper::Add,
+                    StackVal::HostCallResult(Box::new(SorobanExpr::I128Literal(1)))
+                ),
+                true
+            )),
+            "constant +1 with Eqz carry rebuilds q + 1"
+        );
     }
 
     #[test]
