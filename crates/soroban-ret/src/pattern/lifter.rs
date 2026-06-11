@@ -818,7 +818,13 @@ impl<'a> LiftContext<'a> {
     /// direct `I128Limb` pair but also an open-coded add/sub of recovered limbs (via
     /// `reconstruct_i128_operand`) — e.g. the `+ 1` Soroswap's `get_amount_in`
     /// applies to its rounded quotient before storing the result.
-    fn recover_clean_i128(&self, id: u32, base: i32, lo_off: i32, hi_off: i32) -> Option<SorobanExpr> {
+    fn recover_clean_i128(
+        &self,
+        id: u32,
+        base: i32,
+        lo_off: i32,
+        hi_off: i32,
+    ) -> Option<SorobanExpr> {
         let (lo, hi) = {
             let slots = self.frame_slots.borrow();
             (
@@ -1044,7 +1050,10 @@ impl<'a> LiftContext<'a> {
         // anything (they pass through the evaluator abstractly).
         if !matches!(args[0], StackVal::I64(_)) {
             if dbg {
-                eprintln!("[DBG_DK] func {target_idx}: selector not const: {:?}", args[0]);
+                eprintln!(
+                    "[DBG_DK] func {target_idx}: selector not const: {:?}",
+                    args[0]
+                );
             }
             return false;
         }
@@ -1070,7 +1079,10 @@ impl<'a> LiftContext<'a> {
         };
         let Some(Some(result)) = ev.eval_call(target_idx, dk_args, 0) else {
             if dbg {
-                eprintln!("[DBG_DK] func {target_idx}: eval bailed (selector {:?})", args[0]);
+                eprintln!(
+                    "[DBG_DK] func {target_idx}: eval bailed (selector {:?})",
+                    args[0]
+                );
             }
             return false;
         };
@@ -1081,7 +1093,10 @@ impl<'a> LiftContext<'a> {
             return false;
         };
         if dbg {
-            eprintln!("[DBG_DK] func {target_idx}: FOLDED {:?} -> {key:?}", args[0]);
+            eprintln!(
+                "[DBG_DK] func {target_idx}: FOLDED {:?} -> {key:?}",
+                args[0]
+            );
         }
         self.stack.push(StackVal::HostCallResult(Box::new(key)));
         self.found_host_calls = true;
@@ -1097,9 +1112,7 @@ impl<'a> LiftContext<'a> {
     fn dk_result_to_key_expr(&self, result: &DkVal, args: &[StackVal]) -> Option<SorobanExpr> {
         let sym_of = |v: &DkVal| -> Option<String> {
             match v {
-                DkVal::I64(raw) => {
-                    crate::wasm::data::DataSection::decode_symbol_val(*raw as u64)
-                }
+                DkVal::I64(raw) => crate::wasm::data::DataSection::decode_symbol_val(*raw as u64),
                 DkVal::SymObj(name) => Some(name.clone()),
                 _ => None,
             }
@@ -1731,8 +1744,8 @@ impl<'a> LiftContext<'a> {
                     // -> i64` br_table'ing over the selector (neither `(i32) ->
                     // i64` case above matches it). A constant selector resolves
                     // the key by micro-evaluating the dispatcher's own bytecode.
-                    let did_key_construct = did_key_construct
-                        || self.try_fold_datakey_dispatcher(*target_idx, &args);
+                    let did_key_construct =
+                        did_key_construct || self.try_fold_datakey_dispatcher(*target_idx, &args);
 
                     // Sign-check-and-panic: functions like check_nonnegative_amount
                     // that compare a parameter against 0 and panic if negative.
@@ -2570,8 +2583,8 @@ impl<'a> LiftContext<'a> {
                             // pointer's frame slot, so chained helpers compose instead
                             // of inlining into limb-soup `todo!`s.
                             handled
-                        } else if let Some(handled) = self
-                            .try_lower_result_unwrap_pack(*target_idx, &args, num_results)
+                        } else if let Some(handled) =
+                            self.try_lower_result_unwrap_pack(*target_idx, &args, num_results)
                         {
                             // `Result<i128,E>::unwrap`-and-pack helper consuming a
                             // frame slot that already holds a reconstructed i128
@@ -6519,8 +6532,7 @@ fn stmt_contains_unknown(stmt: &SorobanStmt) -> bool {
                 || stmts_contain_unknown(else_body)
         }
         SorobanStmt::Match { scrutinee, arms } => {
-            expr_contains_unknown(scrutinee)
-                || arms.iter().any(|a| stmts_contain_unknown(&a.body))
+            expr_contains_unknown(scrutinee) || arms.iter().any(|a| stmts_contain_unknown(&a.body))
         }
         SorobanStmt::Loop { body } | SorobanStmt::Block(body) => stmts_contain_unknown(body),
         SorobanStmt::For {
@@ -6538,9 +6550,9 @@ fn stmt_contains_unknown(stmt: &SorobanStmt) -> bool {
 /// silently reading as "clean".
 fn expr_contains_unknown(expr: &SorobanExpr) -> bool {
     match expr {
-        SorobanExpr::UnknownVal | SorobanExpr::CyclicSlot { .. } | SorobanExpr::RawHostCall { .. } => {
-            true
-        }
+        SorobanExpr::UnknownVal
+        | SorobanExpr::CyclicSlot { .. }
+        | SorobanExpr::RawHostCall { .. } => true,
         // Leaves with no expression children.
         SorobanExpr::U32Literal(_)
         | SorobanExpr::I32Literal(_)
@@ -7556,12 +7568,7 @@ impl DkEval<'_> {
 
     /// Interpret one function body. Outer `None` = anything out of model
     /// (bail the fold); inner value = the function's result (None for void).
-    fn eval_call(
-        &mut self,
-        func_idx: u32,
-        args: Vec<DkVal>,
-        depth: u32,
-    ) -> Option<Option<DkVal>> {
+    fn eval_call(&mut self, func_idx: u32, args: Vec<DkVal>, depth: u32) -> Option<Option<DkVal>> {
         use crate::wasm::ir::{WasmInstr as WI, WasmType};
         if depth > DK_MAX_CALL_DEPTH {
             return None;
@@ -7662,9 +7669,7 @@ impl DkEval<'_> {
                     stack.push(match (a, b) {
                         (DkVal::I32(x), DkVal::I32(y)) => DkVal::I32(x.wrapping_add(y)),
                         (DkVal::StackPtr(o), DkVal::I32(k))
-                        | (DkVal::I32(k), DkVal::StackPtr(o)) => {
-                            DkVal::StackPtr(o.checked_add(k)?)
-                        }
+                        | (DkVal::I32(k), DkVal::StackPtr(o)) => DkVal::StackPtr(o.checked_add(k)?),
                         _ => return None,
                     });
                 }
@@ -7673,9 +7678,7 @@ impl DkEval<'_> {
                     let a = stack.pop()?;
                     stack.push(match (a, b) {
                         (DkVal::I32(x), DkVal::I32(y)) => DkVal::I32(x.wrapping_sub(y)),
-                        (DkVal::StackPtr(o), DkVal::I32(k)) => {
-                            DkVal::StackPtr(o.checked_sub(k)?)
-                        }
+                        (DkVal::StackPtr(o), DkVal::I32(k)) => DkVal::StackPtr(o.checked_sub(k)?),
                         _ => return None,
                     });
                 }
@@ -7863,11 +7866,7 @@ fn i128_result_offsets(func: &crate::wasm::ir::WasmFunction) -> (i32, i32) {
             ]
         )
     });
-    if checked {
-        (8, 16)
-    } else {
-        (0, 8)
-    }
+    if checked { (8, 16) } else { (0, 8) }
 }
 
 fn detect_i128_intrinsic(module: &WasmModule, func_idx: u32) -> Option<I128Intrinsic> {
@@ -8038,8 +8037,12 @@ fn reconstruct_i128_addsub(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bo
     {
         let (a, a_clean) = reconstruct_i128_operand(a_lo, a_hi)?;
         let (b, b_clean) = reconstruct_i128_operand(b_lo, b_hi)?;
-        return (a_clean && b_clean)
-            .then(|| (StackVal::BinOp(Box::new(a), BinOper::Sub, Box::new(b)), true));
+        return (a_clean && b_clean).then(|| {
+            (
+                StackVal::BinOp(Box::new(a), BinOper::Sub, Box::new(b)),
+                true,
+            )
+        });
     }
     // --- Add of a clean value and a small positive constant K (K fits the low
     //     limb, K_hi = 0): lo = A_lo + K ; hi = A_hi + carry, where the carry is
@@ -8068,9 +8071,9 @@ fn reconstruct_i128_addsub(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bo
                     StackVal::BinOp(
                         Box::new(a),
                         BinOper::Add,
-                        Box::new(StackVal::HostCallResult(Box::new(SorobanExpr::I128Literal(
-                            *kv as i128,
-                        )))),
+                        Box::new(StackVal::HostCallResult(Box::new(
+                            SorobanExpr::I128Literal(*kv as i128),
+                        ))),
                     ),
                     true,
                 )
@@ -8104,7 +8107,10 @@ fn reconstruct_i128_addsub(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bo
             ) && a_clean
                 && b_clean
             {
-                return Some((StackVal::BinOp(Box::new(a), BinOper::Add, Box::new(b)), true));
+                return Some((
+                    StackVal::BinOp(Box::new(a), BinOper::Add, Box::new(b)),
+                    true,
+                ));
             }
         }
         return None;
@@ -12240,8 +12246,7 @@ fn stmt_is_pure_arith_husk(stmt: &SorobanStmt) -> bool {
                 && stmts_are_pure_arith_husks(else_body)
         }
         SorobanStmt::Match { scrutinee, arms } => {
-            !expr_has_effect(scrutinee)
-                && arms.iter().all(|a| stmts_are_pure_arith_husks(&a.body))
+            !expr_has_effect(scrutinee) && arms.iter().all(|a| stmts_are_pure_arith_husks(&a.body))
         }
         SorobanStmt::Loop { body } | SorobanStmt::Block(body) => stmts_are_pure_arith_husks(body),
         SorobanStmt::For {
@@ -14014,7 +14019,10 @@ mod tests {
         )
         .expect("wat parses");
         let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
-        assert_eq!(detect_i128_intrinsic(&m, 0).map(|i| i.op), Some(I128Op::Div));
+        assert_eq!(
+            detect_i128_intrinsic(&m, 0).map(|i| i.op),
+            Some(I128Op::Div)
+        );
         assert_eq!(
             detect_i128_intrinsic(&m, 1).map(|i| i.op),
             Some(I128Op::DivCeil),
@@ -14038,8 +14046,10 @@ mod tests {
             value: Box::new(StackVal::Param(n.into())),
             hi: true,
         };
-        let cmp = |a: StackVal, op: CmpOp, b: StackVal| StackVal::Compare(Box::new(a), op, Box::new(b));
-        let bin = |a: StackVal, op: BinOper, b: StackVal| StackVal::BinOp(Box::new(a), op, Box::new(b));
+        let cmp =
+            |a: StackVal, op: CmpOp, b: StackVal| StackVal::Compare(Box::new(a), op, Box::new(b));
+        let bin =
+            |a: StackVal, op: BinOper, b: StackVal| StackVal::BinOp(Box::new(a), op, Box::new(b));
 
         // x - y:  lo = x.lo - y.lo ; hi = (x.hi - y.hi) - (x.lo <u y.lo)
         let sub_lo = bin(lo("x"), BinOper::Sub, lo("y"));
@@ -14051,7 +14061,11 @@ mod tests {
         assert_eq!(
             reconstruct_i128_operand(&sub_lo, &sub_hi),
             Some((
-                bin(StackVal::Param("x".into()), BinOper::Sub, StackVal::Param("y".into())),
+                bin(
+                    StackVal::Param("x".into()),
+                    BinOper::Sub,
+                    StackVal::Param("y".into())
+                ),
                 true
             )),
             "borrow-subtract limb pair rebuilds as x - y"
@@ -14067,7 +14081,11 @@ mod tests {
         assert_eq!(
             reconstruct_i128_operand(&add_lo, &add_hi),
             Some((
-                bin(StackVal::Param("x".into()), BinOper::Add, StackVal::Param("y".into())),
+                bin(
+                    StackVal::Param("x".into()),
+                    BinOper::Add,
+                    StackVal::Param("y".into())
+                ),
                 true
             )),
             "carry-add limb pair rebuilds as x + y"
@@ -14080,7 +14098,11 @@ mod tests {
         let neg_hi = bin(
             StackVal::I64(0),
             BinOper::Sub,
-            bin(hi("y"), BinOper::Add, cmp(lo("y"), CmpOp::Ne, StackVal::I64(0))),
+            bin(
+                hi("y"),
+                BinOper::Add,
+                cmp(lo("y"), CmpOp::Ne, StackVal::I64(0)),
+            ),
         );
         assert_eq!(
             reconstruct_i128_operand(&neg_lo, &neg_hi),
@@ -14100,8 +14122,10 @@ mod tests {
             value: Box::new(StackVal::Param(n.into())),
             hi: true,
         };
-        let cmp = |a: StackVal, op: CmpOp, b: StackVal| StackVal::Compare(Box::new(a), op, Box::new(b));
-        let bin = |a: StackVal, op: BinOper, b: StackVal| StackVal::BinOp(Box::new(a), op, Box::new(b));
+        let cmp =
+            |a: StackVal, op: CmpOp, b: StackVal| StackVal::Compare(Box::new(a), op, Box::new(b));
+        let bin =
+            |a: StackVal, op: BinOper, b: StackVal| StackVal::BinOp(Box::new(a), op, Box::new(b));
 
         // x - y with the borrow written as the mirror `y.lo >u x.lo` (GtU form) —
         // equivalent to `x.lo <u y.lo`. Soroswap's get_amount_in emits this spelling.
@@ -14114,7 +14138,11 @@ mod tests {
         assert_eq!(
             reconstruct_i128_operand(&sub_lo, &sub_hi),
             Some((
-                bin(StackVal::Param("x".into()), BinOper::Sub, StackVal::Param("y".into())),
+                bin(
+                    StackVal::Param("x".into()),
+                    BinOper::Sub,
+                    StackVal::Param("y".into())
+                ),
                 true
             )),
             "GtU-form borrow still rebuilds x - y"
@@ -14122,7 +14150,11 @@ mod tests {
 
         // q + 1: lo = q.lo + 1 ; hi = q.hi + (q.lo + 1 == 0)  [Eqz carry for +1].
         let inc_lo = bin(lo("q"), BinOper::Add, StackVal::I64(1));
-        let inc_hi = bin(hi("q"), BinOper::Add, StackVal::Eqz(Box::new(inc_lo.clone())));
+        let inc_hi = bin(
+            hi("q"),
+            BinOper::Add,
+            StackVal::Eqz(Box::new(inc_lo.clone())),
+        );
         assert_eq!(
             reconstruct_i128_operand(&inc_lo, &inc_hi),
             Some((
