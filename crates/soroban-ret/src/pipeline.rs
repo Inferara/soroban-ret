@@ -5903,6 +5903,16 @@ fn recover_enum_key_in_expr(expr: &mut SorobanExpr, registry: &TypeRegistry) {
                 recover_enum_key_in_expr(arg, registry);
             }
         }
+        // The admin-auth idiom threads a keyed load into the auth target
+        // (`get(&Admin).unwrap().require_auth()`) — recurse so its key
+        // upgrades like any other storage key.
+        SorobanExpr::RequireAuth(target) => {
+            recover_enum_key_in_expr(target, registry);
+        }
+        SorobanExpr::RequireAuthForArgs { address, args } => {
+            recover_enum_key_in_expr(address, registry);
+            recover_enum_key_in_expr(args, registry);
+        }
         SorobanExpr::StructConstruct { fields, .. } => {
             for (_, val) in fields.iter_mut() {
                 recover_enum_key_in_expr(val, registry);
@@ -5942,6 +5952,25 @@ fn try_convert_enum_key(expr: &SorobanExpr, registry: &TypeRegistry) -> Option<S
                     type_name: union_name,
                     variant: variant_name.clone(),
                     fields: vec![fields[1].clone()],
+                });
+            }
+            None
+        }
+        // Unit variant in its host encoding: Vec[SymbolLiteral("Variant")] →
+        // Type::Variant. `#[contracttype]` unions vec-wrap unit variants too, so
+        // a recovered key arrives as a 1-element vec; without this arm only the
+        // inner symbol upgrades, leaving a double-wrapped `vec![&env, Key::V]`.
+        SorobanExpr::TupleConstruct(fields) | SorobanExpr::VecConstruct(fields)
+            if fields.len() == 1 =>
+        {
+            if let SorobanExpr::SymbolLiteral(variant_name) = &fields[0]
+                && let Some((union_name, has_data)) = registry.find_union_variant(variant_name)
+                && !has_data
+            {
+                return Some(SorobanExpr::EnumConstruct {
+                    type_name: union_name,
+                    variant: variant_name.clone(),
+                    fields: vec![],
                 });
             }
             None

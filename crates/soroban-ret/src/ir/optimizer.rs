@@ -999,10 +999,76 @@ fn recover_discarded_storage_get_into_consumer(stmts: Vec<SorobanStmt>) -> Vec<S
             k += 2;
             continue;
         }
+        // `Expr(StorageGet { key: K }); Return(K)` — the guard-arm getter idiom
+        // (`k = key(); if has(k) { k = get(k); br out } trap`) whose key register
+        // is conservatively not phi-merged out of the terminating arm: the lift
+        // emits the keyed load as a discarded statement and returns the *stale
+        // key*. Returning the storage key right after discarding a load on that
+        // very key is the evidence the register was overwritten on the only live
+        // path — fold both into `Return(get(K))`.
+        // `Expr(StorageGet { key: K }); <consumer of K>` — the guard-arm getter
+        // idiom (`k = key(); if has(k) { k = get(k); br out } trap`) whose key
+        // register is conservatively not phi-merged out of the terminating arm:
+        // the lift emits the keyed load as a discarded statement and the
+        // consumer (a return, or the admin-auth `require_auth`) receives the
+        // *stale key*. Consuming the storage key itself right after discarding
+        // a load on that very key is the evidence the register was overwritten
+        // on the only live path — thread the load into the consumer.
+        if k + 1 < stmts.len()
+            && let Some(get) = discarded_storage_get(&stmts[k])
+            && let SorobanExpr::StorageGet { key, .. } = get
+        {
+            match &stmts[k + 1] {
+                SorobanStmt::Return(Some(ret)) if expr_is_stale_key(key, ret) => {
+                    cov_mark::hit!(discarded_get_into_stale_key_return);
+                    result.push(SorobanStmt::Return(Some(get.clone())));
+                    k += 2;
+                    continue;
+                }
+                SorobanStmt::Expr(SorobanExpr::RequireAuth(target))
+                    if expr_is_stale_key(key, target) =>
+                {
+                    cov_mark::hit!(discarded_get_into_stale_key_auth);
+                    result.push(SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(
+                        get.clone(),
+                    ))));
+                    k += 2;
+                    continue;
+                }
+                SorobanStmt::Expr(SorobanExpr::RequireAuthForArgs { address, args })
+                    if expr_is_stale_key(key, address) =>
+                {
+                    cov_mark::hit!(discarded_get_into_stale_key_auth);
+                    result.push(SorobanStmt::Expr(SorobanExpr::RequireAuthForArgs {
+                        address: Box::new(get.clone()),
+                        args: args.clone(),
+                    }));
+                    k += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         result.push(stmts[k].clone());
         k += 1;
     }
     result
+}
+
+/// True when `candidate` is the storage key `key` itself — exactly, or as the
+/// key's single vec element (`#[contracttype]` unit-variant keys arrive
+/// vec-wrapped as `Vec[Symbol]`, while the stale local may surface unwrapped).
+///
+/// A key containing `UnknownVal` never matches: two unknowns are not evidence
+/// of identity, and threading on that would fabricate a value equivalence.
+fn expr_is_stale_key(key: &SorobanExpr, candidate: &SorobanExpr) -> bool {
+    if expr_contains(key, &SorobanExpr::UnknownVal) {
+        return false;
+    }
+    if key == candidate {
+        return true;
+    }
+    matches!(key, SorobanExpr::VecConstruct(elems) if elems.len() == 1 && &elems[0] == candidate)
 }
 
 // ---------------------------------------------------------------------------
@@ -8196,6 +8262,103 @@ mod tests {
             recover_discarded_storage_get_into_consumer(valued).len(),
             2,
             "a require_auth whose target is already a value must not be touched"
+        );
+    }
+
+    #[test]
+    fn discarded_get_replaces_stale_key_return() {
+        cov_mark::check!(discarded_get_into_stale_key_return);
+        // The guard-arm getter idiom: `k = key(); if has(k) { k = get(k); br } trap`.
+        // The key register is not phi-merged out of the terminating arm, so the
+        // lift emits `Expr(get(&K)); Return(K)` — returning the storage KEY. The
+        // adjacency + key equality is the evidence the register was overwritten
+        // on the only live path: fold to `Return(get(&K))`.
+        let key = SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral("Admin".into())]);
+        let get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(key.clone()),
+            unwrap: true,
+        };
+        // The stale local may surface vec-wrapped or as the bare inner symbol.
+        for ret in [key, SorobanExpr::SymbolLiteral("Admin".into())] {
+            let stmts = vec![
+                SorobanStmt::Expr(get.clone()),
+                SorobanStmt::Return(Some(ret)),
+            ];
+            let out = recover_discarded_storage_get_into_consumer(stmts);
+            assert_eq!(out.len(), 1, "Expr(get) + Return(key) should fold into one");
+            match &out[0] {
+                SorobanStmt::Return(Some(v)) => {
+                    assert_eq!(v, &get, "the keyed load becomes the return value");
+                }
+                other => panic!("expected Return(get); got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn discarded_get_replaces_stale_key_auth_target() {
+        cov_mark::check!(discarded_get_into_stale_key_auth);
+        // The admin-auth idiom with a recovered key: `get(&Admin).unwrap()` is
+        // discarded and the auth target received the stale key symbol.
+        let key = SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral("Admin".into())]);
+        let get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(key),
+            unwrap: true,
+        };
+        let stmts = vec![
+            SorobanStmt::Expr(get.clone()),
+            SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(
+                SorobanExpr::SymbolLiteral("Admin".into()),
+            ))),
+        ];
+        let out = recover_discarded_storage_get_into_consumer(stmts);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            SorobanStmt::Expr(SorobanExpr::RequireAuth(target)) => assert_eq!(
+                **target, get,
+                "the keyed load becomes the require_auth target"
+            ),
+            other => panic!("expected Expr(RequireAuth(..)); got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discarded_get_stale_key_requires_evidence() {
+        // (a) A DIFFERENT key in return position is not evidence — left intact.
+        let get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral(
+                "Admin".into(),
+            )])),
+            unwrap: true,
+        };
+        let different = vec![
+            SorobanStmt::Expr(get.clone()),
+            SorobanStmt::Return(Some(SorobanExpr::SymbolLiteral("Other".into()))),
+        ];
+        assert_eq!(
+            recover_discarded_storage_get_into_consumer(different).len(),
+            2,
+            "a return of a different value must not be rewritten"
+        );
+
+        // (b) Two UnknownVals are NOT evidence of identity — a get with an
+        // unknown key never matches an unknown return.
+        let unknown_get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::UnknownVal),
+            unwrap: true,
+        };
+        let unknowns = vec![
+            SorobanStmt::Expr(unknown_get),
+            SorobanStmt::Return(Some(SorobanExpr::UnknownVal)),
+        ];
+        assert_eq!(
+            recover_discarded_storage_get_into_consumer(unknowns).len(),
+            2,
+            "unknown == unknown is not value-identity evidence"
         );
     }
 

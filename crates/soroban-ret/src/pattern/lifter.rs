@@ -1011,6 +1011,156 @@ impl<'a> LiftContext<'a> {
         true
     }
 
+    /// Fold a constant-selector call to a *DataKey dispatcher* — the SDK's
+    /// `DataKey::into_val` lowering for a multi-variant storage-key enum:
+    /// `(i64 selector, i64 payload…) -> i64 Val`, a `br_table` over the
+    /// selector where each arm builds its variant's key from linear-memory
+    /// strings (see the `DkEval` module comment for why structural matching
+    /// is unsafe here).
+    ///
+    /// The arm the constant selector picks is resolved by micro-evaluating
+    /// the dispatcher's real bytecode with payload args held abstract: the
+    /// symbol bytes come from the data section, the key shape from the actual
+    /// `vec_new_from_linear_memory` window — reconstruction by execution,
+    /// never by guessing. Anything unmodeled bails to normal inlining (an
+    /// honest `todo!`).
+    fn try_fold_datakey_dispatcher(&mut self, target_idx: u32, args: &[StackVal]) -> bool {
+        use crate::wasm::ir::WasmType;
+        let dbg = std::env::var("DBG_DK").is_ok();
+        if args.is_empty() {
+            return false;
+        }
+        let Some(ft) = self.wasm_module.get_func_type(target_idx) else {
+            return false;
+        };
+        if ft.results.as_slice() != [WasmType::I64]
+            || ft.params.is_empty()
+            || ft.params.iter().any(|p| *p != WasmType::I64)
+            || ft.params.len() != args.len()
+        {
+            return false;
+        }
+        // The selector must be a compile-time constant; payloads may be
+        // anything (they pass through the evaluator abstractly).
+        if !matches!(args[0], StackVal::I64(_)) {
+            if dbg {
+                eprintln!("[DBG_DK] func {target_idx}: selector not const: {:?}", args[0]);
+            }
+            return false;
+        }
+        if !is_datakey_dispatcher(self.wasm_module, target_idx) {
+            if dbg {
+                eprintln!("[DBG_DK] func {target_idx}: not a dispatcher (shape gate)");
+            }
+            return false;
+        }
+        let dk_args: Vec<DkVal> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| match a {
+                StackVal::I64(v) => DkVal::I64(*v),
+                _ => DkVal::Arg(i),
+            })
+            .collect();
+        let mut ev = DkEval {
+            module: self.wasm_module,
+            mem: HashMap::new(),
+            sp: DkVal::StackPtr(0),
+            steps: 0,
+        };
+        let Some(Some(result)) = ev.eval_call(target_idx, dk_args, 0) else {
+            if dbg {
+                eprintln!("[DBG_DK] func {target_idx}: eval bailed (selector {:?})", args[0]);
+            }
+            return false;
+        };
+        let Some(key) = self.dk_result_to_key_expr(&result, args) else {
+            if dbg {
+                eprintln!("[DBG_DK] func {target_idx}: result not a key: {result:?}");
+            }
+            return false;
+        };
+        if dbg {
+            eprintln!("[DBG_DK] func {target_idx}: FOLDED {:?} -> {key:?}", args[0]);
+        }
+        self.stack.push(StackVal::HostCallResult(Box::new(key)));
+        self.found_host_calls = true;
+        true
+    }
+
+    /// Convert a `DkEval` result into a storage-key expression. Accepts only
+    /// genuine key shapes: a `Symbol` Val, or a `Vec` headed by a `Symbol`
+    /// (the SDK vec-wraps unit variants too — `DataKey::Admin` ⇒
+    /// `Vec[Symbol("Admin")]`). Abstract `Arg(i)` elements (the payloads)
+    /// render through the caller's actual `StackVal`s — an unrecovered
+    /// payload stays an honest `todo!` *inside* the proven key shape.
+    fn dk_result_to_key_expr(&self, result: &DkVal, args: &[StackVal]) -> Option<SorobanExpr> {
+        let sym_of = |v: &DkVal| -> Option<String> {
+            match v {
+                DkVal::I64(raw) => {
+                    crate::wasm::data::DataSection::decode_symbol_val(*raw as u64)
+                }
+                DkVal::SymObj(name) => Some(name.clone()),
+                _ => None,
+            }
+        };
+        // A payload expression is embedded only when it is a plausible runtime
+        // key component. Error-tagged Vals are the SDK's conversion-failure
+        // sentinels — branch-sequential lifting leaves them in caller locals,
+        // and embedding one would fabricate a key payload. The variant name
+        // stays proven; the payload degrades to an honest `UnknownVal` hole.
+        let payload_or_hole = |ex: SorobanExpr| -> SorobanExpr {
+            match &ex {
+                SorobanExpr::ContractError { .. } | SorobanExpr::ErrorFromCode(_) => {
+                    SorobanExpr::UnknownVal
+                }
+                _ => ex,
+            }
+        };
+        match result {
+            DkVal::I64(_) | DkVal::SymObj(_) => Some(SorobanExpr::SymbolLiteral(sym_of(result)?)),
+            DkVal::VecVal(elems) => {
+                let (head, rest) = elems.split_first()?;
+                let mut out = vec![SorobanExpr::SymbolLiteral(sym_of(head)?)];
+                for e in rest {
+                    out.push(match e {
+                        DkVal::Arg(i) => payload_or_hole(stack_val_to_expr(
+                            args.get(*i)?,
+                            self.params,
+                            self.registry,
+                            Some(&self.frame_slots.borrow()),
+                        )),
+                        DkVal::I64(v) => {
+                            // Constant payload Val: only small-value tags are
+                            // plausible static key components (False/True and
+                            // the 4..=14 small range). Tag 3 is Error — the
+                            // ConversionError sentinel lands here.
+                            let tag = (*v as u64) & 0xff;
+                            if !matches!(tag, 0 | 1 | 4..=14) {
+                                SorobanExpr::UnknownVal
+                            } else {
+                                let ex = stack_val_to_expr(
+                                    &StackVal::I64(*v),
+                                    self.params,
+                                    self.registry,
+                                    None,
+                                );
+                                if matches!(ex, SorobanExpr::UnknownVal) {
+                                    return None;
+                                }
+                                ex
+                            }
+                        }
+                        DkVal::SymObj(n) => SorobanExpr::SymbolLiteral(n.clone()),
+                        _ => return None,
+                    });
+                }
+                Some(SorobanExpr::VecConstruct(out))
+            }
+            _ => None,
+        }
+    }
+
     /// A dynamic (loop-indexed) write `frame[base + coeff*i]` may land on any
     /// static slot whose offset is `>= base` and congruent to `base` modulo
     /// `coeff`. Since the analyzer doesn't know the loop bound, conservatively
@@ -1576,6 +1726,13 @@ impl<'a> LiftContext<'a> {
                     // rather than an immediate (the `did_key_construct` case above).
                     let did_key_construct = did_key_construct
                         || self.try_push_descriptor_key(*target_idx, first_arg_i32);
+
+                    // Immediate-selector DataKey *dispatcher*: `(i64 selector, …)
+                    // -> i64` br_table'ing over the selector (neither `(i32) ->
+                    // i64` case above matches it). A constant selector resolves
+                    // the key by micro-evaluating the dispatcher's own bytecode.
+                    let did_key_construct = did_key_construct
+                        || self.try_fold_datakey_dispatcher(*target_idx, &args);
 
                     // Sign-check-and-panic: functions like check_nonnegative_amount
                     // that compare a parameter against 0 and panic if negative.
@@ -7078,6 +7235,610 @@ fn func_reaches_host(
     func.body
         .iter()
         .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_host(module, *t, host_module, name, depth + 1)))
+}
+
+// ---------------------------------------------------------------------------
+// DataKey dispatcher folding (constant-selector micro-evaluation)
+// ---------------------------------------------------------------------------
+//
+// The SDK lowers `DataKey::into_val` for a multi-variant storage-key enum to a
+// *dispatcher*: `(i64 selector, i64 payload…) -> i64 Val` whose body
+// `br_table`s over the selector, each arm building its variant's key —
+// `Vec[Symbol]` for unit variants (the SDK vec-wraps those too),
+// `Vec[Symbol, payload]` for data variants — from linear-memory strings.
+// Inlining can't fold it (branch-sequential execution picks the wrong arm and
+// the key degrades to `UnknownVal`), and structural per-arm string extraction
+// is UNSAFE: arms permute through the `br_table`, and pointer locals are
+// preloaded/overridden across arms (Band's "Relayer" is preloaded before the
+// `br_table`, "RefData" overrides it in an arm), so body-order pairing
+// mis-assigns names to selectors.
+//
+// `DkEval` instead *executes* the dispatcher's real bytecode for the concrete
+// selector: symbol bytes come from the data section, the key shape from the
+// actual `vec_new_from_linear_memory` window. Payload args flow through
+// abstractly (`DkVal::Arg`) — pure moves only; any computation on them, any
+// unmodeled instruction, any runtime-dependent branch, or a non-key result
+// bails the whole fold so the call falls back to normal inlining (an honest
+// `todo!`, never a fabricated key).
+
+/// Hard step budget for one dispatcher evaluation (all interpreted calls included).
+const DK_MAX_STEPS: u32 = 4096;
+/// Max interpreted call depth below the dispatcher itself.
+const DK_MAX_CALL_DEPTH: u32 = 4;
+/// Max instructions in any single interpreted body.
+const DK_MAX_BODY: usize = 400;
+/// Max elements read out of a `vec_new_from_linear_memory` window.
+const DK_MAX_VEC: i32 = 8;
+
+/// Abstract value for the DataKey-dispatcher micro-evaluator.
+#[derive(Clone, Debug, PartialEq)]
+enum DkVal {
+    I32(i32),
+    I64(i64),
+    /// A shadow-stack address, relative to the stack pointer at dispatcher entry.
+    StackPtr(i32),
+    /// The dispatcher's `i`-th argument, passed through abstractly (payloads).
+    Arg(usize),
+    /// A long (>9 char) `Symbol` built via host `symbol_new_from_linear_memory`.
+    SymObj(String),
+    /// A `Vec` built via host `vec_new_from_linear_memory` from tracked slots.
+    VecVal(Vec<DkVal>),
+}
+
+/// One entered block during evaluation.
+#[derive(Clone)]
+struct DkFrame {
+    /// Index of the matching `End`.
+    end: usize,
+    /// Result arity of the block (0 or 1).
+    arity: usize,
+    /// Value-stack height at block entry.
+    height: usize,
+}
+
+/// Forward small-symbol codec — the exact inverse of
+/// `DataSection::decode_symbol_val`. Chars pack MSB-first as 6-bit codes
+/// (`_`=1, '0'..'9'=2..11, 'A'..'Z'=12..37, 'a'..'z'=38..63); the packed body
+/// shifts left 8 and tags `0x0e` (SymbolSmall).
+fn encode_symbol_small(name: &str) -> Option<i64> {
+    if name.is_empty() || name.len() > 9 {
+        return None;
+    }
+    let mut body: u64 = 0;
+    for c in name.chars() {
+        let code = match c {
+            '_' => 1u64,
+            '0'..='9' => 2 + (c as u64 - '0' as u64),
+            'A'..='Z' => 12 + (c as u64 - 'A' as u64),
+            'a'..='z' => 38 + (c as u64 - 'a' as u64),
+            _ => return None,
+        };
+        body = (body << 6) | code;
+    }
+    Some(((body << 8) | TAG_SYMBOL_SMALL) as i64)
+}
+
+/// Cheap shape gate for `try_fold_datakey_dispatcher`: an internal function
+/// whose body `br_table`s and transitively builds `Symbol`s from linear
+/// memory. Loops and indirect calls are out of model (the symbol encoder's
+/// own loop is handled by classification, never interpreted).
+fn is_datakey_dispatcher(module: &WasmModule, func_idx: u32) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    if module.imports.get_by_index(func_idx).is_some() {
+        return false;
+    }
+    let Some(func) = module.get_function(func_idx) else {
+        return false;
+    };
+    if func.body.len() > DK_MAX_BODY {
+        return false;
+    }
+    let mut has_br_table = false;
+    for ins in &func.body {
+        match ins {
+            WasmInstr::BrTable { .. } => has_br_table = true,
+            WasmInstr::Loop { .. } | WasmInstr::CallIndirect(_) => return false,
+            _ => {}
+        }
+    }
+    has_br_table && func_reaches_symbol_encoder(module, func_idx, 0)
+}
+
+/// For each `Block`/`If` in a flat body: instr index → (matching `End`, `Else`).
+/// An unmatched trailing `End` is the function terminator. Returns `None` on a
+/// malformed nesting (the fold then bails).
+fn dk_scan_blocks(
+    body: &[crate::wasm::ir::WasmInstr],
+) -> Option<HashMap<usize, (usize, Option<usize>)>> {
+    use crate::wasm::ir::WasmInstr;
+    let mut map = HashMap::new();
+    let mut open: Vec<(usize, Option<usize>)> = Vec::new();
+    for (i, ins) in body.iter().enumerate() {
+        match ins {
+            WasmInstr::Block { .. } | WasmInstr::Loop { .. } | WasmInstr::If { .. } => {
+                open.push((i, None));
+            }
+            WasmInstr::Else => open.last_mut()?.1 = Some(i),
+            WasmInstr::End => {
+                if let Some((start, els)) = open.pop() {
+                    map.insert(start, (i, els));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(map)
+}
+
+fn dk_block_arity(bt: &crate::wasm::ir::BlockType) -> Option<usize> {
+    use crate::wasm::ir::BlockType;
+    match bt {
+        BlockType::Empty => Some(0),
+        BlockType::Value(_) => Some(1),
+        BlockType::FuncType(_) => None,
+    }
+}
+
+fn dk_i32(v: &DkVal) -> Option<i32> {
+    match v {
+        DkVal::I32(x) => Some(*x),
+        _ => None,
+    }
+}
+
+fn dk_i64(v: &DkVal) -> Option<i64> {
+    match v {
+        DkVal::I64(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// Exit a block normally (its `End` reached): keep the block's results, drop
+/// anything between them and the entry height.
+fn dk_exit_block(stack: &mut Vec<DkVal>, fr: &DkFrame) -> Option<()> {
+    if stack.len() < fr.height + fr.arity {
+        return None;
+    }
+    let results = stack.split_off(stack.len() - fr.arity);
+    stack.truncate(fr.height);
+    stack.extend(results);
+    Some(())
+}
+
+/// Take a branch to label `depth`: unwind to that frame carrying its results,
+/// and resume after its `End`. (Loop frames cannot occur — bodies containing
+/// `Loop` are rejected before interpretation.)
+fn dk_branch(frames: &mut Vec<DkFrame>, stack: &mut Vec<DkVal>, depth: u32) -> Option<usize> {
+    let idx = frames.len().checked_sub(1 + depth as usize)?;
+    let fr = frames[idx].clone();
+    if stack.len() < fr.arity || stack.len() - fr.arity < fr.height {
+        return None;
+    }
+    let results = stack.split_off(stack.len() - fr.arity);
+    stack.truncate(fr.height);
+    stack.extend(results);
+    frames.truncate(idx);
+    Some(fr.end + 1)
+}
+
+/// Micro-evaluator state shared across the dispatcher and the small helpers it
+/// calls (validators, thin wrappers). The shadow stack pointer (global 0) and
+/// the shadow-stack memory persist across interpreted calls, exactly as at
+/// runtime.
+struct DkEval<'m> {
+    module: &'m WasmModule,
+    /// Shadow-stack cells: entry-SP-relative address → (value, store width).
+    /// Loads must match the stored width exactly — no partial aliasing.
+    mem: HashMap<i32, (DkVal, u32)>,
+    /// Global 0 (the shadow stack pointer).
+    sp: DkVal,
+    steps: u32,
+}
+
+impl DkEval<'_> {
+    fn store(&mut self, addr: i32, val: DkVal, width: u32) {
+        // Invalidate any overlapping cell so stale halves can never be re-read.
+        self.mem
+            .retain(|&a, &mut (_, w)| a + w as i32 <= addr || a >= addr + width as i32);
+        self.mem.insert(addr, (val, width));
+    }
+
+    fn load(&self, addr: &DkVal, offset: u32, width: u32) -> Option<DkVal> {
+        match addr {
+            DkVal::StackPtr(o) => {
+                let a = o.checked_add(offset as i32)?;
+                let (v, w) = self.mem.get(&a)?;
+                if *w != width {
+                    return None;
+                }
+                Some(v.clone())
+            }
+            // Static data reads (e.g. variant-name tables); never shadow-stack.
+            DkVal::I32(a) if *a > 1024 => {
+                let bytes = self
+                    .module
+                    .data_sections
+                    .read_bytes_zero_extended((*a as u32).checked_add(offset)?, width)?;
+                let mut v: u64 = 0;
+                for (i, b) in bytes.iter().enumerate() {
+                    v |= (*b as u64) << (8 * i);
+                }
+                Some(match width {
+                    8 => DkVal::I64(v as i64),
+                    _ => DkVal::I32(v as u32 as i32),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Handle a `call` inside an interpreted body: classify `(ptr, len) -> Val`
+    /// symbol/vec builders (computed from static data, never interpreted —
+    /// the symbol encoder contains a loop), otherwise recursively interpret.
+    /// Any direct host-import call is out of model.
+    fn handle_call(&mut self, target: u32, stack: &mut Vec<DkVal>, depth: u32) -> Option<()> {
+        use crate::wasm::ir::WasmType;
+        if self.module.imports.get_by_index(target).is_some() {
+            return None;
+        }
+        let ft = self.module.get_func_type(target)?;
+        let n = ft.params.len();
+        if stack.len() < n {
+            return None;
+        }
+        let args = stack.split_off(stack.len() - n);
+
+        if ft.params.as_slice() == [WasmType::I32, WasmType::I32]
+            && ft.results.as_slice() == [WasmType::I64]
+        {
+            let reaches_sym = func_reaches_symbol_encoder(self.module, target, 0);
+            let reaches_vec = func_reaches_host(
+                self.module,
+                target,
+                HostModule::Vec,
+                "vec_new_from_linear_memory",
+                0,
+            );
+            match (reaches_sym, reaches_vec) {
+                (true, false) => {
+                    // Symbol builder: read the real name from static data.
+                    let (DkVal::I32(ptr), DkVal::I32(len)) = (&args[0], &args[1]) else {
+                        return None;
+                    };
+                    if *ptr <= 1024 || *len <= 0 || *len > 32 {
+                        return None;
+                    }
+                    let name = self
+                        .module
+                        .data_sections
+                        .read_string(*ptr as u32, *len as u32)?;
+                    if name.is_empty()
+                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        return None;
+                    }
+                    stack.push(if name.len() <= 9 {
+                        DkVal::I64(encode_symbol_small(&name)?)
+                    } else {
+                        DkVal::SymObj(name)
+                    });
+                    return Some(());
+                }
+                (false, true) => {
+                    // Vec builder: collect the elements from the tracked window.
+                    let (DkVal::StackPtr(o), DkVal::I32(count)) = (&args[0], &args[1]) else {
+                        return None;
+                    };
+                    if *count <= 0 || *count > DK_MAX_VEC {
+                        return None;
+                    }
+                    let mut elems = Vec::new();
+                    for i in 0..*count {
+                        let (v, w) = self.mem.get(&(o.checked_add(8 * i)?))?;
+                        if *w != 8 {
+                            return None;
+                        }
+                        elems.push(v.clone());
+                    }
+                    stack.push(DkVal::VecVal(elems));
+                    return Some(());
+                }
+                (true, true) => return None,
+                (false, false) => {}
+            }
+        }
+
+        if let Some(v) = self.eval_call(target, args, depth + 1)? {
+            stack.push(v);
+        }
+        Some(())
+    }
+
+    /// Interpret one function body. Outer `None` = anything out of model
+    /// (bail the fold); inner value = the function's result (None for void).
+    fn eval_call(
+        &mut self,
+        func_idx: u32,
+        args: Vec<DkVal>,
+        depth: u32,
+    ) -> Option<Option<DkVal>> {
+        use crate::wasm::ir::{WasmInstr as WI, WasmType};
+        if depth > DK_MAX_CALL_DEPTH {
+            return None;
+        }
+        let func = self.module.get_function(func_idx)?;
+        if func.body.len() > DK_MAX_BODY
+            || func
+                .body
+                .iter()
+                .any(|i| matches!(i, WI::Loop { .. } | WI::CallIndirect(_)))
+        {
+            return None;
+        }
+        let ft = self.module.get_func_type(func_idx)?;
+        if ft.results.len() > 1 || args.len() != ft.params.len() {
+            return None;
+        }
+        let result_arity = ft.results.len();
+
+        let mut locals = args;
+        for ty in &func.locals {
+            locals.push(match ty {
+                WasmType::I32 => DkVal::I32(0),
+                WasmType::I64 => DkVal::I64(0),
+                _ => return None,
+            });
+        }
+
+        let ends = dk_scan_blocks(&func.body)?;
+        let mut stack: Vec<DkVal> = Vec::new();
+        let mut frames: Vec<DkFrame> = Vec::new();
+        let mut ip = 0usize;
+
+        macro_rules! bin_i32 {
+            ($f:expr) => {{
+                let b = dk_i32(&stack.pop()?)?;
+                let a = dk_i32(&stack.pop()?)?;
+                stack.push(DkVal::I32($f(a, b)));
+            }};
+        }
+        macro_rules! bin_i64 {
+            ($f:expr) => {{
+                let b = dk_i64(&stack.pop()?)?;
+                let a = dk_i64(&stack.pop()?)?;
+                stack.push(DkVal::I64($f(a, b)));
+            }};
+        }
+        macro_rules! cmp_i32 {
+            ($f:expr) => {{
+                let b = dk_i32(&stack.pop()?)?;
+                let a = dk_i32(&stack.pop()?)?;
+                stack.push(DkVal::I32($f(a, b) as i32));
+            }};
+        }
+        macro_rules! cmp_i64 {
+            ($f:expr) => {{
+                let b = dk_i64(&stack.pop()?)?;
+                let a = dk_i64(&stack.pop()?)?;
+                stack.push(DkVal::I32($f(a, b) as i32));
+            }};
+        }
+
+        loop {
+            self.steps += 1;
+            if self.steps > DK_MAX_STEPS {
+                return None;
+            }
+            let Some(ins) = func.body.get(ip) else {
+                break; // fell off the end = function return
+            };
+            match ins {
+                WI::I32Const(v) => stack.push(DkVal::I32(*v)),
+                WI::I64Const(v) => stack.push(DkVal::I64(*v)),
+                WI::LocalGet(n) => stack.push(locals.get(*n as usize)?.clone()),
+                WI::LocalSet(n) => *locals.get_mut(*n as usize)? = stack.pop()?,
+                WI::LocalTee(n) => {
+                    let v = stack.last()?.clone();
+                    *locals.get_mut(*n as usize)? = v;
+                }
+                WI::GlobalGet(0) => stack.push(self.sp.clone()),
+                WI::GlobalSet(0) => self.sp = stack.pop()?,
+                WI::Drop => {
+                    stack.pop()?;
+                }
+                WI::Select => {
+                    let c = dk_i32(&stack.pop()?)?;
+                    let b = stack.pop()?;
+                    let a = stack.pop()?;
+                    stack.push(if c != 0 { a } else { b });
+                }
+                WI::Nop => {}
+
+                // Pointer-aware i32 add/sub (shadow-stack frame arithmetic);
+                // everything else concrete-only.
+                WI::I32Add => {
+                    let b = stack.pop()?;
+                    let a = stack.pop()?;
+                    stack.push(match (a, b) {
+                        (DkVal::I32(x), DkVal::I32(y)) => DkVal::I32(x.wrapping_add(y)),
+                        (DkVal::StackPtr(o), DkVal::I32(k))
+                        | (DkVal::I32(k), DkVal::StackPtr(o)) => {
+                            DkVal::StackPtr(o.checked_add(k)?)
+                        }
+                        _ => return None,
+                    });
+                }
+                WI::I32Sub => {
+                    let b = stack.pop()?;
+                    let a = stack.pop()?;
+                    stack.push(match (a, b) {
+                        (DkVal::I32(x), DkVal::I32(y)) => DkVal::I32(x.wrapping_sub(y)),
+                        (DkVal::StackPtr(o), DkVal::I32(k)) => {
+                            DkVal::StackPtr(o.checked_sub(k)?)
+                        }
+                        _ => return None,
+                    });
+                }
+                WI::I32Mul => bin_i32!(|a: i32, b: i32| a.wrapping_mul(b)),
+                WI::I32And => bin_i32!(|a, b| a & b),
+                WI::I32Or => bin_i32!(|a, b| a | b),
+                WI::I32Xor => bin_i32!(|a, b| a ^ b),
+                WI::I32Shl => bin_i32!(|a: i32, b: i32| a.wrapping_shl(b as u32)),
+                WI::I32ShrU => bin_i32!(|a: i32, b: i32| ((a as u32) >> (b as u32 & 31)) as i32),
+                WI::I32ShrS => bin_i32!(|a: i32, b: i32| a.wrapping_shr(b as u32)),
+                WI::I64Add => bin_i64!(|a: i64, b: i64| a.wrapping_add(b)),
+                WI::I64Sub => bin_i64!(|a: i64, b: i64| a.wrapping_sub(b)),
+                WI::I64Mul => bin_i64!(|a: i64, b: i64| a.wrapping_mul(b)),
+                WI::I64And => bin_i64!(|a, b| a & b),
+                WI::I64Or => bin_i64!(|a, b| a | b),
+                WI::I64Xor => bin_i64!(|a, b| a ^ b),
+                WI::I64Shl => bin_i64!(|a: i64, b: i64| a.wrapping_shl(b as u32)),
+                WI::I64ShrU => bin_i64!(|a: i64, b: i64| ((a as u64) >> (b as u64 & 63)) as i64),
+                WI::I64ShrS => bin_i64!(|a: i64, b: i64| a.wrapping_shr(b as u32)),
+
+                WI::I32Eqz => {
+                    let a = dk_i32(&stack.pop()?)?;
+                    stack.push(DkVal::I32((a == 0) as i32));
+                }
+                WI::I64Eqz => {
+                    let a = dk_i64(&stack.pop()?)?;
+                    stack.push(DkVal::I32((a == 0) as i32));
+                }
+                WI::I32Eq => cmp_i32!(|a, b| a == b),
+                WI::I32Ne => cmp_i32!(|a, b| a != b),
+                WI::I32LtS => cmp_i32!(|a, b| a < b),
+                WI::I32LtU => cmp_i32!(|a: i32, b: i32| (a as u32) < (b as u32)),
+                WI::I32GtS => cmp_i32!(|a, b| a > b),
+                WI::I32GtU => cmp_i32!(|a: i32, b: i32| (a as u32) > (b as u32)),
+                WI::I32LeS => cmp_i32!(|a, b| a <= b),
+                WI::I32LeU => cmp_i32!(|a: i32, b: i32| (a as u32) <= (b as u32)),
+                WI::I32GeS => cmp_i32!(|a, b| a >= b),
+                WI::I32GeU => cmp_i32!(|a: i32, b: i32| (a as u32) >= (b as u32)),
+                WI::I64Eq => cmp_i64!(|a, b| a == b),
+                WI::I64Ne => cmp_i64!(|a, b| a != b),
+                WI::I64LtS => cmp_i64!(|a, b| a < b),
+                WI::I64LtU => cmp_i64!(|a: i64, b: i64| (a as u64) < (b as u64)),
+                WI::I64GtS => cmp_i64!(|a, b| a > b),
+                WI::I64GtU => cmp_i64!(|a: i64, b: i64| (a as u64) > (b as u64)),
+                WI::I64LeS => cmp_i64!(|a, b| a <= b),
+                WI::I64LeU => cmp_i64!(|a: i64, b: i64| (a as u64) <= (b as u64)),
+                WI::I64GeS => cmp_i64!(|a, b| a >= b),
+                WI::I64GeU => cmp_i64!(|a: i64, b: i64| (a as u64) >= (b as u64)),
+
+                WI::I32WrapI64 => {
+                    let a = dk_i64(&stack.pop()?)?;
+                    stack.push(DkVal::I32(a as i32));
+                }
+                WI::I64ExtendI32U => {
+                    let a = dk_i32(&stack.pop()?)?;
+                    stack.push(DkVal::I64(a as u32 as i64));
+                }
+                WI::I64ExtendI32S => {
+                    let a = dk_i32(&stack.pop()?)?;
+                    stack.push(DkVal::I64(a as i64));
+                }
+
+                WI::I32Load(off) => {
+                    let addr = stack.pop()?;
+                    stack.push(self.load(&addr, *off, 4)?);
+                }
+                WI::I64Load(off) => {
+                    let addr = stack.pop()?;
+                    stack.push(self.load(&addr, *off, 8)?);
+                }
+                WI::I32Load8U(off) => {
+                    let addr = stack.pop()?;
+                    stack.push(self.load(&addr, *off, 1)?);
+                }
+                WI::I32Store(off) => {
+                    let val = stack.pop()?;
+                    let DkVal::StackPtr(o) = stack.pop()? else {
+                        return None;
+                    };
+                    self.store(o.checked_add(*off as i32)?, val, 4);
+                }
+                WI::I64Store(off) => {
+                    let val = stack.pop()?;
+                    let DkVal::StackPtr(o) = stack.pop()? else {
+                        return None;
+                    };
+                    self.store(o.checked_add(*off as i32)?, val, 8);
+                }
+
+                WI::Block { block_type } => {
+                    let (end, _) = *ends.get(&ip)?;
+                    frames.push(DkFrame {
+                        end,
+                        arity: dk_block_arity(block_type)?,
+                        height: stack.len(),
+                    });
+                }
+                WI::If { block_type } => {
+                    let cond = dk_i32(&stack.pop()?)?;
+                    let (end, els) = *ends.get(&ip)?;
+                    let fr = DkFrame {
+                        end,
+                        arity: dk_block_arity(block_type)?,
+                        height: stack.len(),
+                    };
+                    if cond != 0 {
+                        frames.push(fr);
+                    } else if let Some(e) = els {
+                        frames.push(fr);
+                        ip = e + 1;
+                        continue;
+                    } else {
+                        ip = end + 1;
+                        continue;
+                    }
+                }
+                WI::Else => {
+                    // End of the taken then-branch: exit past the matching End.
+                    let fr = frames.pop()?;
+                    dk_exit_block(&mut stack, &fr)?;
+                    ip = fr.end + 1;
+                    continue;
+                }
+                WI::End => {
+                    if let Some(fr) = frames.pop() {
+                        dk_exit_block(&mut stack, &fr)?;
+                    } else {
+                        break; // function end
+                    }
+                }
+                WI::Br(d) => {
+                    ip = dk_branch(&mut frames, &mut stack, *d)?;
+                    continue;
+                }
+                WI::BrIf(d) => {
+                    let cond = dk_i32(&stack.pop()?)?;
+                    if cond != 0 {
+                        ip = dk_branch(&mut frames, &mut stack, *d)?;
+                        continue;
+                    }
+                }
+                WI::BrTable { targets, default } => {
+                    let idx = dk_i32(&stack.pop()?)? as u32 as usize;
+                    let d = targets.get(idx).copied().unwrap_or(*default);
+                    ip = dk_branch(&mut frames, &mut stack, d)?;
+                    continue;
+                }
+                WI::Return => break,
+                // A trapping path means the selector is invalid at runtime —
+                // nothing to recover.
+                WI::Unreachable => return None,
+                WI::Call(t) => self.handle_call(*t, &mut stack, depth)?,
+                _ => return None,
+            }
+            ip += 1;
+        }
+
+        if result_arity == 1 {
+            Some(Some(stack.pop()?))
+        } else {
+            Some(None)
+        }
+    }
 }
 
 /// Where an i128 soft-arith helper writes its result limbs relative to the output
@@ -13411,6 +14172,208 @@ mod tests {
         assert!(
             !is_symbol_from_lm_builder(&m, 3),
             "wrong signature is not a builder even if it reaches the encoder"
+        );
+    }
+
+    #[test]
+    fn encode_symbol_small_round_trips() {
+        // The forward codec must be the exact inverse of decode_symbol_val.
+        for name in ["Admin", "TTLConfig", "Relayer", "RefData", "_x0Zz9", "a"] {
+            let v = encode_symbol_small(name).unwrap_or_else(|| panic!("{name} encodes"));
+            assert_eq!(
+                crate::wasm::data::DataSection::decode_symbol_val(v as u64).as_deref(),
+                Some(name),
+                "decode(encode({name})) round-trips"
+            );
+        }
+        assert_eq!(encode_symbol_small(""), None, "empty never encodes");
+        assert_eq!(
+            encode_symbol_small("TenCharsXX"),
+            None,
+            ">9 chars is not a small symbol"
+        );
+        assert_eq!(encode_symbol_small("a-b"), None, "invalid char rejected");
+    }
+
+    /// A module mirroring Band's `DataKey::into_val` dispatcher (func 27),
+    /// including everything that defeats structural per-arm string pairing:
+    /// the `br_table` permutes selectors to arms, the "Relayer" pointer is
+    /// preloaded BEFORE the `br_table`, "RefData" overrides it inside an arm,
+    /// and the two data variants share one vec-packing tail.
+    /// Layout (same as Band): Admin@+0(5) TTLConfig@+5(9) Relayer@+14(7) RefData@+21(7).
+    fn datakey_dispatcher_module() -> crate::wasm::WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "v" "g" (func $hostvec (param i64 i64) (result i64)))
+                (memory 1)
+                (global $sp (mut i32) (i32.const 1048576))
+                (data (i32.const 1048768) "AdminTTLConfigRelayerRefData")
+                ;; small-symbol encoder stub: carries the 95/48/65/97 fingerprint.
+                ;; Classified by the string args, never interpreted.
+                (func $enc (param i32 i32) (result i64)
+                    i32.const 95 drop i32.const 48 drop
+                    i32.const 65 drop i32.const 97 drop
+                    i64.const 0)
+                ;; vec_new_from_linear_memory wrapper (classified, not interpreted)
+                (func $vecbuild (param i32 i32) (result i64)
+                    i64.const 0 i64.const 0 call $hostvec)
+                ;; validator: outptr[0] = 0, outptr[8] = Vec[val]  (Band func 31)
+                (func $validate (param i32 i64)
+                    (local i32)
+                    global.get $sp i32.const 16 i32.sub local.tee 2 global.set $sp
+                    local.get 2 local.get 1 i64.store offset=8
+                    local.get 0
+                    local.get 2 i32.const 8 i32.add i32.const 1 call $vecbuild
+                    i64.store offset=8
+                    local.get 0 i64.const 0 i64.store
+                    local.get 2 i32.const 16 i32.add global.set $sp)
+                ;; the dispatcher (Band func 27)
+                (func $disp (param i64 i64) (result i64)
+                    (local i32 i32 i32)
+                    global.get $sp i32.const 48 i32.sub local.tee 2 global.set $sp
+                    i32.const 1048782 local.set 3      ;; preload "Relayer"
+                    block (result i64)
+                      block
+                        block
+                          block
+                            block
+                              block
+                                local.get 0
+                                i32.wrap_i64
+                                i32.const 1
+                                i32.sub
+                                br_table 0 4 3 1
+                              end
+                              ;; sel==1 -> unit "TTLConfig"
+                              local.get 2 i32.const 16 i32.add
+                              i32.const 1048773 i32.const 9 call $enc
+                              call $validate
+                              local.get 2 i64.load offset=16 i32.wrap_i64 br_if 1
+                              local.get 2 i64.load offset=24
+                              br 4
+                            end
+                            ;; default (sel==0 or >=4) -> unit "Admin"
+                            local.get 2
+                            i32.const 1048768 i32.const 5 call $enc
+                            call $validate
+                            local.get 2 i64.load i32.wrap_i64 br_if 0
+                            local.get 2 i64.load offset=8
+                            br 3
+                          end
+                          unreachable
+                        end
+                        ;; sel==3 -> override pointer to "RefData"
+                        i32.const 1048789 local.set 3
+                      end
+                      ;; shared data-variant tail: Vec[Symbol(ptr,7), payload]
+                      local.get 3 i32.const 7 call $enc
+                      local.set 0
+                      global.get $sp i32.const 16 i32.sub local.tee 3 global.set $sp
+                      local.get 3 local.get 1 i64.store offset=8
+                      local.get 3 local.get 0 i64.store
+                      local.get 2 i32.const 32 i32.add local.tee 4
+                      local.get 3 i32.const 2 call $vecbuild
+                      i64.store offset=8
+                      local.get 4 i64.const 0 i64.store
+                      local.get 3 i32.const 16 i32.add global.set $sp
+                      local.get 2 i64.load offset=40
+                    end
+                    local.get 2 i32.const 48 i32.add global.set $sp)
+                ;; same-signature decoy with a br_table but no symbol encoder
+                (func $decoy (param i64 i64) (result i64)
+                    block
+                      block
+                        local.get 0 i32.wrap_i64 br_table 0 1
+                      end
+                    end
+                    i64.const 14)
+                ;; loop-carrying variant: out of model even though it reaches $enc
+                (func $loopy (param i64 i64) (result i64)
+                    loop
+                      nop
+                    end
+                    block
+                      block
+                        local.get 0 i32.wrap_i64 br_table 0 1
+                      end
+                    end
+                    i32.const 1048768 i32.const 5 call $enc))
+            "#,
+        )
+        .expect("wat parses");
+        crate::wasm::WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn datakey_dispatcher_folds_by_execution() {
+        let m = datakey_dispatcher_module();
+        let (disp, decoy, loopy) = (4u32, 5u32, 6u32);
+
+        assert!(
+            is_datakey_dispatcher(&m, disp),
+            "the Band-shaped dispatcher classifies"
+        );
+        assert!(
+            !is_datakey_dispatcher(&m, decoy),
+            "a br_table func that never builds symbols is not a dispatcher"
+        );
+        assert!(
+            !is_datakey_dispatcher(&m, loopy),
+            "a loop-carrying body is out of model"
+        );
+
+        let eval = |sel: DkVal, payload: DkVal| {
+            let mut ev = DkEval {
+                module: &m,
+                mem: HashMap::new(),
+                sp: DkVal::StackPtr(0),
+                steps: 0,
+            };
+            ev.eval_call(disp, vec![sel, payload], 0)
+        };
+        let sym = |v: &DkVal| match v {
+            DkVal::I64(raw) => crate::wasm::data::DataSection::decode_symbol_val(*raw as u64),
+            _ => None,
+        };
+
+        // The EXECUTED selector→variant mapping. Body order is
+        // TTLConfig→Admin→RefData→Relayer-tail; naive body-order pairing
+        // would mis-assign every one of these.
+        let unit = |sel: i64, want: &str| {
+            let r = eval(DkVal::I64(sel), DkVal::I64(0));
+            let Some(Some(DkVal::VecVal(elems))) = r else {
+                panic!("selector {sel} should evaluate to a vec key; got {r:?}");
+            };
+            assert_eq!(elems.len(), 1, "unit variant is a 1-element vec");
+            assert_eq!(sym(&elems[0]).as_deref(), Some(want), "selector {sel}");
+        };
+        unit(0, "Admin");
+        unit(1, "TTLConfig");
+        // Out-of-range selectors take the br_table default — the bytecode's
+        // own semantics.
+        unit(9, "Admin");
+
+        let data = |sel: i64, want: &str| {
+            let r = eval(DkVal::I64(sel), DkVal::Arg(1));
+            let Some(Some(DkVal::VecVal(elems))) = r else {
+                panic!("selector {sel} should evaluate to a vec key; got {r:?}");
+            };
+            assert_eq!(elems.len(), 2, "data variant is [Symbol, payload]");
+            assert_eq!(sym(&elems[0]).as_deref(), Some(want), "selector {sel}");
+            assert_eq!(
+                elems[1],
+                DkVal::Arg(1),
+                "the abstract payload passes through untouched"
+            );
+        };
+        data(2, "Relayer");
+        data(3, "RefData");
+
+        // A non-constant selector cannot pick a br_table arm — bail, never guess.
+        assert_eq!(
+            eval(DkVal::Arg(0), DkVal::Arg(1)),
+            None,
+            "runtime selector is honestly unrecoverable"
         );
     }
 
