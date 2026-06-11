@@ -1,11 +1,11 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 90.4,
+  "overall_restoration": 92.5,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
       "entity": "Aqua AMM",
-      "restoration_pct": 95.2,
+      "restoration_pct": 95.0,
       "spec_functions": 75,
       "fn_clean": 21,
       "fn_partial": 54,
@@ -29,24 +29,24 @@
     {
       "file": "arb-bot-contract-CCBVCCNP.wasm",
       "entity": "ARB Bot Contract",
-      "restoration_pct": 86.7,
+      "restoration_pct": 94.7,
       "spec_functions": 5,
-      "fn_clean": 1,
-      "fn_partial": 4,
+      "fn_clean": 3,
+      "fn_partial": 2,
       "fn_logic_lost": 0,
-      "artifacts_total": 15,
+      "artifacts_total": 12,
       "wasm_size": 7083,
       "error": null
     },
     {
       "file": "band-protocol-CCQXWMZV.wasm",
       "entity": "Band Protocol",
-      "restoration_pct": 73.9,
+      "restoration_pct": 87.8,
       "spec_functions": 15,
-      "fn_clean": 1,
-      "fn_partial": 14,
+      "fn_clean": 4,
+      "fn_partial": 11,
       "fn_logic_lost": 0,
-      "artifacts_total": 145,
+      "artifacts_total": 105,
       "wasm_size": 13616,
       "error": null
     },
@@ -113,7 +113,7 @@
     {
       "file": "comet-blnd-usdc-amm-CAS3FL6T.wasm",
       "entity": "Comet BLND-USDC AMM",
-      "restoration_pct": 96.9,
+      "restoration_pct": 96.7,
       "spec_functions": 30,
       "fn_clean": 16,
       "fn_partial": 14,
@@ -137,7 +137,7 @@
     {
       "file": "fxdao-liquidity-locking-pool-CDCART6W.wasm",
       "entity": "FxDAO Liquidity locking pool",
-      "restoration_pct": 82.8,
+      "restoration_pct": 82.4,
       "spec_functions": 12,
       "fn_clean": 0,
       "fn_partial": 12,
@@ -161,7 +161,7 @@
     {
       "file": "fxdao-vault-CCUN4RXU.wasm",
       "entity": "FxDAO Vault",
-      "restoration_pct": 89.7,
+      "restoration_pct": 89.0,
       "spec_functions": 2,
       "fn_clean": 0,
       "fn_partial": 2,
@@ -185,7 +185,7 @@
     {
       "file": "phoenix-amm-CCLZRD4E.wasm",
       "entity": "Phoenix AMM",
-      "restoration_pct": 93.8,
+      "restoration_pct": 93.4,
       "spec_functions": 12,
       "fn_clean": 7,
       "fn_partial": 5,
@@ -221,7 +221,7 @@
     {
       "file": "soroban-domains-CATRNPHY.wasm",
       "entity": "Soroban Domains",
-      "restoration_pct": 90.8,
+      "restoration_pct": 90.5,
       "spec_functions": 15,
       "fn_clean": 3,
       "fn_partial": 12,
@@ -233,7 +233,7 @@
     {
       "file": "soroswap-CA4HEQTL.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 91.0,
+      "restoration_pct": 90.8,
       "spec_functions": 12,
       "fn_clean": 3,
       "fn_partial": 9,
@@ -245,12 +245,12 @@
     {
       "file": "soroswap-CAG5LRYQ.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 55.9,
+      "restoration_pct": 85.9,
       "spec_functions": 20,
-      "fn_clean": 2,
+      "fn_clean": 8,
       "fn_partial": 11,
-      "fn_logic_lost": 7,
-      "artifacts_total": 106,
+      "fn_logic_lost": 1,
+      "artifacts_total": 90,
       "wasm_size": 34253,
       "error": null
     },

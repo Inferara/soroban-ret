@@ -762,23 +762,45 @@ impl<'a> LiftContext<'a> {
         let result_expr = match intr.op {
             I128Op::Mul => SorobanExpr::Mul(Box::new(a_expr), Box::new(b_expr)),
             I128Op::Div => SorobanExpr::Div(Box::new(a_expr), Box::new(b_expr)),
+            // `a / b + (a % b != 0) as i128`: truncating quotient plus 1 when the
+            // division is inexact (the round-up wrapper's verified semantics).
+            I128Op::DivCeil => SorobanExpr::Add(
+                Box::new(SorobanExpr::Div(
+                    Box::new(a_expr.clone()),
+                    Box::new(b_expr.clone()),
+                )),
+                Box::new(SorobanExpr::CastAs {
+                    value: Box::new(SorobanExpr::Ne(
+                        Box::new(SorobanExpr::Rem(Box::new(a_expr), Box::new(b_expr))),
+                        Box::new(SorobanExpr::I128Literal(0)),
+                    )),
+                    target_type: "i128".to_string(),
+                }),
+            ),
         };
         let result = StackVal::HostCallResult(Box::new(result_expr));
-        // Write the result back to every result-pointer frame slot, as a limb pair.
+        // Write the result back to every result-pointer frame slot, as a limb pair,
+        // at the helper's own result layout (`intr.res_*_off`): unchecked helpers
+        // write `{lo@0, hi@8}`; checked `Result<i128,E>` helpers write `{lo@8, hi@16}`
+        // with the success/Err discriminant at `+0`. The discriminant slot is left
+        // unmodeled (Unknown) on purpose — its success polarity is inconsistent
+        // across helpers (some write `0` on Ok, some `1`); an Unknown branch
+        // condition is resolved by `fold_checked_result_branch` selecting the
+        // value-producing arm, so we recover the value without guessing the polarity.
         for arg in args {
             if let StackVal::FrameSlot(id, base) = arg
                 && base.is_static()
             {
                 let mut slots = self.frame_slots.borrow_mut();
                 slots.insert(
-                    (*id, base.base),
+                    (*id, base.base + intr.res_lo_off),
                     StackVal::I128Limb {
                         value: Box::new(result.clone()),
                         hi: false,
                     },
                 );
                 slots.insert(
-                    (*id, base.base + 8),
+                    (*id, base.base + intr.res_hi_off),
                     StackVal::I128Limb {
                         value: Box::new(result.clone()),
                         hi: true,
@@ -786,6 +808,106 @@ impl<'a> LiftContext<'a> {
                 );
             }
         }
+        self.found_host_calls = true;
+        Some(true)
+    }
+
+    /// Reconstruct a fully-clean i128 from the two result-limb slots at
+    /// `(id, base+lo_off)` / `(base+hi_off)` as a clean-arith expression, or `None`
+    /// if a slot is missing or the value isn't fully recovered. Accepts not only a
+    /// direct `I128Limb` pair but also an open-coded add/sub of recovered limbs (via
+    /// `reconstruct_i128_operand`) — e.g. the `+ 1` Soroswap's `get_amount_in`
+    /// applies to its rounded quotient before storing the result.
+    fn recover_clean_i128(
+        &self,
+        id: u32,
+        base: i32,
+        lo_off: i32,
+        hi_off: i32,
+    ) -> Option<SorobanExpr> {
+        let (lo, hi) = {
+            let slots = self.frame_slots.borrow();
+            (
+                slots.get(&(id, base + lo_off))?.clone(),
+                slots.get(&(id, base + hi_off))?.clone(),
+            )
+        };
+        let (val, clean) = reconstruct_i128_operand(&lo, &hi)?;
+        if !clean {
+            return None;
+        }
+        let expr = {
+            let slots = self.frame_slots.borrow();
+            stack_val_to_expr(&val, self.params, self.registry, Some(&slots))
+        };
+        expr_is_clean_arith(&expr).then_some(expr)
+    }
+
+    /// If the i128 result limbs at `(id, base)` are fully recovered to a clean
+    /// arithmetic value (no `UnknownVal`), return their `(lo_off, hi_off)`. Checks
+    /// both the unchecked (`lo@0, hi@8`) and checked (`lo@8, hi@16`) result layouts;
+    /// `None` if neither is clean. Gate for the checked-arith husk drop.
+    fn clean_i128_result_layout(&self, id: u32, base: i32) -> Option<(i32, i32)> {
+        if self.recover_clean_i128(id, base, 8, 16).is_some() {
+            Some((8, 16))
+        } else if self.recover_clean_i128(id, base, 0, 8).is_some() {
+            Some((0, 8))
+        } else {
+            None
+        }
+    }
+
+    /// Recognize the SDK `Result<i128,E>::unwrap`-and-pack helper and return the
+    /// recovered i128 value directly, instead of inlining its multi-level
+    /// discriminant-check + `obj_from_i128_pieces` chain (which underflows to
+    /// `todo!` four or five inline levels deep). The helper `(i32 ptr, ..) -> i64`
+    /// reads a `Result<i128,E>` at `ptr` (disc@0, value@8/16) and returns the value
+    /// packed as a host `Val`, panicking on `Err`; it is identified by transitively
+    /// reaching `obj_from_i128_pieces`. When `ptr` is a frame slot already holding a
+    /// fully-recovered i128 — left there by a checked-arith composite whose husks
+    /// were dropped — return that value. Faithful: the happy-path result, with the
+    /// unwrap's `Err` panic dropped, and gated on a clean i128 so it can only fire
+    /// when the value was genuinely reconstructed.
+    fn try_lower_result_unwrap_pack(
+        &mut self,
+        target_idx: u32,
+        args: &[StackVal],
+        num_results: usize,
+    ) -> Option<bool> {
+        use crate::wasm::ir::WasmType;
+        if num_results != 1 {
+            return None;
+        }
+        let ft = self.wasm_module.get_func_type(target_idx)?;
+        if ft.params.first() != Some(&WasmType::I32) || ft.results.as_slice() != [WasmType::I64] {
+            return None;
+        }
+        if !(func_reaches_host(
+            self.wasm_module,
+            target_idx,
+            HostModule::Int,
+            "obj_from_i128_pieces",
+            0,
+        ) || func_reaches_host(
+            self.wasm_module,
+            target_idx,
+            HostModule::Int,
+            "obj_from_u128_pieces",
+            0,
+        )) {
+            return None;
+        }
+        let StackVal::FrameSlot(id, base) = args.first()? else {
+            return None;
+        };
+        if !base.is_static() {
+            return None;
+        }
+        let (id, base) = (*id, base.base);
+        // The Result's i128 value lives at ptr+8 / ptr+16 (after the discriminant
+        // at +0). Only fire when both limbs reconstruct to a fully-recovered i128.
+        let value = self.recover_clean_i128(id, base, 8, 16)?;
+        self.stack.push(StackVal::HostCallResult(Box::new(value)));
         self.found_host_calls = true;
         Some(true)
     }
@@ -893,6 +1015,163 @@ impl<'a> LiftContext<'a> {
             SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral(name.clone())]),
         )));
         true
+    }
+
+    /// Fold a constant-selector call to a *DataKey dispatcher* — the SDK's
+    /// `DataKey::into_val` lowering for a multi-variant storage-key enum:
+    /// `(i64 selector, i64 payload…) -> i64 Val`, a `br_table` over the
+    /// selector where each arm builds its variant's key from linear-memory
+    /// strings (see the `DkEval` module comment for why structural matching
+    /// is unsafe here).
+    ///
+    /// The arm the constant selector picks is resolved by micro-evaluating
+    /// the dispatcher's real bytecode with payload args held abstract: the
+    /// symbol bytes come from the data section, the key shape from the actual
+    /// `vec_new_from_linear_memory` window — reconstruction by execution,
+    /// never by guessing. Anything unmodeled bails to normal inlining (an
+    /// honest `todo!`).
+    fn try_fold_datakey_dispatcher(&mut self, target_idx: u32, args: &[StackVal]) -> bool {
+        use crate::wasm::ir::WasmType;
+        let dbg = std::env::var("DBG_DK").is_ok();
+        if args.is_empty() {
+            return false;
+        }
+        let Some(ft) = self.wasm_module.get_func_type(target_idx) else {
+            return false;
+        };
+        if ft.results.as_slice() != [WasmType::I64]
+            || ft.params.is_empty()
+            || ft.params.iter().any(|p| *p != WasmType::I64)
+            || ft.params.len() != args.len()
+        {
+            return false;
+        }
+        // The selector must be a compile-time constant; payloads may be
+        // anything (they pass through the evaluator abstractly).
+        if !matches!(args[0], StackVal::I64(_)) {
+            if dbg {
+                eprintln!(
+                    "[DBG_DK] func {target_idx}: selector not const: {:?}",
+                    args[0]
+                );
+            }
+            return false;
+        }
+        if !is_datakey_dispatcher(self.wasm_module, target_idx) {
+            if dbg {
+                eprintln!("[DBG_DK] func {target_idx}: not a dispatcher (shape gate)");
+            }
+            return false;
+        }
+        let dk_args: Vec<DkVal> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| match a {
+                StackVal::I64(v) => DkVal::I64(*v),
+                _ => DkVal::Arg(i),
+            })
+            .collect();
+        let mut ev = DkEval {
+            module: self.wasm_module,
+            mem: HashMap::new(),
+            sp: DkVal::StackPtr(0),
+            steps: 0,
+        };
+        let Some(Some(result)) = ev.eval_call(target_idx, dk_args, 0) else {
+            if dbg {
+                eprintln!(
+                    "[DBG_DK] func {target_idx}: eval bailed (selector {:?})",
+                    args[0]
+                );
+            }
+            return false;
+        };
+        let Some(key) = self.dk_result_to_key_expr(&result, args) else {
+            if dbg {
+                eprintln!("[DBG_DK] func {target_idx}: result not a key: {result:?}");
+            }
+            return false;
+        };
+        if dbg {
+            eprintln!(
+                "[DBG_DK] func {target_idx}: FOLDED {:?} -> {key:?}",
+                args[0]
+            );
+        }
+        self.stack.push(StackVal::HostCallResult(Box::new(key)));
+        self.found_host_calls = true;
+        true
+    }
+
+    /// Convert a `DkEval` result into a storage-key expression. Accepts only
+    /// genuine key shapes: a `Symbol` Val, or a `Vec` headed by a `Symbol`
+    /// (the SDK vec-wraps unit variants too — `DataKey::Admin` ⇒
+    /// `Vec[Symbol("Admin")]`). Abstract `Arg(i)` elements (the payloads)
+    /// render through the caller's actual `StackVal`s — an unrecovered
+    /// payload stays an honest `todo!` *inside* the proven key shape.
+    fn dk_result_to_key_expr(&self, result: &DkVal, args: &[StackVal]) -> Option<SorobanExpr> {
+        let sym_of = |v: &DkVal| -> Option<String> {
+            match v {
+                DkVal::I64(raw) => crate::wasm::data::DataSection::decode_symbol_val(*raw as u64),
+                DkVal::SymObj(name) => Some(name.clone()),
+                _ => None,
+            }
+        };
+        // A payload expression is embedded only when it is a plausible runtime
+        // key component. Error-tagged Vals are the SDK's conversion-failure
+        // sentinels — branch-sequential lifting leaves them in caller locals,
+        // and embedding one would fabricate a key payload. The variant name
+        // stays proven; the payload degrades to an honest `UnknownVal` hole.
+        let payload_or_hole = |ex: SorobanExpr| -> SorobanExpr {
+            match &ex {
+                SorobanExpr::ContractError { .. } | SorobanExpr::ErrorFromCode(_) => {
+                    SorobanExpr::UnknownVal
+                }
+                _ => ex,
+            }
+        };
+        match result {
+            DkVal::I64(_) | DkVal::SymObj(_) => Some(SorobanExpr::SymbolLiteral(sym_of(result)?)),
+            DkVal::VecVal(elems) => {
+                let (head, rest) = elems.split_first()?;
+                let mut out = vec![SorobanExpr::SymbolLiteral(sym_of(head)?)];
+                for e in rest {
+                    out.push(match e {
+                        DkVal::Arg(i) => payload_or_hole(stack_val_to_expr(
+                            args.get(*i)?,
+                            self.params,
+                            self.registry,
+                            Some(&self.frame_slots.borrow()),
+                        )),
+                        DkVal::I64(v) => {
+                            // Constant payload Val: only small-value tags are
+                            // plausible static key components (False/True and
+                            // the 4..=14 small range). Tag 3 is Error — the
+                            // ConversionError sentinel lands here.
+                            let tag = (*v as u64) & 0xff;
+                            if !matches!(tag, 0 | 1 | 4..=14) {
+                                SorobanExpr::UnknownVal
+                            } else {
+                                let ex = stack_val_to_expr(
+                                    &StackVal::I64(*v),
+                                    self.params,
+                                    self.registry,
+                                    None,
+                                );
+                                if matches!(ex, SorobanExpr::UnknownVal) {
+                                    return None;
+                                }
+                                ex
+                            }
+                        }
+                        DkVal::SymObj(n) => SorobanExpr::SymbolLiteral(n.clone()),
+                        _ => return None,
+                    });
+                }
+                Some(SorobanExpr::VecConstruct(out))
+            }
+            _ => None,
+        }
     }
 
     /// A dynamic (loop-indexed) write `frame[base + coeff*i]` may land on any
@@ -1460,6 +1739,13 @@ impl<'a> LiftContext<'a> {
                     // rather than an immediate (the `did_key_construct` case above).
                     let did_key_construct = did_key_construct
                         || self.try_push_descriptor_key(*target_idx, first_arg_i32);
+
+                    // Immediate-selector DataKey *dispatcher*: `(i64 selector, …)
+                    // -> i64` br_table'ing over the selector (neither `(i32) ->
+                    // i64` case above matches it). A constant selector resolves
+                    // the key by micro-evaluating the dispatcher's own bytecode.
+                    let did_key_construct =
+                        did_key_construct || self.try_fold_datakey_dispatcher(*target_idx, &args);
 
                     // Sign-check-and-panic: functions like check_nonnegative_amount
                     // that compare a parameter against 0 and panic if negative.
@@ -2298,6 +2584,14 @@ impl<'a> LiftContext<'a> {
                             // of inlining into limb-soup `todo!`s.
                             handled
                         } else if let Some(handled) =
+                            self.try_lower_result_unwrap_pack(*target_idx, &args, num_results)
+                        {
+                            // `Result<i128,E>::unwrap`-and-pack helper consuming a
+                            // frame slot that already holds a reconstructed i128
+                            // (from a checked-arith composite): return that value
+                            // directly instead of inlining the deep unwrap chain.
+                            handled
+                        } else if let Some(handled) =
                             self.try_lower_symbol_builder(*target_idx, &args)
                         {
                             // `Symbol::new(&env, "literal")` builder whose encoder sits
@@ -2397,7 +2691,39 @@ impl<'a> LiftContext<'a> {
                                 self.seed_sret_success_status(id, base, *target_idx);
                             }
                             if let Some((inlined_stmts, return_expr)) = inline_result.content {
-                                self.stmts.extend(inlined_stmts);
+                                // Checked-arith composite husk drop (all-or-nothing): a void
+                                // helper (e.g. Soroswap's `quote`/`get_amount_*` checked-i128
+                                // math) whose only meaningful effect is the i128 result it left
+                                // in the output frame slot, and whose inlined body is pure
+                                // arithmetic + error-path husks (Result-discriminant guards,
+                                // overflow panics — no storage/event/auth/invoke side effects),
+                                // faithfully reduces to just that value. Drop the husks so the
+                                // caller's pack/return reads a clean expression instead of a
+                                // control-flow-soup body. Fires only when the result slot holds
+                                // a fully-recovered i128 (no `UnknownVal`) AND nothing real was
+                                // dropped, so it can never emit a misleading partial.
+                                let result_layout = output_frame_slot
+                                    .filter(|_| num_results == 0)
+                                    .and_then(|(id, base)| self.clean_i128_result_layout(id, base));
+                                let dropped_husks = result_layout.is_some()
+                                    && stmts_are_pure_arith_husks(&inlined_stmts);
+                                if dropped_husks {
+                                    // For the checked `Result<i128,E>` layout, seed the
+                                    // output discriminant `Ok(0)` so the consuming
+                                    // `Result::unwrap` (e.g. Soroswap's `call 98`) folds
+                                    // to its value-producing arm instead of emitting the
+                                    // Err husk. The composite writes `0` on success, which
+                                    // matches the unwrap's `if disc != 0 { Err }` guard.
+                                    if let (Some((id, base)), Some((8, _))) =
+                                        (output_frame_slot, result_layout)
+                                    {
+                                        self.frame_slots
+                                            .borrow_mut()
+                                            .insert((id, base), StackVal::I64(0));
+                                    }
+                                } else {
+                                    self.stmts.extend(inlined_stmts);
+                                }
                                 if num_results > 0 {
                                     let rv = return_expr
                                         .map(|e| StackVal::HostCallResult(Box::new(e)))
@@ -6135,9 +6461,237 @@ fn lift_function_body(
         }
     }
 
+    // All-or-nothing for value-returning reconstructions: when no return value was
+    // recovered anywhere — no `Return(Some)` and no value-producing tail — the body
+    // is an incomplete reconstruction (a validation-guard / husk shell whose real
+    // result was lost, e.g. a checked-i128 library fn whose arithmetic didn't fully
+    // compose). Such a body can't type-check as the value-returning function it
+    // belongs to, and the reference-free metric would score it as clean. Emit an
+    // honest stub (empty body → `todo!`) instead of the misleading partial.
     LiftBodyResult {
         stmts: ctx.stmts,
         found_host_calls,
+    }
+}
+
+/// True if the whole body is validation-guard panics with no value-producing
+/// statement — every statement is either a bare `panic!()`/`panic_with_error!()`
+/// or an `if cond { <panic-guard> }` with an empty `else` — **and at least one is
+/// an `if` guard**. A value-returning function with such a body has no return
+/// path; it is the misleading shell a checked-i128 library function collapses to
+/// when its arithmetic didn't compose (`if amount_in != 0 { panic!() }`). The
+/// `if`-guard requirement excludes a lone `{ panic!() }` body, which compiles
+/// (a diverging getter), so this only touches the partials we introduce, not
+/// pre-existing bare-panic reconstructions.
+pub(crate) fn is_panic_guard_shell(stmts: &[SorobanStmt]) -> bool {
+    !stmts.is_empty()
+        && stmts.iter().all(stmt_is_panic_guard)
+        && stmts.iter().any(|s| matches!(s, SorobanStmt::If { .. }))
+}
+
+fn stmt_is_panic_guard(stmt: &SorobanStmt) -> bool {
+    match stmt {
+        SorobanStmt::Expr(SorobanExpr::Panic | SorobanExpr::PanicWithError(_)) => true,
+        SorobanStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            else_body.is_empty()
+                && !then_body.is_empty()
+                && then_body.iter().all(stmt_is_panic_guard)
+        }
+        _ => false,
+    }
+}
+
+/// True if any statement (transitively) contains an unrecovered marker —
+/// `UnknownVal` / `CyclicSlot` / `RawHostCall`, each of which renders as a
+/// `todo!`. Used to keep the all-or-nothing stub from touching honest partials.
+pub(crate) fn stmts_contain_unknown(stmts: &[SorobanStmt]) -> bool {
+    stmts.iter().any(stmt_contains_unknown)
+}
+
+fn stmt_contains_unknown(stmt: &SorobanStmt) -> bool {
+    match stmt {
+        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => expr_contains_unknown(e),
+        SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+            expr_contains_unknown(value)
+        }
+        SorobanStmt::Return(None)
+        | SorobanStmt::Break
+        | SorobanStmt::Continue
+        | SorobanStmt::Comment(_) => false,
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            expr_contains_unknown(condition)
+                || stmts_contain_unknown(then_body)
+                || stmts_contain_unknown(else_body)
+        }
+        SorobanStmt::Match { scrutinee, arms } => {
+            expr_contains_unknown(scrutinee) || arms.iter().any(|a| stmts_contain_unknown(&a.body))
+        }
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => stmts_contain_unknown(body),
+        SorobanStmt::For {
+            start, end, body, ..
+        } => {
+            expr_contains_unknown(start)
+                || expr_contains_unknown(end)
+                || stmts_contain_unknown(body)
+        }
+    }
+}
+
+/// True if `expr` (transitively) contains an unrecovered marker. Exhaustive on
+/// purpose so a new `SorobanExpr` variant forces a decision here rather than
+/// silently reading as "clean".
+fn expr_contains_unknown(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::UnknownVal
+        | SorobanExpr::CyclicSlot { .. }
+        | SorobanExpr::RawHostCall { .. } => true,
+        // Leaves with no expression children.
+        SorobanExpr::U32Literal(_)
+        | SorobanExpr::I32Literal(_)
+        | SorobanExpr::U64Literal(_)
+        | SorobanExpr::I64Literal(_)
+        | SorobanExpr::U128Literal(_)
+        | SorobanExpr::I128Literal(_)
+        | SorobanExpr::BoolLiteral(_)
+        | SorobanExpr::SymbolLiteral(_)
+        | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
+        | SorobanExpr::Void
+        | SorobanExpr::None
+        | SorobanExpr::Param(_)
+        | SorobanExpr::Local(_)
+        | SorobanExpr::NamedLocal(_)
+        | SorobanExpr::Env
+        | SorobanExpr::ContractError { .. }
+        | SorobanExpr::Panic
+        | SorobanExpr::LedgerSequence
+        | SorobanExpr::LedgerTimestamp
+        | SorobanExpr::LedgerNetworkId
+        | SorobanExpr::CurrentContractAddress
+        | SorobanExpr::MaxLiveUntilLedger
+        | SorobanExpr::CollectionNew(_)
+        | SorobanExpr::ValTagName(_) => false,
+        // Single child.
+        SorobanExpr::Some(b)
+        | SorobanExpr::Not(b)
+        | SorobanExpr::RequireAuth(b)
+        | SorobanExpr::AuthorizeAsCurrContract(b)
+        | SorobanExpr::ErrorFromCode(b)
+        | SorobanExpr::PanicWithError(b)
+        | SorobanExpr::CryptoSha256(b)
+        | SorobanExpr::CryptoKeccak256(b)
+        | SorobanExpr::PrngReseed(b)
+        | SorobanExpr::PrngBytesNew(b)
+        | SorobanExpr::PrngVecShuffle(b)
+        | SorobanExpr::StrkeyToAddress(b)
+        | SorobanExpr::AddressToStrkey(b)
+        | SorobanExpr::SretResult(b)
+        | SorobanExpr::ValTag(b)
+        | SorobanExpr::ValConvert { value: b, .. }
+        | SorobanExpr::CastAs { value: b, .. } => expr_contains_unknown(b),
+        // Two children.
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b)
+        | SorobanExpr::RequireAuthForArgs {
+            address: a,
+            args: b,
+        }
+        | SorobanExpr::ExtendInstanceAndCodeTtl {
+            threshold: a,
+            extend_to: b,
+        }
+        | SorobanExpr::VecTryIterFold { vec: a, init: b } => {
+            expr_contains_unknown(a) || expr_contains_unknown(b)
+        }
+        SorobanExpr::StorageGet { key, .. }
+        | SorobanExpr::StorageHas { key, .. }
+        | SorobanExpr::StorageRemove { key, .. } => expr_contains_unknown(key),
+        SorobanExpr::StorageSet { key, value, .. } => {
+            expr_contains_unknown(key) || expr_contains_unknown(value)
+        }
+        SorobanExpr::StorageExtendTtl {
+            key,
+            threshold,
+            extend_to,
+            ..
+        } => {
+            expr_contains_unknown(key)
+                || expr_contains_unknown(threshold)
+                || expr_contains_unknown(extend_to)
+        }
+        SorobanExpr::PublishEvent { topics, data, .. } => {
+            topics.iter().any(expr_contains_unknown) || expr_contains_unknown(data)
+        }
+        SorobanExpr::InvokeContract {
+            address,
+            function,
+            args,
+            ..
+        }
+        | SorobanExpr::TryInvokeContract {
+            address,
+            function,
+            args,
+            ..
+        } => {
+            expr_contains_unknown(address)
+                || expr_contains_unknown(function)
+                || args.iter().any(expr_contains_unknown)
+        }
+        SorobanExpr::StructConstruct { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_contains_unknown(v))
+        }
+        SorobanExpr::EnumConstruct { fields, .. } => fields.iter().any(expr_contains_unknown),
+        SorobanExpr::TupleConstruct(items)
+        | SorobanExpr::VecConstruct(items)
+        | SorobanExpr::Log(items) => items.iter().any(expr_contains_unknown),
+        SorobanExpr::MapConstruct(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_contains_unknown(k) || expr_contains_unknown(v)),
+        SorobanExpr::FieldAccess { object, .. } => expr_contains_unknown(object),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            expr_contains_unknown(object) || args.iter().any(expr_contains_unknown)
+        }
+        SorobanExpr::CryptoEd25519Verify {
+            public_key,
+            message,
+            signature,
+        } => {
+            expr_contains_unknown(public_key)
+                || expr_contains_unknown(message)
+                || expr_contains_unknown(signature)
+        }
+        SorobanExpr::CryptoSecp256k1Recover {
+            msg_digest,
+            signature,
+            recovery_id,
+        } => {
+            expr_contains_unknown(msg_digest)
+                || expr_contains_unknown(signature)
+                || expr_contains_unknown(recovery_id)
+        }
+        SorobanExpr::PrngU64InRange { low, high } => {
+            expr_contains_unknown(low) || expr_contains_unknown(high)
+        }
     }
 }
 
@@ -6521,6 +7075,9 @@ fn try_extract_param_from_stack_val(val: &StackVal) -> Option<SorobanExpr> {
 enum I128Op {
     Mul,
     Div,
+    /// Truncating divide that adds 1 to the quotient when the remainder is
+    /// nonzero — `a / b + (a % b != 0) as i128`. Soroswap's fee `div_ceil`.
+    DivCeil,
 }
 
 /// A classified i128 soft-arith helper: the operation plus the arg indices of
@@ -6533,6 +7090,11 @@ struct I128Intrinsic {
     a_hi: usize,
     b_lo: usize,
     b_hi: usize,
+    /// Result-limb byte offsets from the output pointer. Unchecked helpers write
+    /// the value directly (`lo@0, hi@8`); checked (`Result<i128,E>`-returning)
+    /// helpers reserve `+0` for the status discriminant (`lo@8, hi@16`).
+    res_lo_off: i32,
+    res_hi_off: i32,
 }
 
 /// Count occurrences of selected opcodes in a function body (a coarse fingerprint).
@@ -6663,6 +7225,650 @@ fn func_reaches_symbol_encoder(module: &WasmModule, idx: u32, depth: u32) -> boo
         .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_symbol_encoder(module, *t, depth + 1)))
 }
 
+/// True if `idx` transitively (≤2 call levels) reaches the host function
+/// `host_module::name`. The generic sibling of `func_reaches_symbol_encoder`.
+fn func_reaches_host(
+    module: &WasmModule,
+    idx: u32,
+    host_module: HostModule,
+    name: &str,
+    depth: u32,
+) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    if depth > 2 {
+        return false;
+    }
+    if let Some(hf) = module.imports.get_by_index(idx) {
+        return hf.module == host_module && hf.name == name;
+    }
+    let Some(func) = module.get_function(idx) else {
+        return false;
+    };
+    func.body
+        .iter()
+        .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_host(module, *t, host_module, name, depth + 1)))
+}
+
+// ---------------------------------------------------------------------------
+// DataKey dispatcher folding (constant-selector micro-evaluation)
+// ---------------------------------------------------------------------------
+//
+// The SDK lowers `DataKey::into_val` for a multi-variant storage-key enum to a
+// *dispatcher*: `(i64 selector, i64 payload…) -> i64 Val` whose body
+// `br_table`s over the selector, each arm building its variant's key —
+// `Vec[Symbol]` for unit variants (the SDK vec-wraps those too),
+// `Vec[Symbol, payload]` for data variants — from linear-memory strings.
+// Inlining can't fold it (branch-sequential execution picks the wrong arm and
+// the key degrades to `UnknownVal`), and structural per-arm string extraction
+// is UNSAFE: arms permute through the `br_table`, and pointer locals are
+// preloaded/overridden across arms (Band's "Relayer" is preloaded before the
+// `br_table`, "RefData" overrides it in an arm), so body-order pairing
+// mis-assigns names to selectors.
+//
+// `DkEval` instead *executes* the dispatcher's real bytecode for the concrete
+// selector: symbol bytes come from the data section, the key shape from the
+// actual `vec_new_from_linear_memory` window. Payload args flow through
+// abstractly (`DkVal::Arg`) — pure moves only; any computation on them, any
+// unmodeled instruction, any runtime-dependent branch, or a non-key result
+// bails the whole fold so the call falls back to normal inlining (an honest
+// `todo!`, never a fabricated key).
+
+/// Hard step budget for one dispatcher evaluation (all interpreted calls included).
+const DK_MAX_STEPS: u32 = 4096;
+/// Max interpreted call depth below the dispatcher itself.
+const DK_MAX_CALL_DEPTH: u32 = 4;
+/// Max instructions in any single interpreted body.
+const DK_MAX_BODY: usize = 400;
+/// Max elements read out of a `vec_new_from_linear_memory` window.
+const DK_MAX_VEC: i32 = 8;
+
+/// Abstract value for the DataKey-dispatcher micro-evaluator.
+#[derive(Clone, Debug, PartialEq)]
+enum DkVal {
+    I32(i32),
+    I64(i64),
+    /// A shadow-stack address, relative to the stack pointer at dispatcher entry.
+    StackPtr(i32),
+    /// The dispatcher's `i`-th argument, passed through abstractly (payloads).
+    Arg(usize),
+    /// A long (>9 char) `Symbol` built via host `symbol_new_from_linear_memory`.
+    SymObj(String),
+    /// A `Vec` built via host `vec_new_from_linear_memory` from tracked slots.
+    VecVal(Vec<DkVal>),
+}
+
+/// One entered block during evaluation.
+#[derive(Clone)]
+struct DkFrame {
+    /// Index of the matching `End`.
+    end: usize,
+    /// Result arity of the block (0 or 1).
+    arity: usize,
+    /// Value-stack height at block entry.
+    height: usize,
+}
+
+/// Forward small-symbol codec — the exact inverse of
+/// `DataSection::decode_symbol_val`. Chars pack MSB-first as 6-bit codes
+/// (`_`=1, '0'..'9'=2..11, 'A'..'Z'=12..37, 'a'..'z'=38..63); the packed body
+/// shifts left 8 and tags `0x0e` (SymbolSmall).
+fn encode_symbol_small(name: &str) -> Option<i64> {
+    if name.is_empty() || name.len() > 9 {
+        return None;
+    }
+    let mut body: u64 = 0;
+    for c in name.chars() {
+        let code = match c {
+            '_' => 1u64,
+            '0'..='9' => 2 + (c as u64 - '0' as u64),
+            'A'..='Z' => 12 + (c as u64 - 'A' as u64),
+            'a'..='z' => 38 + (c as u64 - 'a' as u64),
+            _ => return None,
+        };
+        body = (body << 6) | code;
+    }
+    Some(((body << 8) | TAG_SYMBOL_SMALL) as i64)
+}
+
+/// Cheap shape gate for `try_fold_datakey_dispatcher`: an internal function
+/// whose body `br_table`s and transitively builds `Symbol`s from linear
+/// memory. Loops and indirect calls are out of model (the symbol encoder's
+/// own loop is handled by classification, never interpreted).
+fn is_datakey_dispatcher(module: &WasmModule, func_idx: u32) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    if module.imports.get_by_index(func_idx).is_some() {
+        return false;
+    }
+    let Some(func) = module.get_function(func_idx) else {
+        return false;
+    };
+    if func.body.len() > DK_MAX_BODY {
+        return false;
+    }
+    let mut has_br_table = false;
+    for ins in &func.body {
+        match ins {
+            WasmInstr::BrTable { .. } => has_br_table = true,
+            WasmInstr::Loop { .. } | WasmInstr::CallIndirect(_) => return false,
+            _ => {}
+        }
+    }
+    has_br_table && func_reaches_symbol_encoder(module, func_idx, 0)
+}
+
+/// For each `Block`/`If` in a flat body: instr index → (matching `End`, `Else`).
+/// An unmatched trailing `End` is the function terminator. Returns `None` on a
+/// malformed nesting (the fold then bails).
+fn dk_scan_blocks(
+    body: &[crate::wasm::ir::WasmInstr],
+) -> Option<HashMap<usize, (usize, Option<usize>)>> {
+    use crate::wasm::ir::WasmInstr;
+    let mut map = HashMap::new();
+    let mut open: Vec<(usize, Option<usize>)> = Vec::new();
+    for (i, ins) in body.iter().enumerate() {
+        match ins {
+            WasmInstr::Block { .. } | WasmInstr::Loop { .. } | WasmInstr::If { .. } => {
+                open.push((i, None));
+            }
+            WasmInstr::Else => open.last_mut()?.1 = Some(i),
+            WasmInstr::End => {
+                if let Some((start, els)) = open.pop() {
+                    map.insert(start, (i, els));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(map)
+}
+
+fn dk_block_arity(bt: &crate::wasm::ir::BlockType) -> Option<usize> {
+    use crate::wasm::ir::BlockType;
+    match bt {
+        BlockType::Empty => Some(0),
+        BlockType::Value(_) => Some(1),
+        BlockType::FuncType(_) => None,
+    }
+}
+
+fn dk_i32(v: &DkVal) -> Option<i32> {
+    match v {
+        DkVal::I32(x) => Some(*x),
+        _ => None,
+    }
+}
+
+fn dk_i64(v: &DkVal) -> Option<i64> {
+    match v {
+        DkVal::I64(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// Exit a block normally (its `End` reached): keep the block's results, drop
+/// anything between them and the entry height.
+fn dk_exit_block(stack: &mut Vec<DkVal>, fr: &DkFrame) -> Option<()> {
+    if stack.len() < fr.height + fr.arity {
+        return None;
+    }
+    let results = stack.split_off(stack.len() - fr.arity);
+    stack.truncate(fr.height);
+    stack.extend(results);
+    Some(())
+}
+
+/// Take a branch to label `depth`: unwind to that frame carrying its results,
+/// and resume after its `End`. (Loop frames cannot occur — bodies containing
+/// `Loop` are rejected before interpretation.)
+fn dk_branch(frames: &mut Vec<DkFrame>, stack: &mut Vec<DkVal>, depth: u32) -> Option<usize> {
+    let idx = frames.len().checked_sub(1 + depth as usize)?;
+    let fr = frames[idx].clone();
+    if stack.len() < fr.arity || stack.len() - fr.arity < fr.height {
+        return None;
+    }
+    let results = stack.split_off(stack.len() - fr.arity);
+    stack.truncate(fr.height);
+    stack.extend(results);
+    frames.truncate(idx);
+    Some(fr.end + 1)
+}
+
+/// Micro-evaluator state shared across the dispatcher and the small helpers it
+/// calls (validators, thin wrappers). The shadow stack pointer (global 0) and
+/// the shadow-stack memory persist across interpreted calls, exactly as at
+/// runtime.
+struct DkEval<'m> {
+    module: &'m WasmModule,
+    /// Shadow-stack cells: entry-SP-relative address → (value, store width).
+    /// Loads must match the stored width exactly — no partial aliasing.
+    mem: HashMap<i32, (DkVal, u32)>,
+    /// Global 0 (the shadow stack pointer).
+    sp: DkVal,
+    steps: u32,
+}
+
+impl DkEval<'_> {
+    fn store(&mut self, addr: i32, val: DkVal, width: u32) {
+        // Invalidate any overlapping cell so stale halves can never be re-read.
+        self.mem
+            .retain(|&a, &mut (_, w)| a + w as i32 <= addr || a >= addr + width as i32);
+        self.mem.insert(addr, (val, width));
+    }
+
+    fn load(&self, addr: &DkVal, offset: u32, width: u32) -> Option<DkVal> {
+        match addr {
+            DkVal::StackPtr(o) => {
+                let a = o.checked_add(offset as i32)?;
+                let (v, w) = self.mem.get(&a)?;
+                if *w != width {
+                    return None;
+                }
+                Some(v.clone())
+            }
+            // Static data reads (e.g. variant-name tables); never shadow-stack.
+            DkVal::I32(a) if *a > 1024 => {
+                let bytes = self
+                    .module
+                    .data_sections
+                    .read_bytes_zero_extended((*a as u32).checked_add(offset)?, width)?;
+                let mut v: u64 = 0;
+                for (i, b) in bytes.iter().enumerate() {
+                    v |= (*b as u64) << (8 * i);
+                }
+                Some(match width {
+                    8 => DkVal::I64(v as i64),
+                    _ => DkVal::I32(v as u32 as i32),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Handle a `call` inside an interpreted body: classify `(ptr, len) -> Val`
+    /// symbol/vec builders (computed from static data, never interpreted —
+    /// the symbol encoder contains a loop), otherwise recursively interpret.
+    /// Any direct host-import call is out of model.
+    fn handle_call(&mut self, target: u32, stack: &mut Vec<DkVal>, depth: u32) -> Option<()> {
+        use crate::wasm::ir::WasmType;
+        if self.module.imports.get_by_index(target).is_some() {
+            return None;
+        }
+        let ft = self.module.get_func_type(target)?;
+        let n = ft.params.len();
+        if stack.len() < n {
+            return None;
+        }
+        let args = stack.split_off(stack.len() - n);
+
+        if ft.params.as_slice() == [WasmType::I32, WasmType::I32]
+            && ft.results.as_slice() == [WasmType::I64]
+        {
+            let reaches_sym = func_reaches_symbol_encoder(self.module, target, 0);
+            let reaches_vec = func_reaches_host(
+                self.module,
+                target,
+                HostModule::Vec,
+                "vec_new_from_linear_memory",
+                0,
+            );
+            match (reaches_sym, reaches_vec) {
+                (true, false) => {
+                    // Symbol builder: read the real name from static data.
+                    let (DkVal::I32(ptr), DkVal::I32(len)) = (&args[0], &args[1]) else {
+                        return None;
+                    };
+                    if *ptr <= 1024 || *len <= 0 || *len > 32 {
+                        return None;
+                    }
+                    let name = self
+                        .module
+                        .data_sections
+                        .read_string(*ptr as u32, *len as u32)?;
+                    if name.is_empty()
+                        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        return None;
+                    }
+                    stack.push(if name.len() <= 9 {
+                        DkVal::I64(encode_symbol_small(&name)?)
+                    } else {
+                        DkVal::SymObj(name)
+                    });
+                    return Some(());
+                }
+                (false, true) => {
+                    // Vec builder: collect the elements from the tracked window.
+                    let (DkVal::StackPtr(o), DkVal::I32(count)) = (&args[0], &args[1]) else {
+                        return None;
+                    };
+                    if *count <= 0 || *count > DK_MAX_VEC {
+                        return None;
+                    }
+                    let mut elems = Vec::new();
+                    for i in 0..*count {
+                        let (v, w) = self.mem.get(&(o.checked_add(8 * i)?))?;
+                        if *w != 8 {
+                            return None;
+                        }
+                        elems.push(v.clone());
+                    }
+                    stack.push(DkVal::VecVal(elems));
+                    return Some(());
+                }
+                (true, true) => return None,
+                (false, false) => {}
+            }
+        }
+
+        if let Some(v) = self.eval_call(target, args, depth + 1)? {
+            stack.push(v);
+        }
+        Some(())
+    }
+
+    /// Interpret one function body. Outer `None` = anything out of model
+    /// (bail the fold); inner value = the function's result (None for void).
+    fn eval_call(&mut self, func_idx: u32, args: Vec<DkVal>, depth: u32) -> Option<Option<DkVal>> {
+        use crate::wasm::ir::{WasmInstr as WI, WasmType};
+        if depth > DK_MAX_CALL_DEPTH {
+            return None;
+        }
+        let func = self.module.get_function(func_idx)?;
+        if func.body.len() > DK_MAX_BODY
+            || func
+                .body
+                .iter()
+                .any(|i| matches!(i, WI::Loop { .. } | WI::CallIndirect(_)))
+        {
+            return None;
+        }
+        let ft = self.module.get_func_type(func_idx)?;
+        if ft.results.len() > 1 || args.len() != ft.params.len() {
+            return None;
+        }
+        let result_arity = ft.results.len();
+
+        let mut locals = args;
+        for ty in &func.locals {
+            locals.push(match ty {
+                WasmType::I32 => DkVal::I32(0),
+                WasmType::I64 => DkVal::I64(0),
+                _ => return None,
+            });
+        }
+
+        let ends = dk_scan_blocks(&func.body)?;
+        let mut stack: Vec<DkVal> = Vec::new();
+        let mut frames: Vec<DkFrame> = Vec::new();
+        let mut ip = 0usize;
+
+        macro_rules! bin_i32 {
+            ($f:expr) => {{
+                let b = dk_i32(&stack.pop()?)?;
+                let a = dk_i32(&stack.pop()?)?;
+                stack.push(DkVal::I32($f(a, b)));
+            }};
+        }
+        macro_rules! bin_i64 {
+            ($f:expr) => {{
+                let b = dk_i64(&stack.pop()?)?;
+                let a = dk_i64(&stack.pop()?)?;
+                stack.push(DkVal::I64($f(a, b)));
+            }};
+        }
+        macro_rules! cmp_i32 {
+            ($f:expr) => {{
+                let b = dk_i32(&stack.pop()?)?;
+                let a = dk_i32(&stack.pop()?)?;
+                stack.push(DkVal::I32($f(a, b) as i32));
+            }};
+        }
+        macro_rules! cmp_i64 {
+            ($f:expr) => {{
+                let b = dk_i64(&stack.pop()?)?;
+                let a = dk_i64(&stack.pop()?)?;
+                stack.push(DkVal::I32($f(a, b) as i32));
+            }};
+        }
+
+        loop {
+            self.steps += 1;
+            if self.steps > DK_MAX_STEPS {
+                return None;
+            }
+            let Some(ins) = func.body.get(ip) else {
+                break; // fell off the end = function return
+            };
+            match ins {
+                WI::I32Const(v) => stack.push(DkVal::I32(*v)),
+                WI::I64Const(v) => stack.push(DkVal::I64(*v)),
+                WI::LocalGet(n) => stack.push(locals.get(*n as usize)?.clone()),
+                WI::LocalSet(n) => *locals.get_mut(*n as usize)? = stack.pop()?,
+                WI::LocalTee(n) => {
+                    let v = stack.last()?.clone();
+                    *locals.get_mut(*n as usize)? = v;
+                }
+                WI::GlobalGet(0) => stack.push(self.sp.clone()),
+                WI::GlobalSet(0) => self.sp = stack.pop()?,
+                WI::Drop => {
+                    stack.pop()?;
+                }
+                WI::Select => {
+                    let c = dk_i32(&stack.pop()?)?;
+                    let b = stack.pop()?;
+                    let a = stack.pop()?;
+                    stack.push(if c != 0 { a } else { b });
+                }
+                WI::Nop => {}
+
+                // Pointer-aware i32 add/sub (shadow-stack frame arithmetic);
+                // everything else concrete-only.
+                WI::I32Add => {
+                    let b = stack.pop()?;
+                    let a = stack.pop()?;
+                    stack.push(match (a, b) {
+                        (DkVal::I32(x), DkVal::I32(y)) => DkVal::I32(x.wrapping_add(y)),
+                        (DkVal::StackPtr(o), DkVal::I32(k))
+                        | (DkVal::I32(k), DkVal::StackPtr(o)) => DkVal::StackPtr(o.checked_add(k)?),
+                        _ => return None,
+                    });
+                }
+                WI::I32Sub => {
+                    let b = stack.pop()?;
+                    let a = stack.pop()?;
+                    stack.push(match (a, b) {
+                        (DkVal::I32(x), DkVal::I32(y)) => DkVal::I32(x.wrapping_sub(y)),
+                        (DkVal::StackPtr(o), DkVal::I32(k)) => DkVal::StackPtr(o.checked_sub(k)?),
+                        _ => return None,
+                    });
+                }
+                WI::I32Mul => bin_i32!(|a: i32, b: i32| a.wrapping_mul(b)),
+                WI::I32And => bin_i32!(|a, b| a & b),
+                WI::I32Or => bin_i32!(|a, b| a | b),
+                WI::I32Xor => bin_i32!(|a, b| a ^ b),
+                WI::I32Shl => bin_i32!(|a: i32, b: i32| a.wrapping_shl(b as u32)),
+                WI::I32ShrU => bin_i32!(|a: i32, b: i32| ((a as u32) >> (b as u32 & 31)) as i32),
+                WI::I32ShrS => bin_i32!(|a: i32, b: i32| a.wrapping_shr(b as u32)),
+                WI::I64Add => bin_i64!(|a: i64, b: i64| a.wrapping_add(b)),
+                WI::I64Sub => bin_i64!(|a: i64, b: i64| a.wrapping_sub(b)),
+                WI::I64Mul => bin_i64!(|a: i64, b: i64| a.wrapping_mul(b)),
+                WI::I64And => bin_i64!(|a, b| a & b),
+                WI::I64Or => bin_i64!(|a, b| a | b),
+                WI::I64Xor => bin_i64!(|a, b| a ^ b),
+                WI::I64Shl => bin_i64!(|a: i64, b: i64| a.wrapping_shl(b as u32)),
+                WI::I64ShrU => bin_i64!(|a: i64, b: i64| ((a as u64) >> (b as u64 & 63)) as i64),
+                WI::I64ShrS => bin_i64!(|a: i64, b: i64| a.wrapping_shr(b as u32)),
+
+                WI::I32Eqz => {
+                    let a = dk_i32(&stack.pop()?)?;
+                    stack.push(DkVal::I32((a == 0) as i32));
+                }
+                WI::I64Eqz => {
+                    let a = dk_i64(&stack.pop()?)?;
+                    stack.push(DkVal::I32((a == 0) as i32));
+                }
+                WI::I32Eq => cmp_i32!(|a, b| a == b),
+                WI::I32Ne => cmp_i32!(|a, b| a != b),
+                WI::I32LtS => cmp_i32!(|a, b| a < b),
+                WI::I32LtU => cmp_i32!(|a: i32, b: i32| (a as u32) < (b as u32)),
+                WI::I32GtS => cmp_i32!(|a, b| a > b),
+                WI::I32GtU => cmp_i32!(|a: i32, b: i32| (a as u32) > (b as u32)),
+                WI::I32LeS => cmp_i32!(|a, b| a <= b),
+                WI::I32LeU => cmp_i32!(|a: i32, b: i32| (a as u32) <= (b as u32)),
+                WI::I32GeS => cmp_i32!(|a, b| a >= b),
+                WI::I32GeU => cmp_i32!(|a: i32, b: i32| (a as u32) >= (b as u32)),
+                WI::I64Eq => cmp_i64!(|a, b| a == b),
+                WI::I64Ne => cmp_i64!(|a, b| a != b),
+                WI::I64LtS => cmp_i64!(|a, b| a < b),
+                WI::I64LtU => cmp_i64!(|a: i64, b: i64| (a as u64) < (b as u64)),
+                WI::I64GtS => cmp_i64!(|a, b| a > b),
+                WI::I64GtU => cmp_i64!(|a: i64, b: i64| (a as u64) > (b as u64)),
+                WI::I64LeS => cmp_i64!(|a, b| a <= b),
+                WI::I64LeU => cmp_i64!(|a: i64, b: i64| (a as u64) <= (b as u64)),
+                WI::I64GeS => cmp_i64!(|a, b| a >= b),
+                WI::I64GeU => cmp_i64!(|a: i64, b: i64| (a as u64) >= (b as u64)),
+
+                WI::I32WrapI64 => {
+                    let a = dk_i64(&stack.pop()?)?;
+                    stack.push(DkVal::I32(a as i32));
+                }
+                WI::I64ExtendI32U => {
+                    let a = dk_i32(&stack.pop()?)?;
+                    stack.push(DkVal::I64(a as u32 as i64));
+                }
+                WI::I64ExtendI32S => {
+                    let a = dk_i32(&stack.pop()?)?;
+                    stack.push(DkVal::I64(a as i64));
+                }
+
+                WI::I32Load(off) => {
+                    let addr = stack.pop()?;
+                    stack.push(self.load(&addr, *off, 4)?);
+                }
+                WI::I64Load(off) => {
+                    let addr = stack.pop()?;
+                    stack.push(self.load(&addr, *off, 8)?);
+                }
+                WI::I32Load8U(off) => {
+                    let addr = stack.pop()?;
+                    stack.push(self.load(&addr, *off, 1)?);
+                }
+                WI::I32Store(off) => {
+                    let val = stack.pop()?;
+                    let DkVal::StackPtr(o) = stack.pop()? else {
+                        return None;
+                    };
+                    self.store(o.checked_add(*off as i32)?, val, 4);
+                }
+                WI::I64Store(off) => {
+                    let val = stack.pop()?;
+                    let DkVal::StackPtr(o) = stack.pop()? else {
+                        return None;
+                    };
+                    self.store(o.checked_add(*off as i32)?, val, 8);
+                }
+
+                WI::Block { block_type } => {
+                    let (end, _) = *ends.get(&ip)?;
+                    frames.push(DkFrame {
+                        end,
+                        arity: dk_block_arity(block_type)?,
+                        height: stack.len(),
+                    });
+                }
+                WI::If { block_type } => {
+                    let cond = dk_i32(&stack.pop()?)?;
+                    let (end, els) = *ends.get(&ip)?;
+                    let fr = DkFrame {
+                        end,
+                        arity: dk_block_arity(block_type)?,
+                        height: stack.len(),
+                    };
+                    if cond != 0 {
+                        frames.push(fr);
+                    } else if let Some(e) = els {
+                        frames.push(fr);
+                        ip = e + 1;
+                        continue;
+                    } else {
+                        ip = end + 1;
+                        continue;
+                    }
+                }
+                WI::Else => {
+                    // End of the taken then-branch: exit past the matching End.
+                    let fr = frames.pop()?;
+                    dk_exit_block(&mut stack, &fr)?;
+                    ip = fr.end + 1;
+                    continue;
+                }
+                WI::End => {
+                    if let Some(fr) = frames.pop() {
+                        dk_exit_block(&mut stack, &fr)?;
+                    } else {
+                        break; // function end
+                    }
+                }
+                WI::Br(d) => {
+                    ip = dk_branch(&mut frames, &mut stack, *d)?;
+                    continue;
+                }
+                WI::BrIf(d) => {
+                    let cond = dk_i32(&stack.pop()?)?;
+                    if cond != 0 {
+                        ip = dk_branch(&mut frames, &mut stack, *d)?;
+                        continue;
+                    }
+                }
+                WI::BrTable { targets, default } => {
+                    let idx = dk_i32(&stack.pop()?)? as u32 as usize;
+                    let d = targets.get(idx).copied().unwrap_or(*default);
+                    ip = dk_branch(&mut frames, &mut stack, d)?;
+                    continue;
+                }
+                WI::Return => break,
+                // A trapping path means the selector is invalid at runtime —
+                // nothing to recover.
+                WI::Unreachable => return None,
+                WI::Call(t) => self.handle_call(*t, &mut stack, depth)?,
+                _ => return None,
+            }
+            ip += 1;
+        }
+
+        if result_arity == 1 {
+            Some(Some(stack.pop()?))
+        } else {
+            Some(None)
+        }
+    }
+}
+
+/// Where an i128 soft-arith helper writes its result limbs relative to the output
+/// pointer (param 0). Unchecked helpers (the SDK's inline soft-arith) write the
+/// value directly as `{lo@0, hi@8}`; checked (`Result<i128,E>`-returning) helpers
+/// — used by SDK consumers like Soroswap that call `checked_mul`/`checked_div` —
+/// reserve `+0` for the status discriminant and write `{lo@8, hi@16}`. Detected by
+/// whether the body computes the `param0 + 16` store address
+/// (`local.get 0; i32.const 16; i32.add`): only the 24-byte checked layout
+/// addresses `+16`; the 16-byte unchecked layout never does, and a multiply leaf
+/// that surfaces overflow through a separate `i32` flag pointer writes its hi limb
+/// at `+8`, so it stays unchecked.
+fn i128_result_offsets(func: &crate::wasm::ir::WasmFunction) -> (i32, i32) {
+    use crate::wasm::ir::WasmInstr;
+    let checked = func.body.windows(3).any(|w| {
+        matches!(
+            w,
+            [
+                WasmInstr::LocalGet(0),
+                WasmInstr::I32Const(16),
+                WasmInstr::I32Add
+            ]
+        )
+    });
+    if checked { (8, 16) } else { (0, 8) }
+}
+
 fn detect_i128_intrinsic(module: &WasmModule, func_idx: u32) -> Option<I128Intrinsic> {
     detect_i128_intrinsic_inner(module, func_idx, 0)
 }
@@ -6677,20 +7883,28 @@ fn detect_i128_intrinsic_inner(
     }
     let func = module.get_function(func_idx)?;
     let fp = opcode_counts(func);
+    let (res_lo_off, res_hi_off) = i128_result_offsets(func);
     let layout = |op: I128Op| I128Intrinsic {
         op,
         a_lo: 1,
         a_hi: 2,
         b_lo: 3,
         b_hi: 4,
+        res_lo_off,
+        res_hi_off,
     };
 
     // Leaf unsigned multiply: schoolbook 32-bit limb products, two stores, no calls.
     if fp.calls.is_empty() && fp.mul >= 5 && fp.store >= 2 && fp.div == 0 {
         return Some(layout(I128Op::Mul));
     }
-    // Leaf / near-leaf unsigned divide: a long-division `I64DivU` core.
-    if fp.div >= 1 && fp.mul <= 6 {
+    // Leaf / near-leaf unsigned divide: any inline `I64DivU`/`I64DivS` marks a
+    // division core. A 128-bit multiply never divides (branches 1 and 3 require
+    // `div == 0`), so a 64-bit division op uniquely identifies a divide — including
+    // a Knuth long-division core whose quotient estimation legitimately contains
+    // several `i64.mul` (the real mainnet core has mul == 7, which the old
+    // `mul <= 6` cap wrongly rejected).
+    if fp.div >= 1 {
         return Some(layout(I128Op::Div));
     }
     // Widening / fixed-point multiply (6-param, delegates the limb products to a
@@ -6713,7 +7927,41 @@ fn detect_i128_intrinsic_inner(
         let core = detect_i128_intrinsic_inner(module, fp.calls[0], depth + 1)?;
         return Some(layout(core.op));
     }
+    // Round-up-on-inexact divide wrapper (e.g. Soroswap's fee `div_ceil`): no
+    // direct mul/div of its own, delegates the truncating division to a Div core,
+    // then adds 1 to the quotient whenever the remainder is nonzero. Empirically
+    // (executed under wasmi) it computes `a / b + (a % b != 0) as i128` over the
+    // full signed domain — NOT a sign-aware ceiling. Distinguished from a plain
+    // signed-div wrapper by the post-division `+1` increment idiom.
+    if fp.div == 0
+        && fp.mul == 0
+        && fp.calls.iter().any(|&t| {
+            matches!(
+                detect_i128_intrinsic_inner(module, t, depth + 1).map(|i| i.op),
+                Some(I128Op::Div)
+            )
+        })
+        && has_inexact_increment(func)
+    {
+        return Some(layout(I128Op::DivCeil));
+    }
     None
+}
+
+/// True if the body contains the "+1 when the division was inexact" idiom that
+/// marks a round-up divide wrapper: a remainder-zero test (`i64.or; i64.eqz`,
+/// combining the two remainder limbs) AND a literal-`1` increment of the
+/// quotient (`i64.const 1; i64.add`). A plain truncating-div wrapper has neither.
+fn has_inexact_increment(func: &crate::wasm::ir::WasmFunction) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    let body = &func.body;
+    let has_increment = body
+        .windows(2)
+        .any(|w| matches!(w, [WasmInstr::I64Const(1), WasmInstr::I64Add]));
+    let has_remainder_test = body
+        .windows(2)
+        .any(|w| matches!(w, [WasmInstr::I64Or, WasmInstr::I64Eqz]));
+    has_increment && has_remainder_test
 }
 
 /// Rebuild a whole 128-bit operand from its two i64 limb args. Returns the value
@@ -6758,8 +8006,133 @@ fn reconstruct_i128_operand(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, b
         // the operand is that whole value; the degraded high arg is the junk hi word.
         // Best-effort — only trustworthy when paired with a limb-tracked operand.
         (lo, h) if is_whole_i128_value(lo) && !is_clean_hi_limb(h) => Some((lo.clone(), false)),
-        _ => None,
+        // Open-coded i128 add/sub (carry/borrow limb chains the SDK emits inline
+        // rather than via a helper call).
+        _ => reconstruct_i128_addsub(lo, hi),
     }
+}
+
+/// Recognize the open-coded i128 add/sub limb idiom — the two's-complement
+/// carry/borrow chains the SDK emits inline (no helper call) — and rebuild the
+/// whole 128-bit value as `Add`/`Sub` of its recursively-reconstructed operands.
+///
+/// Borrow-subtract `A - B`:
+///   lo = A_lo - B_lo
+///   hi = (A_hi - B_hi) - (A_lo <u B_lo)            // the borrow
+/// Carry-add `A + B`:
+///   lo = A_lo + B_lo
+///   hi = (lo <u addend_lo) + (B_hi + A_hi)         // the carry; operand order varies
+///
+/// Strictly structural: the borrow/carry comparison must reference the SAME limb
+/// sub-expressions as the `lo` computation, and BOTH operands must reconstruct
+/// cleanly. So it can only fire on a genuine 128-bit add/sub — never on the
+/// `0 - x` negations the signed mul/div wrappers emit (whose hi limb is
+/// `0 - (x_hi + (x_lo != 0))`, matching neither shape).
+fn reconstruct_i128_addsub(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bool)> {
+    // --- Borrow-subtract: lo = A_lo - B_lo, hi = (A_hi - B_hi) - (A_lo <u B_lo) ---
+    if let StackVal::BinOp(a_lo, BinOper::Sub, b_lo) = lo
+        && let StackVal::BinOp(hi_diff, BinOper::Sub, borrow) = hi
+        && let StackVal::BinOp(a_hi, BinOper::Sub, b_hi) = &**hi_diff
+        && is_unsigned_lt(borrow, a_lo, b_lo)
+    {
+        let (a, a_clean) = reconstruct_i128_operand(a_lo, a_hi)?;
+        let (b, b_clean) = reconstruct_i128_operand(b_lo, b_hi)?;
+        return (a_clean && b_clean).then(|| {
+            (
+                StackVal::BinOp(Box::new(a), BinOper::Sub, Box::new(b)),
+                true,
+            )
+        });
+    }
+    // --- Add of a clean value and a small positive constant K (K fits the low
+    //     limb, K_hi = 0): lo = A_lo + K ; hi = A_hi + carry, where the carry is
+    //     `(A_lo + K) <u K` — which the compiler folds to `Eqz(lo)` when K == 1.
+    //     Soroswap's `get_amount_in` applies this `+ 1` to its rounded quotient. ---
+    if let StackVal::BinOp(a_lo, BinOper::Add, k) = lo
+        && let StackVal::I64(kv) = &**k
+        && *kv > 0
+        && let StackVal::BinOp(s1, BinOper::Add, s2) = hi
+    {
+        let is_const_carry = |c: &StackVal| match c {
+            StackVal::Eqz(inner) => *kv == 1 && **inner == *lo,
+            _ => is_unsigned_lt(c, lo, k),
+        };
+        let a_hi = if is_const_carry(s2) {
+            Some(&**s1)
+        } else if is_const_carry(s1) {
+            Some(&**s2)
+        } else {
+            None
+        };
+        if let Some(a_hi) = a_hi {
+            let (a, a_clean) = reconstruct_i128_operand(a_lo, a_hi)?;
+            return a_clean.then(|| {
+                (
+                    StackVal::BinOp(
+                        Box::new(a),
+                        BinOper::Add,
+                        Box::new(StackVal::HostCallResult(Box::new(
+                            SorobanExpr::I128Literal(*kv as i128),
+                        ))),
+                    ),
+                    true,
+                )
+            });
+        }
+        return None;
+    }
+    // --- Carry-add: lo = A_lo + B_lo, hi = (lo <u addend_lo) + (B_hi + A_hi) ---
+    if let StackVal::BinOp(x_lo, BinOper::Add, y_lo) = lo
+        && let StackVal::BinOp(s1, BinOper::Add, s2) = hi
+    {
+        // One summand of `hi` is the carry `(lo <u addend_lo)`, the other is the
+        // hi-limb sum `Add(_, _)`.
+        let (carry, hi_sum) = match (is_carry(s1, lo, x_lo, y_lo), is_carry(s2, lo, x_lo, y_lo)) {
+            (true, false) => (true, s2),
+            (false, true) => (true, s1),
+            _ => return None,
+        };
+        if !carry {
+            return None;
+        }
+        let StackVal::BinOp(p_hi, BinOper::Add, q_hi) = &**hi_sum else {
+            return None;
+        };
+        // Pair each low limb with its matching high limb (addition is commutative,
+        // so try both pairings and accept the one where both operands reconstruct).
+        for (xh, yh) in [(p_hi, q_hi), (q_hi, p_hi)] {
+            if let (Some((a, a_clean)), Some((b, b_clean))) = (
+                reconstruct_i128_operand(x_lo, xh),
+                reconstruct_i128_operand(y_lo, yh),
+            ) && a_clean
+                && b_clean
+            {
+                return Some((
+                    StackVal::BinOp(Box::new(a), BinOper::Add, Box::new(b)),
+                    true,
+                ));
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// True if `e` computes the unsigned comparison `x <u y`. The compiler emits this
+/// borrow/carry bit either way around — `x <u y` directly or its mirror `y >u x` —
+/// so accept both spellings.
+fn is_unsigned_lt(e: &StackVal, x: &StackVal, y: &StackVal) -> bool {
+    match e {
+        StackVal::Compare(l, CmpOp::LtU, r) => **l == *x && **r == *y,
+        StackVal::Compare(l, CmpOp::GtU, r) => **l == *y && **r == *x,
+        _ => false,
+    }
+}
+
+/// True if `e` is the add carry bit `sum_lo <u addend_lo` — the comparison of the
+/// freshly-computed low sum against one of the two addends' low limbs.
+fn is_carry(e: &StackVal, sum_lo: &StackVal, x_lo: &StackVal, y_lo: &StackVal) -> bool {
+    is_unsigned_lt(e, sum_lo, x_lo) || is_unsigned_lt(e, sum_lo, y_lo)
 }
 
 /// True for a `StackVal` that already represents a complete 128-bit value (not a
@@ -10816,6 +12189,127 @@ fn stack_val_contains_unknown(val: &StackVal) -> bool {
     }
 }
 
+fn expr_is_clean_arith(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        // Comparisons appear in the round-up divide's `(a % b != 0)` inexact term;
+        // they are pure and operate over clean-arith operands.
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b) => expr_is_clean_arith(a) && expr_is_clean_arith(b),
+        SorobanExpr::CastAs { value, .. } | SorobanExpr::ValConvert { value, .. } => {
+            expr_is_clean_arith(value)
+        }
+        SorobanExpr::Param(_)
+        | SorobanExpr::Local(_)
+        | SorobanExpr::NamedLocal(_)
+        | SorobanExpr::I128Literal(_)
+        | SorobanExpr::U128Literal(_)
+        | SorobanExpr::I64Literal(_)
+        | SorobanExpr::U64Literal(_)
+        | SorobanExpr::I32Literal(_)
+        | SorobanExpr::U32Literal(_) => true,
+        _ => false,
+    }
+}
+
+/// True if every statement is a pure-arithmetic "husk" — none performs a real
+/// side effect (storage write, event, auth, cross-contract invoke, prng, log).
+/// Error-path panics, arithmetic, and control flow are allowed: they are the
+/// Result-discriminant guards a checked-arith composite collapses to once its
+/// happy-path value is recovered into the frame slot. Conservative — an
+/// unrecognized effect keeps the statements (no drop).
+fn stmts_are_pure_arith_husks(stmts: &[SorobanStmt]) -> bool {
+    stmts.iter().all(stmt_is_pure_arith_husk)
+}
+
+fn stmt_is_pure_arith_husk(stmt: &SorobanStmt) -> bool {
+    match stmt {
+        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => !expr_has_effect(e),
+        SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+            !expr_has_effect(value)
+        }
+        SorobanStmt::Return(None)
+        | SorobanStmt::Break
+        | SorobanStmt::Continue
+        | SorobanStmt::Comment(_) => true,
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            !expr_has_effect(condition)
+                && stmts_are_pure_arith_husks(then_body)
+                && stmts_are_pure_arith_husks(else_body)
+        }
+        SorobanStmt::Match { scrutinee, arms } => {
+            !expr_has_effect(scrutinee) && arms.iter().all(|a| stmts_are_pure_arith_husks(&a.body))
+        }
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => stmts_are_pure_arith_husks(body),
+        SorobanStmt::For {
+            start, end, body, ..
+        } => !expr_has_effect(start) && !expr_has_effect(end) && stmts_are_pure_arith_husks(body),
+    }
+}
+
+/// True if `expr` (transitively) performs a state-changing side effect that must
+/// not be silently dropped. Storage *reads* and arithmetic are effect-free.
+fn expr_has_effect(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::StorageSet { .. }
+        | SorobanExpr::StorageRemove { .. }
+        | SorobanExpr::StorageExtendTtl { .. }
+        | SorobanExpr::ExtendInstanceAndCodeTtl { .. }
+        | SorobanExpr::PublishEvent { .. }
+        | SorobanExpr::RequireAuth(_)
+        | SorobanExpr::RequireAuthForArgs { .. }
+        | SorobanExpr::AuthorizeAsCurrContract(_)
+        | SorobanExpr::InvokeContract { .. }
+        | SorobanExpr::TryInvokeContract { .. }
+        | SorobanExpr::Log(_)
+        | SorobanExpr::PrngReseed(_)
+        | SorobanExpr::PrngBytesNew(_)
+        | SorobanExpr::PrngVecShuffle(_)
+        | SorobanExpr::PrngU64InRange { .. } => true,
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => expr_has_effect(a) || expr_has_effect(b),
+        SorobanExpr::Not(a)
+        | SorobanExpr::Some(a)
+        | SorobanExpr::PanicWithError(a)
+        | SorobanExpr::ErrorFromCode(a)
+        | SorobanExpr::CastAs { value: a, .. }
+        | SorobanExpr::ValConvert { value: a, .. } => expr_has_effect(a),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            expr_has_effect(object) || args.iter().any(expr_has_effect)
+        }
+        SorobanExpr::FieldAccess { object, .. } => expr_has_effect(object),
+        SorobanExpr::TupleConstruct(items) | SorobanExpr::VecConstruct(items) => {
+            items.iter().any(expr_has_effect)
+        }
+        SorobanExpr::StructConstruct { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_has_effect(v))
+        }
+        SorobanExpr::EnumConstruct { fields, .. } => fields.iter().any(expr_has_effect),
+        // Storage reads (`StorageGet`/`StorageHas`) are idempotent; all remaining
+        // variants are leaves or pure projections.
+        _ => false,
+    }
+}
+
 /// True if `val` is a Soroban Val tag comparison: `(v & 0xFF) <cmp> TAG`.
 ///
 /// These are the SDK's argument type-validation checks. A multi-guard validation
@@ -12414,6 +13908,268 @@ mod tests {
     }
 
     #[test]
+    fn div_core_with_many_muls_still_classifies() {
+        // The real mainnet 128-bit division core uses several `i64.mul` for quotient
+        // estimation (Knuth long division). The old `mul <= 6` cap rejected it; an
+        // inline division op alone must mark a divide.
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $div_heavy (param i32 i64 i64 i64 i64)
+                    local.get 0
+                    local.get 1 local.get 3 i64.mul
+                    local.get 1 local.get 4 i64.mul i64.add
+                    local.get 2 local.get 3 i64.mul i64.add
+                    local.get 2 local.get 4 i64.mul i64.add
+                    local.get 1 local.get 3 i64.mul i64.add
+                    local.get 2 local.get 4 i64.mul i64.add
+                    local.get 1 local.get 4 i64.mul i64.add
+                    local.get 3 i64.div_u
+                    i64.store))
+            "#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        assert_eq!(
+            detect_i128_intrinsic(&m, 0).map(|i| i.op),
+            Some(I128Op::Div),
+            "div core with 7 muls classifies as divide"
+        );
+    }
+
+    #[test]
+    fn i128_result_offsets_detects_checked_layout() {
+        // Unchecked helpers write the value as `{lo@0, hi@8}`; checked
+        // `Result<i128,E>` helpers reserve `+0` for the discriminant and address
+        // `param0 + 16` for the hi limb.
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $unchecked (param i32 i64 i64)
+                    local.get 0 local.get 1 i64.store
+                    local.get 0 local.get 2 i64.store offset=8)
+                (func $checked (param i32 i64 i64)
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 i64.store offset=8
+                    local.get 0 i32.const 16 i32.add local.get 2 i64.store))
+            "#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        assert_eq!(
+            i128_result_offsets(m.get_function(0).unwrap()),
+            (0, 8),
+            "unchecked layout"
+        );
+        assert_eq!(
+            i128_result_offsets(m.get_function(1).unwrap()),
+            (8, 16),
+            "checked Result layout"
+        );
+    }
+
+    #[test]
+    fn panic_guard_shell_and_unknown_detection() {
+        use crate::ir::{SorobanExpr, SorobanStmt};
+        let guard = SorobanStmt::If {
+            condition: SorobanExpr::Ne(
+                Box::new(SorobanExpr::Param("amount_in".into())),
+                Box::new(SorobanExpr::I128Literal(0)),
+            ),
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+            else_body: vec![],
+        };
+        // `if cond { panic!() }` with no value path is the misleading shell.
+        assert!(is_panic_guard_shell(std::slice::from_ref(&guard)));
+        // A bare `panic!()` (no `if`) is NOT a shell — it compiles as a diverging
+        // getter and must be preserved.
+        assert!(!is_panic_guard_shell(&[SorobanStmt::Expr(
+            SorobanExpr::Panic
+        )]));
+        // A value-producing tail is not a shell.
+        assert!(!is_panic_guard_shell(&[SorobanStmt::Return(Some(
+            SorobanExpr::Param("x".into())
+        ))]));
+        // The clean guard carries no `todo!`; an `UnknownVal` condition is an honest
+        // partial that must not be stubbed.
+        assert!(!stmts_contain_unknown(std::slice::from_ref(&guard)));
+        let dirty = SorobanStmt::If {
+            condition: SorobanExpr::UnknownVal,
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+            else_body: vec![],
+        };
+        assert!(stmts_contain_unknown(std::slice::from_ref(&dirty)));
+    }
+
+    #[test]
+    fn divceil_classifies_round_up_wrapper() {
+        // $core has an inline divide → classifies as Div. $ceil delegates to $core
+        // and carries the inexact-increment idiom (`i64.or; i64.eqz` remainder test
+        // + `i64.const 1; i64.add` quotient bump) → DivCeil. $plain forwards to the
+        // div core but has no increment → not classified (the increment is required).
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $core (param i32 i64 i64 i64 i64)
+                    local.get 0 local.get 1 local.get 3 i64.div_u i64.store)
+                (func $ceil (param i32 i64 i64 i64 i64)
+                    local.get 0 local.get 1 local.get 2 local.get 3 local.get 4 call $core
+                    local.get 1 local.get 2 i64.or i64.eqz drop
+                    local.get 1 i64.const 1 i64.add drop)
+                (func $plain (param i32 i64 i64 i64 i64)
+                    local.get 0 local.get 1 local.get 2 local.get 3 local.get 4 call $core))
+            "#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        assert_eq!(
+            detect_i128_intrinsic(&m, 0).map(|i| i.op),
+            Some(I128Op::Div)
+        );
+        assert_eq!(
+            detect_i128_intrinsic(&m, 1).map(|i| i.op),
+            Some(I128Op::DivCeil),
+            "div core + inexact increment classifies as DivCeil"
+        );
+        assert_eq!(
+            detect_i128_intrinsic(&m, 2).map(|i| i.op),
+            None,
+            "a plain forwarder without the increment is not a DivCeil"
+        );
+    }
+
+    #[test]
+    fn reconstruct_i128_inline_borrow_sub_and_carry_add() {
+        // Clean limb pairs for two whole 128-bit operands x and y.
+        let lo = |n: &str| StackVal::I128Limb {
+            value: Box::new(StackVal::Param(n.into())),
+            hi: false,
+        };
+        let hi = |n: &str| StackVal::I128Limb {
+            value: Box::new(StackVal::Param(n.into())),
+            hi: true,
+        };
+        let cmp =
+            |a: StackVal, op: CmpOp, b: StackVal| StackVal::Compare(Box::new(a), op, Box::new(b));
+        let bin =
+            |a: StackVal, op: BinOper, b: StackVal| StackVal::BinOp(Box::new(a), op, Box::new(b));
+
+        // x - y:  lo = x.lo - y.lo ; hi = (x.hi - y.hi) - (x.lo <u y.lo)
+        let sub_lo = bin(lo("x"), BinOper::Sub, lo("y"));
+        let sub_hi = bin(
+            bin(hi("x"), BinOper::Sub, hi("y")),
+            BinOper::Sub,
+            cmp(lo("x"), CmpOp::LtU, lo("y")),
+        );
+        assert_eq!(
+            reconstruct_i128_operand(&sub_lo, &sub_hi),
+            Some((
+                bin(
+                    StackVal::Param("x".into()),
+                    BinOper::Sub,
+                    StackVal::Param("y".into())
+                ),
+                true
+            )),
+            "borrow-subtract limb pair rebuilds as x - y"
+        );
+
+        // x + y:  lo = x.lo + y.lo ; hi = (lo <u y.lo) + (y.hi + x.hi)
+        let add_lo = bin(lo("x"), BinOper::Add, lo("y"));
+        let add_hi = bin(
+            cmp(add_lo.clone(), CmpOp::LtU, lo("y")),
+            BinOper::Add,
+            bin(hi("y"), BinOper::Add, hi("x")),
+        );
+        assert_eq!(
+            reconstruct_i128_operand(&add_lo, &add_hi),
+            Some((
+                bin(
+                    StackVal::Param("x".into()),
+                    BinOper::Add,
+                    StackVal::Param("y".into())
+                ),
+                true
+            )),
+            "carry-add limb pair rebuilds as x + y"
+        );
+
+        // A two's-complement negation `0 - y` (the signed-wrapper abs idiom) must NOT
+        // be mistaken for a 128-bit subtract: its hi limb is `0 - (y.hi + (y.lo != 0))`,
+        // whose left operand is `0`, not a `Sub`.
+        let neg_lo = bin(StackVal::I64(0), BinOper::Sub, lo("y"));
+        let neg_hi = bin(
+            StackVal::I64(0),
+            BinOper::Sub,
+            bin(
+                hi("y"),
+                BinOper::Add,
+                cmp(lo("y"), CmpOp::Ne, StackVal::I64(0)),
+            ),
+        );
+        assert_eq!(
+            reconstruct_i128_operand(&neg_lo, &neg_hi),
+            None,
+            "a 0 - y negation is not a 128-bit subtract"
+        );
+    }
+
+    #[test]
+    fn reconstruct_i128_gtu_borrow_and_const_increment() {
+        use crate::ir::SorobanExpr;
+        let lo = |n: &str| StackVal::I128Limb {
+            value: Box::new(StackVal::Param(n.into())),
+            hi: false,
+        };
+        let hi = |n: &str| StackVal::I128Limb {
+            value: Box::new(StackVal::Param(n.into())),
+            hi: true,
+        };
+        let cmp =
+            |a: StackVal, op: CmpOp, b: StackVal| StackVal::Compare(Box::new(a), op, Box::new(b));
+        let bin =
+            |a: StackVal, op: BinOper, b: StackVal| StackVal::BinOp(Box::new(a), op, Box::new(b));
+
+        // x - y with the borrow written as the mirror `y.lo >u x.lo` (GtU form) —
+        // equivalent to `x.lo <u y.lo`. Soroswap's get_amount_in emits this spelling.
+        let sub_lo = bin(lo("x"), BinOper::Sub, lo("y"));
+        let sub_hi = bin(
+            bin(hi("x"), BinOper::Sub, hi("y")),
+            BinOper::Sub,
+            cmp(lo("y"), CmpOp::GtU, lo("x")),
+        );
+        assert_eq!(
+            reconstruct_i128_operand(&sub_lo, &sub_hi),
+            Some((
+                bin(
+                    StackVal::Param("x".into()),
+                    BinOper::Sub,
+                    StackVal::Param("y".into())
+                ),
+                true
+            )),
+            "GtU-form borrow still rebuilds x - y"
+        );
+
+        // q + 1: lo = q.lo + 1 ; hi = q.hi + (q.lo + 1 == 0)  [Eqz carry for +1].
+        let inc_lo = bin(lo("q"), BinOper::Add, StackVal::I64(1));
+        let inc_hi = bin(
+            hi("q"),
+            BinOper::Add,
+            StackVal::Eqz(Box::new(inc_lo.clone())),
+        );
+        assert_eq!(
+            reconstruct_i128_operand(&inc_lo, &inc_hi),
+            Some((
+                bin(
+                    StackVal::Param("q".into()),
+                    BinOper::Add,
+                    StackVal::HostCallResult(Box::new(SorobanExpr::I128Literal(1)))
+                ),
+                true
+            )),
+            "constant +1 with Eqz carry rebuilds q + 1"
+        );
+    }
+
+    #[test]
     fn is_symbol_from_lm_builder_classifies_wrappers() {
         // $enc = the small-symbol encoder (carries the _/0/A/a byte boundaries).
         // $wrap = the (result_ptr, str_ptr, str_len) builder that calls it.
@@ -12448,6 +14204,208 @@ mod tests {
         assert!(
             !is_symbol_from_lm_builder(&m, 3),
             "wrong signature is not a builder even if it reaches the encoder"
+        );
+    }
+
+    #[test]
+    fn encode_symbol_small_round_trips() {
+        // The forward codec must be the exact inverse of decode_symbol_val.
+        for name in ["Admin", "TTLConfig", "Relayer", "RefData", "_x0Zz9", "a"] {
+            let v = encode_symbol_small(name).unwrap_or_else(|| panic!("{name} encodes"));
+            assert_eq!(
+                crate::wasm::data::DataSection::decode_symbol_val(v as u64).as_deref(),
+                Some(name),
+                "decode(encode({name})) round-trips"
+            );
+        }
+        assert_eq!(encode_symbol_small(""), None, "empty never encodes");
+        assert_eq!(
+            encode_symbol_small("TenCharsXX"),
+            None,
+            ">9 chars is not a small symbol"
+        );
+        assert_eq!(encode_symbol_small("a-b"), None, "invalid char rejected");
+    }
+
+    /// A module mirroring Band's `DataKey::into_val` dispatcher (func 27),
+    /// including everything that defeats structural per-arm string pairing:
+    /// the `br_table` permutes selectors to arms, the "Relayer" pointer is
+    /// preloaded BEFORE the `br_table`, "RefData" overrides it inside an arm,
+    /// and the two data variants share one vec-packing tail.
+    /// Layout (same as Band): Admin@+0(5) TTLConfig@+5(9) Relayer@+14(7) RefData@+21(7).
+    fn datakey_dispatcher_module() -> crate::wasm::WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "v" "g" (func $hostvec (param i64 i64) (result i64)))
+                (memory 1)
+                (global $sp (mut i32) (i32.const 1048576))
+                (data (i32.const 1048768) "AdminTTLConfigRelayerRefData")
+                ;; small-symbol encoder stub: carries the 95/48/65/97 fingerprint.
+                ;; Classified by the string args, never interpreted.
+                (func $enc (param i32 i32) (result i64)
+                    i32.const 95 drop i32.const 48 drop
+                    i32.const 65 drop i32.const 97 drop
+                    i64.const 0)
+                ;; vec_new_from_linear_memory wrapper (classified, not interpreted)
+                (func $vecbuild (param i32 i32) (result i64)
+                    i64.const 0 i64.const 0 call $hostvec)
+                ;; validator: outptr[0] = 0, outptr[8] = Vec[val]  (Band func 31)
+                (func $validate (param i32 i64)
+                    (local i32)
+                    global.get $sp i32.const 16 i32.sub local.tee 2 global.set $sp
+                    local.get 2 local.get 1 i64.store offset=8
+                    local.get 0
+                    local.get 2 i32.const 8 i32.add i32.const 1 call $vecbuild
+                    i64.store offset=8
+                    local.get 0 i64.const 0 i64.store
+                    local.get 2 i32.const 16 i32.add global.set $sp)
+                ;; the dispatcher (Band func 27)
+                (func $disp (param i64 i64) (result i64)
+                    (local i32 i32 i32)
+                    global.get $sp i32.const 48 i32.sub local.tee 2 global.set $sp
+                    i32.const 1048782 local.set 3      ;; preload "Relayer"
+                    block (result i64)
+                      block
+                        block
+                          block
+                            block
+                              block
+                                local.get 0
+                                i32.wrap_i64
+                                i32.const 1
+                                i32.sub
+                                br_table 0 4 3 1
+                              end
+                              ;; sel==1 -> unit "TTLConfig"
+                              local.get 2 i32.const 16 i32.add
+                              i32.const 1048773 i32.const 9 call $enc
+                              call $validate
+                              local.get 2 i64.load offset=16 i32.wrap_i64 br_if 1
+                              local.get 2 i64.load offset=24
+                              br 4
+                            end
+                            ;; default (sel==0 or >=4) -> unit "Admin"
+                            local.get 2
+                            i32.const 1048768 i32.const 5 call $enc
+                            call $validate
+                            local.get 2 i64.load i32.wrap_i64 br_if 0
+                            local.get 2 i64.load offset=8
+                            br 3
+                          end
+                          unreachable
+                        end
+                        ;; sel==3 -> override pointer to "RefData"
+                        i32.const 1048789 local.set 3
+                      end
+                      ;; shared data-variant tail: Vec[Symbol(ptr,7), payload]
+                      local.get 3 i32.const 7 call $enc
+                      local.set 0
+                      global.get $sp i32.const 16 i32.sub local.tee 3 global.set $sp
+                      local.get 3 local.get 1 i64.store offset=8
+                      local.get 3 local.get 0 i64.store
+                      local.get 2 i32.const 32 i32.add local.tee 4
+                      local.get 3 i32.const 2 call $vecbuild
+                      i64.store offset=8
+                      local.get 4 i64.const 0 i64.store
+                      local.get 3 i32.const 16 i32.add global.set $sp
+                      local.get 2 i64.load offset=40
+                    end
+                    local.get 2 i32.const 48 i32.add global.set $sp)
+                ;; same-signature decoy with a br_table but no symbol encoder
+                (func $decoy (param i64 i64) (result i64)
+                    block
+                      block
+                        local.get 0 i32.wrap_i64 br_table 0 1
+                      end
+                    end
+                    i64.const 14)
+                ;; loop-carrying variant: out of model even though it reaches $enc
+                (func $loopy (param i64 i64) (result i64)
+                    loop
+                      nop
+                    end
+                    block
+                      block
+                        local.get 0 i32.wrap_i64 br_table 0 1
+                      end
+                    end
+                    i32.const 1048768 i32.const 5 call $enc))
+            "#,
+        )
+        .expect("wat parses");
+        crate::wasm::WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn datakey_dispatcher_folds_by_execution() {
+        let m = datakey_dispatcher_module();
+        let (disp, decoy, loopy) = (4u32, 5u32, 6u32);
+
+        assert!(
+            is_datakey_dispatcher(&m, disp),
+            "the Band-shaped dispatcher classifies"
+        );
+        assert!(
+            !is_datakey_dispatcher(&m, decoy),
+            "a br_table func that never builds symbols is not a dispatcher"
+        );
+        assert!(
+            !is_datakey_dispatcher(&m, loopy),
+            "a loop-carrying body is out of model"
+        );
+
+        let eval = |sel: DkVal, payload: DkVal| {
+            let mut ev = DkEval {
+                module: &m,
+                mem: HashMap::new(),
+                sp: DkVal::StackPtr(0),
+                steps: 0,
+            };
+            ev.eval_call(disp, vec![sel, payload], 0)
+        };
+        let sym = |v: &DkVal| match v {
+            DkVal::I64(raw) => crate::wasm::data::DataSection::decode_symbol_val(*raw as u64),
+            _ => None,
+        };
+
+        // The EXECUTED selector→variant mapping. Body order is
+        // TTLConfig→Admin→RefData→Relayer-tail; naive body-order pairing
+        // would mis-assign every one of these.
+        let unit = |sel: i64, want: &str| {
+            let r = eval(DkVal::I64(sel), DkVal::I64(0));
+            let Some(Some(DkVal::VecVal(elems))) = r else {
+                panic!("selector {sel} should evaluate to a vec key; got {r:?}");
+            };
+            assert_eq!(elems.len(), 1, "unit variant is a 1-element vec");
+            assert_eq!(sym(&elems[0]).as_deref(), Some(want), "selector {sel}");
+        };
+        unit(0, "Admin");
+        unit(1, "TTLConfig");
+        // Out-of-range selectors take the br_table default — the bytecode's
+        // own semantics.
+        unit(9, "Admin");
+
+        let data = |sel: i64, want: &str| {
+            let r = eval(DkVal::I64(sel), DkVal::Arg(1));
+            let Some(Some(DkVal::VecVal(elems))) = r else {
+                panic!("selector {sel} should evaluate to a vec key; got {r:?}");
+            };
+            assert_eq!(elems.len(), 2, "data variant is [Symbol, payload]");
+            assert_eq!(sym(&elems[0]).as_deref(), Some(want), "selector {sel}");
+            assert_eq!(
+                elems[1],
+                DkVal::Arg(1),
+                "the abstract payload passes through untouched"
+            );
+        };
+        data(2, "Relayer");
+        data(3, "RefData");
+
+        // A non-constant selector cannot pick a br_table arm — bail, never guess.
+        assert_eq!(
+            eval(DkVal::Arg(0), DkVal::Arg(1)),
+            None,
+            "runtime selector is honestly unrecoverable"
         );
     }
 

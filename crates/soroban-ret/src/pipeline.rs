@@ -17,7 +17,9 @@ use crate::ir::optimizer::{
 };
 use crate::ir::soroban_ir::{MatchArm, MatchPattern, SorobanExpr, SorobanStmt, StorageType};
 use crate::pattern::lift_functions;
-use crate::pattern::lifter::find_identity_passthrough_param;
+use crate::pattern::lifter::{
+    find_identity_passthrough_param, is_panic_guard_shell, stmts_contain_unknown,
+};
 use crate::spec::registry::TypeRegistry;
 use crate::wasm::WasmModule;
 use crate::wasm::imports::HostModule;
@@ -334,6 +336,24 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
                     func.body.push(SorobanStmt::Expr(SorobanExpr::Panic));
                 }
             }
+        }
+
+        // All-or-nothing for value-returning reconstructions: a body that — after
+        // optimization and trailing-panic handling — is *entirely* validation-guard
+        // panics (`if cond { panic!() }` with no value path) is the misleading shell
+        // a checked-i128 library fn collapses to when its arithmetic didn't compose.
+        // It cannot type-check as the value it returns, and the reference-free metric
+        // would score it as clean — emit an honest stub instead. Gated on a
+        // deceptively-clean body (no `todo!`) and an actual `if` guard, so it never
+        // touches an honest partial or a bare diverging `panic!()` getter.
+        if func
+            .return_type
+            .as_ref()
+            .is_some_and(|t| !matches!(t, ScSpecTypeDef::Void))
+            && is_panic_guard_shell(&func.body)
+            && !stmts_contain_unknown(&func.body)
+        {
+            func.body.clear();
         }
     }
 
@@ -5883,6 +5903,16 @@ fn recover_enum_key_in_expr(expr: &mut SorobanExpr, registry: &TypeRegistry) {
                 recover_enum_key_in_expr(arg, registry);
             }
         }
+        // The admin-auth idiom threads a keyed load into the auth target
+        // (`get(&Admin).unwrap().require_auth()`) — recurse so its key
+        // upgrades like any other storage key.
+        SorobanExpr::RequireAuth(target) => {
+            recover_enum_key_in_expr(target, registry);
+        }
+        SorobanExpr::RequireAuthForArgs { address, args } => {
+            recover_enum_key_in_expr(address, registry);
+            recover_enum_key_in_expr(args, registry);
+        }
         SorobanExpr::StructConstruct { fields, .. } => {
             for (_, val) in fields.iter_mut() {
                 recover_enum_key_in_expr(val, registry);
@@ -5922,6 +5952,25 @@ fn try_convert_enum_key(expr: &SorobanExpr, registry: &TypeRegistry) -> Option<S
                     type_name: union_name,
                     variant: variant_name.clone(),
                     fields: vec![fields[1].clone()],
+                });
+            }
+            None
+        }
+        // Unit variant in its host encoding: Vec[SymbolLiteral("Variant")] →
+        // Type::Variant. `#[contracttype]` unions vec-wrap unit variants too, so
+        // a recovered key arrives as a 1-element vec; without this arm only the
+        // inner symbol upgrades, leaving a double-wrapped `vec![&env, Key::V]`.
+        SorobanExpr::TupleConstruct(fields) | SorobanExpr::VecConstruct(fields)
+            if fields.len() == 1 =>
+        {
+            if let SorobanExpr::SymbolLiteral(variant_name) = &fields[0]
+                && let Some((union_name, has_data)) = registry.find_union_variant(variant_name)
+                && !has_data
+            {
+                return Some(SorobanExpr::EnumConstruct {
+                    type_name: union_name,
+                    variant: variant_name.clone(),
+                    fields: vec![],
                 });
             }
             None
