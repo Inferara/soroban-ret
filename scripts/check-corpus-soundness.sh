@@ -21,11 +21,22 @@
 # Usage: scripts/check-corpus-soundness.sh [corpus-glob]
 #   default glob: benchmark-data/mainnet/*.wasm
 set -u
+set -o pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VERIFY_DIR="$HOME/.cache/soroban-ret-verify"
 GLOB="${1:-benchmark-data/mainnet/*.wasm}"
 BIN="$REPO_DIR/target/debug/soroban-ret"
+TARGET="wasm32v1-none"
+
+# Preflight: a broken environment (missing target, no registry access, wrong
+# toolchain) makes `cargo check` fail for reasons unrelated to the decompiled
+# code. Without this the error grep would see no `error[E…]` lines and report 0,
+# silently passing the ratchet against output that never actually compiled.
+if ! rustup target list --installed 2>/dev/null | grep -qx "$TARGET"; then
+    echo "FATAL: rust target '$TARGET' is not installed (rustup target add $TARGET)" >&2
+    exit 2
+fi
 
 mkdir -p "$VERIFY_DIR/src"
 cat > "$VERIFY_DIR/Cargo.toml" << 'TOML'
@@ -51,14 +62,28 @@ COUNT=0
 for wasm in "$REPO_DIR"/$GLOB; do
     name=$(basename "$wasm" .wasm)
     "$BIN" "$wasm" 2>/dev/null > "$VERIFY_DIR/src/lib.rs"
-    errs=$( (cd "$VERIFY_DIR" && cargo check --target wasm32v1-none --message-format=short 2>&1) \
-            | grep -cE 'src/lib\.rs.*error\[E[0-9]+\]' )
+    # Capture output and exit status separately: cargo's status (0 iff the crate
+    # compiled) is the source of truth for clean-vs-broken, NOT the error grep —
+    # which can't tell "compiled, 0 errors" from "cargo never ran rustc on our
+    # file". The grep only quantifies the ratchet metric (E-coded errors).
+    out=$( cd "$VERIFY_DIR" && cargo check --target "$TARGET" --message-format=short 2>&1 )
+    status=$?
+    errs=$( printf '%s\n' "$out" | grep -cE 'src/lib\.rs.*error\[E[0-9]+\]' )
     COUNT=$((COUNT + 1))
-    TOTAL=$((TOTAL + errs))
-    if [ "$errs" -eq 0 ]; then
+    if [ "$status" -eq 0 ]; then
         CLEAN=$((CLEAN + 1))
         echo "CLEAN $name"
     else
+        # Non-zero exit with no diagnostic referencing the generated file means
+        # the build broke for an environment reason (registry, toolchain, …),
+        # not because the decompiled code is wrong. Abort loudly rather than
+        # silently scoring 0 and passing the ratchet on untrusted output.
+        if ! printf '%s\n' "$out" | grep -qE 'src/lib\.rs.*error'; then
+            echo "FATAL: cargo check failed for $name with no diagnostics against the generated file (broken environment?)" >&2
+            printf '%s\n' "$out" | tail -20 >&2
+            exit 2
+        fi
+        TOTAL=$((TOTAL + errs))
         echo "ERR   $name ($errs)"
     fi
 done

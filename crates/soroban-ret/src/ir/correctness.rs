@@ -196,7 +196,8 @@ fn collect_let_names(stmts: &[SorobanStmt], out: &mut HashSet<String>) {
             }
             SorobanStmt::Match { arms, .. } => {
                 for a in arms {
-                    if let super::soroban_ir::MatchPattern::EnumVariant { bindings, .. } = &a.pattern
+                    if let super::soroban_ir::MatchPattern::EnumVariant { bindings, .. } =
+                        &a.pattern
                     {
                         out.extend(bindings.iter().cloned());
                     }
@@ -213,8 +214,15 @@ fn collect_let_names(stmts: &[SorobanStmt], out: &mut HashSet<String>) {
     }
 }
 
-/// Walk in document order (sharing `seen` so only the first assignment to each
-/// undeclared name is promoted) converting `Assign` → `Let { mutable: true }`.
+/// Walk in document order converting the first `Assign` to an undeclared name
+/// into `Let { mutable: true }`. `seen` is threaded mutably through *sequential*
+/// statements in one list (so only the first occurrence is promoted), but each
+/// nested scope — `if`/`else` branches, match arms, loop/block bodies — recurses
+/// on a **clone**: those are independent execution paths, and a `let` introduced
+/// inside one does not declare the name in a sibling branch or the enclosing
+/// scope. Sharing `seen` across them would wrongly suppress promotion of the
+/// same undeclared assignment in the `else` branch / next arm (it would stay an
+/// `Assign`, i.e. an E0425 error in that path).
 fn declare_first_assign(
     stmts: Vec<SorobanStmt>,
     declared: &HashSet<String>,
@@ -239,8 +247,8 @@ fn declare_first_assign(
                 else_body,
             } => SorobanStmt::If {
                 condition,
-                then_body: declare_first_assign(then_body, declared, seen),
-                else_body: declare_first_assign(else_body, declared, seen),
+                then_body: declare_first_assign(then_body, declared, &mut seen.clone()),
+                else_body: declare_first_assign(else_body, declared, &mut seen.clone()),
             },
             SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
                 scrutinee,
@@ -248,12 +256,12 @@ fn declare_first_assign(
                     .into_iter()
                     .map(|a| MatchArm {
                         pattern: a.pattern,
-                        body: declare_first_assign(a.body, declared, seen),
+                        body: declare_first_assign(a.body, declared, &mut seen.clone()),
                     })
                     .collect(),
             },
             SorobanStmt::Loop { body } => SorobanStmt::Loop {
-                body: declare_first_assign(body, declared, seen),
+                body: declare_first_assign(body, declared, &mut seen.clone()),
             },
             SorobanStmt::For {
                 var,
@@ -266,10 +274,10 @@ fn declare_first_assign(
                 start,
                 end,
                 step,
-                body: declare_first_assign(body, declared, seen),
+                body: declare_first_assign(body, declared, &mut seen.clone()),
             },
             SorobanStmt::Block(body) => {
-                SorobanStmt::Block(declare_first_assign(body, declared, seen))
+                SorobanStmt::Block(declare_first_assign(body, declared, &mut seen.clone()))
             }
             other => other,
         })
@@ -523,17 +531,11 @@ fn map_subexprs(expr: SorobanExpr, f: &dyn Fn(SorobanExpr) -> SorobanExpr) -> So
         },
         E::SretResult(a) => E::SretResult(b(a, f)),
         E::ValTag(a) => E::ValTag(b(a, f)),
-        E::ValConvert {
-            value,
-            target_type,
-        } => E::ValConvert {
+        E::ValConvert { value, target_type } => E::ValConvert {
             value: b(value, f),
             target_type,
         },
-        E::CastAs {
-            value,
-            target_type,
-        } => E::CastAs {
+        E::CastAs { value, target_type } => E::CastAs {
             value: b(value, f),
             target_type,
         },
@@ -648,7 +650,10 @@ mod tests {
             field: "threshold".into(),
         };
         let out = guard_broken_constructs(vec![SorobanStmt::Expr(access.clone())]);
-        assert!(matches!(&out[0], SorobanStmt::Expr(SorobanExpr::FieldAccess { .. })));
+        assert!(matches!(
+            &out[0],
+            SorobanStmt::Expr(SorobanExpr::FieldAccess { .. })
+        ));
     }
 
     #[test]
@@ -671,6 +676,38 @@ mod tests {
         assert!(
             matches!(&out[1], SorobanStmt::Assign { target, .. } if target == "var_11"),
             "later assignment should stay an assignment: {out:?}"
+        );
+    }
+
+    #[test]
+    fn promotes_undeclared_assignment_in_both_branches() {
+        // if c { var_9 = 1 } else { var_9 = 2 }  →  each branch declares its own
+        // `let mut var_9` (independent paths; the `seen` set must not carry the
+        // then-branch promotion into the else branch).
+        let assign = |v: i64| SorobanStmt::Assign {
+            target: "var_9".into(),
+            value: SorobanExpr::I64Literal(v),
+        };
+        let out = guard_broken_constructs(vec![SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![assign(1)],
+            else_body: vec![assign(2)],
+        }]);
+        let SorobanStmt::If {
+            then_body,
+            else_body,
+            ..
+        } = &out[0]
+        else {
+            panic!("expected if");
+        };
+        assert!(
+            matches!(&then_body[0], SorobanStmt::Let { name, .. } if name == "var_9"),
+            "then branch should promote: {then_body:?}"
+        );
+        assert!(
+            matches!(&else_body[0], SorobanStmt::Let { name, .. } if name == "var_9"),
+            "else branch should promote independently: {else_body:?}"
         );
     }
 
@@ -722,6 +759,9 @@ mod tests {
             args: vec![],
         };
         let out = guard_broken_constructs(vec![SorobanStmt::Expr(expr)]);
-        assert!(matches!(&out[0], SorobanStmt::Expr(SorobanExpr::UnknownVal)));
+        assert!(matches!(
+            &out[0],
+            SorobanStmt::Expr(SorobanExpr::UnknownVal)
+        ));
     }
 }

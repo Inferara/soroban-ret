@@ -50,7 +50,10 @@ fn corpus_soundness_within_ceiling() {
     let total = stdout
         .lines()
         .rev()
-        .find_map(|l| l.strip_prefix("TOTAL_ERRORS=").and_then(|s| s.trim().parse::<u32>().ok()))
+        .find_map(|l| {
+            l.strip_prefix("TOTAL_ERRORS=")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        })
         .expect("could not parse TOTAL_ERRORS from check-corpus-soundness.sh output");
 
     assert!(
