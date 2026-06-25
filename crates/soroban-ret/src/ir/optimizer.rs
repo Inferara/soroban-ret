@@ -49,7 +49,11 @@ fn optimize_stmts_to_fixpoint(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -
     // converges, so every other pass (name propagation, DCE, let-binding) has
     // already processed the loop as a `Loop`. This confines `SorobanStmt::For`
     // to a single late rewrite + codegen, instead of every optimizer walker.
-    recover_for_loops(current)
+    let current = recover_for_loops(current);
+    // Final safety net: replace any provably-broken construct that survived
+    // lifting + optimization with honest, compiling output (see `correctness`).
+    // Runs dead last, on the final IR shape, so it never masks recoverable work.
+    super::correctness::guard_broken_constructs(current)
 }
 
 fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<SorobanStmt> {
@@ -7355,30 +7359,49 @@ mod tests {
         assert!(out.is_empty(), "Expected empty, got {:?}", out);
     }
 
+    // Side-effecting `StorageRemove` markers (which survive optimization, unlike
+    // a bare `break`/`continue` — those are now dropped outside a loop by the
+    // correctness guard) prove the constant condition keeps the right branch.
+    fn remove_marker(key: &str) -> SorobanStmt {
+        SorobanStmt::Expr(SorobanExpr::StorageRemove {
+            storage_type: StorageType::Persistent,
+            key: Box::new(param(key)),
+        })
+    }
+    fn marker_key(stmt: &SorobanStmt) -> Option<&str> {
+        match stmt {
+            SorobanStmt::Expr(SorobanExpr::StorageRemove { key, .. }) => match key.as_ref() {
+                SorobanExpr::Param(p) => Some(p.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     #[test]
     fn fold_constant_true_if() {
-        // if 1i32 { continue; }  →  continue;
+        // if 1i32 { remove("then"); }  →  remove("then");
         let stmts = vec![SorobanStmt::If {
             condition: SorobanExpr::I32Literal(1),
-            then_body: vec![SorobanStmt::Continue],
+            then_body: vec![remove_marker("then")],
             else_body: vec![],
         }];
         let out = optimize_stmts(stmts);
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], SorobanStmt::Continue));
+        assert_eq!(marker_key(&out[0]), Some("then"));
     }
 
     #[test]
     fn fold_constant_false_if_else() {
-        // if 0i64 { break; } else { continue; }  →  continue;
+        // if 0i64 { remove("then"); } else { remove("else"); }  →  remove("else");
         let stmts = vec![SorobanStmt::If {
             condition: SorobanExpr::I64Literal(0),
-            then_body: vec![SorobanStmt::Break],
-            else_body: vec![SorobanStmt::Continue],
+            then_body: vec![remove_marker("then")],
+            else_body: vec![remove_marker("else")],
         }];
         let out = optimize_stmts(stmts);
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], SorobanStmt::Continue));
+        assert_eq!(marker_key(&out[0]), Some("else"));
     }
 
     // ----- Leading panic removal -----
