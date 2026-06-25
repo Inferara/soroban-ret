@@ -10,10 +10,12 @@
 use std::collections::HashMap;
 
 use crate::codegen::module::{assemble_generic_module, assemble_module, format_source};
+use crate::ir::correctness::annotate_uninferable_gets;
 use crate::ir::optimizer::{
-    drop_void_unknown_value_return_guards, optimize_stmts, optimize_stmts_preserve_host_calls,
-    propagate_variable_names, recover_match_arm_storage_keys, recover_tokens_sorted_validation,
-    remove_self_assignments, replace_void_with_none_in_option_fields,
+    drop_void_unknown_value_return_guards, fold_tautological_tag_guards, optimize_stmts,
+    optimize_stmts_preserve_host_calls, propagate_variable_names, recover_match_arm_storage_keys,
+    recover_tokens_sorted_validation, remove_self_assignments,
+    replace_void_with_none_in_option_fields,
 };
 use crate::ir::soroban_ir::{MatchArm, MatchPattern, SorobanExpr, SorobanStmt, StorageType};
 use crate::pattern::lift_functions;
@@ -206,6 +208,14 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // to the faithful `for i in 1..tokens.len() { … }`. Run pre-optimization
         // while the mangled loop and the recovered error codes are both intact.
         func.body = recover_tokens_sorted_validation(std::mem::take(&mut func.body));
+
+        // Tautological SDK type-tag guards: `<param>.get_tag() == Tag::<T>` where
+        // the param's type uniquely fixes the tag (Address→AddressObject, …) is
+        // always true. Fold to a constant `bool` (using the param types) so the
+        // optimizer's constant-`if` folding drops the guard, clearing the
+        // non-compiling `get_tag()`/`Tag` references. Run pre-optimization while
+        // the operand is still the lifter's `ValTag(Param(_))` (before naming).
+        func.body = fold_tautological_tag_guards(std::mem::take(&mut func.body), &func.params);
 
         let optimized = optimize_stmts(std::mem::take(&mut func.body));
         func.body = optimized;
@@ -770,6 +780,15 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
             resolve_event_data_params(&mut func.body, &func.params, param_local_base);
         }
         log::trace!("Pipeline pass: stage_4y resolve_event_data_params");
+    }
+
+    // Final compile-correctness pass: annotate un-inferable storage gets with an
+    // explicit `Val` type so they type-check (E0277/E0282/E0284). Runs last, on
+    // the fully-shaped body after every other stage, and applies to all output
+    // (not just SDK contracts). See `ir::correctness::annotate_uninferable_gets`.
+    for func in &mut contract_module.functions {
+        let returns_value = !matches!(&func.return_type, None | Some(ScSpecTypeDef::Void));
+        func.body = annotate_uninferable_gets(std::mem::take(&mut func.body), returns_value);
     }
 
     // Stage 5: Generate Rust source

@@ -3403,6 +3403,171 @@ fn remove_val_tag_guards_nested(stmt: SorobanStmt) -> SorobanStmt {
     }
 }
 
+/// Name → Val tag map for a function's uniquely-tagged parameters.
+type TagMap<'a> = std::collections::HashMap<&'a str, &'static str>;
+
+/// The single Val tag a type can carry, when it has exactly one. `Address`/`Vec`/
+/// `Map`/`Bytes`/`String` are always *objects*, and `u32`/`i32` always *small* —
+/// so a value of that type has a statically-known tag and the SDK's inlined
+/// `try_from_val` tag check against it is a tautology. Types with both a small
+/// and an object representation (`Symbol`, `u64`/`i128`/…) — and value-dependent
+/// `bool` — return `None`: their tag is not fixed, so the check is genuine.
+fn unique_val_tag(td: &stellar_xdr::curr::ScSpecTypeDef) -> Option<&'static str> {
+    use stellar_xdr::curr::ScSpecTypeDef as T;
+    Some(match td {
+        T::Address => "AddressObject",
+        T::Vec(_) => "VecObject",
+        T::Map(_) => "MapObject",
+        T::Bytes | T::BytesN(_) => "BytesObject",
+        T::String => "StringObject",
+        T::U32 => "U32Val",
+        T::I32 => "I32Val",
+        _ => return None,
+    })
+}
+
+/// Fold a *tautological* SDK type-tag guard to its constant truth value.
+///
+/// `<param>.get_tag() == Tag::<T>` (and the `!=` form) where `<param>`'s declared
+/// type uniquely determines tag `T` (see [`unique_val_tag`]) is provably true: a
+/// value of type `Address` is *always* a Val with tag `AddressObject`, a `Vec`
+/// always `VecObject`, a `u32` always `U32Val` — a Val-encoding invariant, and the
+/// host guarantees a parameter matches its spec type. The check is the SDK's
+/// inlined `try_from_val` assertion, redundant once the operand is recovered as
+/// the concrete type. Fold `==` to `true` / `!=` to `false`; the constant-`if`
+/// folding in [`optimize_stmts`] then drops the guard (`if true { body }` →
+/// `body`, `if false { panic }` → removed), clearing the `Val::get_tag()` / `Tag`
+/// references (E0599/E0433) that the public `soroban_sdk` surface doesn't expose.
+///
+/// Only `Param` operands are matched (the genuine parameter — this runs before
+/// name propagation, so the lifter's `ValTag(Param(_))` is intact) and only when
+/// the param's tag is unique; every other tag check is left untouched.
+pub fn fold_tautological_tag_guards(
+    stmts: Vec<SorobanStmt>,
+    params: &[crate::ir::high_level_ir::FnParam],
+) -> Vec<SorobanStmt> {
+    let tags: TagMap = params
+        .iter()
+        .filter_map(|p| unique_val_tag(&p.type_def).map(|t| (p.name.as_str(), t)))
+        .collect();
+    if tags.is_empty() {
+        return stmts;
+    }
+    stmts
+        .into_iter()
+        .map(|s| fold_tag_guards_stmt(s, &tags))
+        .collect()
+}
+
+fn fold_tag_guards_stmt(stmt: SorobanStmt, tags: &TagMap) -> SorobanStmt {
+    let body = |b: Vec<SorobanStmt>| {
+        b.into_iter()
+            .map(|s| fold_tag_guards_stmt(s, tags))
+            .collect()
+    };
+    match stmt {
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => SorobanStmt::If {
+            condition: fold_tag_guards_expr(condition, tags),
+            then_body: body(then_body),
+            else_body: body(else_body),
+        },
+        SorobanStmt::Expr(e) => SorobanStmt::Expr(fold_tag_guards_expr(e, tags)),
+        SorobanStmt::Let {
+            name,
+            mutable,
+            value,
+        } => SorobanStmt::Let {
+            name,
+            mutable,
+            value: fold_tag_guards_expr(value, tags),
+        },
+        SorobanStmt::Assign { target, value } => SorobanStmt::Assign {
+            target,
+            value: fold_tag_guards_expr(value, tags),
+        },
+        SorobanStmt::Return(Some(e)) => SorobanStmt::Return(Some(fold_tag_guards_expr(e, tags))),
+        SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+            scrutinee: fold_tag_guards_expr(scrutinee, tags),
+            arms: arms
+                .into_iter()
+                .map(|a| MatchArm {
+                    pattern: a.pattern,
+                    body: body(a.body),
+                })
+                .collect(),
+        },
+        SorobanStmt::Loop { body: b } => SorobanStmt::Loop { body: body(b) },
+        SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body: b,
+        } => SorobanStmt::For {
+            var,
+            start,
+            end,
+            step,
+            body: body(b),
+        },
+        SorobanStmt::Block(b) => SorobanStmt::Block(body(b)),
+        other => other,
+    }
+}
+
+/// Rewrite a boolean expression, folding a tautological `ValTag == ValTagName`
+/// comparison to a constant. Recurses through the boolean structure
+/// (`&&`/`||`/`!`) so a tag check nested in a compound condition is reached.
+fn fold_tag_guards_expr(expr: SorobanExpr, tags: &TagMap) -> SorobanExpr {
+    match expr {
+        SorobanExpr::Eq(a, b) => {
+            let a = fold_tag_guards_expr(*a, tags);
+            let b = fold_tag_guards_expr(*b, tags);
+            if tag_check_is_tautology(&a, &b, tags) {
+                return SorobanExpr::BoolLiteral(true);
+            }
+            SorobanExpr::Eq(Box::new(a), Box::new(b))
+        }
+        SorobanExpr::Ne(a, b) => {
+            let a = fold_tag_guards_expr(*a, tags);
+            let b = fold_tag_guards_expr(*b, tags);
+            if tag_check_is_tautology(&a, &b, tags) {
+                return SorobanExpr::BoolLiteral(false);
+            }
+            SorobanExpr::Ne(Box::new(a), Box::new(b))
+        }
+        SorobanExpr::Not(inner) => SorobanExpr::Not(Box::new(fold_tag_guards_expr(*inner, tags))),
+        SorobanExpr::And(a, b) => SorobanExpr::And(
+            Box::new(fold_tag_guards_expr(*a, tags)),
+            Box::new(fold_tag_guards_expr(*b, tags)),
+        ),
+        SorobanExpr::Or(a, b) => SorobanExpr::Or(
+            Box::new(fold_tag_guards_expr(*a, tags)),
+            Box::new(fold_tag_guards_expr(*b, tags)),
+        ),
+        other => other,
+    }
+}
+
+/// True when `a`/`b` compare `<param>.get_tag()` against `Tag::<T>` where the
+/// param's type uniquely carries tag `T` — i.e. the equality is always true.
+fn tag_check_is_tautology(a: &SorobanExpr, b: &SorobanExpr, tags: &TagMap) -> bool {
+    let (operand, name) = match (a, b) {
+        (SorobanExpr::ValTag(x), SorobanExpr::ValTagName(t))
+        | (SorobanExpr::ValTagName(t), SorobanExpr::ValTag(x)) => (x.as_ref(), t.as_str()),
+        _ => return false,
+    };
+    // Only the genuine parameter — not a reassignable local that may shadow it.
+    let SorobanExpr::Param(p) = operand else {
+        return false;
+    };
+    tags.get(p.as_str()).is_some_and(|t| *t == name)
+}
+
 /// Drop SDK Val-decode dispatch husks left behind in **void** functions.
 ///
 /// Inlining a non-void decoder (e.g. a `Symbol`→index ladder) into a void caller
@@ -4344,11 +4509,21 @@ fn is_bool_typed(e: &SorobanExpr) -> bool {
     ) {
         return true;
     }
-    // Soroban crypto methods that return bool
+    // Soroban methods that return `bool`: collection membership/emptiness queries
+    // (`Map::contains_key`, `Vec::contains`, `*::is_empty`) and crypto checks. The
+    // lifter lowers the WASM `i32` result of these against a `0`/`1` literal
+    // (`map.contains_key(k) == 1`); recognising them lets the existing
+    // `bool == 1 → bool` fold recover the logical comparison (fixes E0308
+    // "expected bool, found integer").
     if let SorobanExpr::MethodCall { method, .. } = e {
         return matches!(
             method.as_str(),
-            "pairing_check" | "g1_is_in_subgroup" | "g2_is_in_subgroup"
+            "contains_key"
+                | "contains"
+                | "is_empty"
+                | "pairing_check"
+                | "g1_is_in_subgroup"
+                | "g2_is_in_subgroup"
         );
     }
     false
@@ -7581,6 +7756,101 @@ mod tests {
             &out[0],
             SorobanStmt::Return(Some(SorobanExpr::StorageHas { .. }))
         ));
+    }
+
+    #[test]
+    fn fold_contains_key_eq_one() {
+        // map.contains_key(k) == 1  →  map.contains_key(k)
+        let stmts = vec![ret(SorobanExpr::Eq(
+            Box::new(SorobanExpr::MethodCall {
+                object: Box::new(param("map")),
+                method: "contains_key".into(),
+                args: vec![param("k")],
+            }),
+            Box::new(SorobanExpr::I32Literal(1)),
+        ))];
+        let out = optimize_stmts(stmts);
+        assert!(
+            matches!(
+                &out[0],
+                SorobanStmt::Return(Some(SorobanExpr::MethodCall { method, .. })) if method == "contains_key"
+            ),
+            "contains_key == 1 should fold to the bare call: {out:?}"
+        );
+    }
+
+    fn tag_guard(operand: &str, tag: &str) -> SorobanStmt {
+        SorobanStmt::If {
+            condition: SorobanExpr::Eq(
+                Box::new(SorobanExpr::ValTag(Box::new(param(operand)))),
+                Box::new(SorobanExpr::ValTagName(tag.into())),
+            ),
+            then_body: vec![ret(SorobanExpr::U32Literal(0))],
+            else_body: vec![],
+        }
+    }
+
+    fn fnparam(
+        name: &str,
+        td: stellar_xdr::curr::ScSpecTypeDef,
+    ) -> crate::ir::high_level_ir::FnParam {
+        crate::ir::high_level_ir::FnParam {
+            name: name.into(),
+            type_def: td,
+        }
+    }
+
+    #[test]
+    fn folds_tautological_address_tag_guard() {
+        // addr: Address  →  `addr.get_tag() == Tag::AddressObject` is always true.
+        use stellar_xdr::curr::ScSpecTypeDef;
+        let out = fold_tautological_tag_guards(
+            vec![tag_guard("addr", "AddressObject")],
+            &[fnparam("addr", ScSpecTypeDef::Address)],
+        );
+        let SorobanStmt::If { condition, .. } = &out[0] else {
+            panic!("expected if, got {out:?}");
+        };
+        assert!(
+            matches!(condition, SorobanExpr::BoolLiteral(true)),
+            "Address tag guard should fold to true: {condition:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_ambiguous_symbol_tag_guard() {
+        // Symbol has both SymbolSmall and SymbolObject forms — the tag is value-
+        // dependent, so the check is genuine and must be left untouched.
+        use stellar_xdr::curr::ScSpecTypeDef;
+        let out = fold_tautological_tag_guards(
+            vec![tag_guard("s", "SymbolObject")],
+            &[fnparam("s", ScSpecTypeDef::Symbol)],
+        );
+        let SorobanStmt::If { condition, .. } = &out[0] else {
+            panic!("expected if, got {out:?}");
+        };
+        assert!(
+            matches!(condition, SorobanExpr::Eq(..)),
+            "ambiguous Symbol tag guard must be preserved: {condition:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_mismatched_tag_guard() {
+        // addr: Address checked against VecObject — not a tautology (and a likely
+        // lifter confusion); leave it visible rather than fold to a wrong constant.
+        use stellar_xdr::curr::ScSpecTypeDef;
+        let out = fold_tautological_tag_guards(
+            vec![tag_guard("addr", "VecObject")],
+            &[fnparam("addr", ScSpecTypeDef::Address)],
+        );
+        let SorobanStmt::If { condition, .. } = &out[0] else {
+            panic!("expected if, got {out:?}");
+        };
+        assert!(
+            matches!(condition, SorobanExpr::Eq(..)),
+            "mismatched tag guard must be preserved: {condition:?}"
+        );
     }
 
     #[test]

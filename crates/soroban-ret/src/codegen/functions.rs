@@ -480,8 +480,19 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             }
         }
         SorobanExpr::VecConstruct(elements) => {
-            let elem_exprs: Vec<_> = elements.iter().map(generate_expr).collect();
-            quote! { vec![&env, #(#elem_exprs),*] }
+            if is_heterogeneous_val_vec(elements) {
+                // Mixed element types can't form a homogeneous `Vec<T>` (E0308) —
+                // the lost-`DataKey` shape `vec![&env, 14, addr]`, a raw
+                // discriminant beside a variable payload. Convert each element to
+                // `Val` so the literal types as `Vec<Val>`. Faithful: `into_val`
+                // yields the identical per-element ScVal, and `Vec<Val>` is the
+                // only type a heterogeneous key vec can have.
+                let elem_exprs: Vec<_> = elements.iter().map(generate_val_elem).collect();
+                quote! { vec![&env, #(#elem_exprs),*] }
+            } else {
+                let elem_exprs: Vec<_> = elements.iter().map(generate_expr).collect();
+                quote! { vec![&env, #(#elem_exprs),*] }
+            }
         }
         SorobanExpr::MapConstruct(entries) => {
             let entry_exprs: Vec<_> = entries
@@ -771,6 +782,113 @@ fn generate_cond_expr(expr: &SorobanExpr) -> TokenStream {
 /// Generate a Soroban expression in tail position (no outer parentheses on operators).
 fn generate_tail_expr(expr: &SorobanExpr) -> TokenStream {
     generate_expr_prec(expr, 0, false)
+}
+
+/// True when a `vec![&env, ...]` literal mixes element types and so cannot type
+/// as a homogeneous `Vec<T>` — the lost-`DataKey` shape `vec![&env, 14, addr]`
+/// (a raw discriminant beside a variable payload). Conservative: fires only when
+/// there are ≥2 *distinct* known scalar types, or a known numeric literal sits
+/// beside an element whose type can't be told (`Address`/`Param`/method call/…).
+/// A uniform vec, or one whose element types are indistinguishable, is untouched.
+///
+/// `!`-typed elements (`todo!()`/`panic!()`) are skipped: they coerce to any
+/// element type and so never force a heterogeneous vec — forcing `.into_val()`
+/// on one would instead *break* a vec that previously compiled via coercion.
+pub(crate) fn is_heterogeneous_val_vec(elems: &[SorobanExpr]) -> bool {
+    if elems.len() < 2 {
+        return false;
+    }
+    let mut known: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    let mut has_unknown = false;
+    let mut has_numeric = false;
+    for e in elems {
+        if is_never_typed(e) {
+            continue;
+        }
+        match scalar_class(e) {
+            Some(c) => {
+                known.insert(c);
+                if is_numeric_class(c) {
+                    has_numeric = true;
+                }
+            }
+            None => has_unknown = true,
+        }
+    }
+    known.len() >= 2 || (has_numeric && has_unknown)
+}
+
+/// A `!`-typed expression (`todo!()`, `panic!()`, `panic_with_error!()`) — it
+/// coerces to any type, so it never participates in a type mismatch.
+fn is_never_typed(e: &SorobanExpr) -> bool {
+    matches!(
+        e,
+        SorobanExpr::UnknownVal | SorobanExpr::Panic | SorobanExpr::PanicWithError(_)
+    )
+}
+
+/// The concrete Rust scalar type of an element, when statically known. `None`
+/// for elements whose type can't be determined from the IR node alone (variables,
+/// addresses, method results) — those are treated as the unknown class.
+fn scalar_class(e: &SorobanExpr) -> Option<&'static str> {
+    use SorobanExpr as E;
+    match e {
+        E::U32Literal(_) => Some("u32"),
+        E::I32Literal(_) => Some("i32"),
+        E::U64Literal(_) => Some("u64"),
+        E::I64Literal(_) => Some("i64"),
+        E::U128Literal(_) => Some("u128"),
+        E::I128Literal(_) => Some("i128"),
+        E::BoolLiteral(_) => Some("bool"),
+        E::SymbolLiteral(_) => Some("symbol"),
+        E::StringLiteral(_) => Some("string"),
+        _ => None,
+    }
+}
+
+fn is_numeric_class(c: &str) -> bool {
+    matches!(c, "u32" | "i32" | "u64" | "i64" | "u128" | "i128")
+}
+
+/// Render one heterogeneous-vec element as a `Val` via fully-qualified
+/// `IntoVal::<_, Val>::into_val(&elem, &env)`. The explicit `Val` target is
+/// required: a bare `elem.into_val(&env)` leaves the conversion target ambiguous
+/// inside a `vec!` whose element type isn't otherwise pinned (E0283). Integer
+/// literals carry a width suffix so the source type is unambiguous too.
+fn generate_val_elem(e: &SorobanExpr) -> TokenStream {
+    let inner = generate_suffixed_scalar(e);
+    quote! { IntoVal::<_, Val>::into_val(&(#inner), &env) }
+}
+
+fn generate_suffixed_scalar(e: &SorobanExpr) -> TokenStream {
+    use SorobanExpr as E;
+    match e {
+        E::U32Literal(v) => {
+            let l = proc_macro2::Literal::u32_suffixed(*v);
+            quote! { #l }
+        }
+        E::I32Literal(v) => {
+            let l = proc_macro2::Literal::i32_suffixed(*v);
+            quote! { #l }
+        }
+        E::U64Literal(v) => {
+            let l = proc_macro2::Literal::u64_suffixed(*v);
+            quote! { #l }
+        }
+        E::I64Literal(v) => {
+            let l = proc_macro2::Literal::i64_suffixed(*v);
+            quote! { #l }
+        }
+        E::U128Literal(v) => {
+            let l = proc_macro2::Literal::u128_suffixed(*v);
+            quote! { #l }
+        }
+        E::I128Literal(v) => {
+            let l = proc_macro2::Literal::i128_suffixed(*v);
+            quote! { #l }
+        }
+        _ => generate_expr(e),
+    }
 }
 
 /// Generate a token stream for a Soroban statement
@@ -1631,6 +1749,70 @@ mod generate_expr_tests {
     }
     fn boxed(e: SorobanExpr) -> Box<SorobanExpr> {
         Box::new(e)
+    }
+
+    // ----- Heterogeneous key vecs -> Vec<Val> -----
+
+    #[test]
+    fn heterogeneous_vec_detection() {
+        use SorobanExpr as E;
+        let addr = || E::Param("address".into());
+        // numeric literal beside a variable payload (the lost-DataKey shape)
+        assert!(is_heterogeneous_val_vec(&[E::I64Literal(14), addr()]));
+        // two distinct known scalar types
+        assert!(is_heterogeneous_val_vec(&[
+            E::I32Literal(1),
+            E::U64Literal(2)
+        ]));
+        // uniform: same int type / same symbol kind / single element
+        assert!(!is_heterogeneous_val_vec(&[
+            E::I32Literal(1),
+            E::I32Literal(2)
+        ]));
+        assert!(!is_heterogeneous_val_vec(&[
+            E::SymbolLiteral("a".into()),
+            E::SymbolLiteral("b".into())
+        ]));
+        assert!(!is_heterogeneous_val_vec(&[E::I64Literal(14)]));
+        // `!`-typed (todo!()/panic!()) elements coerce — they do not force a wrap
+        assert!(!is_heterogeneous_val_vec(&[
+            E::I64Literal(14),
+            E::UnknownVal
+        ]));
+        assert!(!is_heterogeneous_val_vec(&[
+            E::U32Literal(1),
+            E::UnknownVal,
+            E::UnknownVal
+        ]));
+        // …but a real concrete unknown beside a numeric still wraps, todo ignored
+        assert!(is_heterogeneous_val_vec(&[
+            E::I64Literal(14),
+            E::UnknownVal,
+            addr()
+        ]));
+    }
+
+    #[test]
+    fn heterogeneous_vec_renders_into_val() {
+        use SorobanExpr as E;
+        let v = E::VecConstruct(vec![E::I64Literal(14), E::Param("address".into())]);
+        let out = collapse(&s(generate_expr(&v)));
+        assert!(
+            out.contains("IntoVal :: < _ , Val > :: into_val (& (14i64)"),
+            "numeric element should be suffixed + Val-pinned: {out}"
+        );
+        assert!(
+            out.contains("into_val (& (address) , & env)"),
+            "variable element should be Val-pinned: {out}"
+        );
+    }
+
+    #[test]
+    fn homogeneous_vec_unchanged() {
+        use SorobanExpr as E;
+        let v = E::VecConstruct(vec![E::I32Literal(1), E::I32Literal(2)]);
+        let out = collapse(&s(generate_expr(&v)));
+        assert_eq!(out, "vec ! [& env , 1 , 2]", "got: {out}");
     }
 
     // ----- Literals & basic atoms -----

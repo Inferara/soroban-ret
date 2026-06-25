@@ -21,8 +21,24 @@ use std::process::Command;
 /// Max tolerated hard compile errors across the whole mainnet corpus.
 ///
 /// History (drive this down): 1339 (pre correctness-guard) → 1318 (break-outside-
-/// loop + error-sentinel-access + undeclared-assignment husks).
-const ERROR_CEILING: u32 = 1318;
+/// loop + error-sentinel-access + undeclared-assignment husks) → 1295 (`Val`
+/// turbofish for un-inferable storage gets + heterogeneous key vecs → `Vec<Val>`;
+/// fxdao-oracle becomes the first corpus contract to compile cleanly) → 1259
+/// (`Address` annotation for `require_auth()`-ed gets + tail-aware discarded-get
+/// detection). The latter drop nets −36 but raised two contracts by +1/+2 as
+/// faithful type fixes *unmasked* pre-existing latent errors (E0382 moves, lost
+/// Val-tag husks) that an earlier type error had hidden — not new wrongness.
+/// → 1234 (recognise collection bool-methods `contains_key`/`contains`/`is_empty`
+/// in `is_bool_typed`, so the existing `bool == 1 → bool` fold fires on
+/// `map.contains_key(k) == 1`; fixes E0308 "expected bool, found integer",
+/// aqua-amm −25, zero regression).
+/// → 1201 (fold tautological SDK type-tag guards `<param>.get_tag() == Tag::<T>`
+/// to a constant when the param type uniquely fixes the tag — Address/Vec/Map/
+/// Bytes/String/u32/i32; clears E0599 `get_tag`/E0433 `Tag`. unknown-oracle −10,
+/// band −9. Nets −33; aqua-rewards +5 as folding a broken guard *condition* lets
+/// rustc see the (always-reached) body's pre-existing lost-key/value errors it
+/// had been suppressing — faithful unmasking, not new wrongness.
+const ERROR_CEILING: u32 = 1201;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

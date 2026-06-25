@@ -150,6 +150,9 @@ pub fn compute_imports(module: &ContractModule, registry: &TypeRegistry) -> Toke
     if needs.into_val {
         items.push(quote! { IntoVal });
     }
+    if needs.val {
+        items.push(quote! { Val });
+    }
 
     // Sort imports to match rustfmt convention: lowercase items (macros/keywords)
     // first, then uppercase items (types), both groups sorted alphabetically.
@@ -193,6 +196,7 @@ struct ImportNeeds {
     u256: bool,
     i256: bool,
     into_val: bool,
+    val: bool,
 }
 
 fn scan_type_def(type_def: &ScSpecTypeDef, needs: &mut ImportNeeds, crypto: &CryptoUsage) {
@@ -302,6 +306,13 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
         SorobanExpr::VecConstruct(elems) => {
             needs.vec_type = true;
             needs.vec_macro = true;
+            // A heterogeneous key vec renders each element via
+            // `IntoVal::<_, Val>::into_val(...)` (see `functions::generate_val_elem`),
+            // which names both `IntoVal` and `Val`.
+            if super::functions::is_heterogeneous_val_vec(elems) {
+                needs.into_val = true;
+                needs.val = true;
+            }
             for e in elems {
                 scan_expr(e, needs);
             }
@@ -455,9 +466,17 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
         SorobanExpr::PrngVecShuffle(vec) => scan_expr(vec, needs),
         SorobanExpr::AddressToStrkey(addr) => scan_expr(addr, needs),
         SorobanExpr::ErrorFromCode(e) => scan_expr(e, needs),
-        SorobanExpr::ValConvert { value, .. } | SorobanExpr::CastAs { value, .. } => {
-            scan_expr(value, needs)
+        SorobanExpr::CastAs { value, target_type } => {
+            // A storage-get type annotation (`CastAs { StorageGet, T }`) lowers to
+            // `get::<_, T>` (annotate_uninferable_gets), naming `T` explicitly.
+            match target_type.as_str() {
+                "Val" => needs.val = true,
+                "Address" => needs.address = true,
+                _ => {}
+            }
+            scan_expr(value, needs);
         }
+        SorobanExpr::ValConvert { value, .. } => scan_expr(value, needs),
         SorobanExpr::RawHostCall { args, .. } => {
             for a in args {
                 scan_expr(a, needs);

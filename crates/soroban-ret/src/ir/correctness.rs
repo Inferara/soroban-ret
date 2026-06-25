@@ -285,6 +285,352 @@ fn declare_first_assign(
 }
 
 // ---------------------------------------------------------------------------
+// Pass: annotate un-inferable storage gets with an explicit value type.
+// ---------------------------------------------------------------------------
+//
+// `env.storage().<area>().get(&key)` is generic over its value type
+// `V: TryFromVal<Env, Val>`. When the result flows into a typed context (a
+// typed `let`, a typed return, a typed argument) rustc infers `V`. But the
+// corpus leaves many gets whose result is *discarded* (`get(&k).unwrap();`) or
+// bound to an *unused* local — there `V` is unconstrained and the code does not
+// compile (E0282/E0284, with the `TryFromVal` chain surfacing as E0277).
+//
+// We supply the type by wrapping the get in `CastAs { .., T }`, which codegen
+// lowers to a `get::<_, T>(&key)` turbofish (see `generate_expr`'s
+// `CastAs { StorageGet, T }` arm). This is a pure type annotation — it changes
+// no runtime value, only makes the (failed) inference explicit. Two cases:
+//
+//   1. **`Address`** when the get's value is `require_auth()`-ed
+//      (`RequireAuth(StorageGet)` — the admin-gate idiom
+//      `get(&admin).unwrap().require_auth()`). `require_auth` is an `Address`
+//      method, so the value is *provably* an `Address` — `Val` would be wrong
+//      (no such method). This is consumer-driven type recovery, not a guess.
+//   2. **`Val`** for a get whose result is otherwise unused: the untyped host
+//      value is exactly what the lifter could not narrow. Applied to a
+//      *discarded* `Expr(StorageGet)` (one not in tail/return position — its
+//      value is thrown away) or a `Let { value: StorageGet }` whose binding is
+//      *never referenced*. A value-returning tail get, a typed `let`, or any
+//      used binding is left to inference (the 38 compile-back fixtures rely on
+//      it), so the pass is a no-op on correctly-lifted bodies.
+
+/// Annotate un-inferable storage gets with a concrete value type. `returns_value`
+/// is whether the enclosing function returns a value (`func.return_type` is some
+/// non-`Void`): when false, no `Expr(StorageGet)` is ever a return, so all are
+/// discarded.
+pub fn annotate_uninferable_gets(stmts: Vec<SorobanStmt>, returns_value: bool) -> Vec<SorobanStmt> {
+    // Address-from-require_auth first, so the Val pass below skips a get already
+    // wrapped as an auth target (it is no longer a bare `StorageGet`).
+    let stmts = annotate_auth_target_gets(stmts);
+    let used = collect_referenced_names(&stmts);
+    annotate_gets(stmts, returns_value, &used)
+}
+
+/// Case 1: `RequireAuth(StorageGet)` / `RequireAuthForArgs { address:
+/// StorageGet, .. }` → annotate the get `Address`. The value has `require_auth`
+/// called on it, so it can only be an `Address`.
+fn annotate_auth_target_gets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    map_exprs_in_stmts(stmts, &auth_target_expr)
+}
+
+fn auth_target_expr(expr: SorobanExpr) -> SorobanExpr {
+    match expr {
+        SorobanExpr::RequireAuth(inner) if matches!(*inner, SorobanExpr::StorageGet { .. }) => {
+            SorobanExpr::RequireAuth(Box::new(annotate_with(*inner, "Address")))
+        }
+        SorobanExpr::RequireAuthForArgs { address, args }
+            if matches!(*address, SorobanExpr::StorageGet { .. }) =>
+        {
+            SorobanExpr::RequireAuthForArgs {
+                address: Box::new(annotate_with(*address, "Address")),
+                args: Box::new(auth_target_expr(*args)),
+            }
+        }
+        other => map_subexprs(other, &auth_target_expr),
+    }
+}
+
+/// Case 2: annotate discarded / unused bare gets with `Val`. `tail_is_return` is
+/// true when the *last* statement of this list is in tail (return) position —
+/// only that statement, in a value-returning function, can be the inferable
+/// return value; every earlier `Expr(StorageGet)` is discarded. Mirrors
+/// codegen's tail handling: `if`/`match`/`block` propagate tail position into
+/// their last statement; loop bodies never do.
+fn annotate_gets(
+    stmts: Vec<SorobanStmt>,
+    tail_is_return: bool,
+    used: &HashSet<String>,
+) -> Vec<SorobanStmt> {
+    let last = stmts.len().saturating_sub(1);
+    stmts
+        .into_iter()
+        .enumerate()
+        .map(|(i, stmt)| {
+            let this_is_tail = tail_is_return && i == last;
+            match stmt {
+                // Discarded get (not the inferable tail return).
+                SorobanStmt::Expr(e)
+                    if !this_is_tail && matches!(e, SorobanExpr::StorageGet { .. }) =>
+                {
+                    SorobanStmt::Expr(annotate_with(e, "Val"))
+                }
+                // Get bound to a never-referenced local — its `V` is unconstrained.
+                SorobanStmt::Let {
+                    name,
+                    mutable,
+                    value,
+                } if matches!(value, SorobanExpr::StorageGet { .. }) && !used.contains(&name) => {
+                    SorobanStmt::Let {
+                        name,
+                        mutable,
+                        value: annotate_with(value, "Val"),
+                    }
+                }
+                SorobanStmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => SorobanStmt::If {
+                    condition,
+                    then_body: annotate_gets(then_body, this_is_tail, used),
+                    else_body: annotate_gets(else_body, this_is_tail, used),
+                },
+                SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+                    scrutinee,
+                    arms: arms
+                        .into_iter()
+                        .map(|a| MatchArm {
+                            pattern: a.pattern,
+                            body: annotate_gets(a.body, this_is_tail, used),
+                        })
+                        .collect(),
+                },
+                SorobanStmt::Loop { body } => SorobanStmt::Loop {
+                    body: annotate_gets(body, false, used),
+                },
+                SorobanStmt::For {
+                    var,
+                    start,
+                    end,
+                    step,
+                    body,
+                } => SorobanStmt::For {
+                    var,
+                    start,
+                    end,
+                    step,
+                    body: annotate_gets(body, false, used),
+                },
+                SorobanStmt::Block(body) => {
+                    SorobanStmt::Block(annotate_gets(body, this_is_tail, used))
+                }
+                other => other,
+            }
+        })
+        .collect()
+}
+
+/// Wrap a storage get in `CastAs { .., ty }` — codegen lowers this to the
+/// `get::<_, ty>(&key)` turbofish.
+fn annotate_with(get: SorobanExpr, ty: &str) -> SorobanExpr {
+    SorobanExpr::CastAs {
+        value: Box::new(get),
+        target_type: ty.to_string(),
+    }
+}
+
+/// Every variable name referenced anywhere in the body. `Local(i)` renders as
+/// `var_i` (see codegen), so it is normalised to that form to match a `let`
+/// binding of the same name. A direct read-only walk over the borrowed body —
+/// no allocation beyond the result set.
+fn collect_referenced_names(stmts: &[SorobanStmt]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    visit_stmt_names(stmts, &mut names);
+    names
+}
+
+fn visit_stmt_names(stmts: &[SorobanStmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(e)
+            | SorobanStmt::Let { value: e, .. }
+            | SorobanStmt::Assign { value: e, .. }
+            | SorobanStmt::Return(Some(e)) => visit_expr_names(e, out),
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                visit_expr_names(condition, out);
+                visit_stmt_names(then_body, out);
+                visit_stmt_names(else_body, out);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                visit_expr_names(scrutinee, out);
+                for a in arms {
+                    visit_stmt_names(&a.body, out);
+                }
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => visit_stmt_names(body, out),
+            SorobanStmt::For {
+                start, end, body, ..
+            } => {
+                visit_expr_names(start, out);
+                visit_expr_names(end, out);
+                visit_stmt_names(body, out);
+            }
+            SorobanStmt::Return(None)
+            | SorobanStmt::Comment(_)
+            | SorobanStmt::Break
+            | SorobanStmt::Continue => {}
+        }
+    }
+}
+
+fn visit_expr_names(expr: &SorobanExpr, out: &mut HashSet<String>) {
+    match expr {
+        SorobanExpr::Param(n) | SorobanExpr::NamedLocal(n) => {
+            out.insert(n.clone());
+        }
+        SorobanExpr::Local(i) => {
+            out.insert(format!("var_{i}"));
+        }
+        _ => {}
+    }
+    for_each_subexpr(expr, &mut |child| visit_expr_names(child, out));
+}
+
+/// Borrowed read-only twin of [`map_subexprs`]: invoke `f` on each *direct*
+/// sub-expression of `expr`. Kept structurally identical to `map_subexprs` —
+/// update both together when a variant gains a sub-expression.
+fn for_each_subexpr(expr: &SorobanExpr, f: &mut dyn FnMut(&SorobanExpr)) {
+    use SorobanExpr as E;
+    match expr {
+        E::Add(a, b)
+        | E::Sub(a, b)
+        | E::Mul(a, b)
+        | E::Div(a, b)
+        | E::Rem(a, b)
+        | E::Eq(a, b)
+        | E::Ne(a, b)
+        | E::Lt(a, b)
+        | E::Le(a, b)
+        | E::Gt(a, b)
+        | E::Ge(a, b)
+        | E::And(a, b)
+        | E::Or(a, b) => {
+            f(a);
+            f(b);
+        }
+        E::Not(a) | E::Some(a) => f(a),
+        E::StorageGet { key, .. } | E::StorageHas { key, .. } | E::StorageRemove { key, .. } => {
+            f(key)
+        }
+        E::StorageSet { key, value, .. } => {
+            f(key);
+            f(value);
+        }
+        E::StorageExtendTtl {
+            key,
+            threshold,
+            extend_to,
+            ..
+        } => {
+            f(key);
+            f(threshold);
+            f(extend_to);
+        }
+        E::ExtendInstanceAndCodeTtl {
+            threshold,
+            extend_to,
+        } => {
+            f(threshold);
+            f(extend_to);
+        }
+        E::RequireAuth(a) | E::AuthorizeAsCurrContract(a) => f(a),
+        E::RequireAuthForArgs { address, args } => {
+            f(address);
+            f(args);
+        }
+        E::PublishEvent { topics, data, .. } => {
+            topics.iter().for_each(&mut *f);
+            f(data);
+        }
+        E::InvokeContract {
+            address,
+            function,
+            args,
+            ..
+        }
+        | E::TryInvokeContract {
+            address,
+            function,
+            args,
+            ..
+        } => {
+            f(address);
+            f(function);
+            args.iter().for_each(&mut *f);
+        }
+        E::StructConstruct { fields, .. } => fields.iter().for_each(|(_, e)| f(e)),
+        E::EnumConstruct { fields, .. } => fields.iter().for_each(&mut *f),
+        E::TupleConstruct(items) | E::VecConstruct(items) | E::Log(items) => {
+            items.iter().for_each(&mut *f)
+        }
+        E::MapConstruct(pairs) => pairs.iter().for_each(|(k, v)| {
+            f(k);
+            f(v);
+        }),
+        E::FieldAccess { object, .. } => f(object),
+        E::MethodCall { object, args, .. } => {
+            f(object);
+            args.iter().for_each(&mut *f);
+        }
+        E::ErrorFromCode(a)
+        | E::PanicWithError(a)
+        | E::CryptoSha256(a)
+        | E::CryptoKeccak256(a)
+        | E::PrngReseed(a)
+        | E::PrngBytesNew(a)
+        | E::PrngVecShuffle(a)
+        | E::StrkeyToAddress(a)
+        | E::AddressToStrkey(a)
+        | E::SretResult(a)
+        | E::ValTag(a)
+        | E::ValConvert { value: a, .. }
+        | E::CastAs { value: a, .. } => f(a),
+        E::CryptoEd25519Verify {
+            public_key,
+            message,
+            signature,
+        } => {
+            f(public_key);
+            f(message);
+            f(signature);
+        }
+        E::CryptoSecp256k1Recover {
+            msg_digest,
+            signature,
+            recovery_id,
+        } => {
+            f(msg_digest);
+            f(signature);
+            f(recovery_id);
+        }
+        E::PrngU64InRange { low, high } => {
+            f(low);
+            f(high);
+        }
+        E::RawHostCall { args, .. } => args.iter().for_each(&mut *f),
+        E::VecTryIterFold { vec, init } => {
+            f(vec);
+            f(init);
+        }
+        // Leaves (literals, vars, ledger/contract constants, tag names, …).
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Minimal generic walkers (the IR has no shared visitor; these stay local).
 // ---------------------------------------------------------------------------
 
@@ -763,5 +1109,119 @@ mod tests {
             &out[0],
             SorobanStmt::Expr(SorobanExpr::UnknownVal)
         ));
+    }
+
+    // --- annotate_uninferable_gets ---------------------------------------
+
+    fn get(key: &str) -> SorobanExpr {
+        SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::Param(key.into())),
+            unwrap: true,
+        }
+    }
+
+    fn is_val_annotated(e: &SorobanExpr) -> bool {
+        matches!(
+            e,
+            SorobanExpr::CastAs { value, target_type }
+                if target_type == "Val" && matches!(**value, SorobanExpr::StorageGet { .. })
+        )
+    }
+
+    #[test]
+    fn annotates_discarded_get_in_void_fn() {
+        // void fn (returns_value=false): `get(&k);` is discarded → annotate `Val`.
+        let out = annotate_uninferable_gets(vec![SorobanStmt::Expr(get("k"))], false);
+        assert!(
+            matches!(&out[0], SorobanStmt::Expr(e) if is_val_annotated(e)),
+            "discarded get in void fn should be Val-annotated: {out:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_tail_get_in_value_fn() {
+        // value-returning fn: a trailing `get(&k)` is the inferable return value.
+        let out = annotate_uninferable_gets(vec![SorobanStmt::Expr(get("k"))], true);
+        assert!(
+            matches!(&out[0], SorobanStmt::Expr(SorobanExpr::StorageGet { .. })),
+            "tail get in a value fn must stay un-annotated (inferable): {out:?}"
+        );
+    }
+
+    #[test]
+    fn annotates_unused_let_get() {
+        // `let x = get(&k);` with `x` never referenced → annotate (any fn).
+        let out = annotate_uninferable_gets(
+            vec![SorobanStmt::Let {
+                name: "x".into(),
+                mutable: false,
+                value: get("k"),
+            }],
+            true,
+        );
+        assert!(
+            matches!(&out[0], SorobanStmt::Let { value, .. } if is_val_annotated(value)),
+            "unused let-bound get should be Val-annotated: {out:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_used_let_get() {
+        // `let x = get(&k); require_auth(x);` — `x` is used, so `V` is constrained.
+        let out = annotate_uninferable_gets(
+            vec![
+                SorobanStmt::Let {
+                    name: "x".into(),
+                    mutable: false,
+                    value: get("k"),
+                },
+                SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(SorobanExpr::Param(
+                    "x".into(),
+                )))),
+            ],
+            false,
+        );
+        assert!(
+            matches!(&out[0], SorobanStmt::Let { value, .. } if matches!(value, SorobanExpr::StorageGet { .. })),
+            "used let-bound get must stay un-annotated: {out:?}"
+        );
+    }
+
+    #[test]
+    fn annotates_auth_target_get_as_address() {
+        // `get(&admin).unwrap().require_auth();` → `get::<_, Address>` (the value
+        // has require_auth called on it, so it can only be an Address).
+        let stmt = SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(get("admin"))));
+        let out = annotate_uninferable_gets(vec![stmt], false);
+        let SorobanStmt::Expr(SorobanExpr::RequireAuth(inner)) = &out[0] else {
+            panic!("expected RequireAuth, got {out:?}");
+        };
+        assert!(
+            matches!(&**inner, SorobanExpr::CastAs { value, target_type }
+                if target_type == "Address" && matches!(**value, SorobanExpr::StorageGet { .. })),
+            "auth-target get should be Address-annotated: {inner:?}"
+        );
+    }
+
+    #[test]
+    fn annotates_nontail_discarded_get_in_value_fn() {
+        // value fn: `get(&k);  ret` — the first (non-tail) get is discarded → Val,
+        // the trailing `ret` return value is left to inference.
+        let out = annotate_uninferable_gets(
+            vec![
+                SorobanStmt::Expr(get("k")),
+                SorobanStmt::Expr(SorobanExpr::Param("ret".into())),
+            ],
+            true,
+        );
+        assert!(
+            matches!(&out[0], SorobanStmt::Expr(e) if is_val_annotated(e)),
+            "non-tail discarded get in a value fn should be Val-annotated: {out:?}"
+        );
+        assert!(
+            matches!(&out[1], SorobanStmt::Expr(SorobanExpr::Param(_))),
+            "tail return value must be untouched: {out:?}"
+        );
     }
 }
