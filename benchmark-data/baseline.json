@@ -5,12 +5,12 @@
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
       "entity": "Aqua AMM",
-      "restoration_pct": 95.0,
+      "restoration_pct": 95.1,
       "spec_functions": 75,
-      "fn_clean": 21,
-      "fn_partial": 54,
+      "fn_clean": 23,
+      "fn_partial": 52,
       "fn_logic_lost": 0,
-      "artifacts_total": 344,
+      "artifacts_total": 328,
       "wasm_size": 44514,
       "error": null
     },
@@ -41,7 +41,7 @@
     {
       "file": "band-protocol-CCQXWMZV.wasm",
       "entity": "Band Protocol",
-      "restoration_pct": 87.8,
+      "restoration_pct": 87.6,
       "spec_functions": 15,
       "fn_clean": 4,
       "fn_partial": 11,
@@ -53,12 +53,12 @@
     {
       "file": "blend-backstop-CAQQR5SW.wasm",
       "entity": "Blend Backstop",
-      "restoration_pct": 90.5,
+      "restoration_pct": 90.6,
       "spec_functions": 17,
       "fn_clean": 9,
       "fn_partial": 8,
       "fn_logic_lost": 0,
-      "artifacts_total": 83,
+      "artifacts_total": 81,
       "wasm_size": 30772,
       "error": null
     },
@@ -77,12 +77,12 @@
     {
       "file": "blend-fixed-pool-CAJJZSGM.wasm",
       "entity": "Blend Fixed Pool",
-      "restoration_pct": 92.2,
+      "restoration_pct": 92.3,
       "spec_functions": 27,
       "fn_clean": 9,
       "fn_partial": 18,
       "fn_logic_lost": 0,
-      "artifacts_total": 159,
+      "artifacts_total": 151,
       "wasm_size": 57328,
       "error": null
     },
@@ -101,12 +101,12 @@
     {
       "file": "blend-yieldblox-pool-CCCCIQSD.wasm",
       "entity": "Blend Yieldblox Pool",
-      "restoration_pct": 92.2,
+      "restoration_pct": 92.3,
       "spec_functions": 27,
       "fn_clean": 9,
       "fn_partial": 18,
       "fn_logic_lost": 0,
-      "artifacts_total": 159,
+      "artifacts_total": 151,
       "wasm_size": 57328,
       "error": null
     },
@@ -197,24 +197,24 @@
     {
       "file": "reflector-CAFJZQWS.wasm",
       "entity": "Reflector",
-      "restoration_pct": 94.0,
+      "restoration_pct": 94.1,
       "spec_functions": 23,
       "fn_clean": 14,
       "fn_partial": 9,
       "fn_logic_lost": 0,
-      "artifacts_total": 67,
+      "artifacts_total": 69,
       "wasm_size": 19418,
       "error": null
     },
     {
       "file": "reflector-CALI2BYU.wasm",
       "entity": "Reflector",
-      "restoration_pct": 94.0,
+      "restoration_pct": 94.1,
       "spec_functions": 23,
       "fn_clean": 14,
       "fn_partial": 9,
       "fn_logic_lost": 0,
-      "artifacts_total": 67,
+      "artifacts_total": 69,
       "wasm_size": 19418,
       "error": null
     },
@@ -226,7 +226,7 @@
       "fn_clean": 3,
       "fn_partial": 12,
       "fn_logic_lost": 0,
-      "artifacts_total": 113,
+      "artifacts_total": 112,
       "wasm_size": 20215,
       "error": null
     },
