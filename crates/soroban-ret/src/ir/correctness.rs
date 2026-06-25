@@ -16,7 +16,6 @@
 //! strict no-op on the clean fixtures (guarded by the snapshot + compile-back
 //! gates).
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 
 use super::soroban_ir::{MatchArm, SorobanExpr, SorobanStmt};
@@ -441,25 +440,194 @@ fn annotate_with(get: SorobanExpr, ty: &str) -> SorobanExpr {
 
 /// Every variable name referenced anywhere in the body. `Local(i)` renders as
 /// `var_i` (see codegen), so it is normalised to that form to match a `let`
-/// binding of the same name. Routes the cloned body through the existing
-/// `map_*` transformers as a read-only visitor (runs once per function body).
+/// binding of the same name. A direct read-only walk over the borrowed body —
+/// no allocation beyond the result set.
 fn collect_referenced_names(stmts: &[SorobanStmt]) -> HashSet<String> {
-    let names = RefCell::new(HashSet::new());
-    let _ = map_exprs_in_stmts(stmts.to_vec(), &|e| record_names(e, &names));
-    names.into_inner()
+    let mut names = HashSet::new();
+    visit_stmt_names(stmts, &mut names);
+    names
 }
 
-fn record_names(expr: SorobanExpr, names: &RefCell<HashSet<String>>) -> SorobanExpr {
-    match &expr {
+fn visit_stmt_names(stmts: &[SorobanStmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(e)
+            | SorobanStmt::Let { value: e, .. }
+            | SorobanStmt::Assign { value: e, .. }
+            | SorobanStmt::Return(Some(e)) => visit_expr_names(e, out),
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                visit_expr_names(condition, out);
+                visit_stmt_names(then_body, out);
+                visit_stmt_names(else_body, out);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                visit_expr_names(scrutinee, out);
+                for a in arms {
+                    visit_stmt_names(&a.body, out);
+                }
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => visit_stmt_names(body, out),
+            SorobanStmt::For {
+                start, end, body, ..
+            } => {
+                visit_expr_names(start, out);
+                visit_expr_names(end, out);
+                visit_stmt_names(body, out);
+            }
+            SorobanStmt::Return(None)
+            | SorobanStmt::Comment(_)
+            | SorobanStmt::Break
+            | SorobanStmt::Continue => {}
+        }
+    }
+}
+
+fn visit_expr_names(expr: &SorobanExpr, out: &mut HashSet<String>) {
+    match expr {
         SorobanExpr::Param(n) | SorobanExpr::NamedLocal(n) => {
-            names.borrow_mut().insert(n.clone());
+            out.insert(n.clone());
         }
         SorobanExpr::Local(i) => {
-            names.borrow_mut().insert(format!("var_{i}"));
+            out.insert(format!("var_{i}"));
         }
         _ => {}
     }
-    map_subexprs(expr, &|child| record_names(child, names))
+    for_each_subexpr(expr, &mut |child| visit_expr_names(child, out));
+}
+
+/// Borrowed read-only twin of [`map_subexprs`]: invoke `f` on each *direct*
+/// sub-expression of `expr`. Kept structurally identical to `map_subexprs` —
+/// update both together when a variant gains a sub-expression.
+fn for_each_subexpr(expr: &SorobanExpr, f: &mut dyn FnMut(&SorobanExpr)) {
+    use SorobanExpr as E;
+    match expr {
+        E::Add(a, b)
+        | E::Sub(a, b)
+        | E::Mul(a, b)
+        | E::Div(a, b)
+        | E::Rem(a, b)
+        | E::Eq(a, b)
+        | E::Ne(a, b)
+        | E::Lt(a, b)
+        | E::Le(a, b)
+        | E::Gt(a, b)
+        | E::Ge(a, b)
+        | E::And(a, b)
+        | E::Or(a, b) => {
+            f(a);
+            f(b);
+        }
+        E::Not(a) | E::Some(a) => f(a),
+        E::StorageGet { key, .. } | E::StorageHas { key, .. } | E::StorageRemove { key, .. } => {
+            f(key)
+        }
+        E::StorageSet { key, value, .. } => {
+            f(key);
+            f(value);
+        }
+        E::StorageExtendTtl {
+            key,
+            threshold,
+            extend_to,
+            ..
+        } => {
+            f(key);
+            f(threshold);
+            f(extend_to);
+        }
+        E::ExtendInstanceAndCodeTtl {
+            threshold,
+            extend_to,
+        } => {
+            f(threshold);
+            f(extend_to);
+        }
+        E::RequireAuth(a) | E::AuthorizeAsCurrContract(a) => f(a),
+        E::RequireAuthForArgs { address, args } => {
+            f(address);
+            f(args);
+        }
+        E::PublishEvent { topics, data, .. } => {
+            topics.iter().for_each(&mut *f);
+            f(data);
+        }
+        E::InvokeContract {
+            address,
+            function,
+            args,
+            ..
+        }
+        | E::TryInvokeContract {
+            address,
+            function,
+            args,
+            ..
+        } => {
+            f(address);
+            f(function);
+            args.iter().for_each(&mut *f);
+        }
+        E::StructConstruct { fields, .. } => fields.iter().for_each(|(_, e)| f(e)),
+        E::EnumConstruct { fields, .. } => fields.iter().for_each(&mut *f),
+        E::TupleConstruct(items) | E::VecConstruct(items) | E::Log(items) => {
+            items.iter().for_each(&mut *f)
+        }
+        E::MapConstruct(pairs) => pairs.iter().for_each(|(k, v)| {
+            f(k);
+            f(v);
+        }),
+        E::FieldAccess { object, .. } => f(object),
+        E::MethodCall { object, args, .. } => {
+            f(object);
+            args.iter().for_each(&mut *f);
+        }
+        E::ErrorFromCode(a)
+        | E::PanicWithError(a)
+        | E::CryptoSha256(a)
+        | E::CryptoKeccak256(a)
+        | E::PrngReseed(a)
+        | E::PrngBytesNew(a)
+        | E::PrngVecShuffle(a)
+        | E::StrkeyToAddress(a)
+        | E::AddressToStrkey(a)
+        | E::SretResult(a)
+        | E::ValTag(a)
+        | E::ValConvert { value: a, .. }
+        | E::CastAs { value: a, .. } => f(a),
+        E::CryptoEd25519Verify {
+            public_key,
+            message,
+            signature,
+        } => {
+            f(public_key);
+            f(message);
+            f(signature);
+        }
+        E::CryptoSecp256k1Recover {
+            msg_digest,
+            signature,
+            recovery_id,
+        } => {
+            f(msg_digest);
+            f(signature);
+            f(recovery_id);
+        }
+        E::PrngU64InRange { low, high } => {
+            f(low);
+            f(high);
+        }
+        E::RawHostCall { args, .. } => args.iter().for_each(&mut *f),
+        E::VecTryIterFold { vec, init } => {
+            f(vec);
+            f(init);
+        }
+        // Leaves (literals, vars, ledger/contract constants, tag names, …).
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
