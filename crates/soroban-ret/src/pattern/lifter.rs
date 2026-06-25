@@ -14397,7 +14397,7 @@ mod tests {
                     local.get 0 local.get 2 i32.store offset=4
                     local.get 0 local.get 3 i32.store)
                 (func $wrong_sig (param i32 i32) (local i32 i32)
-                    local.get 1 i64.const 2 i64.eq drop
+                    local.get 1 i32.const 2 i32.eq drop
                     i32.const 0 local.set 2)
                 (func $no_select (param i32 i64) (local i32)
                     local.get 1 i64.const 32 i64.shr_u i32.wrap_i64 local.set 2
