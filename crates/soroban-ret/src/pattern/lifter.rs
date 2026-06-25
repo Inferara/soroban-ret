@@ -7361,7 +7361,10 @@ fn detect_option_decode_helper(module: &WasmModule, idx: u32) -> Option<OptionDe
     let has_tag4 = body
         .windows(2)
         .any(|w| matches!(w, [WasmInstr::I64Const(4), WasmInstr::I64Eq]));
-    if !(has_void_check && has_shift && has_tag4 && body.iter().any(|i| matches!(i, WasmInstr::Select)))
+    if !(has_void_check
+        && has_shift
+        && has_tag4
+        && body.iter().any(|i| matches!(i, WasmInstr::Select)))
     {
         return None;
     }
