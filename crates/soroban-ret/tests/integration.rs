@@ -1044,6 +1044,53 @@ fn aquarius_estimate_swap_recovers_tokens_not_sorted_guard() {
     );
 }
 
+// `estimate_swap` looks up `token_in`/`token_out` with `Vec::first_index_of`, whose
+// `Option<u32>` result the SDK decodes with a tiny helper and `br_table`s on the
+// tag (`None`/object → unreachable, `Some(small)` → continue, i.e. `.unwrap()`).
+// The tag load used to degrade to `UnknownVal`, discarding the match and rendering
+// `if todo!("unknown value") == LiquidityPoolType::ConstantProduct { ... }`. Assert
+// the decode is recovered to clean `.first_index_of(..).unwrap()` and the mislabeled
+// enum comparison is gone, scoped to the `estimate_swap` body.
+#[test]
+fn aquarius_estimate_swap_recovers_first_index_of_unwrap() {
+    let wasm = include_bytes!("../../../tests/fixtures/aquarius.wasm");
+    let src = decompile(wasm).expect("aquarius.wasm should decompile");
+    let start = src
+        .find("fn estimate_swap")
+        .expect("estimate_swap should be emitted");
+    let after = &src[start..];
+    let brace_start = after.find('{').expect("no { after fn estimate_swap");
+    let mut depth = 0i32;
+    let mut end = after.len();
+    for (i, c) in after[brace_start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = brace_start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[..end];
+    assert!(
+        body.contains("first_index_of(token_in).unwrap()")
+            && body.contains("first_index_of(token_out).unwrap()"),
+        "estimate_swap should recover both first_index_of Option decodes as .unwrap(), got:\n{body}"
+    );
+    assert!(
+        !body.contains("LiquidityPoolType::ConstantProduct"),
+        "the first_index_of tag must not be mislabeled as a LiquidityPoolType match, got:\n{body}"
+    );
+    assert!(
+        !body.contains("todo!(\"unknown value\")"),
+        "the recovered first_index_of dispatch should leave no unknown-value todo!, got:\n{body}"
+    );
+}
+
 #[test]
 fn aquarius_recovers_tokens_sorted_validation_loop() {
     // The router's sorted+unique token validation is inlined into ~27 accessors and
