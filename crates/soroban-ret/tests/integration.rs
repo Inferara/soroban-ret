@@ -1056,7 +1056,7 @@ fn aquarius_estimate_swap_recovers_first_index_of_unwrap() {
     let wasm = include_bytes!("../../../tests/fixtures/aquarius.wasm");
     let src = decompile(wasm).expect("aquarius.wasm should decompile");
     let start = src
-        .find("fn estimate_swap")
+        .find("fn estimate_swap(")
         .expect("estimate_swap should be emitted");
     let after = &src[start..];
     let brace_start = after.find('{').expect("no { after fn estimate_swap");

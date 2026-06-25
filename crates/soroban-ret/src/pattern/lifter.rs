@@ -964,10 +964,19 @@ impl<'a> LiftContext<'a> {
     ///
     /// Seed the decoder's output so the existing dataflow recovers it: the value
     /// slot with `first_index_of(..).unwrap()`, and the tag slot with the
-    /// proven-live `Some(small)` discriminant (`1`) so the `br_table` folds to that
-    /// arm and the dead arms drop — mirroring [`seed_sret_success_status`].
-    /// Narrowly gated on a `first_index_of` operand and the exact decoder shape, so
-    /// it never fabricates control flow for an `Option` whose `None` is live.
+    /// `Some(small)` discriminant (`1`) so the `br_table` folds to that arm and the
+    /// dead arms drop — mirroring [`seed_sret_success_status`], which likewise seeds
+    /// the convention-live discriminant.
+    ///
+    /// Narrowly gated on the exact decoder shape and a `first_index_of` operand.
+    /// This assumes the `.unwrap()` lowering — the `None`/element-absent arm is
+    /// unreachable, as it is for every `first_index_of` site in the corpus (the
+    /// `br_table` routes `None`/object to a `SafetyNetUnreachable`). A contract that
+    /// genuinely handled the missing element would have its `None` branch folded
+    /// away; recovering that as a real `match`/`if let` (verifying the `None` arm's
+    /// liveness from the consuming `br_table`) is tracked as follow-up. Even so this
+    /// is no worse than the prior output, which discarded the whole dispatch as an
+    /// unresolved `todo!("unknown value")`.
     fn try_lower_option_decode(&mut self, target_idx: u32, args: &[StackVal]) -> Option<bool> {
         let layout = detect_option_decode_helper(self.wasm_module, target_idx)?;
         let StackVal::FrameSlot(id, base) = args.first()? else {
