@@ -952,6 +952,63 @@ impl<'a> LiftContext<'a> {
         Some(true)
     }
 
+    /// Recover the SDK `Option<u32>` decode of a `Vec::first_index_of` result.
+    ///
+    /// The decoder (see [`detect_option_decode_helper`]) writes a `{tag, value}`
+    /// struct, and the caller `br_table`s on `tag` (`0 = None`, `1 = Some(small)`,
+    /// `2 = Some(obj)`), routing `None`/`obj` to a `SafetyNetUnreachable` and only
+    /// `Some(small)` to the live continuation — i.e. an `.unwrap()`. Without
+    /// modeling, the tag load reads an untracked frame slot, degrades to
+    /// `UnknownVal`, the `br_table` match is discarded, and the body renders the
+    /// downstream as `todo!("unknown value")` (the aquarius `estimate_swap` case).
+    ///
+    /// Seed the decoder's output so the existing dataflow recovers it: the value
+    /// slot with `first_index_of(..).unwrap()`, and the tag slot with the
+    /// `Some(small)` discriminant (`1`) so the `br_table` folds to that arm and the
+    /// dead arms drop — mirroring [`seed_sret_success_status`], which likewise seeds
+    /// the convention-live discriminant.
+    ///
+    /// Narrowly gated on the exact decoder shape and a `first_index_of` operand.
+    /// This assumes the `.unwrap()` lowering — the `None`/element-absent arm is
+    /// unreachable, as it is for every `first_index_of` site in the corpus (the
+    /// `br_table` routes `None`/object to a `SafetyNetUnreachable`). A contract that
+    /// genuinely handled the missing element would have its `None` branch folded
+    /// away; recovering that as a real `match`/`if let` (verifying the `None` arm's
+    /// liveness from the consuming `br_table`) is tracked as follow-up. Even so this
+    /// is no worse than the prior output, which discarded the whole dispatch as an
+    /// unresolved `todo!("unknown value")`.
+    fn try_lower_option_decode(&mut self, target_idx: u32, args: &[StackVal]) -> Option<bool> {
+        let layout = detect_option_decode_helper(self.wasm_module, target_idx)?;
+        let StackVal::FrameSlot(id, base) = args.first()? else {
+            return None;
+        };
+        if !base.is_static() {
+            return None;
+        }
+        let (id, base) = (*id, base.base);
+        let opt_expr = {
+            let slots = self.frame_slots.borrow();
+            stack_val_to_expr(args.get(1)?, self.params, self.registry, Some(&slots))
+        };
+        if !expr_is_first_index_of(&opt_expr) {
+            return None;
+        }
+        let unwrapped = SorobanExpr::MethodCall {
+            object: Box::new(opt_expr),
+            method: "unwrap".to_string(),
+            args: Vec::new(),
+        };
+        self.store_frame_slot(
+            id,
+            base + layout.val_off,
+            StackVal::HostCallResult(Box::new(unwrapped)),
+        );
+        self.store_frame_slot(id, base + layout.tag_off, StackVal::I32(1));
+        self.found_host_calls = true;
+        cov_mark::hit!(option_decode_first_index_of);
+        Some(true)
+    }
+
     /// Recover a `DataKey` storage key built from a *constant descriptor pointer*.
     ///
     /// Some SDK key accessors don't pass an immediate variant index to the key
@@ -2598,6 +2655,15 @@ impl<'a> LiftContext<'a> {
                             // past the inline depth limit: recover the symbol from the
                             // static `(ptr, len)` string args and write it to the result
                             // pointer, instead of degrading to `todo!`.
+                            handled
+                        } else if let Some(handled) =
+                            self.try_lower_option_decode(*target_idx, &args)
+                        {
+                            // SDK `Option<u32>` decode of a `Vec::first_index_of`
+                            // result: recover the `.unwrap()` value and fold the tag
+                            // `br_table` to the proven-live `Some` arm, instead of
+                            // degrading the tag to `UnknownVal` (which discards the
+                            // match and renders `todo!("unknown value")`).
                             handled
                         } else if self.inline_depth < MAX_INLINE_CALL_DEPTH {
                             // Check if this is a load-struct wrapper BEFORE inlining.
@@ -5137,6 +5203,17 @@ impl<'a> LiftContext<'a> {
             ));
         }
 
+        // A clean `i32` literal scrutinee is a *known* br_table selector — a folded
+        // discriminant or a seeded `Option`-decode tag — so it must fold to its
+        // single live arm (`fold_constant_matches`), not resolve to an enum. The
+        // integer-enum loop below would otherwise grab the first registry enum with
+        // enough variants and mislabel it (e.g. `1 == LiquidityPoolType::ConstantProduct`),
+        // which also blocks the constant fold. Mirrors the literal-scrutinee guard
+        // the union path already applies.
+        if matches!(scrutinee, SorobanExpr::I32Literal(_)) {
+            return None;
+        }
+
         // Prefer an enum/union that matches one of THIS function's parameters: a
         // br_table is almost always dispatching on a parameter, and the param's
         // declared type disambiguates same-arity candidates. Without this, the
@@ -7247,6 +7324,97 @@ fn func_reaches_host(
     func.body
         .iter()
         .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_host(module, *t, host_module, name, depth + 1)))
+}
+
+/// Output-struct offsets of the SDK `Option<u32>` decode helper.
+struct OptionDecodeLayout {
+    /// Offset of the discriminant byte (`0 = None`, `1 = Some(small)`, `2 = Some(obj)`).
+    tag_off: i32,
+    /// Offset of the unwrapped `u32` payload.
+    val_off: i32,
+}
+
+/// Recognize the SDK-generated `Option<u32>` decoder `(i32 ptr, i64 opt) -> ()`.
+///
+/// `Vec::first_index_of` returns `Option<u32>` as a host `Val`; the SDK decodes it
+/// with a tiny pure helper that writes a `{tag, value}` struct to `ptr`:
+/// `if opt == 2 /*Void*/ { tag = 0 } else { value = (opt >> 32) as u32;
+///  tag = if (opt & 0xff) == 4 /*U32Val*/ { 1 } else { 2 } };
+///  *(ptr + val_off) = value; *(ptr + tag_off) = tag`.
+/// Returns the two store offsets. Matches only the exact shape (the `Void(2)`
+/// check, the `>> 32` payload extract, the `U32Val(4)` tag `select`, two `i32`
+/// stores, no calls) so it can never misfire on a generic scratch writer.
+fn detect_option_decode_helper(module: &WasmModule, idx: u32) -> Option<OptionDecodeLayout> {
+    use crate::wasm::ir::{WasmInstr, WasmType};
+    // Local function only — never an import.
+    if module.imports.get_by_index(idx).is_some() {
+        return None;
+    }
+    let ft = module.get_func_type(idx)?;
+    if ft.params.as_slice() != [WasmType::I32, WasmType::I64] || !ft.results.is_empty() {
+        return None;
+    }
+    let body = &module.get_function(idx)?.body;
+    if body
+        .iter()
+        .any(|i| matches!(i, WasmInstr::Call(_) | WasmInstr::CallIndirect(_)))
+    {
+        return None;
+    }
+    let has_void_check = body
+        .windows(2)
+        .any(|w| matches!(w, [WasmInstr::I64Const(2), WasmInstr::I64Eq]));
+    let has_shift = body
+        .windows(2)
+        .any(|w| matches!(w, [WasmInstr::I64Const(32), WasmInstr::I64ShrU]));
+    let has_tag4 = body
+        .windows(2)
+        .any(|w| matches!(w, [WasmInstr::I64Const(4), WasmInstr::I64Eq]));
+    if !(has_void_check
+        && has_shift
+        && has_tag4
+        && body.iter().any(|i| matches!(i, WasmInstr::Select)))
+    {
+        return None;
+    }
+    // The payload local is set right after the `>> 32; wrap` extract; the tag
+    // local is the first `local.set` after the discriminant `if`'s closing `end`.
+    let value_local = body.windows(2).find_map(|w| match w {
+        [WasmInstr::I32WrapI64, WasmInstr::LocalSet(v)] => Some(*v),
+        _ => None,
+    })?;
+    let select_pos = body.iter().position(|i| matches!(i, WasmInstr::Select))?;
+    let end_pos = select_pos
+        + body[select_pos..]
+            .iter()
+            .position(|i| matches!(i, WasmInstr::End))?;
+    let tag_local = body[end_pos..].iter().find_map(|i| match i {
+        WasmInstr::LocalSet(t) => Some(*t),
+        _ => None,
+    })?;
+    // Each store is `local.get ptr; local.get <local>; i32.store off`.
+    let mut val_off = None;
+    let mut tag_off = None;
+    for w in body.windows(2) {
+        if let [WasmInstr::LocalGet(x), WasmInstr::I32Store(off)] = w {
+            if *x == value_local {
+                val_off = Some(*off as i32);
+            } else if *x == tag_local {
+                tag_off = Some(*off as i32);
+            }
+        }
+    }
+    Some(OptionDecodeLayout {
+        tag_off: tag_off?,
+        val_off: val_off?,
+    })
+}
+
+/// True for a `Vec::first_index_of` method call (the only `Option` decode we
+/// collapse to `.unwrap()`; its `None`/element-absent path is the
+/// compiler-proven-dead arm here).
+fn expr_is_first_index_of(e: &SorobanExpr) -> bool {
+    matches!(e, SorobanExpr::MethodCall { method, .. } if method == "first_index_of")
 }
 
 // ---------------------------------------------------------------------------
@@ -14204,6 +14372,50 @@ mod tests {
         assert!(
             !is_symbol_from_lm_builder(&m, 3),
             "wrong signature is not a builder even if it reaches the encoder"
+        );
+    }
+
+    #[test]
+    fn detect_option_decode_helper_classifies_decoder() {
+        // $decode mirrors the SDK `Option<u32>` decoder: Void(2) -> tag 0; else
+        // value = opt>>32, tag = select(1, 2, (opt&0xff)==4); stores value@+4, tag@+0.
+        // $wrong_sig has the right body shape but the wrong signature; $no_select
+        // has the right signature but no tag `select`.
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $decode (param i32 i64) (local i32 i32)
+                    local.get 1 i64.const 2 i64.eq
+                    if (result i32)
+                        i32.const 0
+                    else
+                        local.get 1 i64.const 32 i64.shr_u i32.wrap_i64 local.set 2
+                        i32.const 1 i32.const 2
+                        local.get 1 i64.const 255 i64.and i64.const 4 i64.eq
+                        select
+                    end
+                    local.set 3
+                    local.get 0 local.get 2 i32.store offset=4
+                    local.get 0 local.get 3 i32.store)
+                (func $wrong_sig (param i32 i32) (local i32 i32)
+                    local.get 1 i32.const 2 i32.eq drop
+                    i32.const 0 local.set 2)
+                (func $no_select (param i32 i64) (local i32)
+                    local.get 1 i64.const 32 i64.shr_u i32.wrap_i64 local.set 2
+                    local.get 0 local.get 2 i32.store offset=4))
+            "#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        let layout = detect_option_decode_helper(&m, 0).expect("$decode is recognized");
+        assert_eq!(layout.tag_off, 0, "tag is stored at +0");
+        assert_eq!(layout.val_off, 4, "value is stored at +4");
+        assert!(
+            detect_option_decode_helper(&m, 1).is_none(),
+            "wrong signature is not an option decoder"
+        );
+        assert!(
+            detect_option_decode_helper(&m, 2).is_none(),
+            "a decoder without the tag select is not recognized"
         );
     }
 
