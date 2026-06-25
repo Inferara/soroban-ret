@@ -1,11 +1,11 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 92.5,
+  "overall_restoration": 92.7,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
       "entity": "Aqua AMM",
-      "restoration_pct": 95.1,
+      "restoration_pct": 95.3,
       "spec_functions": 75,
       "fn_clean": 23,
       "fn_partial": 52,
@@ -17,7 +17,7 @@
     {
       "file": "aqua-rewards-CCY2PXGM.wasm",
       "entity": "Aqua Rewards",
-      "restoration_pct": 92.8,
+      "restoration_pct": 92.9,
       "spec_functions": 76,
       "fn_clean": 21,
       "fn_partial": 55,
@@ -29,7 +29,7 @@
     {
       "file": "arb-bot-contract-CCBVCCNP.wasm",
       "entity": "ARB Bot Contract",
-      "restoration_pct": 94.7,
+      "restoration_pct": 95.4,
       "spec_functions": 5,
       "fn_clean": 3,
       "fn_partial": 2,
@@ -41,7 +41,7 @@
     {
       "file": "band-protocol-CCQXWMZV.wasm",
       "entity": "Band Protocol",
-      "restoration_pct": 87.6,
+      "restoration_pct": 88.3,
       "spec_functions": 15,
       "fn_clean": 4,
       "fn_partial": 11,
@@ -53,7 +53,7 @@
     {
       "file": "blend-backstop-CAQQR5SW.wasm",
       "entity": "Blend Backstop",
-      "restoration_pct": 90.6,
+      "restoration_pct": 90.9,
       "spec_functions": 17,
       "fn_clean": 9,
       "fn_partial": 8,
@@ -65,7 +65,7 @@
     {
       "file": "blend-emitter-CCOQM6S7.wasm",
       "entity": "Blend Emitter",
-      "restoration_pct": 95.2,
+      "restoration_pct": 95.6,
       "spec_functions": 9,
       "fn_clean": 5,
       "fn_partial": 4,
@@ -77,7 +77,7 @@
     {
       "file": "blend-fixed-pool-CAJJZSGM.wasm",
       "entity": "Blend Fixed Pool",
-      "restoration_pct": 92.3,
+      "restoration_pct": 92.6,
       "spec_functions": 27,
       "fn_clean": 9,
       "fn_partial": 18,
@@ -89,7 +89,7 @@
     {
       "file": "blend-pool-factory-CDSYOAVX.wasm",
       "entity": "Blend Pool Factory",
-      "restoration_pct": 78.0,
+      "restoration_pct": 78.2,
       "spec_functions": 3,
       "fn_clean": 1,
       "fn_partial": 2,
@@ -101,7 +101,7 @@
     {
       "file": "blend-yieldblox-pool-CCCCIQSD.wasm",
       "entity": "Blend Yieldblox Pool",
-      "restoration_pct": 92.3,
+      "restoration_pct": 92.6,
       "spec_functions": 27,
       "fn_clean": 9,
       "fn_partial": 18,
@@ -161,7 +161,7 @@
     {
       "file": "fxdao-vault-CCUN4RXU.wasm",
       "entity": "FxDAO Vault",
-      "restoration_pct": 89.0,
+      "restoration_pct": 89.1,
       "spec_functions": 2,
       "fn_clean": 0,
       "fn_partial": 2,
@@ -173,7 +173,7 @@
     {
       "file": "lightecho-CDOR3QD2.wasm",
       "entity": "Lightecho",
-      "restoration_pct": 94.5,
+      "restoration_pct": 94.8,
       "spec_functions": 23,
       "fn_clean": 17,
       "fn_partial": 6,
@@ -185,7 +185,7 @@
     {
       "file": "phoenix-amm-CCLZRD4E.wasm",
       "entity": "Phoenix AMM",
-      "restoration_pct": 93.4,
+      "restoration_pct": 93.5,
       "spec_functions": 12,
       "fn_clean": 7,
       "fn_partial": 5,
@@ -197,7 +197,7 @@
     {
       "file": "reflector-CAFJZQWS.wasm",
       "entity": "Reflector",
-      "restoration_pct": 94.1,
+      "restoration_pct": 94.6,
       "spec_functions": 23,
       "fn_clean": 14,
       "fn_partial": 9,
@@ -209,7 +209,7 @@
     {
       "file": "reflector-CALI2BYU.wasm",
       "entity": "Reflector",
-      "restoration_pct": 94.1,
+      "restoration_pct": 94.6,
       "spec_functions": 23,
       "fn_clean": 14,
       "fn_partial": 9,
@@ -233,7 +233,7 @@
     {
       "file": "soroswap-CA4HEQTL.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 90.8,
+      "restoration_pct": 91.2,
       "spec_functions": 12,
       "fn_clean": 3,
       "fn_partial": 9,
@@ -245,7 +245,7 @@
     {
       "file": "soroswap-CAG5LRYQ.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 85.9,
+      "restoration_pct": 86.1,
       "spec_functions": 20,
       "fn_clean": 8,
       "fn_partial": 11,
@@ -281,7 +281,7 @@
     {
       "file": "ybx-claim-contract-CBBM3WOK.wasm",
       "entity": "YBX Claim Contract",
-      "restoration_pct": 91.4,
+      "restoration_pct": 92.0,
       "spec_functions": 10,
       "fn_clean": 3,
       "fn_partial": 7,
