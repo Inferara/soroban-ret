@@ -8,7 +8,7 @@ use super::functions::{
 };
 use super::imports::{compute_extra_imports, compute_imports};
 use crate::ir::high_level_ir::{ContractFn, ContractModule, CryptoUsage};
-use crate::ir::soroban_ir::SorobanStmt;
+use crate::ir::soroban_ir::{SorobanExpr, SorobanStmt};
 use crate::spec::registry::TypeRegistry;
 use crate::wasm::WasmType;
 
@@ -242,13 +242,18 @@ fn generate_contract_fn(
         .as_ref()
         .is_some_and(|rt| !matches!(rt, ScSpecTypeDef::Void));
     let needs_ok_tail = is_result_return && needs_ok_unit_tail(func);
-    let body_stmts: Vec<_> = if is_result_return && !needs_ok_tail {
+    // Non-unit-returning fn whose body lost its success value (ends in a `()`-typed,
+    // non-diverging tail) → append an honest `todo!()` tail. The non-unit analog of
+    // `needs_ok_tail`. Disjoint from it by the unit-ok-type exclusion + the
+    // `!needs_ok_tail` belt.
+    let needs_todo_tail = !needs_ok_tail && needs_todo_value_tail(func);
+    let body_stmts: Vec<_> = if is_result_return && !needs_ok_tail && !needs_todo_tail {
         // Use tail form only when the function's own body provides the final return
         generate_stmts_with_tail_result_wrapped(&func.body)
     } else if is_result_return {
-        // When Ok(()) will be appended, use normal (non-tail) form for all statements
+        // When Ok(()) or a todo!() tail will be appended, use normal (non-tail) form
         func.body.iter().map(generate_stmt_result_wrapped).collect()
-    } else if has_return_type && !func.body.is_empty() {
+    } else if has_return_type && !func.body.is_empty() && !needs_todo_tail {
         // Strip the trailing semicolon from the last expression to make it a tail expression
         generate_stmts_with_tail(&func.body)
     } else {
@@ -257,10 +262,14 @@ fn generate_contract_fn(
 
     // If needs_ok_tail, append Ok(()) — even for empty bodies (e.g., Result<(), E>
     // functions whose body was all XDR unpacking artifacts that got stripped).
+    // If needs_todo_tail, append todo!() — a non-unit return whose value was lost
+    // (`todo!()` is `!` and coerces to the return type; honest hole, not a fabrication).
     // Otherwise, empty body + return type → todo!() placeholder.
     // Void-returning functions with empty bodies are valid — they just need `{}`.
     let body = if needs_ok_tail {
         quote! { #(#body_stmts)* Ok(()) }
+    } else if needs_todo_tail {
+        quote! { #(#body_stmts)* todo!("decompiled return value") }
     } else if body_stmts.is_empty()
         && func
             .return_type
@@ -286,11 +295,108 @@ fn needs_ok_unit_tail(func: &ContractFn) -> bool {
     let Some(ScSpecTypeDef::Result(r)) = &func.return_type else {
         return false;
     };
-    if !matches!(*r.ok_type, ScSpecTypeDef::Void) {
+    // The unit ok-type renders as `()` either as `Void` or as an empty tuple
+    // `()` — the SDK's spec for `Result<(), E>` uses the latter. Both mean the
+    // only success value is `Ok(())`, which is faithful to append; a non-unit
+    // ok-type (`Result<u128, E>` etc.) is a *lost value* and must stay honest.
+    if !is_unit_ok_type(&r.ok_type) {
         return false;
     }
     // If the body's last statement is already a Return, no tail needed
     !matches!(func.body.last(), Some(SorobanStmt::Return(_)))
+}
+
+/// Whether a Result ok-type is the unit type `()` — modeled either as `Void` or
+/// (as the SDK emits for `Result<(), E>`) an empty tuple.
+fn is_unit_ok_type(ok_type: &ScSpecTypeDef) -> bool {
+    match ok_type {
+        ScSpecTypeDef::Void => true,
+        ScSpecTypeDef::Tuple(t) => t.value_types.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether a **non-unit**-returning function lost its success value — its body
+/// ends in a non-diverging `()`-typed tail (the lifter recovered the side effects
+/// but not the returned value, so the tail mismatches the declared return type).
+/// The faithful completion is a `todo!()` tail: the value is unrecoverable, so an
+/// honest hole is correct (a wrong recovery is worse than a `todo!()`). This is
+/// the non-unit analog of [`needs_ok_unit_tail`] — they are mutually exclusive by
+/// the unit-ok-type exclusion below.
+fn needs_todo_value_tail(func: &ContractFn) -> bool {
+    let Some(rt) = &func.return_type else {
+        return false;
+    };
+    // Non-unit returns only. `Void` has no value to lose; `Result<(), E>` (and a
+    // `Void` ok-type) are Lever B's `Ok(())` territory — never steal them.
+    match rt {
+        ScSpecTypeDef::Void => return false,
+        ScSpecTypeDef::Result(r) if is_unit_ok_type(&r.ok_type) => return false,
+        _ => {}
+    }
+    // An empty body is already handled by the `todo!("decompiled function body")`
+    // path; only fire when there is a concrete `()`-typed, non-diverging tail.
+    match func.body.last() {
+        Some(stmt) => tail_is_unit(stmt),
+        None => false,
+    }
+}
+
+/// Whether a statement in function-tail position evaluates to a non-diverging
+/// `()`. Conservative on purpose — only shapes that are *provably* `()` count, so
+/// a real recovered value tail is never mistaken for a lost one.
+fn tail_is_unit(stmt: &SorobanStmt) -> bool {
+    match stmt {
+        // `if cond { .. }` with no else is `()` in Rust regardless of the then
+        // branch — the strongest, unconditional signal (and the dominant case).
+        SorobanStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            if else_body.is_empty() {
+                true
+            } else {
+                stmts_tail_is_unit(then_body) && stmts_tail_is_unit(else_body)
+            }
+        }
+        SorobanStmt::Loop { .. } | SorobanStmt::For { .. } => true,
+        SorobanStmt::Block(body) => stmts_tail_is_unit(body),
+        SorobanStmt::Expr(e) => expr_is_unit_typed(e),
+        // Return / Match / Comment / Break / Continue / Assign / Let → not a
+        // non-diverging unit tail (a `Return`/value already produces a value; a
+        // diverging panic/todo tail already type-checks). Leave untouched.
+        _ => false,
+    }
+}
+
+/// `()`-ness of a statement block's tail (an empty block is `()`).
+fn stmts_tail_is_unit(body: &[SorobanStmt]) -> bool {
+    match body.last() {
+        Some(stmt) => tail_is_unit(stmt),
+        None => true,
+    }
+}
+
+/// Whether a `SorobanExpr` used as a statement tail is statically `()`-typed.
+/// Restricted to the host operations the SDK types as `()`; an arbitrary
+/// `MethodCall`/value expr is **not** assumed unit (it may legitimately be the
+/// value). Never-typed exprs (`Panic`/`PanicWithError`/`UnknownVal`) are excluded
+/// — they already type-check as the tail, so we must not append a dead `todo!()`.
+fn expr_is_unit_typed(e: &SorobanExpr) -> bool {
+    matches!(
+        e,
+        SorobanExpr::StorageSet { .. }
+            | SorobanExpr::StorageRemove { .. }
+            | SorobanExpr::StorageExtendTtl { .. }
+            | SorobanExpr::ExtendInstanceAndCodeTtl { .. }
+            | SorobanExpr::RequireAuth(_)
+            | SorobanExpr::RequireAuthForArgs { .. }
+            | SorobanExpr::AuthorizeAsCurrContract(_)
+            | SorobanExpr::PublishEvent { .. }
+            | SorobanExpr::Log(_)
+            | SorobanExpr::PrngReseed(_)
+    )
 }
 
 /// Format a token stream into a pretty-printed Rust string
@@ -1101,6 +1207,146 @@ mod tests {
         assert!(
             formatted.contains("Result<(), MyError>"),
             "got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn assemble_module_result_empty_tuple_ok_appends_ok_unit_tail() {
+        // The SDK encodes `Result<(), E>`'s ok-type as an *empty tuple*, not
+        // `Void`. Both render as `()`, and both must get an `Ok(())` tail — a
+        // non-unit ok-type (a lost value) must not.
+        use stellar_xdr::curr::ScSpecTypeTuple;
+        let mut module = ContractModule::new("Contract".to_string());
+        module.error_enums.push(crate::ir::high_level_ir::TypeDef {
+            kind: crate::ir::high_level_ir::TypeDefKind::ErrorEnum,
+            name: "MyError".to_string(),
+            generated_tokens: Some(quote! { pub enum MyError { Bad = 1 } }),
+        });
+        module.functions.push(ContractFn {
+            name: "touch".to_string(),
+            params: vec![],
+            return_type: Some(ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+                ok_type: Box::new(ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
+                    value_types: Default::default(),
+                }))),
+                error_type: Box::new(ScSpecTypeDef::Error),
+            }))),
+            // Non-Return tail (a discarded expr) → must gain an Ok(()) tail.
+            body: vec![SorobanStmt::Expr(SorobanExpr::UnknownVal)],
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        });
+        let formatted =
+            format_source(&assemble_module(&module, &empty_registry())).expect("must format");
+        assert!(
+            formatted.contains("Ok(())"),
+            "empty-tuple ok-type must append Ok(()): {formatted}"
+        );
+    }
+
+    // --- Lever 1: non-unit return with a lost `()` tail → `todo!()` tail ---
+
+    fn fn_with(return_type: Option<ScSpecTypeDef>, body: Vec<SorobanStmt>) -> ContractFn {
+        ContractFn {
+            name: "f".to_string(),
+            params: vec![],
+            return_type,
+            body,
+            takes_env: false,
+            is_constructor: false,
+            is_check_auth: false,
+            wrapper_panics: false,
+            had_host_calls: false,
+            wasm_param_base: 0,
+            wasm_signature: None,
+        }
+    }
+
+    fn result_ty(ok: ScSpecTypeDef) -> ScSpecTypeDef {
+        ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+            ok_type: Box::new(ok),
+            error_type: Box::new(ScSpecTypeDef::Error),
+        }))
+    }
+
+    fn render_fn(func: ContractFn) -> String {
+        let mut module = ContractModule::new("Contract".to_string());
+        module.functions.push(func);
+        format_source(&assemble_module(&module, &empty_registry())).expect("must format")
+    }
+
+    #[test]
+    fn result_nonunit_if_without_else_tail_appends_todo() {
+        // `Result<u64, E>` whose body ends in `if cond { .. }` (no else → `()`): the
+        // success value was lost, so a faithful `todo!()` tail is appended (no `Ok`).
+        let body = vec![SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::StorageExtendTtl {
+                storage_type: crate::ir::soroban_ir::StorageType::Instance,
+                key: Box::new(SorobanExpr::SymbolLiteral("k".to_string())),
+                threshold: Box::new(SorobanExpr::U32Literal(1)),
+                extend_to: Box::new(SorobanExpr::U32Literal(2)),
+            })],
+            else_body: vec![],
+        }];
+        let out = render_fn(fn_with(Some(result_ty(ScSpecTypeDef::U64)), body));
+        assert!(out.contains("todo!"), "missing todo!() tail: {out}");
+        assert!(!out.contains("Ok("), "must not Ok-wrap a lost value: {out}");
+    }
+
+    #[test]
+    fn result_nonunit_explicit_return_not_touched() {
+        // A real recovered value tail must be left alone (Ok-wrapped, no todo!()).
+        let body = vec![SorobanStmt::Return(Some(SorobanExpr::U64Literal(7)))];
+        let out = render_fn(fn_with(Some(result_ty(ScSpecTypeDef::U64)), body));
+        assert!(out.contains("Ok(7)"), "expected Ok(7): {out}");
+        assert!(!out.contains("todo!"), "must not append a tail: {out}");
+    }
+
+    #[test]
+    fn result_unit_still_gets_ok_unit_not_todo() {
+        // `Result<(), E>` with an if-tail is Lever B's `Ok(())` territory — Lever 1
+        // must not steal it.
+        let body = vec![SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![],
+            else_body: vec![],
+        }];
+        let out = render_fn(fn_with(Some(result_ty(ScSpecTypeDef::Void)), body));
+        assert!(out.contains("Ok(())"), "expected Ok(()) tail: {out}");
+        assert!(!out.contains("todo!"), "must not append todo!(): {out}");
+    }
+
+    #[test]
+    fn plain_value_fn_unit_tail_appends_todo() {
+        // A plain `-> u64` (non-Result) value fn ending in a unit-typed effect →
+        // todo!() tail (exercises the `expr_is_unit_typed` path, not the if path).
+        let body = vec![SorobanStmt::Expr(SorobanExpr::StorageExtendTtl {
+            storage_type: crate::ir::soroban_ir::StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral("k".to_string())),
+            threshold: Box::new(SorobanExpr::U32Literal(1)),
+            extend_to: Box::new(SorobanExpr::U32Literal(2)),
+        })];
+        let out = render_fn(fn_with(Some(ScSpecTypeDef::U64), body));
+        assert!(out.contains("todo!"), "missing todo!() tail: {out}");
+    }
+
+    #[test]
+    fn result_nonunit_diverging_panic_tail_not_touched() {
+        // A diverging `panic_with_error!` tail already type-checks (`!`) — appending
+        // a `todo!()` would be dead code AND a false "lost value" (Session-3 trap).
+        let body = vec![SorobanStmt::Expr(SorobanExpr::PanicWithError(Box::new(
+            SorobanExpr::U32Literal(1),
+        )))];
+        let out = render_fn(fn_with(Some(result_ty(ScSpecTypeDef::U64)), body));
+        assert!(
+            !out.contains("decompiled return value"),
+            "must not append a todo!() tail after a diverging panic: {out}"
         );
     }
 

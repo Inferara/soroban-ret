@@ -38,7 +38,39 @@ use std::process::Command;
 /// band −9. Nets −33; aqua-rewards +5 as folding a broken guard *condition* lets
 /// rustc see the (always-reached) body's pre-existing lost-key/value errors it
 /// had been suppressing — faithful unmasking, not new wrongness.
-const ERROR_CEILING: u32 = 1201;
+/// → 1199 (annotate un-inferable empty `Map::new`/`Vec::new` collections whose
+/// value type the lifter lost — `Map::<_, Val>::new` / `Vec::<Val>::new`,
+/// pinning only the value param. Fires only when the collection is reached
+/// exclusively through value-agnostic methods (`keys`/`contains_key`/`len`/
+/// `is_empty`), so it never over-constrains a typed collection. digicus 3→2
+/// getter Maps recovered → 3→1; zero other-contract drift.
+/// → 1194 (recognise the SDK's empty-tuple encoding of `Result<(), E>`'s ok-type
+/// in `needs_ok_unit_tail`, not only `Void`, so codegen appends the missing
+/// `Ok(())` success tail — fixes E0308 "expected `Result<(), E>`, found `()`".
+/// Gated to a unit ok-type, so a lost `Result<T, E>` value stays honest.
+/// unknown-oracle −4, soroswap ×2 −4; phoenix +1 / xycloans +2 are *faithful
+/// rustc unmasking* — the correct `Ok(())` clears the tail type error that was
+/// suppressing pre-existing un-inferable `.get()` (E0284) errors, now visible.
+/// → 1188 (clone a non-Copy `Address` param consumed by value in ≥2 `DataKey`
+/// enum-construct payloads — `DataKey::Balance(addr)` keying several storage ops
+/// each move-s it, E0382. A host-handle `.clone()` is a refcount bump = same
+/// value, faithful. Gated to ≥2 enum-field uses of a non-Copy param, so it is a
+/// no-op on compiling output. E0382 6→0; blend-pool-factory −3, comet −2,
+/// blend-emitter −1; zero regressions, snapshots byte-identical.
+/// → 1134 (lost-value tail completion — the non-unit analog of the `Ok(())` tail.
+/// Lever 1: a non-unit-returning fn whose body lost its success value ends in a
+/// `()`-typed, non-diverging tail (an `if cond { extend_ttl }` with no else) →
+/// append `todo!()` (the value is unrecoverable; an honest hole, not a wrong
+/// recovery). Lever 2: a fabricated literal in the success tail whose scalar class
+/// can never unify with `Result<T, E>`'s scalar `T` (`Ok(false)` / a `ValConvert`
+/// of it in `-> Result<u128, E>`) → `todo!()`; numeric↔numeric never fires
+/// (unsuffixed integer literals coerce). Both retreat only to the safe `todo!()`
+/// harbor on a *guaranteed* compile error, so they are strict no-ops on clean
+/// output (snapshots byte-identical, compile-back 38/38). unknown-oracle 6→0
+/// becomes the 2nd corpus contract to compile cleanly; the lost-`()` tail spans
+/// 19/24 contracts (E0308 309→265). Zero per-contract regressions — unlike Lever
+/// B these fire on husk-bodied getters with nothing latent to unmask.
+const ERROR_CEILING: u32 = 1134;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

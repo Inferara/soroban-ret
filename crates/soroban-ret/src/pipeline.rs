@@ -10,7 +10,10 @@
 use std::collections::HashMap;
 
 use crate::codegen::module::{assemble_generic_module, assemble_module, format_source};
-use crate::ir::correctness::annotate_uninferable_gets;
+use crate::ir::correctness::{
+    annotate_uninferable_collections, annotate_uninferable_gets, clone_reused_move_params,
+    husk_type_mismatched_ok_literal,
+};
 use crate::ir::optimizer::{
     drop_void_unknown_value_return_guards, fold_tautological_tag_guards, optimize_stmts,
     optimize_stmts_preserve_host_calls, propagate_variable_names, recover_match_arm_storage_keys,
@@ -783,12 +786,20 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
     }
 
     // Final compile-correctness pass: annotate un-inferable storage gets with an
-    // explicit `Val` type so they type-check (E0277/E0282/E0284). Runs last, on
-    // the fully-shaped body after every other stage, and applies to all output
-    // (not just SDK contracts). See `ir::correctness::annotate_uninferable_gets`.
+    // explicit `Val` type so they type-check (E0277/E0282/E0284), then the same
+    // for empty `Map::new`/`Vec::new` collections whose value type was lost
+    // (E0283 → `Map::<_, Val>`). Runs last, on the fully-shaped body after every
+    // other stage, and applies to all output (not just SDK contracts). See
+    // `ir::correctness::{annotate_uninferable_gets, annotate_uninferable_collections}`.
     for func in &mut contract_module.functions {
         let returns_value = !matches!(&func.return_type, None | Some(ScSpecTypeDef::Void));
-        func.body = annotate_uninferable_gets(std::mem::take(&mut func.body), returns_value);
+        let body = annotate_uninferable_gets(std::mem::take(&mut func.body), returns_value);
+        let body = annotate_uninferable_collections(body);
+        // Lever 2: a fabricated literal in the success tail whose type contradicts a
+        // scalar `Result<T, E>` ok-type (e.g. `Ok(false)` in `-> Result<u128, E>`) →
+        // honest `todo!()`. Guaranteed-mismatch only; never touches a coercing value.
+        let body = husk_type_mismatched_ok_literal(body, func.return_type.as_ref());
+        func.body = clone_reused_move_params(body, &func.params);
     }
 
     // Stage 5: Generate Rust source
