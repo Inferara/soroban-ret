@@ -181,8 +181,10 @@ and compares the outcomes (lowered to canonical `ScVal`). A divergence is a
 decompiler correctness limitation; the gate is a ratchet on the divergence
 count, like the corpus-soundness gate.
 
-Current baseline: **61 functions / 424 cases executed across 40 contracts, 82.3 %
-behavioral match, 75 known divergences** — each a genuine decompiler limitation
+Current baseline: **61 functions / 424 cases executed; 62 contracts checked
+(38 fixtures + all 24 mainnet corpus, of which 22 do not yet recompile and are
+reported as `not_recompilable`), 82.3 % behavioral match, 75 known
+divergences** — each a genuine decompiler limitation
 the harness surfaced: `test_add_u64` lowers `checked_add(..).ok_or(E)` to
 `Ok(a + b)` (traps instead of `Err` on overflow); `test_alloc::num_list` loses
 its populate-loop and returns an empty `Vec`; `unknown-oracle` returns a host

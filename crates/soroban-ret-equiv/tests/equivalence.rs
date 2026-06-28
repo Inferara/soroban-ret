@@ -37,7 +37,8 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// recovers more behavior; never raise without understanding the new divergence.
 ///
 /// Measured baseline = 75, all genuine decompiler limitations the harness
-/// surfaced (61 fns / 424 cases executed across 40 contracts, 82.3% match):
+/// surfaced (61 fns / 424 cases executed; 62 contracts checked — 38 fixtures +
+/// 24 corpus, of which 22 do not yet recompile — 82.3% match):
 ///   - `test_add_u64` (15): `safe_add`/`safe_add_two` lower
 ///     `a.checked_add(b).ok_or(E)` to `Ok(a + b)`, so overflow inputs trap on
 ///     the recompiled contract instead of returning `Err(Overflow)`.
@@ -166,8 +167,10 @@ fn equivalence_within_ceiling() {
     );
 }
 
-/// Fixtures (`tests/fixtures/test_*.wasm`) plus the clean mainnet corpus
-/// contracts (the only corpus contracts whose decompiled output recompiles).
+/// Fixtures (`tests/fixtures/test_*.wasm`) plus every mainnet corpus contract.
+/// Corpus contracts whose decompiled output does not (yet) recompile are routed
+/// to the `not_recompilable` bucket by the harness rather than excluded here, so
+/// newly-recompilable contracts are picked up and executed automatically.
 fn collect_targets(root: &std::path::Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
 
@@ -190,16 +193,18 @@ fn collect_targets(root: &std::path::Path) -> Vec<(String, PathBuf)> {
         }
     }
 
+    // Every corpus contract: the harness recompiles each and drops the ones that
+    // do not rebuild into `not_recompilable` (not a failure), so only the
+    // recompilable ones are actually executed. This auto-discovery future-proofs
+    // the gate — as the decompiler improves and more corpus contracts rebuild,
+    // they are executed automatically (today: fxdao-oracle + unknown-oracle), and
+    // any new divergence they surface trips the ceiling.
     let mainnet = root.join("benchmark-data/mainnet");
     if let Ok(entries) = fs::read_dir(&mainnet) {
         let mut corpus: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| {
-                let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                (fname.starts_with("fxdao-oracle") || fname.starts_with("unknown-oracle"))
-                    && fname.ends_with(".wasm")
-            })
+            .filter(|p| p.extension().is_some_and(|e| e == "wasm"))
             .collect();
         corpus.sort();
         for p in corpus {

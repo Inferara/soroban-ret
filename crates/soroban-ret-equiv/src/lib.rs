@@ -249,8 +249,12 @@ fn gen_cases(fn_name: &str, kinds: &[ParamKind]) -> Vec<Vec<ScVal>> {
 /// `$HOME/.cache/soroban-ret-equiv-verify` so the heavy `soroban-sdk` build is
 /// cached across runs; only the tiny `lib.rs` recompiles each call.
 ///
-/// NOTE: the cache dir is shared, so callers must recompile **sequentially**
-/// (the equivalence test is a single sequential `#[test]`).
+/// NOTE: the cache dir is shared to preserve that dependency-build cache, so
+/// callers must recompile **sequentially**. The sole caller is the single
+/// sequential `equivalence_within_ceiling` `#[test]`, so no two recompiles ever
+/// race — including under `cargo nextest` (one test ⇒ one caller). Per-contract
+/// cache dirs would make it hermetic but rebuild `soroban-sdk` for wasm on every
+/// call, which is the dominant cost; that trade-off is deliberately not taken.
 pub fn recompile_to_wasm(source: &str) -> Result<Vec<u8>, EquivError> {
     let dir: PathBuf = cache_dir();
     std::fs::create_dir_all(dir.join("src"))
@@ -330,12 +334,24 @@ fn run_side(wasm: &[u8], func: &str, inputs: &[ScVal]) -> Outcome {
             }
         }
         let sym = Symbol::new(&env, func);
+        // `try_invoke_contract::<Val, _>` returns
+        // `Result<Result<Val, _>, Result<Error, InvokeError>>`. The OUTER result
+        // discriminates "the returned `Val` was an error" (`Err`) from "was a
+        // normal value" (`Ok`) — the SDK decodes the return value and routes an
+        // error Val to the `Err` side. So a contract-returned Soroban error is
+        // `Err(Ok(e))`, NOT `Ok(Err(..))`.
         match env.try_invoke_contract::<Val, soroban_sdk::Error>(&addr, &sym, args) {
             Ok(Ok(v)) => match ScVal::try_from_val(&env, &v) {
                 Ok(sc) => Outcome::Value(sc),
                 Err(_) => Outcome::Unconvertible,
             },
+            // Normal value that failed `Val`-conversion. Unreachable for `T = Val`
+            // (`Val: TryFromVal<Env, Val>` is infallible — `Ok(*val)`); kept only
+            // for match exhaustiveness. This is NOT a contract-error path.
             Ok(Err(_conv)) => Outcome::Unconvertible,
+            // Contract / host error. The error value is preserved in the string,
+            // so two *different* contract errors compare unequal (a real
+            // divergence) rather than collapsing to one bucket.
             Err(Ok(e)) => Outcome::ContractError(format!("{e:?}")),
             Err(Err(ie)) => Outcome::InvokeError(format!("{ie:?}")),
         }
