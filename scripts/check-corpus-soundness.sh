@@ -66,9 +66,13 @@ for wasm in "$REPO_DIR"/$GLOB; do
     # compiled) is the source of truth for clean-vs-broken, NOT the error grep —
     # which can't tell "compiled, 0 errors" from "cargo never ran rustc on our
     # file". The grep only quantifies the ratchet metric (E-coded errors).
-    out=$( cd "$VERIFY_DIR" && cargo check --target "$TARGET" --message-format=short 2>&1 )
+    out=$( cd "$VERIFY_DIR" && cargo check --target "$TARGET" --message-format=short --color never 2>&1 )
     status=$?
-    errs=$( printf '%s\n' "$out" | grep -cE 'src/lib\.rs.*error\[E[0-9]+\]' )
+    # Match bytes, not characters: decompiled source can carry non-UTF-8 bytes in
+    # identifiers/messages, and GNU grep in a UTF-8 locale (the CI default) then
+    # fails to match present lines, whereas `LC_ALL=C grep -a` treats input as
+    # raw text. Without this the gate spuriously trips the FATAL guard below.
+    errs=$( printf '%s\n' "$out" | LC_ALL=C grep -acE 'src/lib\.rs.*error\[E[0-9]+\]' )
     COUNT=$((COUNT + 1))
     if [ "$status" -eq 0 ]; then
         CLEAN=$((CLEAN + 1))
@@ -78,7 +82,7 @@ for wasm in "$REPO_DIR"/$GLOB; do
         # the build broke for an environment reason (registry, toolchain, …),
         # not because the decompiled code is wrong. Abort loudly rather than
         # silently scoring 0 and passing the ratchet on untrusted output.
-        if ! printf '%s\n' "$out" | grep -qE 'src/lib\.rs.*error'; then
+        if ! printf '%s\n' "$out" | LC_ALL=C grep -qaE 'src/lib\.rs.*error'; then
             echo "FATAL: cargo check failed for $name with no diagnostics against the generated file (broken environment?)" >&2
             printf '%s\n' "$out" | tail -20 >&2
             exit 2

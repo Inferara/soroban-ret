@@ -54,14 +54,22 @@ jobs:
     # Lint enforcement is the `build` job's responsibility.
     env:
       RUSTFLAGS: ""
+      # Pin rustc for these gates only. Corpus-soundness is a hard error-count
+      # ratchet, and the compile-back / equivalence baselines are likewise
+      # calibrated against exact rustc diagnostics — all of which drift across
+      # floating `stable` releases. RUSTUP_TOOLCHAIN overrides rust-toolchain.toml
+      # so the gates are reproducible against the locally-measured baselines
+      # (corpus 1134, equiv 75, compile-back 38/38). Bump with the baselines.
+      RUSTUP_TOOLCHAIN: "1.95.0"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
       - name: Install Rust toolchain (+ wasm32v1-none)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.95.0"
           targets: wasm32v1-none
 
       - name: Cache cargo registry, index and target
