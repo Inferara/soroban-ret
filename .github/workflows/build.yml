@@ -80,4 +80,13 @@ jobs:
           SOROBAN_RET_COMPILE_BACK: "1"
           SOROBAN_RET_CORPUS_SOUNDNESS: "1"
           SOROBAN_RET_EQUIV: "1"
-        run: cargo test --workspace --locked -- --nocapture
+        # Run ONLY the three env-gated heavy gates — not the whole workspace.
+        # The full unit/integration/snapshot suite is the `build` job's
+        # responsibility (on floating `stable`); re-running it here under the
+        # pinned 1.95.0 is redundant and breaks the rustfmt-formatted snapshot
+        # tests (this job intentionally omits the rustfmt component). The three
+        # gates are formatting-insensitive: they compile, count errors, and run
+        # behavior.
+        run: |
+          cargo test --locked -p soroban-ret --test compile_back --test corpus_soundness -- --nocapture
+          cargo test --locked -p soroban-ret-equiv --test equivalence -- --nocapture
