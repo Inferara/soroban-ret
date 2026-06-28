@@ -16,8 +16,11 @@
 //! strict no-op on the clean fixtures (guarded by the snapshot + compile-back
 //! gates).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use stellar_xdr::curr::ScSpecTypeDef;
+
+use super::high_level_ir::FnParam;
 use super::soroban_ir::{MatchArm, SorobanExpr, SorobanStmt};
 
 /// Guard a single function body. Order is irrelevant — the detectors target
@@ -438,6 +441,220 @@ fn annotate_with(get: SorobanExpr, ty: &str) -> SorobanExpr {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Un-inferable empty collections (`Map::new`/`Vec::new`) → `Map::<_, Val>` etc.
+// ---------------------------------------------------------------------------
+
+/// Value-type-agnostic collection methods: calling one tells rustc nothing about
+/// the collection's *value* type, so an empty `Map::new`/`Vec::new` reached only
+/// through them leaves `V` unconstrained (E0283). `keys`/`contains_key` are
+/// Map-only and also pin the *key* type (from the arg / `Vec<K>` result), so the
+/// `_` key placeholder still resolves. `get`/`set`/`values`/`iter`/`push_*` all
+/// touch the value type and are deliberately excluded — a collection reached
+/// through any of them has a constrained `V` and is left to inference.
+fn is_value_agnostic_method(method: &str) -> bool {
+    matches!(method, "keys" | "contains_key" | "len" | "is_empty")
+}
+
+/// An empty `Map::new(&env)` / `Vec::new(&env)` (a [`SorobanExpr::CollectionNew`]
+/// of `"Map"`/`"Vec"`) — the only shape whose element types are unconstrained by
+/// construction. A `map![..]`/`vec![..]` literal carries its elements' types.
+fn is_empty_map_or_vec(expr: &SorobanExpr) -> bool {
+    matches!(expr, SorobanExpr::CollectionNew(c) if c == "Map" || c == "Vec")
+}
+
+/// The variable name an expression denotes, if it is a bare variable reference.
+/// `Local(i)` renders as `var_i` (see codegen), matching a `let` of that name.
+fn var_name_of(expr: &SorobanExpr) -> Option<String> {
+    match expr {
+        SorobanExpr::Param(n) | SorobanExpr::NamedLocal(n) => Some(n.clone()),
+        SorobanExpr::Local(i) => Some(format!("var_{i}")),
+        _ => None,
+    }
+}
+
+/// Annotate empty `Map::new`/`Vec::new` collections whose value type the lifter
+/// lost and which no usage constrains, so rustc cannot infer `V` (E0283). Pins
+/// only the value param to `Val` (`Map::<_, Val>` / `Vec::<Val>`), leaving the
+/// key to inference — faithful, since every concrete `Map<K, V>`/`Vec<T>` is a
+/// `Map<_, Val>`/`Vec<Val>` at the host level. Fires only when the collection is
+/// reached *exclusively* through value-type-agnostic methods
+/// ([`is_value_agnostic_method`]); a collection fed a typed value (`set`,
+/// `push_back`) or whose `get` result is consumed typed has a constrained `V`
+/// and is left untouched, so this can never over-constrain a typed collection
+/// (worst case it is a no-op).
+///
+/// `referenced` / `value_pinned` are **scope-flat** — names accumulate into one
+/// function-wide set, not per lexical scope. A same-name binding shadowed across
+/// scopes (an outer pinned `m`, an inner agnostic `m`) would therefore leave the
+/// inner `let` un-annotated. That direction is safe: it is an *under*-annotation
+/// (a fixable `E0283` left honest), never a wrong `Val` pin on a typed
+/// collection. The lifter's unique `var_N` local numbering makes such a collision
+/// effectively impossible, so this stays a flat scan (matching the shipped
+/// `annotate_uninferable_gets` machinery).
+pub fn annotate_uninferable_collections(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    let referenced = collect_referenced_names(&stmts);
+    let mut value_pinned = HashSet::new();
+    collect_value_pinning_names(&stmts, &mut value_pinned);
+    // 1) Inline receivers — `Map::new(&env).keys()`, `Map::new(&env).contains_key(k)`.
+    let stmts = map_exprs_in_stmts(stmts, &annotate_inline_collection);
+    // 2) Let-bound collections used only value-agnostically:
+    //    `let m = Map::new(&env); … m.contains_key(k)`.
+    annotate_let_collections(stmts, &referenced, &value_pinned)
+}
+
+/// Wrap the receiver of `Map::new(&env).<agnostic>()` (and `Vec`) in
+/// `CastAs { .., "Val" }` so codegen emits the `Map::<_, Val>::new` turbofish.
+fn annotate_inline_collection(expr: SorobanExpr) -> SorobanExpr {
+    match expr {
+        SorobanExpr::MethodCall {
+            object,
+            method,
+            args,
+        } if is_value_agnostic_method(&method) && is_empty_map_or_vec(&object) => {
+            SorobanExpr::MethodCall {
+                object: Box::new(annotate_with(*object, "Val")),
+                method,
+                args: args.into_iter().map(annotate_inline_collection).collect(),
+            }
+        }
+        other => map_subexprs(other, &annotate_inline_collection),
+    }
+}
+
+/// Annotate `let m = Map::new(&env)` whose binding is referenced but never in a
+/// value-pinning position (every use is a value-agnostic method).
+fn annotate_let_collections(
+    stmts: Vec<SorobanStmt>,
+    referenced: &HashSet<String>,
+    value_pinned: &HashSet<String>,
+) -> Vec<SorobanStmt> {
+    stmts
+        .into_iter()
+        .map(|stmt| match stmt {
+            SorobanStmt::Let {
+                name,
+                mutable,
+                value,
+            } if is_empty_map_or_vec(&value)
+                && referenced.contains(&name)
+                && !value_pinned.contains(&name) =>
+            {
+                SorobanStmt::Let {
+                    name,
+                    mutable,
+                    value: annotate_with(value, "Val"),
+                }
+            }
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => SorobanStmt::If {
+                condition,
+                then_body: annotate_let_collections(then_body, referenced, value_pinned),
+                else_body: annotate_let_collections(else_body, referenced, value_pinned),
+            },
+            SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+                scrutinee,
+                arms: arms
+                    .into_iter()
+                    .map(|a| MatchArm {
+                        pattern: a.pattern,
+                        body: annotate_let_collections(a.body, referenced, value_pinned),
+                    })
+                    .collect(),
+            },
+            SorobanStmt::Loop { body } => SorobanStmt::Loop {
+                body: annotate_let_collections(body, referenced, value_pinned),
+            },
+            SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body: annotate_let_collections(body, referenced, value_pinned),
+            },
+            SorobanStmt::Block(body) => {
+                SorobanStmt::Block(annotate_let_collections(body, referenced, value_pinned))
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// Collect names whose *value* type a use constrains: every occurrence of a
+/// variable except as the receiver of a value-agnostic method
+/// ([`is_value_agnostic_method`]). Mirrors [`visit_stmt_names`]'s structure.
+fn collect_value_pinning_names(stmts: &[SorobanStmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(e)
+            | SorobanStmt::Let { value: e, .. }
+            | SorobanStmt::Assign { value: e, .. }
+            | SorobanStmt::Return(Some(e)) => visit_expr_pinning(e, out),
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                visit_expr_pinning(condition, out);
+                collect_value_pinning_names(then_body, out);
+                collect_value_pinning_names(else_body, out);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                visit_expr_pinning(scrutinee, out);
+                for a in arms {
+                    collect_value_pinning_names(&a.body, out);
+                }
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                collect_value_pinning_names(body, out)
+            }
+            SorobanStmt::For {
+                start, end, body, ..
+            } => {
+                visit_expr_pinning(start, out);
+                visit_expr_pinning(end, out);
+                collect_value_pinning_names(body, out);
+            }
+            SorobanStmt::Return(None)
+            | SorobanStmt::Comment(_)
+            | SorobanStmt::Break
+            | SorobanStmt::Continue => {}
+        }
+    }
+}
+
+fn visit_expr_pinning(expr: &SorobanExpr, out: &mut HashSet<String>) {
+    // A value-agnostic method call on a bare variable does not pin that
+    // variable's value type — skip the receiver, but its args are normal
+    // pinning positions.
+    if let SorobanExpr::MethodCall {
+        object,
+        method,
+        args,
+    } = expr
+        && is_value_agnostic_method(method)
+        && var_name_of(object).is_some()
+    {
+        for a in args {
+            visit_expr_pinning(a, out);
+        }
+        return;
+    }
+    if let Some(n) = var_name_of(expr) {
+        out.insert(n);
+    }
+    for_each_subexpr(expr, &mut |child| visit_expr_pinning(child, out));
+}
+
 /// Every variable name referenced anywhere in the body. `Local(i)` renders as
 /// `var_i` (see codegen), so it is normalised to that form to match a `let`
 /// binding of the same name. A direct read-only walk over the borrowed body —
@@ -627,6 +844,150 @@ fn for_each_subexpr(expr: &SorobanExpr, f: &mut dyn FnMut(&SorobanExpr)) {
         }
         // Leaves (literals, vars, ledger/contract constants, tag names, …).
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clone non-Copy params reused by-value across enum (DataKey) constructions.
+// ---------------------------------------------------------------------------
+
+/// Whether a param type is a non-Copy Soroban host handle — moving it by value
+/// twice is a use-after-move (E0382), and a `.clone()` is a faithful refcount
+/// bump. Copy scalars/`Symbol`/`Val` are excluded (cloning them is redundant
+/// churn and they never trigger E0382).
+fn is_non_copy_param_type(t: &ScSpecTypeDef) -> bool {
+    matches!(
+        t,
+        ScSpecTypeDef::Address
+            | ScSpecTypeDef::Bytes
+            | ScSpecTypeDef::BytesN(_)
+            | ScSpecTypeDef::String
+            | ScSpecTypeDef::Vec(_)
+            | ScSpecTypeDef::Map(_)
+            | ScSpecTypeDef::Udt(_)
+    )
+}
+
+/// Insert `.clone()` on a non-Copy param consumed by value in **multiple**
+/// `EnumConstruct` payloads — the `DataKey::Variant(addr)` idiom where the same
+/// `addr` keys several storage ops (`has`/`get`/`extend_ttl`), each move-ing it
+/// (E0382: "use of moved value"). A Soroban host object is a reference-counted
+/// handle, so `addr.clone()` is the same value — faithful, behaviour-preserving.
+///
+/// Fires only when a non-Copy param appears in **≥2** enum-construct fields, so
+/// it never touches a single-use or Copy param (a correctly-lifted body cannot
+/// contain an un-cloned double-move, so this is a no-op on compiling output).
+pub fn clone_reused_move_params(stmts: Vec<SorobanStmt>, params: &[FnParam]) -> Vec<SorobanStmt> {
+    let eligible: HashSet<String> = params
+        .iter()
+        .filter(|p| is_non_copy_param_type(&p.type_def))
+        .map(|p| p.name.clone())
+        .collect();
+    if eligible.is_empty() {
+        return stmts;
+    }
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for_each_expr_in_stmts(&stmts, &mut |e| {
+        count_enum_field_params(e, &eligible, &mut counts)
+    });
+    let to_clone: HashSet<String> = eligible
+        .into_iter()
+        .filter(|n| counts.get(n).copied().unwrap_or(0) >= 2)
+        .collect();
+    if to_clone.is_empty() {
+        return stmts;
+    }
+    map_exprs_in_stmts(stmts, &|e| clone_enum_field_params(e, &to_clone))
+}
+
+/// Count bare-variable occurrences of `eligible` names in `EnumConstruct` field
+/// positions (the by-value move sites), recursing through all sub-expressions.
+fn count_enum_field_params(
+    expr: &SorobanExpr,
+    eligible: &HashSet<String>,
+    counts: &mut HashMap<String, u32>,
+) {
+    if let SorobanExpr::EnumConstruct { fields, .. } = expr {
+        for field in fields {
+            match var_name_of(field) {
+                Some(n) if eligible.contains(&n) => *counts.entry(n).or_insert(0) += 1,
+                _ => count_enum_field_params(field, eligible, counts),
+            }
+        }
+        return;
+    }
+    for_each_subexpr(expr, &mut |c| count_enum_field_params(c, eligible, counts));
+}
+
+/// Wrap every bare `to_clone` variable that appears as an `EnumConstruct` field
+/// in `.clone()`. Cloning every occurrence (including the last) is harmless — a
+/// redundant handle clone still yields the same value and compiles — and avoids
+/// threading evaluation-order state through the rewrite.
+fn clone_enum_field_params(expr: SorobanExpr, to_clone: &HashSet<String>) -> SorobanExpr {
+    match expr {
+        SorobanExpr::EnumConstruct {
+            type_name,
+            variant,
+            fields,
+        } => SorobanExpr::EnumConstruct {
+            type_name,
+            variant,
+            fields: fields
+                .into_iter()
+                .map(|field| match var_name_of(&field) {
+                    Some(n) if to_clone.contains(&n) => SorobanExpr::MethodCall {
+                        object: Box::new(field),
+                        method: "clone".to_string(),
+                        args: vec![],
+                    },
+                    _ => clone_enum_field_params(field, to_clone),
+                })
+                .collect(),
+        },
+        other => map_subexprs(other, &|e| clone_enum_field_params(e, to_clone)),
+    }
+}
+
+/// Apply `f` to every expression appearing directly in `stmts`, recursing into
+/// nested statement bodies — the borrowed read-only counterpart of
+/// [`map_exprs_in_stmts`].
+fn for_each_expr_in_stmts(stmts: &[SorobanStmt], f: &mut dyn FnMut(&SorobanExpr)) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(e)
+            | SorobanStmt::Let { value: e, .. }
+            | SorobanStmt::Assign { value: e, .. }
+            | SorobanStmt::Return(Some(e)) => f(e),
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                f(condition);
+                for_each_expr_in_stmts(then_body, f);
+                for_each_expr_in_stmts(else_body, f);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                f(scrutinee);
+                for a in arms {
+                    for_each_expr_in_stmts(&a.body, f);
+                }
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                for_each_expr_in_stmts(body, f)
+            }
+            SorobanStmt::For {
+                start, end, body, ..
+            } => {
+                f(start);
+                f(end);
+                for_each_expr_in_stmts(body, f);
+            }
+            SorobanStmt::Return(None)
+            | SorobanStmt::Comment(_)
+            | SorobanStmt::Break
+            | SorobanStmt::Continue => {}
+        }
     }
 }
 
@@ -892,6 +1253,124 @@ fn map_subexprs(expr: SorobanExpr, f: &dyn Fn(SorobanExpr) -> SorobanExpr) -> So
         // Leaves (literals, vars, ledger/contract constants, tag names, …) and
         // already-terminal nodes have no sub-expressions to rewrite.
         leaf => leaf,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lever 2: a fabricated literal in a `Result<T, E>` success value whose type
+// contradicts a scalar `T` (rustc E0308).
+// ---------------------------------------------------------------------------
+//
+// When the lifter loses a function's success value it sometimes fabricates a
+// stand-in literal — e.g. unknown-oracle's `get_gas_cost_in_native_token`
+// returns `Ok(false)` for a `-> Result<u128, E>`. A literal whose scalar class
+// can never unify with the declared ok-type is a *guaranteed* compile error, so
+// it cannot be the real value: replace it with an honest `todo!()` (`UnknownVal`,
+// emitted bare and coercing to the return type). The class comparison collapses
+// every integer width to "numeric" because unsuffixed integer literals coerce —
+// so a genuinely-recovered constant return such as `Ok(0)` in `-> Result<i128, E>`
+// is **never** touched.
+
+/// Husk a type-mismatched literal in the success-value position(s) of a non-unit
+/// scalar `Result<T, E>` function. No-op for non-Result / non-scalar / unit
+/// ok-types and for any literal whose class unifies with `T`.
+pub fn husk_type_mismatched_ok_literal(
+    mut stmts: Vec<SorobanStmt>,
+    return_type: Option<&ScSpecTypeDef>,
+) -> Vec<SorobanStmt> {
+    let Some(ScSpecTypeDef::Result(r)) = return_type else {
+        return stmts;
+    };
+    let Some(ok_class) = scalar_ok_class(&r.ok_type) else {
+        return stmts;
+    };
+    // `return Ok(<lit>)` at any depth.
+    husk_mismatched_returns(&mut stmts, ok_class);
+    // The function-level tail `Ok(<lit>)` is an `Expr(<lit>)` (the `Ok` wrap is
+    // synthesized at codegen).
+    if let Some(SorobanStmt::Expr(e)) = stmts.last_mut()
+        && literal_mismatches(e, ok_class)
+    {
+        *e = SorobanExpr::UnknownVal;
+    }
+    stmts
+}
+
+fn husk_mismatched_returns(stmts: &mut [SorobanStmt], ok_class: &str) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            SorobanStmt::Return(Some(e)) if literal_mismatches(e, ok_class) => {
+                *e = SorobanExpr::UnknownVal;
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                husk_mismatched_returns(then_body, ok_class);
+                husk_mismatched_returns(else_body, ok_class);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                husk_mismatched_returns(body, ok_class);
+            }
+            SorobanStmt::For { body, .. } => husk_mismatched_returns(body, ok_class),
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms.iter_mut() {
+                    husk_mismatched_returns(&mut arm.body, ok_class);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn literal_mismatches(e: &SorobanExpr, ok_class: &str) -> bool {
+    // Look through a `ValConvert` — the lifter wraps a fabricated lost value as
+    // `ValConvert { value: <lit>, target_type }` and renders it as the bare inner
+    // literal (so `ValConvert { false, "u128" }` surfaces as `false`, the E0308).
+    // A real `CastAs` (`false as u128`) is a *valid* cast and is deliberately NOT
+    // unwrapped here.
+    let inner = match e {
+        SorobanExpr::ValConvert { value, .. } => value.as_ref(),
+        other => other,
+    };
+    literal_scalar_class(inner).is_some_and(|c| c != ok_class)
+}
+
+/// Scalar class of a `Result` ok-type, but **only** for the primitive scalars
+/// where a literal of the wrong class is a guaranteed E0308 (so husking is always
+/// safe). Integer widths collapse to `"numeric"` (unsuffixed integer literals
+/// coerce between them). Non-scalar ok-types (`Address`/`Vec`/`Map`/`Symbol`/
+/// `String`/`Bytes`/UDT/`Option`/`Val`/`U256`/`I256`/…) return `None` → the pass
+/// never fires on them.
+fn scalar_ok_class(ok: &ScSpecTypeDef) -> Option<&'static str> {
+    match ok {
+        ScSpecTypeDef::U32
+        | ScSpecTypeDef::I32
+        | ScSpecTypeDef::U64
+        | ScSpecTypeDef::I64
+        | ScSpecTypeDef::U128
+        | ScSpecTypeDef::I128 => Some("numeric"),
+        ScSpecTypeDef::Bool => Some("bool"),
+        _ => None,
+    }
+}
+
+/// Scalar class of a primitive literal expression — mirrors [`scalar_ok_class`].
+/// Returns `None` for any non-literal expression (so only literals are huskable).
+fn literal_scalar_class(e: &SorobanExpr) -> Option<&'static str> {
+    match e {
+        SorobanExpr::U32Literal(_)
+        | SorobanExpr::I32Literal(_)
+        | SorobanExpr::U64Literal(_)
+        | SorobanExpr::I64Literal(_)
+        | SorobanExpr::U128Literal(_)
+        | SorobanExpr::I128Literal(_) => Some("numeric"),
+        SorobanExpr::BoolLiteral(_) => Some("bool"),
+        SorobanExpr::SymbolLiteral(_) => Some("symbol"),
+        SorobanExpr::StringLiteral(_) => Some("string"),
+        SorobanExpr::BytesLiteral(_) => Some("bytes"),
+        _ => None,
     }
 }
 
@@ -1222,6 +1701,303 @@ mod tests {
         assert!(
             matches!(&out[1], SorobanStmt::Expr(SorobanExpr::Param(_))),
             "tail return value must be untouched: {out:?}"
+        );
+    }
+
+    // --- annotate_uninferable_collections --------------------------------
+
+    fn map_new() -> SorobanExpr {
+        SorobanExpr::CollectionNew("Map".into())
+    }
+
+    fn method(obj: SorobanExpr, m: &str, args: Vec<SorobanExpr>) -> SorobanExpr {
+        SorobanExpr::MethodCall {
+            object: Box::new(obj),
+            method: m.into(),
+            args,
+        }
+    }
+
+    fn is_val_collection(e: &SorobanExpr) -> bool {
+        matches!(
+            e,
+            SorobanExpr::CastAs { value, target_type }
+                if target_type == "Val" && matches!(**value, SorobanExpr::CollectionNew(_))
+        )
+    }
+
+    #[test]
+    fn annotates_inline_map_keys() {
+        // `Map::new(&env).keys()` — `.keys()` is value-agnostic, so `V` is lost →
+        // annotate the receiver `Map::<_, Val>`.
+        let out = annotate_uninferable_collections(vec![SorobanStmt::Expr(method(
+            map_new(),
+            "keys",
+            vec![],
+        ))]);
+        let SorobanStmt::Expr(SorobanExpr::MethodCall { object, .. }) = &out[0] else {
+            panic!("expected method call, got {out:?}");
+        };
+        assert!(
+            is_val_collection(object),
+            "inline agnostic-method receiver should be Val-annotated: {object:?}"
+        );
+    }
+
+    #[test]
+    fn annotates_let_map_used_via_contains_key() {
+        // `let m = Map::new(&env); m.contains_key(k)` — contains_key pins the key
+        // but not the value → annotate `Map::<_, Val>`.
+        let out = annotate_uninferable_collections(vec![
+            SorobanStmt::Let {
+                name: "m".into(),
+                mutable: false,
+                value: map_new(),
+            },
+            SorobanStmt::Expr(method(
+                SorobanExpr::Param("m".into()),
+                "contains_key",
+                vec![SorobanExpr::Param("k".into())],
+            )),
+        ]);
+        assert!(
+            matches!(&out[0], SorobanStmt::Let { value, .. } if is_val_collection(value)),
+            "let-bound map used only value-agnostically should be Val-annotated: {out:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_let_map_fed_typed_value() {
+        // config()-shape: contains_key is agnostic, but `set(k, v)` pins the value
+        // type → leave honest (annotating `Val` would mismatch the set arg).
+        let out = annotate_uninferable_collections(vec![
+            SorobanStmt::Let {
+                name: "m".into(),
+                mutable: false,
+                value: map_new(),
+            },
+            SorobanStmt::Expr(method(
+                SorobanExpr::Param("m".into()),
+                "contains_key",
+                vec![SorobanExpr::Param("k".into())],
+            )),
+            SorobanStmt::Expr(method(
+                SorobanExpr::Param("m".into()),
+                "set",
+                vec![SorobanExpr::Param("k".into()), map_new()],
+            )),
+        ]);
+        assert!(
+            matches!(
+                &out[0],
+                SorobanStmt::Let {
+                    value: SorobanExpr::CollectionNew(_),
+                    ..
+                }
+            ),
+            "map fed a value via set must stay un-annotated: {out:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_unused_let_map() {
+        // A never-referenced `let m = Map::new()` has both params unconstrained;
+        // pinning only `V` would not help, so leave it (out of scope, no-op).
+        let out = annotate_uninferable_collections(vec![SorobanStmt::Let {
+            name: "m".into(),
+            mutable: false,
+            value: map_new(),
+        }]);
+        assert!(
+            matches!(
+                &out[0],
+                SorobanStmt::Let {
+                    value: SorobanExpr::CollectionNew(_),
+                    ..
+                }
+            ),
+            "unused let map must stay un-annotated: {out:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_bare_map_new() {
+        // `Map::new(&env)` as a bare expr (e.g. a typed tail return) — not a
+        // value-agnostic receiver, so inference handles it; leave it alone.
+        let out = annotate_uninferable_collections(vec![SorobanStmt::Expr(map_new())]);
+        assert!(
+            matches!(&out[0], SorobanStmt::Expr(SorobanExpr::CollectionNew(_))),
+            "bare Map::new in a typed context must stay un-annotated: {out:?}"
+        );
+    }
+
+    // --- clone_reused_move_params ----------------------------------------
+
+    fn addr_param(name: &str) -> FnParam {
+        FnParam {
+            name: name.into(),
+            type_def: ScSpecTypeDef::Address,
+        }
+    }
+
+    fn datakey(field: SorobanExpr) -> SorobanStmt {
+        SorobanStmt::Expr(SorobanExpr::EnumConstruct {
+            type_name: "DataKey".into(),
+            variant: "Balance".into(),
+            fields: vec![field],
+        })
+    }
+
+    fn enum_field_is_clone(stmt: &SorobanStmt) -> bool {
+        let SorobanStmt::Expr(SorobanExpr::EnumConstruct { fields, .. }) = stmt else {
+            return false;
+        };
+        matches!(&fields[0], SorobanExpr::MethodCall { method, .. } if method == "clone")
+    }
+
+    #[test]
+    fn clones_addr_param_reused_in_enum_fields() {
+        // `DataKey::Balance(addr)` twice → both moves become `addr.clone()`.
+        let out = clone_reused_move_params(
+            vec![
+                datakey(SorobanExpr::Param("addr".into())),
+                datakey(SorobanExpr::Param("addr".into())),
+            ],
+            &[addr_param("addr")],
+        );
+        assert!(
+            enum_field_is_clone(&out[0]) && enum_field_is_clone(&out[1]),
+            "both reused Address moves should be cloned: {out:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_single_use_enum_param() {
+        // One use → no move-after-move, so no clone.
+        let out = clone_reused_move_params(
+            vec![datakey(SorobanExpr::Param("addr".into()))],
+            &[addr_param("addr")],
+        );
+        assert!(
+            !enum_field_is_clone(&out[0]),
+            "single-use param must not be cloned: {out:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_copy_param_reused_in_enum_fields() {
+        // A Copy scalar never triggers E0382, so cloning it would be churn.
+        let out = clone_reused_move_params(
+            vec![
+                datakey(SorobanExpr::Param("idx".into())),
+                datakey(SorobanExpr::Param("idx".into())),
+            ],
+            &[FnParam {
+                name: "idx".into(),
+                type_def: ScSpecTypeDef::U32,
+            }],
+        );
+        assert!(
+            !enum_field_is_clone(&out[0]),
+            "Copy param must not be cloned: {out:?}"
+        );
+    }
+
+    // --- Lever 2: type-mismatched Ok-literal husking ---
+
+    fn result_of(ok: ScSpecTypeDef) -> ScSpecTypeDef {
+        use stellar_xdr::curr::ScSpecTypeResult;
+        ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
+            ok_type: Box::new(ok),
+            error_type: Box::new(ScSpecTypeDef::Error),
+        }))
+    }
+
+    #[test]
+    fn husks_bool_literal_in_u128_result() {
+        // `Ok(false)` in `-> Result<u128, E>` — bool can never be u128 → husk to todo!().
+        let rt = result_of(ScSpecTypeDef::U128);
+        let out = husk_type_mismatched_ok_literal(
+            vec![SorobanStmt::Expr(SorobanExpr::BoolLiteral(false))],
+            Some(&rt),
+        );
+        assert!(
+            matches!(out.as_slice(), [SorobanStmt::Expr(SorobanExpr::UnknownVal)]),
+            "expected the bool tail husked to UnknownVal: {out:?}"
+        );
+    }
+
+    #[test]
+    fn husks_valconvert_bool_in_u128_result() {
+        // The real corpus shape: a lost value wrapped as `ValConvert { false, "u128" }`
+        // in a `return` — renders as bare `false` (E0308). Look through the wrapper.
+        let rt = result_of(ScSpecTypeDef::U128);
+        let out = husk_type_mismatched_ok_literal(
+            vec![SorobanStmt::Return(Some(SorobanExpr::ValConvert {
+                value: Box::new(SorobanExpr::BoolLiteral(false)),
+                target_type: "u128".to_string(),
+            }))],
+            Some(&rt),
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SorobanStmt::Return(Some(SorobanExpr::UnknownVal))]
+            ),
+            "expected the ValConvert-wrapped bool husked to UnknownVal: {out:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_matching_numeric_literal() {
+        // A numeric literal in a numeric ok-type coerces (unsuffixed) → never husked,
+        // even across integer widths (`u64` literal in `Result<i128, E>`).
+        let rt = result_of(ScSpecTypeDef::I128);
+        let out = husk_type_mismatched_ok_literal(
+            vec![SorobanStmt::Return(Some(SorobanExpr::U64Literal(5)))],
+            Some(&rt),
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SorobanStmt::Return(Some(SorobanExpr::U64Literal(5)))]
+            ),
+            "matching numeric literal must be left untouched: {out:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_literal_when_ok_type_nonscalar() {
+        // Non-scalar ok-type (Address) is out of scope — a literal there is a
+        // different error class; leave it honest rather than guess.
+        let rt = result_of(ScSpecTypeDef::Address);
+        let out = husk_type_mismatched_ok_literal(
+            vec![SorobanStmt::Expr(SorobanExpr::BoolLiteral(false))],
+            Some(&rt),
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SorobanStmt::Expr(SorobanExpr::BoolLiteral(false))]
+            ),
+            "non-scalar ok-type must not be touched: {out:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_bool_literal_in_bool_result() {
+        // Classes match → no mismatch → no husk.
+        let rt = result_of(ScSpecTypeDef::Bool);
+        let out = husk_type_mismatched_ok_literal(
+            vec![SorobanStmt::Expr(SorobanExpr::BoolLiteral(false))],
+            Some(&rt),
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SorobanStmt::Expr(SorobanExpr::BoolLiteral(false))]
+            ),
+            "matching bool literal must be left untouched: {out:?}"
         );
     }
 }

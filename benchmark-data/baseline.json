@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 92.6,
+  "overall_restoration": 92.5,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -10,7 +10,7 @@
       "fn_clean": 22,
       "fn_partial": 53,
       "fn_logic_lost": 0,
-      "artifacts_total": 340,
+      "artifacts_total": 341,
       "wasm_size": 44514,
       "error": null
     },
@@ -113,7 +113,7 @@
     {
       "file": "comet-blnd-usdc-amm-CAS3FL6T.wasm",
       "entity": "Comet BLND-USDC AMM",
-      "restoration_pct": 96.7,
+      "restoration_pct": 96.8,
       "spec_functions": 30,
       "fn_clean": 16,
       "fn_partial": 14,
@@ -257,12 +257,12 @@
     {
       "file": "unknown-oracle-CAWGFKEL.wasm",
       "entity": "Unknown Oracle",
-      "restoration_pct": 100.0,
+      "restoration_pct": 97.1,
       "spec_functions": 10,
-      "fn_clean": 10,
-      "fn_partial": 0,
+      "fn_clean": 8,
+      "fn_partial": 2,
       "fn_logic_lost": 0,
-      "artifacts_total": 0,
+      "artifacts_total": 2,
       "wasm_size": 7554,
       "error": null
     },

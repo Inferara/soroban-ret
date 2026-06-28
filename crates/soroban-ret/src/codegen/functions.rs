@@ -739,6 +739,27 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             }
         }
 
+        // An un-inferable empty collection (`Map::new`/`Vec::new`) whose value
+        // type the lifter lost: emit a `Map::<_, T>::new` / `Vec::<T>::new`
+        // turbofish pinning only the value param (the key stays inferred). A
+        // plain `as` cast (the fallback arm below) cannot annotate a generic
+        // constructor, so this must precede it.
+        SorobanExpr::CastAs { value, target_type }
+            if matches!(value.as_ref(), SorobanExpr::CollectionNew(_))
+                && syn::parse_str::<syn::Type>(target_type).is_ok() =>
+        {
+            let SorobanExpr::CollectionNew(coll) = value.as_ref() else {
+                unreachable!("guarded by matches! on CollectionNew")
+            };
+            let coll_ident = safe_ident(coll);
+            let ty: syn::Type = syn::parse_str(target_type).expect("checked by guard");
+            if coll == "Map" {
+                quote! { #coll_ident::<_, #ty>::new(&env) }
+            } else {
+                quote! { #coll_ident::<#ty>::new(&env) }
+            }
+        }
+
         SorobanExpr::CastAs { value, target_type } => {
             let val = generate_expr(value);
             // `target_type` originates from spec/IR strings and is not guaranteed
@@ -2284,6 +2305,24 @@ mod generate_expr_tests {
     fn collection_new() {
         let v = SorobanExpr::CollectionNew("Vec".into());
         assert_eq!(collapse(&s(generate_expr(&v))), "Vec :: new (& env)");
+    }
+
+    #[test]
+    fn cast_collection_emits_value_turbofish() {
+        // Map pins only the value param, leaving the key inferred.
+        let m = SorobanExpr::CastAs {
+            value: boxed(SorobanExpr::CollectionNew("Map".into())),
+            target_type: "Val".into(),
+        };
+        let out = collapse(&s(generate_expr(&m)));
+        assert!(out.contains("Map :: < _ , Val > :: new"), "got: {out}");
+        // Vec has a single element param.
+        let v = SorobanExpr::CastAs {
+            value: boxed(SorobanExpr::CollectionNew("Vec".into())),
+            target_type: "Val".into(),
+        };
+        let out = collapse(&s(generate_expr(&v)));
+        assert!(out.contains("Vec :: < Val > :: new"), "got: {out}");
     }
 
     #[test]
