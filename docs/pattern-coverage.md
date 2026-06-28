@@ -119,29 +119,26 @@ every fixture reports in `contractmetav0`.
 - `… -- --against accuracy-baseline.json --tolerance 0.5` — regression gate
   (exit 1 if any contract drops > 0.5 pp from the committed baseline).
 
-Current status (v26.0.1): **97.4 % overall**, every complexity level meets its
-target (L1 = 100 %, L2 = 100 %, L3 = 93.7 % ≥ 92 %, L4 = 100 %, L5 = 96.6 % ≥ 80 %).
-The v26.0.1 SDK sources are more complex than v25.1.1, so `udt` (76.0), `import_contract`
-(74.3) and `logging` (70.0, release WASM strips `log!`) sit below their individual
-level targets but are absorbed by the level averages; `udt`'s `add` in particular keeps
-its match unrecovered because the UdtEnum discriminant is not extracted from the
-parameter (a documented v26.0.1 lifter gap). The committed baseline is
-`accuracy-baseline.json` at the repo root; refresh it via an explicit PR when output
-changes intentionally.
+Current status (v26.0.1): **98.3 % overall** over 37 scored contracts
+(`liquidity_pool` is skipped for lacking a reference source), every complexity
+level meets its target (L1 = 100 %, L2 = 100 %, L3 = 100 %, L4 = 100 %,
+L5 = 96.6 % ≥ 80 %). `import_contract` (74.3) and `logging` (70.0, release WASM
+strips `log!`) sit below their individual level targets but are absorbed by the
+level averages. The committed baseline is `accuracy-baseline.json` at the repo
+root; refresh it via an explicit PR when output changes intentionally.
 
 ### Compile-back fidelity (`scripts/check-compilable.sh`)
 
 The accuracy metric is interface/fingerprint-based and does **not** check that
 output compiles. `scripts/check-compilable.sh` decompiles every fixture and runs
-`cargo check --target wasm32v1-none` against `soroban-sdk`. Current status
-(v26.0.1, pin `=26.0.1`): **29/35 non-skipped compile (82 %)**. This is down from
-97 % at v25.1.1: standardizing on the larger v26.0.1 SDK sources newly broke
-compile-back for `constructor`, `import_contract`, `bls`, `bn254`, and `udt` — each
-a distinct v26.0.1 coverage gap (e.g. `import_contract` because `invoke_contract`'s
-signature gained a second generic argument; `constructor` because a body returns
-`()` where `Option<i64>` is expected), not a single shared regression. `liquidity_pool`
-remains the one always-expected failure (no reference source). Two earlier
-compile-fidelity codegen fixes landed in `crates/soroban-ret/src/ir/optimizer.rs`:
+`cargo check --target wasm32v1-none` against `soroban-sdk` (pin `=26.0.1`); the
+`compile_back` test gate (`SOROBAN_RET_COMPILE_BACK=1`) wraps it with a 95 %
+floor. Current status: **38/38 non-skipped compile (100 %)**, including
+`test_liquidity_pool` (its earlier `E0284 into_val` type-inference failure has
+since been resolved). `test_liquidity_pool` is still *skipped by the accuracy
+metric* — for lack of a reference source to score against, which is unrelated to
+compile-back. Two earlier compile-fidelity codegen fixes landed in
+`crates/soroban-ret/src/ir/optimizer.rs`:
 
 - **`remove_val_tag_guards`** strips SDK argument-validation guards of the shape
   `if v.get_tag() != Tag::X { panic!() }`. The lifter's `ValTag`/`ValTagName`
@@ -152,6 +149,51 @@ compile-fidelity codegen fixes landed in `crates/soroban-ret/src/ir/optimizer.rs
   drops standalone `*_to_linear_memory` / `*_from_linear_memory` host calls
   (e.g. `map_unpack_to_linear_memory`) whose result is discarded — pure SDK
   (de)serialization that codegen rendered as non-public `env.map()…` API.
+
+### Spec-consistency (`tests/spec_consistency.rs`)
+
+Beyond *interface similarity vs a reference source* (the accuracy metric, which
+only covers the SDK fixtures), this gate checks the generated Rust against the
+contract's **own** `contractspecv0` — so it covers **every** contract including
+the 24 mainnet corpus contracts that have no reference source. It builds the
+expected interface from the spec (via the same `generate_type_ident` codegen
+uses) and asserts, across all 62 contracts (38 fixtures + 24 corpus): **0**
+dropped/extra functions and **0** arity mismatches, with mean signature
+similarity **98.9 %** and type similarity **98.6 %**. Runs in the default
+`cargo test` (decompile + `syn`, no wasm build).
+
+### Structural plausibility (`crates/soroban-ret-bench/tests/plausibility.rs`)
+
+Turns the corpus restoration numbers — previously *report-only* in
+`benchmark.yml` — into an asserted ratchet against `benchmark-data/baseline.json`.
+Fails if any corpus contract regresses (fewer clean functions, more logic-lost
+functions, or more decompilation artifacts). Improvements pass; an intentional
+change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
+the default `cargo test`.
+
+### Functional equivalence (`crates/soroban-ret-equiv`, `SOROBAN_RET_EQUIV=1`)
+
+The strongest check: it **recompiles** decompiled output to a real `.wasm`
+(`cargo build --target wasm32v1-none`), registers BOTH the original and
+recompiled contract in a `soroban-sdk` test host (`soroban-env-host`), invokes
+each scalar-invocable exported function with boundary + seeded-random inputs,
+and compares the outcomes (lowered to canonical `ScVal`). A divergence is a
+decompiler correctness limitation; the gate is a ratchet on the divergence
+count, like the corpus-soundness gate.
+
+Current baseline: **61 functions / 424 cases executed across 40 contracts, 82.3 %
+behavioral match, 75 known divergences** — each a genuine decompiler limitation
+the harness surfaced: `test_add_u64` lowers `checked_add(..).ok_or(E)` to
+`Ok(a + b)` (traps instead of `Err` on overflow); `test_alloc::num_list` loses
+its populate-loop and returns an empty `Vec`; `unknown-oracle` returns a host
+error instead of the original's contract error on empty-storage paths.
+
+**Coverage is intrinsically limited** (by design): only functions invocable with
+generated scalar arguments and no required storage/auth state are executed;
+aggregate/UDT-argument functions, and the renamed `__constructor`/`__check_auth`,
+are skipped, as are contracts whose output does not recompile. It is a
+correctness sanity-check + behavioral-match metric, not a full-corpus
+differential test.
 
 ### Known gaps
 
@@ -166,7 +208,3 @@ compile-fidelity codegen fixes landed in `crates/soroban-ret/src/ir/optimizer.rs
   and scores 100 % on the accuracy metric. Recovering the original
   `trait T { … } impl T for Contract` shape is **not possible** from the bytecode
   alone and is out of scope.
-- **`test_liquidity_pool` does not compile** (the 1/38 compile-back failure):
-  `E0284 type annotations needed` on `.into_val(&env)` calls where the target
-  `Val` type cannot be inferred from context. This is a known type-inference
-  limitation that also affects the upstream `soroban-decompiler` reference repo.

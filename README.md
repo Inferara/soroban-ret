@@ -109,6 +109,33 @@ cargo test --workspace
 cargo run -p soroban-ret-cli -- path/to/contract.wasm
 ```
 
+## Validation
+
+`cargo test --workspace` runs the fast gates by default, including:
+
+- **Accuracy** — interface similarity vs the SDK reference sources (≈98 % over 37 contracts).
+- **Spec-consistency** — generated signatures/types vs each contract's own `contractspecv0` (covers the mainnet corpus too, which has no reference source).
+- **Structural plausibility** — a ratchet on per-contract recovery vs `benchmark-data/baseline.json`.
+
+Three heavier gates compile decompiled output back for `wasm32v1-none` and are opt-in via env var (also run in CI):
+
+```bash
+# ≥95% of fixtures recompile (cargo check)
+SOROBAN_RET_COMPILE_BACK=1 cargo test -p soroban-ret --test compile_back
+
+# mainnet corpus hard-error ratchet
+SOROBAN_RET_CORPUS_SOUNDNESS=1 cargo test -p soroban-ret --test corpus_soundness
+
+# functional equivalence: recompile to wasm, run BOTH the original and
+# recompiled contract through soroban-env-host, and diff their outputs
+SOROBAN_RET_EQUIV=1 cargo test -p soroban-ret-equiv --test equivalence
+```
+
+The equivalence harness differentially executes scalar-invocable functions and
+reports a behavioral-match metric; see
+[`docs/pattern-coverage.md`](docs/pattern-coverage.md) for its scope and the
+current divergence baseline.
+
 ## Roadmap
 
 | Stage | Scope | Status |
@@ -126,7 +153,7 @@ patterns (allowance flows, complex token contracts, snapshot-quality
 recovery) is on the roadmap.
 
 A per-pattern audit of code, fixtures, and explicit assertions lives in
-[`docs/pattern-coverage.md`](docs/pattern-c overage.md).
+[`docs/pattern-coverage.md`](docs/pattern-coverage.md).
 
 ## Acknowledgements
 

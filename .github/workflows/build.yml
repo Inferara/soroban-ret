@@ -42,3 +42,34 @@ jobs:
       - name: Clippy
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets --locked
+
+  # Heavy, wasm-toolchain gates that are env-gated (skipped by the default
+  # `cargo test` above). Enforced here so compile-back, corpus-soundness, and
+  # functional-equivalence run on every PR — previously they were opt-in only.
+  heavy-gates:
+    name: Heavy gates (compile-back, corpus, equivalence)
+    runs-on: ubuntu-latest
+    # NOT `-D warnings`: these gates recompile decompiled output, which carries
+    # benign warnings (unused vars/imports) that must not fail the recompile.
+    # Lint enforcement is the `build` job's responsibility.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain (+ wasm32v1-none)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache cargo registry, index and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile-back, corpus-soundness, and functional-equivalence gates
+        env:
+          SOROBAN_RET_COMPILE_BACK: "1"
+          SOROBAN_RET_CORPUS_SOUNDNESS: "1"
+          SOROBAN_RET_EQUIV: "1"
+        run: cargo test --workspace --locked -- --nocapture
