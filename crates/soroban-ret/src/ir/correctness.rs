@@ -483,6 +483,15 @@ fn var_name_of(expr: &SorobanExpr) -> Option<String> {
 /// `push_back`) or whose `get` result is consumed typed has a constrained `V`
 /// and is left untouched, so this can never over-constrain a typed collection
 /// (worst case it is a no-op).
+///
+/// `referenced` / `value_pinned` are **scope-flat** — names accumulate into one
+/// function-wide set, not per lexical scope. A same-name binding shadowed across
+/// scopes (an outer pinned `m`, an inner agnostic `m`) would therefore leave the
+/// inner `let` un-annotated. That direction is safe: it is an *under*-annotation
+/// (a fixable `E0283` left honest), never a wrong `Val` pin on a typed
+/// collection. The lifter's unique `var_N` local numbering makes such a collision
+/// effectively impossible, so this stays a flat scan (matching the shipped
+/// `annotate_uninferable_gets` machinery).
 pub fn annotate_uninferable_collections(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     let referenced = collect_referenced_names(&stmts);
     let mut value_pinned = HashSet::new();
