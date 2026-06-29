@@ -21,7 +21,8 @@ run `soroban-ret --info <fixture>` to read it back.
 | `test_account.wasm` | rs-soroban-sdk | `__check_auth` custom-account contract |
 | `test_add_i128.wasm` | rs-soroban-sdk | i128 arithmetic shape |
 | `test_add_u128.wasm` | rs-soroban-sdk | u128 arithmetic shape |
-| `test_add_u64.wasm` | rs-soroban-sdk | u64 arithmetic shape |
+| `test_add_u64.wasm` | rs-soroban-sdk | u64 arithmetic shape (`checked_add` recovery) |
+| `test_sub_u64.wasm` | this repo (`tests/fixtures-src/sub_u64`) | u64 `checked_sub().ok_or(..)` recovery |
 | `test_alloc.wasm` | rs-soroban-sdk | Allocator-using contract |
 | `test_auth.wasm` | rs-soroban-sdk | `require_auth` / `require_auth_for_args` |
 | `test_bls.wasm` | rs-soroban-sdk | BLS12-381 host calls (g1/g2/msm/pairing) |

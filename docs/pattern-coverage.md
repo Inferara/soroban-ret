@@ -157,9 +157,9 @@ only covers the SDK fixtures), this gate checks the generated Rust against the
 contract's **own** `contractspecv0` — so it covers **every** contract including
 the 24 mainnet corpus contracts that have no reference source. It builds the
 expected interface from the spec (via the same `generate_type_ident` codegen
-uses) and asserts, across all 62 contracts (38 fixtures + 24 corpus): **0**
+uses) and asserts, across all 63 contracts (39 fixtures + 24 corpus): **0**
 dropped/extra functions and **0** arity mismatches, with mean signature
-similarity **98.9 %** and type similarity **98.6 %**. Runs in the default
+similarity **~99 %** and type similarity **~99 %**. Runs in the default
 `cargo test` (decompile + `syn`, no wasm build).
 
 ### Structural plausibility (`crates/soroban-ret-bench/tests/plausibility.rs`)
@@ -181,14 +181,16 @@ and compares the outcomes (lowered to canonical `ScVal`). A divergence is a
 decompiler correctness limitation; the gate is a ratchet on the divergence
 count, like the corpus-soundness gate.
 
-Current baseline: **61 functions / 424 cases executed; 62 contracts checked
-(38 fixtures + all 24 mainnet corpus, of which 22 do not yet recompile and are
-reported as `not_recompilable`), 82.3 % behavioral match, 75 known
+Current baseline: **63 functions / 474 cases executed; 63 contracts checked
+(39 fixtures + all 24 mainnet corpus, of which 22 do not yet recompile and are
+reported as `not_recompilable`), 87.3 % behavioral match, 60 known
 divergences** — each a genuine decompiler limitation
-the harness surfaced: `test_add_u64` lowers `checked_add(..).ok_or(E)` to
-`Ok(a + b)` (traps instead of `Err` on overflow); `test_alloc::num_list` loses
-its populate-loop and returns an empty `Vec`; `unknown-oracle` returns a host
-error instead of the original's contract error on empty-storage paths.
+the harness surfaced: `test_alloc::num_list` loses its populate-loop and returns
+an empty `Vec`; `unknown-oracle` returns a host error instead of the original's
+contract error on empty-storage paths. (Previously 75 / 82.3 %; the
+`checked_add`/`checked_sub` → `.ok_or(..)` recovery in the lifter eliminated
+`test_add_u64`'s 15 overflow-trap divergences, and the `test_sub_u64` fixture
+verifies `checked_sub` at 0 divergences.)
 
 **Coverage is intrinsically limited** (by design): only functions invocable with
 generated scalar arguments and no required storage/auth state are executed;

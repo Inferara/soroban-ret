@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use soroban_ret_accuracy::spec_compare::check_spec_consistency;
 
 // --- Ratchets (drive consistency up; never loosen without understanding why) ---
-// Calibrated from the first measured run (62 contracts: 38 fixtures + 24 corpus):
+// Calibrated from the first measured run (63 contracts: 39 fixtures + 24 corpus):
 // 0 fn-violations / 0 extra fns on BOTH sets; mean signatures 98.9%, types 98.6%.
 /// Fixtures are the controlled set: they must be perfectly spec-consistent.
 const FIXTURE_FN_VIOLATIONS_MAX: usize = 0;

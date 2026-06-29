@@ -36,22 +36,24 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// recompiled contracts differ). A ratchet: drive DOWN as the decompiler
 /// recovers more behavior; never raise without understanding the new divergence.
 ///
-/// Measured baseline = 75, all genuine decompiler limitations the harness
-/// surfaced (61 fns / 424 cases executed; 62 contracts checked — 38 fixtures +
-/// 24 corpus, of which 22 do not yet recompile — 82.3% match):
-///   - `test_add_u64` (15): `safe_add`/`safe_add_two` lower
-///     `a.checked_add(b).ok_or(E)` to `Ok(a + b)`, so overflow inputs trap on
-///     the recompiled contract instead of returning `Err(Overflow)`.
+/// Measured baseline = 60, all genuine decompiler limitations the harness
+/// surfaced (63 fns / 474 cases executed; 63 contracts checked — 39 fixtures +
+/// 24 corpus, of which 22 do not yet recompile — 87.3% match):
 ///   - `test_alloc` (4): `num_list` loses its `alloc`-vec population loop and
 ///     returns an empty `Vec` instead of `[0..count]`.
 ///   - `unknown-oracle` (56): empty-storage error paths return a host
 ///     `Context/InvalidAction` error instead of the original's contract error.
-const DIVERGENCE_CEILING: usize = 75;
+///
+/// Previously 75; the `checked_add`/`checked_sub` recovery
+/// (`recover_checked_arith_from_body` in the lifter) eliminated `test_add_u64`'s
+/// 15 divergences (`a.checked_add(b).ok_or(E)` was collapsing to `Ok(a + b)`),
+/// and the new `test_sub_u64` fixture verifies `checked_sub` at 0 divergences.
+const DIVERGENCE_CEILING: usize = 60;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).
-/// Measured 61; floored with headroom.
-const EXECUTED_FN_FLOOR: usize = 55;
+/// Measured 63; floored with headroom.
+const EXECUTED_FN_FLOOR: usize = 60;
 
 /// Max contracts that may hard-panic the harness (should be zero).
 const ERRORED_MAX: usize = 0;
