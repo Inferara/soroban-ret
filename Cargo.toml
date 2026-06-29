@@ -5,6 +5,7 @@ members = [
     "crates/soroban-ret-accuracy",
     "crates/soroban-ret-bench",
     "crates/soroban-ret-cli",
+    "crates/soroban-ret-equiv",
 ]
 
 [workspace.package]

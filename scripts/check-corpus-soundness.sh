@@ -66,9 +66,15 @@ for wasm in "$REPO_DIR"/$GLOB; do
     # compiled) is the source of truth for clean-vs-broken, NOT the error grep —
     # which can't tell "compiled, 0 errors" from "cargo never ran rustc on our
     # file". The grep only quantifies the ratchet metric (E-coded errors).
-    out=$( cd "$VERIFY_DIR" && cargo check --target "$TARGET" --message-format=short 2>&1 )
+    out=$( cd "$VERIFY_DIR" && cargo check --target "$TARGET" --message-format=short --color never 2>&1 )
     status=$?
-    errs=$( printf '%s\n' "$out" | grep -cE 'src/lib\.rs.*error\[E[0-9]+\]' )
+    # Use here-strings (not `printf | grep`): with `set -o pipefail`, `grep -q`
+    # exits on the first match and SIGPIPEs the still-writing `printf`, so the
+    # pipeline reports failure *despite a match* and the guard below spuriously
+    # fires. A here-string has no upstream process to SIGPIPE. `LC_ALL=C grep -a`
+    # also matches bytes, not characters, so non-UTF-8 bytes in the decompiled
+    # source can't make GNU grep (CI's UTF-8 locale) miss present lines.
+    errs=$( LC_ALL=C grep -acE 'src/lib\.rs.*error\[E[0-9]+\]' <<<"$out" )
     COUNT=$((COUNT + 1))
     if [ "$status" -eq 0 ]; then
         CLEAN=$((CLEAN + 1))
@@ -78,7 +84,7 @@ for wasm in "$REPO_DIR"/$GLOB; do
         # the build broke for an environment reason (registry, toolchain, …),
         # not because the decompiled code is wrong. Abort loudly rather than
         # silently scoring 0 and passing the ratchet on untrusted output.
-        if ! printf '%s\n' "$out" | grep -qE 'src/lib\.rs.*error'; then
+        if ! LC_ALL=C grep -qaE 'src/lib\.rs.*error' <<<"$out"; then
             echo "FATAL: cargo check failed for $name with no diagnostics against the generated file (broken environment?)" >&2
             printf '%s\n' "$out" | tail -20 >&2
             exit 2

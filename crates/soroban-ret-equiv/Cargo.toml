@@ -1,0 +1,29 @@
+[package]
+name = "soroban-ret-equiv"
+description = "Functional-equivalence harness: recompile decompiled output and diff its behavior against the original under a Soroban host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+# Never published: this is a dev/test harness that shells out to `cargo build`
+# and depends on `soroban-sdk` testutils (a host). The release flow only ships
+# `soroban-ret` + `soroban-ret-cli`.
+publish = false
+
+[lib]
+name = "soroban_ret_equiv"
+path = "src/lib.rs"
+
+[dependencies]
+soroban-ret = { workspace = true }
+stellar-xdr = { workspace = true }
+# Host side: a native build of soroban-sdk with the test environment. Pulls in
+# soroban-env-host transitively. The contract (recompiled) side is built by
+# shelling out to a separate verify crate (see src/lib.rs), mirroring
+# scripts/check-compilable.sh.
+soroban-sdk = { version = "=26.0.1", features = ["testutils"] }

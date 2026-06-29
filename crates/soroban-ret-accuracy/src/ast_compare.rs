@@ -964,7 +964,11 @@ fn strip_references(ty: &Type) -> Type {
     }
 }
 
-fn normalize_type_str(s: &str) -> String {
+/// Canonicalize a rendered type string for comparison: strips `soroban_sdk::`,
+/// collapses whitespace, removes spacing around `< > , ::`, and maps known
+/// aliases. Public so the spec-consistency checker can render `ScSpecTypeDef`s
+/// into the same canonical form the syn-extracted interface uses.
+pub fn normalize_type_str(s: &str) -> String {
     let mut t = s.to_string();
     // Strip soroban_sdk:: prefix
     t = t.replace("soroban_sdk ::", "");

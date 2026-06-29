@@ -42,3 +42,51 @@ jobs:
       - name: Clippy
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets --locked
+
+  # Heavy, wasm-toolchain gates that are env-gated (skipped by the default
+  # `cargo test` above). Enforced here so compile-back, corpus-soundness, and
+  # functional-equivalence run on every PR — previously they were opt-in only.
+  heavy-gates:
+    name: Heavy gates (compile-back, corpus, equivalence)
+    runs-on: ubuntu-latest
+    # NOT `-D warnings`: these gates recompile decompiled output, which carries
+    # benign warnings (unused vars/imports) that must not fail the recompile.
+    # Lint enforcement is the `build` job's responsibility.
+    env:
+      RUSTFLAGS: ""
+      # Pin rustc for these gates only. Corpus-soundness is a hard error-count
+      # ratchet, and the compile-back / equivalence baselines are likewise
+      # calibrated against exact rustc diagnostics — all of which drift across
+      # floating `stable` releases. RUSTUP_TOOLCHAIN overrides rust-toolchain.toml
+      # so the gates are reproducible against the locally-measured baselines
+      # (corpus 1134, equiv 75, compile-back 38/38). Bump with the baselines.
+      RUSTUP_TOOLCHAIN: "1.95.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain (+ wasm32v1-none)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          targets: wasm32v1-none
+
+      - name: Cache cargo registry, index and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile-back, corpus-soundness, and functional-equivalence gates
+        env:
+          SOROBAN_RET_COMPILE_BACK: "1"
+          SOROBAN_RET_CORPUS_SOUNDNESS: "1"
+          SOROBAN_RET_EQUIV: "1"
+        # Run ONLY the three env-gated heavy gates — not the whole workspace.
+        # The full unit/integration/snapshot suite is the `build` job's
+        # responsibility (on floating `stable`); re-running it here under the
+        # pinned 1.95.0 is redundant and breaks the rustfmt-formatted snapshot
+        # tests (this job intentionally omits the rustfmt component). The three
+        # gates are formatting-insensitive: they compile, count errors, and run
+        # behavior.
+        run: |
+          cargo test --locked -p soroban-ret --test compile_back --test corpus_soundness -- --nocapture
+          cargo test --locked -p soroban-ret-equiv --test equivalence -- --nocapture
