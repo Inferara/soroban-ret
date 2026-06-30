@@ -3164,7 +3164,7 @@ fn remove_val_tag_guards(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                 else_body,
             } if else_body.is_empty()
                 && is_val_tag_guard_condition(&condition)
-                && is_panic_body(&then_body) =>
+                && (is_panic_body(&then_body) || is_control_transfer_body(&then_body)) =>
             {
                 None
             }
@@ -3210,6 +3210,18 @@ fn is_panic_body(body: &[SorobanStmt]) -> bool {
         Some(SorobanStmt::Expr(
             SorobanExpr::Panic | SorobanExpr::PanicWithError(_)
         ))
+    )
+}
+
+/// True when a guard body is purely a loop control transfer (`break`/`continue`).
+/// A `Val` type assertion (`get_tag() != Tag::X`) sometimes lifts with a loop-exit
+/// `break` instead of a `panic!()` trap; dropping it is faithful for the same
+/// reason as the panic case — `Tag` is not public SDK surface, so a surviving
+/// `Tag::X` is non-compiling residue (E0433) and the operand value is already lost.
+fn is_control_transfer_body(body: &[SorobanStmt]) -> bool {
+    matches!(
+        body.first(),
+        Some(SorobanStmt::Break | SorobanStmt::Continue)
     )
 }
 
@@ -9339,5 +9351,42 @@ mod tests {
         // keep it even though the constant is a genuine type tag.
         let out = remove_val_tag_guards(vec![unknown_tag_husk(false, 69, true)]);
         assert_eq!(out.len(), 1, "error guard must not be dropped: {out:?}");
+    }
+
+    #[test]
+    fn val_tag_guard_with_break_body_is_dropped() {
+        // `if x.get_tag() != Tag::VecObject { break }` — a `Val` type assertion that
+        // lifted with a loop-exit `break` instead of a `panic!()`. `Tag` is not
+        // public SDK surface (E0433), so dropping it is faithful, exactly as for the
+        // panic-bodied case.
+        let guard = SorobanStmt::If {
+            condition: SorobanExpr::Ne(
+                Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param("x".into())))),
+                Box::new(SorobanExpr::ValTagName("VecObject".into())),
+            ),
+            then_body: vec![SorobanStmt::Break],
+            else_body: vec![],
+        };
+        let out = remove_val_tag_guards(vec![guard]);
+        assert!(
+            out.is_empty(),
+            "break-bodied val-tag guard not dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn val_tag_guard_with_value_body_is_kept() {
+        // A value/effect body is not a control-only husk — keep it (only panic and
+        // bare break/continue bodies are the droppable SDK type-assertion shapes).
+        let guard = SorobanStmt::If {
+            condition: SorobanExpr::Ne(
+                Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param("x".into())))),
+                Box::new(SorobanExpr::ValTagName("VecObject".into())),
+            ),
+            then_body: vec![SorobanStmt::Expr(SorobanExpr::Param("y".into()))],
+            else_body: vec![],
+        };
+        let out = remove_val_tag_guards(vec![guard]);
+        assert_eq!(out.len(), 1, "guard with a value body must be kept: {out:?}");
     }
 }

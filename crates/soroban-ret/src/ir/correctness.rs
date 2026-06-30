@@ -875,6 +875,55 @@ fn is_non_copy_param_type(t: &ScSpecTypeDef) -> bool {
     )
 }
 
+/// Husk a *type-impossible* comparison `<non-Copy-handle param> ==/!= <int
+/// literal>` to an honest `UnknownVal`. An `Address`/`Bytes`/`Vec`/`Map`/… can
+/// never be compared to an integer in real source (it would not type-check), so
+/// such a comparison is always a lifter collapse of an inlined `Val` validity/tag
+/// assertion whose operand degraded to the bare param and whose tag degraded to an
+/// int literal (e.g. `if from != 0 { panic!() }` for an `Address` param, E0308
+/// "expected Address, found integer"). Reducing it to a hole clears the error
+/// *without* assuming the guard's outcome — we deliberately do NOT fold it to a
+/// constant, because the original branch behaviour is unrecoverable. Gated to a
+/// bare non-Copy `Param` operand against an integer literal, so it can never touch
+/// a scalar param (where `!= 0` is real logic) or any compiling comparison.
+pub fn husk_handle_int_comparisons(
+    stmts: Vec<SorobanStmt>,
+    params: &[FnParam],
+) -> Vec<SorobanStmt> {
+    let handles: HashSet<String> = params
+        .iter()
+        .filter(|p| is_non_copy_param_type(&p.type_def))
+        .map(|p| p.name.clone())
+        .collect();
+    if handles.is_empty() {
+        return stmts;
+    }
+    map_exprs_in_stmts(stmts, &|e| husk_handle_int_cmp_expr(e, &handles))
+}
+
+fn husk_handle_int_cmp_expr(expr: SorobanExpr, handles: &HashSet<String>) -> SorobanExpr {
+    if let SorobanExpr::Eq(a, b) | SorobanExpr::Ne(a, b) = &expr
+        && (is_handle_vs_int(a, b, handles) || is_handle_vs_int(b, a, handles))
+    {
+        return SorobanExpr::UnknownVal;
+    }
+    map_subexprs(expr, &|e| husk_handle_int_cmp_expr(e, handles))
+}
+
+/// `param` is a bare non-Copy-handle `Param` and `lit` is an integer literal.
+fn is_handle_vs_int(param: &SorobanExpr, lit: &SorobanExpr, handles: &HashSet<String>) -> bool {
+    matches!(param, SorobanExpr::Param(p) if handles.contains(p))
+        && matches!(
+            lit,
+            SorobanExpr::I32Literal(_)
+                | SorobanExpr::I64Literal(_)
+                | SorobanExpr::U32Literal(_)
+                | SorobanExpr::U64Literal(_)
+                | SorobanExpr::I128Literal(_)
+                | SorobanExpr::U128Literal(_)
+        )
+}
+
 /// Insert `.clone()` on a non-Copy param consumed by value in **multiple**
 /// `EnumConstruct` payloads — the `DataKey::Variant(addr)` idiom where the same
 /// `addr` keys several storage ops (`has`/`get`/`extend_ttl`), each move-ing it
@@ -1878,6 +1927,51 @@ mod tests {
         assert!(
             enum_field_is_clone(&out[0]) && enum_field_is_clone(&out[1]),
             "both reused Address moves should be cloned: {out:?}"
+        );
+    }
+
+    #[test]
+    fn husks_handle_vs_int_comparison() {
+        // `if from != 0 { panic!() }` for an Address param is type-impossible
+        // (Address vs integer) → husk the condition to an honest hole.
+        let cond = SorobanExpr::Ne(
+            Box::new(SorobanExpr::Param("from".into())),
+            Box::new(SorobanExpr::I32Literal(0)),
+        );
+        let out = husk_handle_int_comparisons(
+            vec![SorobanStmt::If {
+                condition: cond,
+                then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+                else_body: vec![],
+            }],
+            &[addr_param("from")],
+        );
+        let SorobanStmt::If { condition, .. } = &out[0] else {
+            panic!("expected If, got {out:?}");
+        };
+        assert!(
+            matches!(condition, SorobanExpr::UnknownVal),
+            "handle-vs-int condition should husk to a hole, got {condition:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_scalar_vs_int_comparison() {
+        // A scalar param `n != 0` is genuine logic — must NOT be husked.
+        let cond = SorobanExpr::Ne(
+            Box::new(SorobanExpr::Param("n".into())),
+            Box::new(SorobanExpr::I32Literal(0)),
+        );
+        let out = husk_handle_int_comparisons(
+            vec![SorobanStmt::Expr(cond)],
+            &[FnParam {
+                name: "n".into(),
+                type_def: ScSpecTypeDef::U32,
+            }],
+        );
+        assert!(
+            matches!(&out[0], SorobanStmt::Expr(SorobanExpr::Ne(..))),
+            "a scalar comparison must survive: {out:?}"
         );
     }
 
