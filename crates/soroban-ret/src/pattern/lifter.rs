@@ -626,6 +626,13 @@ struct LiftContext<'a> {
     /// contexts via `Rc<RefCell>` so a record made while lifting a nested block
     /// reaches `lift_function_body`. See [`FallibleGetRecord`].
     fallible_get_recovery: Rc<RefCell<Option<FallibleGetRecord>>>,
+    /// Count of fallible storage-get helpers the top-level function calls (also
+    /// only at `inline_depth == 0`, shared like `fallible_get_recovery`). When
+    /// `> 1` the getter reads more than one key, so it cannot be rebuilt as a
+    /// single value-returning `get(..).ok_or(..)` tail (that would return the
+    /// FIRST key's value/error and silently drop the rest); `lift_function_body`
+    /// downgrades it to the always-faithful early-return guard form instead.
+    fallible_get_count: Rc<RefCell<u32>>,
 }
 
 impl<'a> LiftContext<'a> {
@@ -660,6 +667,7 @@ impl<'a> LiftContext<'a> {
             dynamic_slots: Rc::new(RefCell::new(HashMap::new())),
             guard_block_depth: 0,
             fallible_get_recovery: Rc::new(RefCell::new(None)),
+            fallible_get_count: Rc::new(RefCell::new(0)),
         }
     }
 
@@ -689,6 +697,7 @@ impl<'a> LiftContext<'a> {
             guard_block_depth: self.guard_block_depth,
             // Shared so a record made in a nested block reaches the top-level ctx.
             fallible_get_recovery: Rc::clone(&self.fallible_get_recovery),
+            fallible_get_count: Rc::clone(&self.fallible_get_count),
         }
     }
 
@@ -1038,8 +1047,8 @@ impl<'a> LiftContext<'a> {
     /// does not consume the call (it still inlines as before; the husk is replaced
     /// wholesale only for a direct-return getter).
     fn note_fallible_storage_get(&mut self, target_idx: u32, args: &[StackVal]) {
-        // Only the top-level function's own getters, and only the first.
-        if self.inline_depth != 0 || self.fallible_get_recovery.borrow().is_some() {
+        // Only the top-level function's own getters.
+        if self.inline_depth != 0 {
             return;
         }
         // `.ok_or(..)` needs a `Result<_, E>` return to graft the error onto.
@@ -1051,6 +1060,17 @@ impl<'a> LiftContext<'a> {
         else {
             return;
         };
+        // Count EVERY fallible-get the function performs so `lift_function_body`
+        // can tell a single-read getter (rebuildable as a value-returning tail)
+        // from a multi-read one (only its leading early-return is faithful).
+        // Record only the genuine FIRST: if its key is unrecoverable we record
+        // nothing (husk unchanged) rather than grafting a later, possibly
+        // out-of-order read's error onto the return.
+        let is_first = *self.fallible_get_count.borrow() == 0;
+        *self.fallible_get_count.borrow_mut() += 1;
+        if !is_first {
+            return;
+        }
         let key = if let Some(k) = info.const_key {
             k
         } else {
@@ -6547,6 +6567,7 @@ fn lift_function_body(
     // (recovering its early-return faithfully is the follow-up). The recovered get
     // is emitted as a bare tail `Expr` (NOT `Return(Some(..))`, which codegen would
     // double-wrap to `Ok(get(..).ok_or(..))`).
+    let multiple_gets = *ctx.fallible_get_count.borrow() > 1;
     let fallible_rec = ctx.fallible_get_recovery.borrow_mut().take();
     if let Some(rec) = fallible_rec
         && let Some(ScSpecTypeDef::Result(r)) = return_type
@@ -6558,7 +6579,12 @@ fn lift_function_body(
         // `get(..).ok_or(..)` IS the tail. The turbofish pins the value type the
         // `.ok_or` can't infer — the declared ok-type for direct, `Val` for computed
         // (the value is discarded by the `?`).
-        let computed = function_calls_math_helper(wasm_module, func_index, 3);
+        //
+        // A getter that reads more than one key (`multiple_gets`) is treated as
+        // computed even without arithmetic: the value-returning tail would return
+        // the FIRST key's value/error and drop the later reads, so emit only the
+        // always-faithful leading early-return guard.
+        let computed = multiple_gets || function_calls_math_helper(wasm_module, func_index, 3);
         let value_ty = if computed {
             Some("soroban_sdk::Val".to_string())
         } else {
@@ -15009,6 +15035,45 @@ mod tests {
             !function_calls_math_helper(&m, 2, 3),
             "the get helper itself has no arithmetic"
         );
+    }
+
+    #[test]
+    fn note_fallible_get_counts_all_but_records_first() {
+        // A getter that reads more than one key must NOT be rebuilt as a single
+        // value-returning `get(..).ok_or(..)` tail — that would return the FIRST
+        // key's value/error and silently drop the rest. The observer therefore
+        // counts EVERY fallible-get (so `lift_function_body` can force the faithful
+        // early-return guard when count > 1) while keeping only the FIRST record.
+        // Guards greptile P1 "First Helper Replaces Body".
+        let m = fallible_get_module();
+        let reg = empty_registry();
+        let params: Vec<FnParam> = Vec::new();
+        let ret = result_u64_error();
+        let mut ctx = LiftContext::new(&m, &reg, &params, &ret, Vec::new(), 0);
+
+        // First read: helper 2, keyed by the caller's 2nd arg (Temporary, code 400).
+        ctx.note_fallible_storage_get(
+            2,
+            &[StackVal::Unknown, StackVal::Param("chain_id".to_string())],
+        );
+        assert_eq!(*ctx.fallible_get_count.borrow(), 1, "first get counted");
+        // Second read: helper 6, const "Admin" key — counted but NOT recorded.
+        ctx.note_fallible_storage_get(6, &[]);
+        assert_eq!(
+            *ctx.fallible_get_count.borrow(),
+            2,
+            "second get also counted"
+        );
+
+        let rec = ctx.fallible_get_recovery.borrow();
+        let rec = rec.as_ref().expect("first get recorded");
+        assert_eq!(
+            rec.key,
+            SorobanExpr::Param("chain_id".to_string()),
+            "the FIRST read's key is kept, not overwritten by the later const-key read"
+        );
+        assert_eq!(rec.error_code, 400, "first read's error code is kept");
+        assert_eq!(rec.storage_type, StorageType::Temporary);
     }
 
     #[test]
