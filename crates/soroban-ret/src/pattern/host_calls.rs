@@ -785,11 +785,10 @@ fn lift_buf_call(name: &str, mut args: Vec<SorobanExpr>) -> SorobanExpr {
                 args: vec![],
             }
         }
-        "bytes_new" => SorobanExpr::MethodCall {
-            object: Box::new(SorobanExpr::Env),
-            method: "bytes_new".to_string(),
-            args: vec![],
-        },
+        // The host `bytes_new` constructs an empty bytes object — the public
+        // `Bytes::new(&env)` (soroban-sdk `bytes.rs`), via the `CollectionNew`
+        // codegen (`Bytes::new(&env)`). Was `env.bytes_new()`, no such method (E0599).
+        "bytes_new" => SorobanExpr::CollectionNew("Bytes".to_string()),
         "bytes_push" => {
             let val = args.pop().unwrap_or(SorobanExpr::Void);
             let bytes = args.pop().unwrap_or(SorobanExpr::Void);
@@ -1628,7 +1627,6 @@ mod tests {
     #[test]
     fn buf_bytes_ops() {
         let cases = [
-            ("bytes_new", 0, "bytes_new"),
             ("bytes_push", 2, "push"),
             ("bytes_append", 2, "append"),
             ("bytes_slice", 3, "slice"),
@@ -1643,6 +1641,17 @@ mod tests {
                 other => panic!("{name}: got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn buf_bytes_new_lowers_to_bytes_collection() {
+        // `bytes_new` → `Bytes::new(&env)` (the public empty-Bytes constructor),
+        // via `CollectionNew("Bytes")`, NOT the nonexistent `env.bytes_new()` (E0599).
+        let out = lift_host_call(&hf(HostModule::Buf, "bytes_new"), vec![]);
+        assert!(
+            matches!(out, SorobanExpr::CollectionNew(ref c) if c == "Bytes"),
+            "got {out:?}"
+        );
     }
 
     #[test]
