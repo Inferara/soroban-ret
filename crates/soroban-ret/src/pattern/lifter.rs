@@ -6503,6 +6503,18 @@ fn lift_function_body(
                 }
             }
         }
+        // A subtraction collapses to this fallback (the U64Small/Object encode
+        // branch defeats the strip path), where `generate_arithmetic_body` would
+        // hard-code `Add`. Restore `a.checked_sub(b).ok_or(..)` from the bytecode
+        // first.
+        if let Some(tail) =
+            recover_checked_arith_from_body(&func.body, params, return_type, registry)
+        {
+            return LiftBodyResult {
+                stmts: vec![tail],
+                found_host_calls: false,
+            };
+        }
         // Fallback for simple a + b (when stack is just a Param, strip_val_encode fails, or
         // the stripped expression contains Unknown from untracked i32 operations)
         return LiftBodyResult {
@@ -12991,6 +13003,218 @@ fn generate_arithmetic_body(
     }
 }
 
+// --- Checked-arithmetic recovery (`a.checked_add/sub(b).ok_or(<err>)`) ---------
+//
+// The SDK compiles `a.checked_add(b).ok_or(E)` to: a wrapping `i{64,32}.add`,
+// an unsigned carry test `(a+b) <u a`, and a branch that returns the preloaded
+// `Err` Val on overflow. The arithmetic shortcut in `lift_function_body`
+// collapses all of that to the bare sum, so the function decompiles to the
+// overflow-UNSAFE `Ok(a + b)` (which traps under `overflow-checks`). These
+// helpers restore the checked form, reading the real error code from the
+// bytecode (no fabrication). Gating is deliberately rigid; any mismatch returns
+// `None`, leaving the shortcut's existing output untouched.
+
+/// Width (bits) of a `Result<int, E>` ok-type the recovery handles (`u32`/`i32`
+/// → 32, `u64`/`i64` → 64), paired with the declared error type. `None` for any
+/// other return shape.
+fn checked_result_shape(return_type: &Option<ScSpecTypeDef>) -> Option<(u32, ScSpecTypeDef)> {
+    let Some(ScSpecTypeDef::Result(r)) = return_type else {
+        return None;
+    };
+    let width = match &*r.ok_type {
+        ScSpecTypeDef::U64 | ScSpecTypeDef::I64 => 64,
+        ScSpecTypeDef::U32 | ScSpecTypeDef::I32 => 32,
+        _ => return None,
+    };
+    Some((width, (*r.error_type).clone()))
+}
+
+/// The single contract-error `Val` constant the SDK preloads on the error path,
+/// returned as its contract error code. `None` if there is no Error-tagged
+/// constant, or more than one distinct one (ambiguous → bail).
+///
+/// An Error `Val` carries the error *type* in bits 8–15 (0 = Contract) and the
+/// code in bits 32–63. Only `ScErrorType::Contract` constants are real
+/// `#[contracterror]` codes; a non-Contract error (host/WasmVm/etc.) must NOT be
+/// mistaken for a contract code, so it is skipped (and if it were the only
+/// Error-tagged const, recovery bails — `None`).
+fn find_checked_error_code(body: &[crate::wasm::ir::WasmInstr]) -> Option<u32> {
+    use crate::wasm::ir::WasmInstr;
+    let mut found: Option<u32> = None;
+    for instr in body {
+        if let WasmInstr::I64Const(c) = instr {
+            let v = *c as u64;
+            if v & 0xff == TAG_ERROR && (v >> 8) & 0xff == 0 {
+                let code = (v >> 32) as u32;
+                match found {
+                    Some(prev) if prev != code => return None,
+                    _ => found = Some(code),
+                }
+            }
+        }
+    }
+    found
+}
+
+/// True if the body contains the width-appropriate unsigned-`<` the SDK emits for
+/// an overflow/underflow guard.
+fn has_unsigned_lt(body: &[crate::wasm::ir::WasmInstr], width: u32) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    body.iter().any(|i| {
+        if width == 64 {
+            matches!(i, WasmInstr::I64LtU)
+        } else {
+            matches!(i, WasmInstr::I32LtU)
+        }
+    })
+}
+
+/// Contract-error expression for a recovered `.ok_or(..)`, rendered to match the
+/// function's declared `Result<_, E>` error type so the result type-checks —
+/// mirrors the return-type rendering in `codegen::module`. Reads the real code
+/// from the WASM; never fabricates an enum/variant the spec doesn't carry.
+fn checked_error_expr(registry: &TypeRegistry, err_type: &ScSpecTypeDef, code: u32) -> SorobanExpr {
+    let enum_name = match err_type {
+        ScSpecTypeDef::Udt(u) => u.name.to_utf8_string().ok(),
+        // Raw `soroban_sdk::Error`: codegen substitutes the sole error enum when
+        // there is exactly one, else leaves it as `soroban_sdk::Error`. With two
+        // or more enums we deliberately do NOT guess a variant via
+        // `lookup_error_variant` (first-match across all enums): two enums can
+        // share a code (e.g. both `=1`), so a guess would fabricate the wrong
+        // `E::Variant`. The declared type is the opaque `Error`, so the honest,
+        // type-correct rendering is `Error::from_contract_error(code)` below.
+        ScSpecTypeDef::Error if registry.error_enums.len() == 1 => {
+            registry.error_enums.keys().next().cloned()
+        }
+        _ => None,
+    };
+    match enum_name {
+        Some(name) => {
+            let variant_name = registry.get_error_enum(&name).and_then(|e| {
+                e.cases
+                    .iter()
+                    .find(|c| c.value == code)
+                    .and_then(|c| c.name.to_utf8_string().ok())
+            });
+            SorobanExpr::ContractError {
+                error_code: code,
+                error_type: Some(name),
+                variant_name,
+            }
+        }
+        None => SorobanExpr::ContractError {
+            error_code: code,
+            error_type: None,
+            variant_name: None,
+        },
+    }
+}
+
+/// Build the recovered tail expression `a.checked_<op>(b).ok_or(<err>)`.
+fn checked_arith_tail(method: &str, a: String, b: String, err: SorobanExpr) -> SorobanStmt {
+    SorobanStmt::Expr(SorobanExpr::MethodCall {
+        object: Box::new(SorobanExpr::MethodCall {
+            object: Box::new(SorobanExpr::Param(a)),
+            method: method.to_string(),
+            args: vec![SorobanExpr::Param(b)],
+        }),
+        method: "ok_or".to_string(),
+        args: vec![err],
+    })
+}
+
+/// Recover `a.checked_add(b)`/`a.checked_sub(b)` `.ok_or(<err>)` from the WASM
+/// body at the arithmetic-shortcut fallback (where `generate_arithmetic_body`
+/// would otherwise hard-code an overflow-unsafe `Ok(a + b)`, even for a
+/// subtraction). Gated on a `Result<int, E>` return over two params, the SDK
+/// overflow guard (unsigned-`<`), and a single Error-tagged constant.
+///
+/// - **sub**: read both op and operand order from the bytecode — the unique
+///   width-appropriate `LocalGet(i); LocalGet(j); Sub` over two distinct param
+///   slots (decoded in place), confirmed by a borrow guard
+///   `LocalGet(i); LocalGet(j); LtU` with the same operands/order (`a < b`). So
+///   `b.checked_sub(a)` is recovered correctly too.
+/// - **add**: commutative, so operands are `params[0], params[1]` — the same
+///   operand assumption `generate_arithmetic_body` already makes for `Ok(a + b)`,
+///   now made overflow-safe.
+fn recover_checked_arith_from_body(
+    body: &[crate::wasm::ir::WasmInstr],
+    params: &[FnParam],
+    return_type: &Option<ScSpecTypeDef>,
+    registry: &TypeRegistry,
+) -> Option<SorobanStmt> {
+    use crate::wasm::ir::WasmInstr;
+    if params.len() != 2 {
+        return None;
+    }
+    let (width, err_type) = checked_result_shape(return_type)?;
+    // Both forms require the SDK overflow/underflow guard and a real error const.
+    if !has_unsigned_lt(body, width) {
+        return None;
+    }
+    let code = find_checked_error_code(body)?;
+    let nparams = params.len() as u32;
+    let is_sub = |o: &WasmInstr| {
+        if width == 64 {
+            matches!(o, WasmInstr::I64Sub)
+        } else {
+            matches!(o, WasmInstr::I32Sub)
+        }
+    };
+    let is_add = |o: &WasmInstr| {
+        if width == 64 {
+            matches!(o, WasmInstr::I64Add)
+        } else {
+            matches!(o, WasmInstr::I32Add)
+        }
+    };
+    let is_lt = |o: &WasmInstr| {
+        if width == 64 {
+            matches!(o, WasmInstr::I64LtU)
+        } else {
+            matches!(o, WasmInstr::I32LtU)
+        }
+    };
+
+    // Subtraction: read operands + order from the bytecode (non-commutative).
+    if let Some((i, j)) = body.windows(3).find_map(|w| match w {
+        [WasmInstr::LocalGet(i), WasmInstr::LocalGet(j), o]
+            if is_sub(o) && *i < nparams && *j < nparams && i != j =>
+        {
+            Some((*i, *j))
+        }
+        _ => None,
+    }) {
+        // Borrow guard with the same operands in the same order (`a < b`).
+        let has_borrow = body.windows(3).any(|w| {
+            matches!(w, [WasmInstr::LocalGet(a), WasmInstr::LocalGet(b), o] if *a == i && *b == j && is_lt(o))
+        });
+        if has_borrow {
+            cov_mark::hit!(checked_arith_recovered);
+            return Some(checked_arith_tail(
+                "checked_sub",
+                params[i as usize].name.clone(),
+                params[j as usize].name.clone(),
+                checked_error_expr(registry, &err_type, code),
+            ));
+        }
+    }
+
+    // Addition: commutative — operands are the two params (the same assumption
+    // the plain-`Ok(a + b)` fallback already makes), now overflow-safe.
+    if body.iter().any(is_add) {
+        cov_mark::hit!(checked_arith_recovered);
+        return Some(checked_arith_tail(
+            "checked_add",
+            params[0].name.clone(),
+            params[1].name.clone(),
+            checked_error_expr(registry, &err_type, code),
+        ));
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     //! Scaffold-level tests for lifter helpers. The full lifter is exercised
@@ -13096,6 +13320,280 @@ mod tests {
             meta: Vec::new(),
             spec_entries: Vec::new(),
         }
+    }
+
+    // ----- checked-arithmetic recovery --------------------------------
+
+    /// `0x1_0000_0003`: a contract-error `Val` constant — tag `0x03` (Error),
+    /// code `1` (`val >> 32`). The Err the SDK preloads for an overflow path.
+    const ERR_VAL: i64 = 4_294_967_299;
+
+    fn u64_param(name: &str) -> FnParam {
+        FnParam {
+            name: name.to_string(),
+            type_def: ScSpecTypeDef::U64,
+        }
+    }
+
+    fn result_u64_error() -> Option<ScSpecTypeDef> {
+        Some(ScSpecTypeDef::Result(Box::new(
+            stellar_xdr::ScSpecTypeResult {
+                ok_type: Box::new(ScSpecTypeDef::U64),
+                error_type: Box::new(ScSpecTypeDef::Error),
+            },
+        )))
+    }
+
+    /// Unwrap the recovered `a.checked_<op>(b).ok_or(_)` tail into
+    /// `(method, minuend, subtrahend)` for assertions.
+    fn checked_parts(stmt: Option<SorobanStmt>) -> (String, String, String) {
+        let Some(SorobanStmt::Expr(SorobanExpr::MethodCall { object, method, .. })) = stmt else {
+            panic!("not a recovered tail expr: {stmt:?}");
+        };
+        assert_eq!(method, "ok_or");
+        let SorobanExpr::MethodCall {
+            method: op,
+            object: inner,
+            args,
+        } = *object
+        else {
+            panic!("inner is not a method call");
+        };
+        let SorobanExpr::Param(a) = *inner else {
+            panic!("receiver is not a param");
+        };
+        let [SorobanExpr::Param(b)] = args.as_slice() else {
+            panic!("arg is not a single param");
+        };
+        (op, a, b.clone())
+    }
+
+    #[test]
+    fn recover_checked_add_emits_checked_add_ok_or() {
+        use crate::wasm::ir::WasmInstr::*;
+        cov_mark::check!(checked_arith_recovered);
+        // add is commutative → operands are params[0], params[1].
+        let body = vec![I64Add, I64LtU, I64Const(ERR_VAL)];
+        let params = [u64_param("a"), u64_param("b")];
+        let got =
+            recover_checked_arith_from_body(&body, &params, &result_u64_error(), &empty_registry());
+        assert_eq!(
+            checked_parts(got),
+            ("checked_add".into(), "a".into(), "b".into())
+        );
+    }
+
+    #[test]
+    fn recover_checked_sub_reads_operand_order_from_bytecode() {
+        use crate::wasm::ir::WasmInstr::*;
+        cov_mark::check!(checked_arith_recovered);
+        // Bytecode computes `b - a` (operands LocalGet(1), LocalGet(0)) with a
+        // matching `b < a` borrow guard — must recover `b.checked_sub(a)`, NOT
+        // declaration order.
+        let body = vec![
+            LocalGet(1),
+            LocalGet(0),
+            I64LtU,
+            LocalGet(1),
+            LocalGet(0),
+            I64Sub,
+            I64Const(ERR_VAL),
+        ];
+        let params = [u64_param("a"), u64_param("b")];
+        let got =
+            recover_checked_arith_from_body(&body, &params, &result_u64_error(), &empty_registry());
+        assert_eq!(
+            checked_parts(got),
+            ("checked_sub".into(), "b".into(), "a".into())
+        );
+    }
+
+    #[test]
+    fn recover_checked_error_is_raw_error_when_no_enum() {
+        use crate::wasm::ir::WasmInstr::*;
+        // No error enums in the registry → `soroban_sdk::Error::from_contract_error(1)`
+        // (ContractError with no type/variant).
+        let body = vec![I64Add, I64LtU, I64Const(ERR_VAL)];
+        let params = [u64_param("a"), u64_param("b")];
+        let Some(SorobanStmt::Expr(SorobanExpr::MethodCall { args, .. })) =
+            recover_checked_arith_from_body(&body, &params, &result_u64_error(), &empty_registry())
+        else {
+            panic!("not recovered");
+        };
+        assert!(matches!(
+            args.as_slice(),
+            [SorobanExpr::ContractError {
+                error_code: 1,
+                error_type: None,
+                variant_name: None,
+            }]
+        ));
+    }
+
+    #[test]
+    fn checked_arith_skips_non_result_or_non_scalar_return() {
+        use crate::wasm::ir::WasmInstr::*;
+        let body = vec![I64Add, I64LtU, I64Const(ERR_VAL)];
+        let params = [u64_param("a"), u64_param("b")];
+        let reg = empty_registry();
+        // Bare scalar return (the plain `add` fn) and no return type → untouched.
+        assert!(
+            recover_checked_arith_from_body(&body, &params, &Some(ScSpecTypeDef::U64), &reg)
+                .is_none()
+        );
+        assert!(recover_checked_arith_from_body(&body, &params, &None, &reg).is_none());
+    }
+
+    #[test]
+    fn checked_arith_skips_without_overflow_guard_or_error_const() {
+        use crate::wasm::ir::WasmInstr::*;
+        let params = [u64_param("a"), u64_param("b")];
+        let reg = empty_registry();
+        // No unsigned-`<` guard → a plain wrapping `Ok(a + b)`, not checked.
+        assert!(
+            recover_checked_arith_from_body(
+                &[I64Add, I64Const(ERR_VAL)],
+                &params,
+                &result_u64_error(),
+                &reg
+            )
+            .is_none()
+        );
+        // `I64Const(7)` has tag 7, not Error(3) → no contract-error const to put
+        // in `.ok_or(..)` → bail (no fabricated error smuggled in).
+        assert!(
+            recover_checked_arith_from_body(
+                &[I64Add, I64LtU, I64Const(7)],
+                &params,
+                &result_u64_error(),
+                &reg
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn checked_arith_skips_non_binary_arity() {
+        use crate::wasm::ir::WasmInstr::*;
+        let body = vec![I64Add, I64LtU, I64Const(ERR_VAL)];
+        let three = [u64_param("a"), u64_param("b"), u64_param("c")];
+        assert!(
+            recover_checked_arith_from_body(&body, &three, &result_u64_error(), &empty_registry())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn checked_arith_skips_non_contract_error_const() {
+        use crate::wasm::ir::WasmInstr::*;
+        // Error-tagged Val whose error-TYPE sub-field (bits 8-15) is non-zero
+        // (`0x01` = a non-Contract error, e.g. WasmVm). `find_checked_error_code`
+        // must skip it — its `val >> 32` is NOT a contract error code — so with no
+        // genuine contract-error const present, recovery bails (no wrong code
+        // smuggled into `.ok_or(..)`).
+        const NON_CONTRACT_ERR: i64 = 0x1_0000_0103; // tag 0x03, type 0x01, code 1
+        assert_eq!(0x103u64 & 0xff, TAG_ERROR);
+        assert_ne!((0x103u64 >> 8) & 0xff, 0);
+        let params = [u64_param("a"), u64_param("b")];
+        assert!(
+            recover_checked_arith_from_body(
+                &[I64Add, I64LtU, I64Const(NON_CONTRACT_ERR)],
+                &params,
+                &result_u64_error(),
+                &empty_registry()
+            )
+            .is_none()
+        );
+    }
+
+    /// Registry holding the named `#[contracterror]` enums, each `(variant, code)`.
+    fn registry_with_error_enums(
+        enums: &[(&str, &[(&str, u32)])],
+    ) -> crate::spec::registry::TypeRegistry {
+        let mut reg = empty_registry();
+        for (name, cases) in enums {
+            let cases: Vec<_> = cases
+                .iter()
+                .map(|(vname, value)| stellar_xdr::ScSpecUdtErrorEnumCaseV0 {
+                    doc: Default::default(),
+                    name: (*vname).try_into().unwrap(),
+                    value: *value,
+                })
+                .collect();
+            reg.error_enums.insert(
+                (*name).to_string(),
+                stellar_xdr::ScSpecUdtErrorEnumV0 {
+                    doc: Default::default(),
+                    lib: Default::default(),
+                    name: (*name).try_into().unwrap(),
+                    cases: cases.try_into().unwrap(),
+                },
+            );
+        }
+        reg
+    }
+
+    fn recovered_ok_or_arg(stmt: Option<SorobanStmt>) -> SorobanExpr {
+        let Some(SorobanStmt::Expr(SorobanExpr::MethodCall { args, .. })) = stmt else {
+            panic!("not a recovered tail expr: {stmt:?}");
+        };
+        let [arg] = args.as_slice() else {
+            panic!("ok_or takes exactly one arg");
+        };
+        arg.clone()
+    }
+
+    #[test]
+    fn checked_error_raw_error_resolves_sole_enum_variant() {
+        use crate::wasm::ir::WasmInstr::*;
+        // Declared error type is the raw `soroban_sdk::Error`, but there is exactly
+        // ONE error enum → codegen substitutes it, so the `.ok_or(..)` arg names
+        // that enum's variant for the recovered code (mirrors return-type rendering).
+        let body = vec![I64Add, I64LtU, I64Const(ERR_VAL)];
+        let params = [u64_param("a"), u64_param("b")];
+        let reg = registry_with_error_enums(&[("Error", &[("Overflow", 1)])]);
+        assert!(matches!(
+            recovered_ok_or_arg(recover_checked_arith_from_body(
+                &body,
+                &params,
+                &result_u64_error(),
+                &reg
+            )),
+            SorobanExpr::ContractError {
+                error_code: 1,
+                error_type: Some(t),
+                variant_name: Some(v),
+            } if t == "Error" && v == "Overflow"
+        ));
+    }
+
+    #[test]
+    fn checked_error_raw_error_with_multiple_enums_is_unguessed() {
+        use crate::wasm::ir::WasmInstr::*;
+        // Declared error type is the raw `soroban_sdk::Error` and TWO enums share
+        // code 1. We deliberately do NOT guess a variant (that would fabricate the
+        // wrong `E::Variant`); the honest rendering is `Error::from_contract_error(1)`
+        // — i.e. ContractError with no type/variant. Locks in this choice against a
+        // regression toward the ambiguous `lookup_error_variant` path.
+        let body = vec![I64Add, I64LtU, I64Const(ERR_VAL)];
+        let params = [u64_param("a"), u64_param("b")];
+        let reg = registry_with_error_enums(&[
+            ("Error", &[("Overflow", 1)]),
+            ("MyError", &[("Boom", 1)]),
+        ]);
+        assert!(matches!(
+            recovered_ok_or_arg(recover_checked_arith_from_body(
+                &body,
+                &params,
+                &result_u64_error(),
+                &reg
+            )),
+            SorobanExpr::ContractError {
+                error_code: 1,
+                error_type: None,
+                variant_name: None,
+            }
+        ));
     }
 
     #[test]

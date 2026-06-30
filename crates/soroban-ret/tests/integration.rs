@@ -132,6 +132,42 @@ fn test_decompile_add_u64() {
     // `a + b` must live inside `pub fn add`, not leak into another fn.
     assert_in_fn(&source, "pub fn add", &["a + b"]);
     assert!(!source.contains("todo!("), "unexpected todo! artifact");
+    // `safe_add`/`safe_add_two` must recover the overflow-checked form, NOT the
+    // unsafe `Ok(a + b)` (which traps on overflow under `overflow-checks`).
+    assert!(
+        source.contains("checked_add") && source.contains(".ok_or("),
+        "safe_add not recovered to checked_add().ok_or(): {source}"
+    );
+    assert!(
+        !source.contains("Ok(a + b)"),
+        "checked_add collapsed to unsafe Ok(a + b)"
+    );
+    // Per-function error scoping: the UDT-typed `safe_add_two` renders its enum.
+    assert!(
+        source.contains("MyError::Overflow"),
+        "safe_add_two error not scoped to MyError"
+    );
+}
+
+#[test]
+fn test_decompile_sub_u64() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_sub_u64.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    // `checked_sub` recovery reads op + operand order from the bytecode (the
+    // arithmetic shortcut's fallback would otherwise hard-code `Add`).
+    assert!(
+        source.contains("checked_sub") && source.contains(".ok_or("),
+        "safe_sub not recovered to checked_sub().ok_or(): {source}"
+    );
+    assert!(
+        source.contains("MyError::Underflow"),
+        "safe_sub_two error not scoped to MyError"
+    );
+    assert!(
+        !source.contains("Ok(a + b)") && !source.contains("Ok(a - b)"),
+        "checked_sub collapsed to an unsafe wrapping op"
+    );
+    assert!(!source.contains("todo!("), "unexpected todo! artifact");
 }
 
 #[test]
@@ -789,6 +825,10 @@ const ALL_FIXTURES: &[(&str, &[u8])] = &[
     (
         "test_add_u64",
         include_bytes!("../../../tests/fixtures/test_add_u64.wasm"),
+    ),
+    (
+        "test_sub_u64",
+        include_bytes!("../../../tests/fixtures/test_sub_u64.wasm"),
     ),
     (
         "test_add_u128",
