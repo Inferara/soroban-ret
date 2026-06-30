@@ -88,6 +88,23 @@ fn lift_ledger_call(name: &str, mut args: Vec<SorobanExpr>) -> SorobanExpr {
                 extend_to: Box::new(extend_to),
             }
         }
+        // The host's `update_current_contract_wasm` is exposed publicly on the
+        // `Deployer`, not the `Ledger` — `env.deployer().update_current_contract_wasm(hash)`
+        // (soroban-sdk `deploy.rs`). Without this it fell through to the RawHostCall
+        // fallback and rendered `env.ledger().update_current_contract_wasm(..)`,
+        // which has no such method (E0599).
+        "update_current_contract_wasm" => {
+            let hash = args.pop().unwrap_or(SorobanExpr::Void);
+            SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::MethodCall {
+                    object: Box::new(SorobanExpr::Env),
+                    method: "deployer".to_string(),
+                    args: vec![],
+                }),
+                method: "update_current_contract_wasm".to_string(),
+                args: vec![hash],
+            }
+        }
         _ => SorobanExpr::RawHostCall {
             module: "Ledger".to_string(),
             function: name.to_string(),
@@ -129,6 +146,19 @@ fn lift_address_call(name: &str, mut args: Vec<SorobanExpr>) -> SorobanExpr {
                 method: "id".to_string(),
                 args: vec![],
             }
+        }
+        // `address_to_strkey`/`strkey_to_address` are the public `Address::to_string`
+        // / `Address::from_string` (soroban-sdk `address.rs`), rendered by the
+        // existing `AddressToStrkey`/`StrkeyToAddress` IR variants. Without these
+        // they fell through to RawHostCall → `env.address().address_to_strkey(..)`,
+        // which has no such method (E0599).
+        "address_to_strkey" => {
+            let addr = args.pop().unwrap_or(SorobanExpr::Void);
+            SorobanExpr::AddressToStrkey(Box::new(addr))
+        }
+        "strkey_to_address" => {
+            let strkey = args.pop().unwrap_or(SorobanExpr::Void);
+            SorobanExpr::StrkeyToAddress(Box::new(strkey))
         }
         _ => SorobanExpr::RawHostCall {
             module: "Address".to_string(),
@@ -968,6 +998,31 @@ mod tests {
         assert!(matches!(out, SorobanExpr::RawHostCall { .. }));
     }
 
+    #[test]
+    fn ledger_update_wasm_lowers_to_deployer() {
+        // Faithful public API is `env.deployer().update_current_contract_wasm(hash)`,
+        // NOT the RawHostCall `env.ledger().update_current_contract_wasm(..)` (E0599).
+        let out = lift_host_call(
+            &hf(HostModule::Ledger, "update_current_contract_wasm"),
+            vec![SorobanExpr::Param("hash".into())],
+        );
+        match out {
+            SorobanExpr::MethodCall {
+                object,
+                method,
+                args,
+            } => {
+                assert_eq!(method, "update_current_contract_wasm");
+                assert!(matches!(args.as_slice(), [SorobanExpr::Param(p)] if p == "hash"));
+                assert!(matches!(
+                    *object,
+                    SorobanExpr::MethodCall { ref method, .. } if method == "deployer"
+                ));
+            }
+            other => panic!("expected deployer().update_current_contract_wasm, got {other:?}"),
+        }
+    }
+
     // ----- Address -----
 
     #[test]
@@ -992,6 +1047,24 @@ mod tests {
             vec![SorobanExpr::VecConstruct(vec![])],
         );
         assert!(matches!(out, SorobanExpr::AuthorizeAsCurrContract(_)));
+    }
+
+    #[test]
+    fn address_strkey_conversions_lower_to_public_api() {
+        // `address_to_strkey` → `addr.to_string()`; `strkey_to_address` →
+        // `Address::from_string(&sk)` (the existing AddressToStrkey/StrkeyToAddress
+        // IR variants), NOT the RawHostCall `env.address().address_to_strkey(..)`.
+        let out = lift_host_call(
+            &hf(HostModule::Address, "address_to_strkey"),
+            vec![SorobanExpr::Param("a".into())],
+        );
+        assert!(matches!(out, SorobanExpr::AddressToStrkey(b) if matches!(*b, SorobanExpr::Param(ref p) if p == "a")));
+
+        let out = lift_host_call(
+            &hf(HostModule::Address, "strkey_to_address"),
+            vec![SorobanExpr::Param("sk".into())],
+        );
+        assert!(matches!(out, SorobanExpr::StrkeyToAddress(b) if matches!(*b, SorobanExpr::Param(ref p) if p == "sk")));
     }
 
     #[test]
