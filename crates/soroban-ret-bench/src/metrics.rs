@@ -328,7 +328,8 @@ fn walk_expr(e: &SorobanExpr, s: &mut NodeStats) {
         | SorobanExpr::SretResult(b)
         | SorobanExpr::ValTag(b)
         | SorobanExpr::ValConvert { value: b, .. }
-        | SorobanExpr::CastAs { value: b, .. } => walk_expr(b, s),
+        | SorobanExpr::CastAs { value: b, .. }
+        | SorobanExpr::Try(b) => walk_expr(b, s),
 
         // Two children.
         SorobanExpr::Add(a, b)

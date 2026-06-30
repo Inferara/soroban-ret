@@ -396,6 +396,10 @@ fn expr_is_unit_typed(e: &SorobanExpr) -> bool {
             | SorobanExpr::PublishEvent { .. }
             | SorobanExpr::Log(_)
             | SorobanExpr::PrngReseed(_)
+            // A `?` in tail position renders as the `()`-typed statement `expr?;`,
+            // so a `todo!()` value tail is appended after it (the computed-getter
+            // early-return guard). Never a recovered value itself.
+            | SorobanExpr::Try(_)
     )
 }
 

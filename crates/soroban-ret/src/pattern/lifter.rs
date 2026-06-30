@@ -548,6 +548,19 @@ fn regenerate_crypto_struct_tokens(registry: &TypeRegistry, contract: &mut Contr
 }
 
 /// State for lifting a single WASM function body into Soroban IR.
+/// A fallible storage-get helper call observed in the top-level function body:
+/// its missing-key path returns the contract error `error_code`. Recorded at the
+/// inline call site (clean key from the lifted args) and consumed by
+/// `lift_function_body` to rebuild `env.storage().<dur>().get(&key).ok_or(Error::V)`
+/// instead of the lossy `has`/`extend_ttl` + `todo!()` husk. See
+/// [`detect_fallible_storage_get_helper`].
+struct FallibleGetRecord {
+    key: SorobanExpr,
+    storage_type: StorageType,
+    error_code: u32,
+    err_type: ScSpecTypeDef,
+}
+
 struct LiftContext<'a> {
     wasm_module: &'a WasmModule,
     registry: &'a TypeRegistry,
@@ -608,6 +621,18 @@ struct LiftContext<'a> {
     /// BrIf(0) handler can safely treat constant-true conditions as pass-through
     /// (instead of no-ops) because the enclosing block has an error path.
     guard_block_depth: u32,
+    /// First fallible storage-get helper observed in the top-level function (only
+    /// recorded at `inline_depth == 0`). Shared across same-function child
+    /// contexts via `Rc<RefCell>` so a record made while lifting a nested block
+    /// reaches `lift_function_body`. See [`FallibleGetRecord`].
+    fallible_get_recovery: Rc<RefCell<Option<FallibleGetRecord>>>,
+    /// Count of fallible storage-get helpers the top-level function calls (also
+    /// only at `inline_depth == 0`, shared like `fallible_get_recovery`). When
+    /// `> 1` the getter reads more than one key, so it cannot be rebuilt as a
+    /// single value-returning `get(..).ok_or(..)` tail (that would return the
+    /// FIRST key's value/error and silently drop the rest); `lift_function_body`
+    /// downgrades it to the always-faithful early-return guard form instead.
+    fallible_get_count: Rc<RefCell<u32>>,
 }
 
 impl<'a> LiftContext<'a> {
@@ -641,6 +666,8 @@ impl<'a> LiftContext<'a> {
             promoted_slots: HashMap::new(),
             dynamic_slots: Rc::new(RefCell::new(HashMap::new())),
             guard_block_depth: 0,
+            fallible_get_recovery: Rc::new(RefCell::new(None)),
+            fallible_get_count: Rc::new(RefCell::new(0)),
         }
     }
 
@@ -668,6 +695,9 @@ impl<'a> LiftContext<'a> {
             promoted_slots: self.promoted_slots.clone(),
             dynamic_slots: Rc::clone(&self.dynamic_slots),
             guard_block_depth: self.guard_block_depth,
+            // Shared so a record made in a nested block reaches the top-level ctx.
+            fallible_get_recovery: Rc::clone(&self.fallible_get_recovery),
+            fallible_get_count: Rc::clone(&self.fallible_get_count),
         }
     }
 
@@ -1007,6 +1037,63 @@ impl<'a> LiftContext<'a> {
         self.found_host_calls = true;
         cov_mark::hit!(option_decode_first_index_of);
         Some(true)
+    }
+
+    /// Observe a fallible storage-get helper call (see
+    /// [`detect_fallible_storage_get_helper`]) and record the FIRST one in the
+    /// top-level function for `lift_function_body` to rebuild as
+    /// `env.storage().<dur>().get(&key).ok_or(Error::V)` — instead of the lossy
+    /// `has`/`extend_ttl` + `todo!()` husk the inliner produces. Pure observer:
+    /// does not consume the call (it still inlines as before; the husk is replaced
+    /// wholesale only for a direct-return getter).
+    fn note_fallible_storage_get(&mut self, target_idx: u32, args: &[StackVal]) {
+        // Only the top-level function's own getters.
+        if self.inline_depth != 0 {
+            return;
+        }
+        // `.ok_or(..)` needs a `Result<_, E>` return to graft the error onto.
+        let Some(ScSpecTypeDef::Result(r)) = self.return_type else {
+            return;
+        };
+        let Some(info) =
+            detect_fallible_storage_get_helper(self.wasm_module, self.registry, target_idx)
+        else {
+            return;
+        };
+        // Count EVERY fallible-get the function performs so `lift_function_body`
+        // can tell a single-read getter (rebuildable as a value-returning tail)
+        // from a multi-read one (only its leading early-return is faithful).
+        // Record only the genuine FIRST: if its key is unrecoverable we record
+        // nothing (husk unchanged) rather than grafting a later, possibly
+        // out-of-order read's error onto the return.
+        let is_first = *self.fallible_get_count.borrow() == 0;
+        *self.fallible_get_count.borrow_mut() += 1;
+        if !is_first {
+            return;
+        }
+        let key = if let Some(k) = info.const_key {
+            k
+        } else {
+            // Parameter-keyed getter: the key is the helper's 2nd argument — NOT
+            // the husk's separate `has(&7)` read (a different, lost load).
+            let slots = self.frame_slots.borrow();
+            stack_val_to_expr(
+                args.get(1).unwrap_or(&StackVal::Unknown),
+                self.params,
+                self.registry,
+                Some(&slots),
+            )
+        };
+        // Don't record a fabricated/unknown key (would render `get(&todo!())`).
+        if matches!(key, SorobanExpr::UnknownVal | SorobanExpr::Void) {
+            return;
+        }
+        *self.fallible_get_recovery.borrow_mut() = Some(FallibleGetRecord {
+            key,
+            storage_type: info.storage_type,
+            error_code: info.error_code,
+            err_type: (*r.error_type).clone(),
+        });
     }
 
     /// Recover a `DataKey` storage key built from a *constant descriptor pointer*.
@@ -2282,6 +2369,7 @@ impl<'a> LiftContext<'a> {
                                         storage_type: keyed_get_info.storage_type,
                                         key: Box::new(key_expr),
                                         unwrap: true,
+                                        on_missing: None,
                                     };
 
                                     // Push result to stack (for return value) or emit as Let
@@ -2385,6 +2473,7 @@ impl<'a> LiftContext<'a> {
                                 storage_type: allowance_info.storage_type,
                                 key: Box::new(key_expr.clone()),
                                 unwrap: true,
+                                on_missing: None,
                             };
                             self.stmts.push(SorobanStmt::Let {
                                 name: "allowance".to_string(),
@@ -2614,6 +2703,7 @@ impl<'a> LiftContext<'a> {
                                 storage_type: balance_info.storage_type,
                                 key: Box::new(key_expr.clone()),
                                 unwrap: true,
+                                on_missing: None,
                             };
 
                             let new_balance = if balance_info.is_receive {
@@ -2666,6 +2756,10 @@ impl<'a> LiftContext<'a> {
                             // match and renders `todo!("unknown value")`).
                             handled
                         } else if self.inline_depth < MAX_INLINE_CALL_DEPTH {
+                            // Observe a fallible storage-get helper before inlining
+                            // loses its error code + value to a husk; the recorded
+                            // info rebuilds `.ok_or(..)` in `lift_function_body`.
+                            self.note_fallible_storage_get(*target_idx, &args);
                             // Check if this is a load-struct wrapper BEFORE inlining.
                             // Save the output pointer info for post-inline gap filling.
                             let output_frame_slot = match args.first() {
@@ -2708,6 +2802,7 @@ impl<'a> LiftContext<'a> {
                                     storage_type,
                                     key: Box::new(SorobanExpr::UnknownVal),
                                     unwrap: true,
+                                    on_missing: None,
                                 };
                                 let slots = self.frame_slots.borrow();
                                 let unknown_offsets: Vec<(i32, String)> = load_info
@@ -5992,6 +6087,7 @@ impl<'a> LiftContext<'a> {
             storage_type,
             key: Box::new(key_expr.unwrap_or(SorobanExpr::UnknownVal)),
             unwrap: true,
+            on_missing: None,
         }
     }
 
@@ -6464,6 +6560,67 @@ fn lift_function_body(
     // (udt::add UdtD) BEFORE the optimizer deletes the constant-folded loop.
     recover_vec_iter_fold(&mut ctx.stmts, registry);
 
+    // Recover a fallible storage getter whose value + missing-key `Err` branch
+    // were lost to a `has`/`extend_ttl` + `todo!()` husk. Phase 1 handles only the
+    // DIRECT-return form (the getter returns the stored value as-is); a "computed"
+    // getter that transforms the value through now-lost arithmetic keeps its husk
+    // (recovering its early-return faithfully is the follow-up). The recovered get
+    // is emitted as a bare tail `Expr` (NOT `Return(Some(..))`, which codegen would
+    // double-wrap to `Ok(get(..).ok_or(..))`).
+    let multiple_gets = *ctx.fallible_get_count.borrow() > 1;
+    let fallible_rec = ctx.fallible_get_recovery.borrow_mut().take();
+    if let Some(rec) = fallible_rec
+        && let Some(ScSpecTypeDef::Result(r)) = return_type
+    {
+        // A "computed" getter feeds the storage value through now-lost arithmetic,
+        // so only its leading missing-key `Err` path is faithfully recoverable: emit
+        // `get::<_, Val>(&key).ok_or(Error::V)?;` then keep the honest `todo!()`
+        // tail. A "direct" getter returns the stored value as-is: the recovered
+        // `get(..).ok_or(..)` IS the tail. The turbofish pins the value type the
+        // `.ok_or` can't infer — the declared ok-type for direct, `Val` for computed
+        // (the value is discarded by the `?`).
+        //
+        // A getter that reads more than one key (`multiple_gets`) is treated as
+        // computed even without arithmetic: the value-returning tail would return
+        // the FIRST key's value/error and drop the later reads, so emit only the
+        // always-faithful leading early-return guard.
+        let computed = multiple_gets || function_calls_math_helper(wasm_module, func_index, 3);
+        let value_ty = if computed {
+            Some("soroban_sdk::Val".to_string())
+        } else {
+            crate::pipeline::spec_type_to_string(&r.ok_type)
+        };
+        if let Some(value_ty) = value_ty {
+            let err = checked_error_expr(registry, &rec.err_type, rec.error_code);
+            let get = SorobanExpr::StorageGet {
+                storage_type: rec.storage_type,
+                key: Box::new(rec.key),
+                unwrap: false,
+                on_missing: Some(Box::new(err)),
+            };
+            // `CastAs` is the turbofish vehicle (codegen renders
+            // `get::<_, T>(&key).ok_or(err)`); `on_missing` carries the error.
+            let get = SorobanExpr::CastAs {
+                value: Box::new(get),
+                target_type: value_ty,
+            };
+            cov_mark::hit!(fallible_get_recovered);
+            // Computed: a lone `get(..).ok_or(err)?;` statement; codegen's
+            // `needs_todo_value_tail` appends the honest `todo!()` value tail
+            // (`Try` in tail position counts as the `()`-typed `?;` statement).
+            // Direct: the `get(..).ok_or(err)` IS the value tail.
+            let stmts = vec![SorobanStmt::Expr(if computed {
+                SorobanExpr::Try(Box::new(get))
+            } else {
+                get
+            })];
+            return LiftBodyResult {
+                stmts,
+                found_host_calls: true,
+            };
+        }
+    }
+
     // Remove Return(None) immediately before Panic: the Return is from an inlined
     // body's WASM return instruction, not a meaningful Rust return statement. Without
     // this, remove_dead_code truncates the Panic as unreachable code after return.
@@ -6685,7 +6842,8 @@ fn expr_contains_unknown(expr: &SorobanExpr) -> bool {
         | SorobanExpr::SretResult(b)
         | SorobanExpr::ValTag(b)
         | SorobanExpr::ValConvert { value: b, .. }
-        | SorobanExpr::CastAs { value: b, .. } => expr_contains_unknown(b),
+        | SorobanExpr::CastAs { value: b, .. }
+        | SorobanExpr::Try(b) => expr_contains_unknown(b),
         // Two children.
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
@@ -10251,6 +10409,160 @@ fn find_enum_dispatch_in_chain(
 }
 
 /// Detect storage type from a function's call chain (up to `depth` levels).
+/// Info recovered from a fallible storage-get helper. See
+/// [`detect_fallible_storage_get_helper`].
+struct FallibleStorageGetInfo {
+    storage_type: StorageType,
+    error_code: u32,
+    /// `Some` when the storage key is a constant inside the helper (a 1-param
+    /// helper like `get_admin`'s `Admin` symbol); `None` when the key is the
+    /// caller's 2nd argument (a parameter-keyed getter).
+    const_key: Option<SorobanExpr>,
+}
+
+/// Recognize a "fallible storage-get" helper: a void function taking an I32
+/// out-pointer that reads `get_contract_data` and writes a discriminated
+/// `Result`-shaped struct `{ tag@0, error_code@4, value@8.. }`, storing a single
+/// literal contract error code on the missing-key path. The SDK compiles
+/// `env.storage().<dur>().get(&key).ok_or(Error::V)` into exactly this shape, but
+/// inlining + structurization collapse it to a `has`/`extend_ttl` + `todo!()`
+/// husk, dropping the value and the `Err`. This recovers `(storage_type,
+/// error_code, const_key?)` so the caller can rebuild the faithful `.ok_or(..)`.
+///
+/// Airtight: requires void return + I32 first param (1 or 2 params), reachability
+/// to `get_contract_data` but NOT `put_contract_data` (excludes setters /
+/// read-modify-write), a discriminant store at offset 0, and EXACTLY ONE distinct
+/// non-zero `[I32Const(code), I32Store(4)]` (the error-field write). Any deviation
+/// → `None` → the existing husk is emitted unchanged.
+fn detect_fallible_storage_get_helper(
+    module: &WasmModule,
+    registry: &TypeRegistry,
+    func_idx: u32,
+) -> Option<FallibleStorageGetInfo> {
+    use crate::wasm::ir::WasmInstr;
+    let func_type = module.get_func_type(func_idx)?;
+    // Void helper whose first param is the I32 out-pointer (sret); 1 or 2 params.
+    if !func_type.results.is_empty() || func_type.params.len() > 2 {
+        return None;
+    }
+    if !matches!(
+        func_type.params.first(),
+        Some(crate::wasm::ir::WasmType::I32)
+    ) {
+        return None;
+    }
+    // Reads storage, never writes it.
+    if !function_calls_host_in_chain(module, func_idx, HostModule::Ledger, "get_contract_data", 3) {
+        return None;
+    }
+    if function_calls_host_in_chain(module, func_idx, HostModule::Ledger, "put_contract_data", 3) {
+        return None;
+    }
+    let func = module.get_function(func_idx)?;
+    // The missing-key path writes a single literal contract error code into the
+    // result's error field: `I32Const(code); I32Store(offset 4)`, code != 0.
+    let mut error_code: Option<u32> = None;
+    for w in func.body.windows(2) {
+        if let [WasmInstr::I32Const(c), WasmInstr::I32Store(4)] = w {
+            let c = *c as u32;
+            if c == 0 {
+                continue;
+            }
+            match error_code {
+                Some(prev) if prev != c => return None, // ambiguous → bail
+                _ => error_code = Some(c),
+            }
+        }
+    }
+    let error_code = error_code?;
+    // A discriminated Result writer tags the ok/err discriminant at offset 0.
+    if !func
+        .body
+        .iter()
+        .any(|i| matches!(i, WasmInstr::I32Store(0)))
+    {
+        return None;
+    }
+    let storage_type = detect_storage_type_in_chain(module, func_idx, 3)?;
+    // A 1-param helper keys storage by a constant inside the helper (e.g. `Admin`):
+    // recover it from the Val const feeding get_contract_data.
+    let const_key = if func_type.params.len() == 1 {
+        fallible_get_const_key(module, registry, func_idx)
+    } else {
+        None
+    };
+    Some(FallibleStorageGetInfo {
+        storage_type,
+        error_code,
+        const_key,
+    })
+}
+
+/// Recover the constant storage key a 1-param fallible-get helper passes to
+/// `get_contract_data`. The host call is `get_contract_data(key_val,
+/// storage_type_val)`, so the key is the `I64Const` two positions before the
+/// `Call` (`key; storage_type; call`).
+fn fallible_get_const_key(
+    module: &WasmModule,
+    registry: &TypeRegistry,
+    func_idx: u32,
+) -> Option<SorobanExpr> {
+    use crate::wasm::ir::WasmInstr;
+    let func = module.get_function(func_idx)?;
+    for (i, instr) in func.body.iter().enumerate() {
+        if let WasmInstr::Call(target) = instr
+            && let Some(hf) = module.imports.get_by_index(*target)
+            && hf.module == HostModule::Ledger
+            && hf.name == "get_contract_data"
+            && i >= 2
+            && let WasmInstr::I64Const(key_val) = func.body[i - 2]
+        {
+            let key = try_decode_val(key_val, registry);
+            // Only accept a clean, fabrication-free key (a symbol/scalar literal).
+            if !matches!(key, SorobanExpr::UnknownVal | SorobanExpr::Void) {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
+/// True if `func_idx` (transitively, depth ≤ 3) reaches a helper that performs
+/// real integer arithmetic — `mul`+`div`, or repeated `mul` — i.e. the gas math
+/// of a "computed" getter, as opposed to a plain `get → re-encode` direct getter.
+/// `shl` (Val tagging) does not count.
+fn function_calls_math_helper(module: &WasmModule, func_idx: u32, depth: u32) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    if depth == 0 {
+        return false;
+    }
+    let Some(func) = module.get_function(func_idx) else {
+        return false;
+    };
+    let muls = func
+        .body
+        .iter()
+        .filter(|i| matches!(i, WasmInstr::I64Mul))
+        .count();
+    let divs = func
+        .body
+        .iter()
+        .filter(|i| matches!(i, WasmInstr::I64DivU | WasmInstr::I64DivS))
+        .count();
+    if (divs >= 1 && muls >= 1) || muls >= 2 {
+        return true;
+    }
+    for instr in &func.body {
+        if let WasmInstr::Call(target) = instr
+            && module.imports.get_by_index(*target).is_none()
+            && function_calls_math_helper(module, *target, depth - 1)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn detect_storage_type_in_chain(
     module: &WasmModule,
     func_idx: u32,
@@ -14630,6 +14942,138 @@ mod tests {
             (8, 16),
             "checked Result layout"
         );
+    }
+
+    /// A module exercising the fallible-storage-get recognizer: imports
+    /// `get_contract_data` (l.1) + `put_contract_data` (l._), then helpers at
+    /// global indices 2..=8 (imports occupy 0,1).
+    fn fallible_get_module() -> crate::wasm::WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "l" "1" (func (param i64 i64) (result i64)))
+                (import "l" "_" (func (param i64 i64 i64)))
+                (func (param i32 i32)                                  ;; 2: keyed get, Temporary, 400
+                    local.get 1 i64.extend_i32_u i64.const 0 call 0 drop
+                    local.get 0 i32.const 0 i32.store
+                    local.get 0 i32.const 400 i32.store offset=4
+                    local.get 0 i32.const 1 i32.store)
+                (func (param i32 i32)                                  ;; 3: get + put (setter) → excluded
+                    local.get 1 i64.extend_i32_u i64.const 0 call 0 drop
+                    local.get 1 i64.extend_i32_u i64.const 0 local.get 1 i64.extend_i32_u call 1
+                    local.get 0 i32.const 400 i32.store offset=4
+                    local.get 0 i32.const 1 i32.store)
+                (func (param i32 i32)                                  ;; 4: no get_contract_data
+                    local.get 0 i32.const 400 i32.store offset=4
+                    local.get 0 i32.const 1 i32.store)
+                (func (param i32 i32)                                  ;; 5: two distinct codes → ambiguous
+                    local.get 1 i64.extend_i32_u i64.const 0 call 0 drop
+                    local.get 0 i32.const 400 i32.store offset=4
+                    local.get 0 i32.const 401 i32.store offset=4
+                    local.get 0 i32.const 1 i32.store)
+                (func (param i32)                                      ;; 6: 1-param const "Admin" key, Instance, 2
+                    i64.const 54344266510 i64.const 2 call 0 drop
+                    local.get 0 i32.const 0 i32.store
+                    local.get 0 i32.const 2 i32.store offset=4
+                    local.get 0 i32.const 1 i32.store)
+                (func (param i64 i64) (result i64)                     ;; 7: math helper (mul + div)
+                    local.get 0 local.get 1 i64.mul
+                    local.get 0 local.get 1 i64.div_u i64.add)
+                (func (param i32 i32)                                  ;; 8: direct getter — calls helper 2
+                    local.get 0 local.get 1 call 2))
+            "#,
+        )
+        .expect("wat parses");
+        crate::wasm::WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn detect_fallible_storage_get_helper_classifies() {
+        let m = fallible_get_module();
+        let reg = empty_registry();
+        // 2: keyed get → Temporary, code 400, no const key (key is the caller arg).
+        let got = detect_fallible_storage_get_helper(&m, &reg, 2).expect("helper 2 matches");
+        assert_eq!(got.storage_type, StorageType::Temporary);
+        assert_eq!(got.error_code, 400);
+        assert!(got.const_key.is_none());
+        // 6: 1-param const-key get → Instance, code 2, key = symbol "Admin".
+        let got6 = detect_fallible_storage_get_helper(&m, &reg, 6).expect("helper 6 matches");
+        assert_eq!(got6.storage_type, StorageType::Instance);
+        assert_eq!(got6.error_code, 2);
+        assert!(
+            matches!(got6.const_key, Some(SorobanExpr::SymbolLiteral(ref s)) if s == "Admin"),
+            "const key should decode to the Admin symbol, got {:?}",
+            got6.const_key
+        );
+        // Negatives → None (today's husk is emitted unchanged).
+        assert!(
+            detect_fallible_storage_get_helper(&m, &reg, 3).is_none(),
+            "a setter (calls put_contract_data) is excluded"
+        );
+        assert!(
+            detect_fallible_storage_get_helper(&m, &reg, 4).is_none(),
+            "no get_contract_data"
+        );
+        assert!(
+            detect_fallible_storage_get_helper(&m, &reg, 5).is_none(),
+            "two distinct error codes is ambiguous"
+        );
+        assert!(
+            detect_fallible_storage_get_helper(&m, &reg, 7).is_none(),
+            "a value-returning math helper is not a fallible get"
+        );
+    }
+
+    #[test]
+    fn function_calls_math_helper_separates_computed_from_direct() {
+        let m = fallible_get_module();
+        assert!(function_calls_math_helper(&m, 7, 3), "7 is the math helper");
+        assert!(
+            !function_calls_math_helper(&m, 8, 3),
+            "8 calls only the fallible get → direct getter"
+        );
+        assert!(
+            !function_calls_math_helper(&m, 2, 3),
+            "the get helper itself has no arithmetic"
+        );
+    }
+
+    #[test]
+    fn note_fallible_get_counts_all_but_records_first() {
+        // A getter that reads more than one key must NOT be rebuilt as a single
+        // value-returning `get(..).ok_or(..)` tail — that would return the FIRST
+        // key's value/error and silently drop the rest. The observer therefore
+        // counts EVERY fallible-get (so `lift_function_body` can force the faithful
+        // early-return guard when count > 1) while keeping only the FIRST record.
+        // Guards greptile P1 "First Helper Replaces Body".
+        let m = fallible_get_module();
+        let reg = empty_registry();
+        let params: Vec<FnParam> = Vec::new();
+        let ret = result_u64_error();
+        let mut ctx = LiftContext::new(&m, &reg, &params, &ret, Vec::new(), 0);
+
+        // First read: helper 2, keyed by the caller's 2nd arg (Temporary, code 400).
+        ctx.note_fallible_storage_get(
+            2,
+            &[StackVal::Unknown, StackVal::Param("chain_id".to_string())],
+        );
+        assert_eq!(*ctx.fallible_get_count.borrow(), 1, "first get counted");
+        // Second read: helper 6, const "Admin" key — counted but NOT recorded.
+        ctx.note_fallible_storage_get(6, &[]);
+        assert_eq!(
+            *ctx.fallible_get_count.borrow(),
+            2,
+            "second get also counted"
+        );
+
+        let rec = ctx.fallible_get_recovery.borrow();
+        let rec = rec.as_ref().expect("first get recorded");
+        assert_eq!(
+            rec.key,
+            SorobanExpr::Param("chain_id".to_string()),
+            "the FIRST read's key is kept, not overwritten by the later const-key read"
+        );
+        assert_eq!(rec.error_code, 400, "first read's error code is kept");
+        assert_eq!(rec.storage_type, StorageType::Temporary);
     }
 
     #[test]

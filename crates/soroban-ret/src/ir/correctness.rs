@@ -1087,10 +1087,12 @@ fn map_subexprs(expr: SorobanExpr, f: &dyn Fn(SorobanExpr) -> SorobanExpr) -> So
             storage_type,
             key,
             unwrap,
+            on_missing,
         } => E::StorageGet {
             storage_type,
             key: b(key, f),
             unwrap,
+            on_missing,
         },
         E::StorageSet {
             storage_type,
@@ -1597,6 +1599,7 @@ mod tests {
             storage_type: StorageType::Instance,
             key: Box::new(SorobanExpr::Param(key.into())),
             unwrap: true,
+            on_missing: None,
         }
     }
 

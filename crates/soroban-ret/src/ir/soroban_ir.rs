@@ -51,6 +51,13 @@ pub enum SorobanExpr {
         storage_type: StorageType,
         key: Box<SorobanExpr>,
         unwrap: bool,
+        /// `Some(err)` renders `.get(&k).ok_or(err)` instead of
+        /// `.get(&k).unwrap()` / `.get(&k)`. Recovered from a fallible-get helper
+        /// whose missing-key path returns a contract error (`err` is always a
+        /// `ContractError`). Mutually exclusive with `unwrap` (when `Some`,
+        /// `unwrap` is `false`). All other construction sites set `None`, leaving
+        /// their output byte-identical.
+        on_missing: Option<Box<SorobanExpr>>,
     },
     StorageSet {
         storage_type: StorageType,
@@ -229,6 +236,12 @@ pub enum SorobanExpr {
         value: Box<SorobanExpr>,
         target_type: String,
     },
+
+    // Rust `?` operator: `<inner>?`. Used to recover a computed getter's leading
+    // fallible storage read as an early-return guard
+    // (`get::<_, Val>(&key).ok_or(Error::V)?;`) when the value it produces feeds
+    // now-lost downstream arithmetic, so only the missing-key `Err` path is faithful.
+    Try(Box<SorobanExpr>),
 
     // `<vec>.try_iter().fold(<init>, |sum, i| sum + i.unwrap())` — the SDK's
     // overflow-checked sum over a `Vec<i64>`. Recovered from the `vec_len`-seeded

@@ -36,19 +36,21 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// recompiled contracts differ). A ratchet: drive DOWN as the decompiler
 /// recovers more behavior; never raise without understanding the new divergence.
 ///
-/// Measured baseline = 60, all genuine decompiler limitations the harness
+/// Measured baseline = 4, the sole remaining decompiler limitation the harness
 /// surfaced (63 fns / 474 cases executed; 63 contracts checked — 39 fixtures +
-/// 24 corpus, of which 22 do not yet recompile — 87.3% match):
+/// 24 corpus, of which 22 do not yet recompile — 99.2% match):
 ///   - `test_alloc` (4): `num_list` loses its `alloc`-vec population loop and
 ///     returns an empty `Vec` instead of `[0..count]`.
-///   - `unknown-oracle` (56): empty-storage error paths return a host
-///     `Context/InvalidAction` error instead of the original's contract error.
 ///
-/// Previously 75; the `checked_add`/`checked_sub` recovery
-/// (`recover_checked_arith_from_body` in the lifter) eliminated `test_add_u64`'s
-/// 15 divergences (`a.checked_add(b).ok_or(E)` was collapsing to `Ok(a + b)`),
-/// and the new `test_sub_u64` fixture verifies `checked_sub` at 0 divergences.
-const DIVERGENCE_CEILING: usize = 60;
+/// Previously 60; the fallible-storage-get recovery
+/// (`detect_fallible_storage_get_helper` in the lifter) eliminated
+/// `unknown-oracle`'s 56 empty-storage divergences — getters whose value + the
+/// missing-key contract-error branch were lost to a `has`/`extend_ttl` + `todo!()`
+/// husk now recover `env.storage().<dur>().get(&key).ok_or(Error::Variant)` (the
+/// error code read from the helper's bytecode), so the recompiled contract returns
+/// the same `Error(Contract, #code)` the original does. Before that, 75 → 60 came
+/// from the `checked_add`/`checked_sub` recovery (`recover_checked_arith_from_body`).
+const DIVERGENCE_CEILING: usize = 4;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).

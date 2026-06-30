@@ -100,7 +100,8 @@ pub fn walk_expr(expr: &SorobanExpr, pred: &dyn Fn(&SorobanExpr) -> bool) -> boo
         | SorobanExpr::PrngVecShuffle(e)
         | SorobanExpr::StrkeyToAddress(e)
         | SorobanExpr::AddressToStrkey(e)
-        | SorobanExpr::ErrorFromCode(e) => walk_expr(e, pred),
+        | SorobanExpr::ErrorFromCode(e)
+        | SorobanExpr::Try(e) => walk_expr(e, pred),
 
         // Storage ops
         SorobanExpr::StorageGet { key, .. }

@@ -171,6 +171,53 @@ fn test_decompile_sub_u64() {
 }
 
 #[test]
+fn test_decompile_unknown_oracle_fallible_gets() {
+    // A mainnet oracle whose getters were lifting to a lossy
+    // `if has(k){extend_ttl} todo!()` husk — dropping the value AND the
+    // missing-key contract error. The fallible-storage-get recovery restores
+    // `env.storage().<dur>().get(&key).ok_or(Error::Variant)` with the error code
+    // read from the helper's bytecode (named variants from the spec).
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/unknown-oracle-CAWGFKEL.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+
+    // Direct getters: the recovered `get(..).ok_or(..)` IS the return value.
+    assert_in_fn(
+        &source,
+        "pub fn get_admin",
+        &[".instance()", "Admin", ".ok_or(Error::Uninitialized)"],
+    );
+    assert_in_fn(
+        &source,
+        "pub fn get_price",
+        &[
+            ".temporary()",
+            "&chain_id",
+            ".ok_or(Error::NoGasDataForChain)",
+        ],
+    );
+    // `get_gas_price` returns the UDT `ChainData`: the `get::<_, ChainData>`
+    // turbofish pins the value type the `.ok_or` can't infer.
+    assert_in_fn(
+        &source,
+        "pub fn get_gas_price",
+        &["get::<_, ChainData>", ".ok_or(Error::NoGasDataForChain)"],
+    );
+
+    // Computed getter: the leading fallible read is recovered as a `?` early-return
+    // guard (faithful on the empty-storage path); the lost arithmetic stays `todo!()`.
+    // The key is the helper's own argument — NOT a fabricated literal.
+    assert_in_fn(
+        &source,
+        "pub fn get_transaction_gas_cost_in_usd",
+        &[
+            "&other_chain_id",
+            ".ok_or(Error::NoGasDataForChain)?",
+            "todo!(",
+        ],
+    );
+}
+
+#[test]
 fn test_decompile_add_u128() {
     let wasm = include_bytes!("../../../tests/fixtures/test_add_u128.wasm");
     let source = decompile(wasm).expect("decompilation failed");
