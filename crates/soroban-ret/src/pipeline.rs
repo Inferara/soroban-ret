@@ -793,7 +793,16 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
     // `ir::correctness::{annotate_uninferable_gets, annotate_uninferable_collections}`.
     for func in &mut contract_module.functions {
         let returns_value = !matches!(&func.return_type, None | Some(ScSpecTypeDef::Void));
-        let body = annotate_uninferable_gets(std::mem::take(&mut func.body), returns_value);
+        let body = std::mem::take(&mut func.body);
+        // A get in tail position is the inferable return value ONLY if the body
+        // actually supplies the tail. When codegen synthesizes the tail (`Ok(())`
+        // for `Result<(), E>`, or a `todo!()` value tail for a lost-value fn), the
+        // trailing statement is discarded — its un-inferable `V` must be annotated.
+        // Without this, a `Result<(), E>` fn's trailing discarded `.get()` was
+        // mistaken for the return value and left to fail inference (E0284).
+        let body_supplies_tail = returns_value
+            && !crate::codegen::module::codegen_synthesizes_tail(&func.return_type, &body);
+        let body = annotate_uninferable_gets(body, body_supplies_tail);
         let body = annotate_uninferable_collections(body);
         // Lever 2: a fabricated literal in the success tail whose type contradicts a
         // scalar `Result<T, E>` ok-type (e.g. `Ok(false)` in `-> Result<u128, E>`) →

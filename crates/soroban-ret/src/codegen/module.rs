@@ -292,7 +292,16 @@ fn generate_contract_fn(
 /// This is the case when the Result ok_type is Void and the body doesn't end
 /// with an explicit Return statement.
 fn needs_ok_unit_tail(func: &ContractFn) -> bool {
-    let Some(ScSpecTypeDef::Result(r)) = &func.return_type else {
+    needs_ok_unit_tail_for(&func.return_type, &func.body)
+}
+
+/// `needs_ok_unit_tail` parameterized on `(return_type, body)` so non-codegen
+/// passes (the get-annotator) can ask the same question without a `ContractFn`.
+pub(crate) fn needs_ok_unit_tail_for(
+    return_type: &Option<ScSpecTypeDef>,
+    body: &[SorobanStmt],
+) -> bool {
+    let Some(ScSpecTypeDef::Result(r)) = return_type else {
         return false;
     };
     // The unit ok-type renders as `()` either as `Void` or as an empty tuple
@@ -303,7 +312,20 @@ fn needs_ok_unit_tail(func: &ContractFn) -> bool {
         return false;
     }
     // If the body's last statement is already a Return, no tail needed
-    !matches!(func.body.last(), Some(SorobanStmt::Return(_)))
+    !matches!(body.last(), Some(SorobanStmt::Return(_)))
+}
+
+/// True when codegen will SYNTHESIZE the function's tail expression (`Ok(())` or
+/// a `todo!()` value tail) instead of the body supplying it. In that case the
+/// body's last statement is NOT the inferable return value, so a trailing
+/// discarded `StorageGet` there must be type-annotated rather than left to
+/// inference (it was previously mistaken for the return → E0284). Mirrors the two
+/// tail-synthesis conditions in `generate_contract_fn`.
+pub(crate) fn codegen_synthesizes_tail(
+    return_type: &Option<ScSpecTypeDef>,
+    body: &[SorobanStmt],
+) -> bool {
+    needs_ok_unit_tail_for(return_type, body) || needs_todo_value_tail_for(return_type, body)
 }
 
 /// Whether a Result ok-type is the unit type `()` — modeled either as `Void` or
@@ -324,7 +346,16 @@ fn is_unit_ok_type(ok_type: &ScSpecTypeDef) -> bool {
 /// the non-unit analog of [`needs_ok_unit_tail`] — they are mutually exclusive by
 /// the unit-ok-type exclusion below.
 fn needs_todo_value_tail(func: &ContractFn) -> bool {
-    let Some(rt) = &func.return_type else {
+    needs_todo_value_tail_for(&func.return_type, &func.body)
+}
+
+/// `needs_todo_value_tail` parameterized on `(return_type, body)` (see
+/// [`needs_ok_unit_tail_for`]).
+pub(crate) fn needs_todo_value_tail_for(
+    return_type: &Option<ScSpecTypeDef>,
+    body: &[SorobanStmt],
+) -> bool {
+    let Some(rt) = return_type else {
         return false;
     };
     // Non-unit returns only. `Void` has no value to lose; `Result<(), E>` (and a
@@ -336,7 +367,7 @@ fn needs_todo_value_tail(func: &ContractFn) -> bool {
     }
     // An empty body is already handled by the `todo!("decompiled function body")`
     // path; only fire when there is a concrete `()`-typed, non-diverging tail.
-    match func.body.last() {
+    match body.last() {
         Some(stmt) => tail_is_unit(stmt),
         None => false,
     }
@@ -817,7 +848,7 @@ fn collapse_single_turbofish(source: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_generic_module, format_source};
+    use super::{assemble_generic_module, codegen_synthesizes_tail, format_source};
     use crate::ir::high_level_ir::{ContractFn, ContractModule, WasmFnSignature};
     use crate::ir::soroban_ir::{SorobanExpr, SorobanStmt};
     use crate::wasm::WasmType;
@@ -1352,6 +1383,50 @@ mod tests {
             !out.contains("decompiled return value"),
             "must not append a todo!() tail after a diverging panic: {out}"
         );
+    }
+
+    #[test]
+    fn codegen_synthesizes_tail_distinguishes_discarded_from_value_get() {
+        // The get-annotator consults this to tell a discarded trailing get (codegen
+        // synthesizes the tail) from a value-returning one (body supplies the tail).
+        let get = || {
+            SorobanStmt::Expr(SorobanExpr::StorageGet {
+                storage_type: crate::ir::soroban_ir::StorageType::Instance,
+                key: Box::new(SorobanExpr::SymbolLiteral("k".to_string())),
+                unwrap: true,
+                on_missing: None,
+            })
+        };
+        // `Result<(), E>` ending in a get: `Ok(())` is synthesized → the get is
+        // discarded (the bug: it was previously mistaken for the return → E0284).
+        assert!(codegen_synthesizes_tail(
+            &Some(result_ty(ScSpecTypeDef::Void)),
+            &[get()]
+        ));
+        // `Result<u128, E>` ending in a get: the get IS the return value → not synth.
+        assert!(!codegen_synthesizes_tail(
+            &Some(result_ty(ScSpecTypeDef::U128)),
+            &[get()]
+        ));
+        // Plain `-> Address` ending in a get: the get is the return value.
+        assert!(!codegen_synthesizes_tail(&Some(ScSpecTypeDef::Address), &[get()]));
+        // `Result<u128, E>` ending in an if-without-else (lost `()` tail): a
+        // `todo!()` value tail is synthesized → the body does not supply the tail.
+        let if_unit = SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![],
+            else_body: vec![],
+        };
+        assert!(codegen_synthesizes_tail(
+            &Some(result_ty(ScSpecTypeDef::U128)),
+            std::slice::from_ref(&if_unit)
+        ));
+        // `Void` / explicit `Return` → nothing synthesized.
+        assert!(!codegen_synthesizes_tail(&Some(ScSpecTypeDef::Void), &[get()]));
+        assert!(!codegen_synthesizes_tail(
+            &Some(result_ty(ScSpecTypeDef::Void)),
+            &[SorobanStmt::Return(None)]
+        ));
     }
 
     #[test]

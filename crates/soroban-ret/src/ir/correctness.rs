@@ -316,16 +316,23 @@ fn declare_first_assign(
 //      used binding is left to inference (the 38 compile-back fixtures rely on
 //      it), so the pass is a no-op on correctly-lifted bodies.
 
-/// Annotate un-inferable storage gets with a concrete value type. `returns_value`
-/// is whether the enclosing function returns a value (`func.return_type` is some
-/// non-`Void`): when false, no `Expr(StorageGet)` is ever a return, so all are
-/// discarded.
-pub fn annotate_uninferable_gets(stmts: Vec<SorobanStmt>, returns_value: bool) -> Vec<SorobanStmt> {
+/// Annotate un-inferable storage gets with a concrete value type.
+/// `body_supplies_tail` is whether the function's body itself supplies the
+/// inferable return value: true only when the function returns a value AND
+/// codegen does **not** synthesize the tail (`Ok(())` / `todo!()`). When false,
+/// no `Expr(StorageGet)` is ever the return — including a trailing get in a
+/// `Result<(), E>` function whose `Ok(())` is codegen-synthesized — so all are
+/// discarded and get the `Val` turbofish (see
+/// [`crate::codegen::module::codegen_synthesizes_tail`]).
+pub fn annotate_uninferable_gets(
+    stmts: Vec<SorobanStmt>,
+    body_supplies_tail: bool,
+) -> Vec<SorobanStmt> {
     // Address-from-require_auth first, so the Val pass below skips a get already
     // wrapped as an auth target (it is no longer a bare `StorageGet`).
     let stmts = annotate_auth_target_gets(stmts);
     let used = collect_referenced_names(&stmts);
-    annotate_gets(stmts, returns_value, &used)
+    annotate_gets(stmts, body_supplies_tail, &used)
 }
 
 /// Case 1: `RequireAuth(StorageGet)` / `RequireAuthForArgs { address:
