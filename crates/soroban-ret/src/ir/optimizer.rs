@@ -2140,7 +2140,9 @@ fn expr_contains(haystack: &SorobanExpr, needle: &SorobanExpr) -> bool {
         | SorobanExpr::Some(e)
         | SorobanExpr::SretResult(e) => c(e),
 
-        SorobanExpr::ValConvert { value, .. } | SorobanExpr::CastAs { value, .. } => c(value),
+        SorobanExpr::ValConvert { value, .. }
+        | SorobanExpr::CastAs { value, .. }
+        | SorobanExpr::Try(value) => c(value),
         SorobanExpr::FieldAccess { object, .. } => c(object),
         SorobanExpr::StorageGet { key, .. }
         | SorobanExpr::StorageHas { key, .. }
@@ -2644,15 +2646,19 @@ fn fold_has_get_pattern(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                     storage_type: get_st,
                     key: get_key,
                     unwrap,
+                    on_missing,
                 }) = get_expr
                     && get_st == storage_type
                     && get_key.as_ref() == has_key.as_ref()
+                    // Never fold a recovered fallible-get (`.ok_or(..)`); leave it intact.
+                    && on_missing.is_none()
                 {
                     cov_mark::hit!(fold_has_get_merged);
                     result.push(SorobanStmt::Expr(SorobanExpr::StorageGet {
                         storage_type: *get_st,
                         key: get_key.clone(),
                         unwrap: *unwrap,
+                        on_missing: None,
                     }));
                     i += 1;
                     continue;
@@ -2667,6 +2673,7 @@ fn fold_has_get_pattern(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                         storage_type: *storage_type,
                         key: has_key.clone(),
                         unwrap: true,
+                        on_missing: None,
                     }));
                     i += 1;
                     continue;
@@ -2702,6 +2709,7 @@ fn fold_has_get_pattern(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                         storage_type: *storage_type,
                         key: has_key.clone(),
                         unwrap: true,
+                        on_missing: None,
                     }));
                     i += 1;
                     // The validation preamble often has a trailing Expr(Panic) as the
@@ -2796,15 +2804,21 @@ fn extract_storage_get_without_unwrap(
         return None;
     }
     if let SorobanStmt::Expr(SorobanExpr::StorageGet {
-        storage_type, key, ..
+        storage_type,
+        key,
+        on_missing,
+        ..
     }) = &body[0]
         && storage_type == expected_st
         && key.as_ref() == expected_key
+        // Never collapse a recovered fallible-get (`.ok_or(..)`) into a bare get.
+        && on_missing.is_none()
     {
         return Some(SorobanExpr::StorageGet {
             storage_type: *storage_type,
             key: key.clone(),
             unwrap: false,
+            on_missing: None,
         });
     }
     None
@@ -4190,10 +4204,12 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
             storage_type,
             key,
             unwrap,
+            on_missing,
         } => SorobanExpr::StorageGet {
             storage_type,
             key: Box::new(fold_expr(*key)),
             unwrap,
+            on_missing,
         },
         SorobanExpr::StorageSet {
             storage_type,
@@ -4733,6 +4749,7 @@ fn invalidate_seen_gets_for_expr(
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::Try(inner)
         | SorobanExpr::ValTag(inner)
         | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner)
@@ -4860,6 +4877,9 @@ fn remove_redundant_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                     storage_type,
                     key,
                     unwrap,
+                    // Never CSE a recovered fallible-get (`.ok_or(..)`): it is not
+                    // interchangeable with a bare get of the same key.
+                    on_missing: None,
                 },
         } = &stmts[i]
             && let Some(idx) = let_name_to_local_idx(name)
@@ -5951,6 +5971,7 @@ fn fill_empty_storage_dispatch_arms(arms: &mut [MatchArm]) {
         storage_type: tmpl_type,
         key,
         unwrap,
+        on_missing,
     }) = template
     else {
         return;
@@ -5987,6 +6008,7 @@ fn fill_empty_storage_dispatch_arms(arms: &mut [MatchArm]) {
             storage_type,
             key: key.clone(),
             unwrap,
+            on_missing: on_missing.clone(),
         })];
     }
 }
@@ -6145,6 +6167,7 @@ fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::Try(inner)
         | SorobanExpr::ValTag(inner)
         | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner)
@@ -6283,11 +6306,13 @@ fn replace_unknown_keys_in_expr(expr: SorobanExpr, replacement: &SorobanExpr) ->
             storage_type,
             key,
             unwrap,
+            on_missing,
         } if *key == SorobanExpr::UnknownVal || is_enum_construct_with_unknown(&key) => {
             SorobanExpr::StorageGet {
                 storage_type,
                 key: Box::new(replacement.clone()),
                 unwrap,
+                on_missing,
             }
         }
         SorobanExpr::StorageSet {
@@ -6863,10 +6888,12 @@ fn rename_in_expr(
             storage_type,
             key,
             unwrap,
+            on_missing,
         } => SorobanExpr::StorageGet {
             storage_type,
             key: rb(key),
             unwrap,
+            on_missing,
         },
         SorobanExpr::StorageSet {
             storage_type,
@@ -7442,6 +7469,7 @@ mod tests {
                     storage_type: StorageType::Persistent,
                     key: Box::new(param("key")),
                     unwrap: true,
+                    on_missing: None,
                 },
             ),
             ret(local(3)),
@@ -8501,6 +8529,7 @@ mod tests {
             storage_type: StorageType::Instance,
             key: Box::new(SorobanExpr::UnknownVal),
             unwrap: true,
+            on_missing: None,
         };
         let stmts = vec![
             SorobanStmt::Expr(get.clone()),
@@ -8526,6 +8555,7 @@ mod tests {
             storage_type: StorageType::Instance,
             key: Box::new(SorobanExpr::UnknownVal),
             unwrap: true,
+            on_missing: None,
         };
         let non_auth = vec![
             SorobanStmt::Expr(get.clone()),
@@ -8571,6 +8601,7 @@ mod tests {
             storage_type: StorageType::Instance,
             key: Box::new(key.clone()),
             unwrap: true,
+            on_missing: None,
         };
         // The stale local may surface vec-wrapped or as the bare inner symbol.
         for ret in [key, SorobanExpr::SymbolLiteral("Admin".into())] {
@@ -8599,6 +8630,7 @@ mod tests {
             storage_type: StorageType::Instance,
             key: Box::new(key),
             unwrap: true,
+            on_missing: None,
         };
         let stmts = vec![
             SorobanStmt::Expr(get.clone()),
@@ -8626,6 +8658,7 @@ mod tests {
                 "Admin".into(),
             )])),
             unwrap: true,
+            on_missing: None,
         };
         let different = vec![
             SorobanStmt::Expr(get.clone()),
@@ -8643,6 +8676,7 @@ mod tests {
             storage_type: StorageType::Instance,
             key: Box::new(SorobanExpr::UnknownVal),
             unwrap: true,
+            on_missing: None,
         };
         let unknowns = vec![
             SorobanStmt::Expr(unknown_get),
@@ -8721,6 +8755,7 @@ mod tests {
                     storage_type: StorageType::Persistent,
                     key: Box::new(key()),
                     unwrap: true,
+                    on_missing: None,
                 },
             },
             SorobanStmt::Expr(SorobanExpr::StorageSet {
@@ -8735,6 +8770,7 @@ mod tests {
                     storage_type: StorageType::Persistent,
                     key: Box::new(key()),
                     unwrap: true,
+                    on_missing: None,
                 },
             },
         ];
@@ -8771,6 +8807,7 @@ mod tests {
                     storage_type: StorageType::Persistent,
                     key: Box::new(key()),
                     unwrap: true,
+                    on_missing: None,
                 },
             },
             SorobanStmt::Let {
@@ -8780,6 +8817,7 @@ mod tests {
                     storage_type: StorageType::Persistent,
                     key: Box::new(key()),
                     unwrap: true,
+                    on_missing: None,
                 },
             },
             // Use both so dead-store removal doesn't strip them.
@@ -9111,6 +9149,7 @@ mod tests {
                 storage_type: st,
                 key: Box::new(param("key")),
                 unwrap: false,
+                on_missing: None,
             })
         }
         fn arm(variant: &str, body: Vec<SorobanStmt>) -> MatchArm {

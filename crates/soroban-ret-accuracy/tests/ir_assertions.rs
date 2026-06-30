@@ -211,6 +211,7 @@ fn one_of_each_expr() -> Vec<SorobanExpr> {
             storage_type: StorageType::Persistent,
             key: bx(leaf()),
             unwrap: true,
+            on_missing: Option::None,
         },
         StorageSet {
             storage_type: StorageType::Temporary,

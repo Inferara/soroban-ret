@@ -1121,6 +1121,7 @@ fn repair_unknown_invoke_functions_in_expr(expr: &mut SorobanExpr, replacement: 
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::Try(inner)
         | SorobanExpr::ValTag(inner)
         | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner) => {
@@ -1348,6 +1349,7 @@ fn repair_unknown_event_values_in_expr(expr: &mut SorobanExpr, hint: &EventRepai
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::Try(inner)
         | SorobanExpr::ValTag(inner)
         | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner) => {
@@ -1610,6 +1612,7 @@ fn repair_weak_auth_in_expr(expr: &mut SorobanExpr, hint: &AuthRepairHint) {
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::Try(inner)
         | SorobanExpr::ValTag(inner)
         | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner) => repair_weak_auth_in_expr(inner, hint),
@@ -1836,6 +1839,7 @@ fn repair_unknown_storage_keys_in_expr(expr: &mut SorobanExpr, replacement: &Sor
         | SorobanExpr::FieldAccess { object: inner, .. }
         | SorobanExpr::ValConvert { value: inner, .. }
         | SorobanExpr::CastAs { value: inner, .. }
+        | SorobanExpr::Try(inner)
         | SorobanExpr::ValTag(inner)
         | SorobanExpr::Some(inner)
         | SorobanExpr::SretResult(inner) => {
@@ -2384,7 +2388,7 @@ fn unique_wasm_opt_temp_dir_path() -> std::path::PathBuf {
 
 /// Convert a ScSpecTypeDef to a Rust type string for invoke_contract type parameters.
 /// Returns None for types that can't be cleanly rendered as a string.
-fn spec_type_to_string(spec: &stellar_xdr::curr::ScSpecTypeDef) -> Option<String> {
+pub(crate) fn spec_type_to_string(spec: &stellar_xdr::curr::ScSpecTypeDef) -> Option<String> {
     use stellar_xdr::curr::ScSpecTypeDef;
     match spec {
         ScSpecTypeDef::U32 => Some("u32".into()),
@@ -3504,7 +3508,8 @@ fn score_param_local_base_in_expr(
         | SorobanExpr::PrngBytesNew(inner)
         | SorobanExpr::ValTag(inner)
         | SorobanExpr::Some(inner)
-        | SorobanExpr::SretResult(inner) => {
+        | SorobanExpr::SretResult(inner)
+        | SorobanExpr::Try(inner) => {
             score_param_local_base_in_expr(inner, param_count, param_local_base, rebound)
         }
         SorobanExpr::FieldAccess { object, .. } => {
@@ -4005,9 +4010,9 @@ fn expr_uses_env(expr: &SorobanExpr) -> bool {
         SorobanExpr::RequireAuthForArgs { address, args } => {
             expr_uses_env(address) || expr_uses_env(args)
         }
-        SorobanExpr::ValConvert { value, .. } | SorobanExpr::CastAs { value, .. } => {
-            expr_uses_env(value)
-        }
+        SorobanExpr::ValConvert { value, .. }
+        | SorobanExpr::CastAs { value, .. }
+        | SorobanExpr::Try(value) => expr_uses_env(value),
         SorobanExpr::ValTag(inner) | SorobanExpr::Some(inner) | SorobanExpr::SretResult(inner) => {
             expr_uses_env(inner)
         }
@@ -6760,6 +6765,7 @@ fn recover_map_unpack_getter(
             storage_type,
             key: Box::new(key_expr.clone()),
             unwrap: true,
+            on_missing: None,
         };
         cov_mark::hit!(stage_4s_getter_recovered);
         func.body = vec![SorobanStmt::Return(Some(get_expr))];
@@ -6813,6 +6819,7 @@ fn recover_map_unpack_getter(
             storage_type,
             key: Box::new(key_expr.clone()),
             unwrap: true,
+            on_missing: None,
         };
         let field_expr = SorobanExpr::FieldAccess {
             object: Box::new(get_expr),
@@ -6875,6 +6882,7 @@ fn recover_broken_struct_getter(
                                 storage_type: StorageType::Instance,
                                 key: Box::new(key_expr),
                                 unwrap: true,
+                                on_missing: None,
                             };
                             cov_mark::hit!(stage_4t_broken_getter_recovered);
                             func.body = vec![SorobanStmt::Return(Some(get_expr))];
@@ -6906,6 +6914,7 @@ fn recover_broken_struct_getter(
                                 storage_type: StorageType::Persistent,
                                 key: Box::new(key_expr),
                                 unwrap: true,
+                                on_missing: None,
                             };
                             cov_mark::hit!(stage_4t_broken_getter_recovered);
                             func.body = vec![SorobanStmt::Return(Some(get_expr))];
@@ -7024,6 +7033,7 @@ fn recover_has_get_in_stmts(stmts: &mut [SorobanStmt], zero_expr: &SorobanExpr) 
                     storage_type,
                     key,
                     unwrap: true,
+                    ..
                 }) if *storage_type == has_st && *key == has_key
             );
 
@@ -7210,6 +7220,7 @@ fn resolve_unknown_key_field_access(stmts: &mut [SorobanStmt]) {
                     storage_type,
                     key,
                     unwrap: true,
+                    ..
                 },
             ..
         } = stmt
@@ -7274,6 +7285,7 @@ fn replace_unknown_get_in_expr(expr: &mut SorobanExpr, bindings: &[(String, Stor
             storage_type,
             key,
             unwrap: true,
+            ..
         } = object.as_ref()
             && matches!(key.as_ref(), SorobanExpr::UnknownVal)
             && let Some((name, _)) = bindings.iter().find(|(_, st)| st == storage_type)
@@ -8084,6 +8096,7 @@ mod tests {
                 storage_type: StorageType::Persistent,
                 key: Box::new(SorobanExpr::UnknownVal),
                 unwrap: true,
+                on_missing: None,
             }),
             SorobanStmt::Expr(SorobanExpr::StorageSet {
                 storage_type: StorageType::Persistent,
@@ -8137,6 +8150,7 @@ mod tests {
             storage_type: StorageType::Persistent,
             key: Box::new(SorobanExpr::UnknownVal),
             unwrap: true,
+            on_missing: None,
         })];
 
         if let Some(replacement) = unique_storage_hint_key_for_function(&matching(&hints, "read")) {
@@ -8160,6 +8174,7 @@ mod tests {
             storage_type: StorageType::Persistent,
             key: Box::new(SorobanExpr::UnknownVal),
             unwrap: true,
+            on_missing: None,
         })];
 
         repair_unknown_storage_keys_from_hint(&mut body, &replacement);
@@ -8199,6 +8214,7 @@ mod tests {
             storage_type: StorageType::Persistent,
             key: Box::new(SorobanExpr::UnknownVal),
             unwrap: true,
+            on_missing: None,
         })];
 
         repair_unknown_storage_keys_from_hint(&mut body, &replacement);
@@ -8236,6 +8252,7 @@ mod tests {
             storage_type: StorageType::Persistent,
             key: Box::new(SorobanExpr::SymbolLiteral("Existing".to_string())),
             unwrap: true,
+            on_missing: None,
         })];
 
         repair_unknown_storage_keys_from_hint(&mut body, &replacement);

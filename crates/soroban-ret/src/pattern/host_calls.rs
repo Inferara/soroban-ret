@@ -49,6 +49,7 @@ fn lift_ledger_call(name: &str, mut args: Vec<SorobanExpr>) -> SorobanExpr {
                 storage_type,
                 key: Box::new(key),
                 unwrap: true,
+                on_missing: None,
             }
         }
         "has_contract_data" => {

@@ -300,10 +300,14 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             storage_type,
             key,
             unwrap,
+            on_missing,
         } => {
             let key = generate_expr(key);
             let storage = storage_method(*storage_type);
-            if *unwrap {
+            if let Some(err) = on_missing {
+                let err = generate_expr(err);
+                quote! { env.storage().#storage().get(&#key).ok_or(#err) }
+            } else if *unwrap {
                 quote! { env.storage().#storage().get(&#key).unwrap() }
             } else {
                 quote! { env.storage().#storage().get(&#key) }
@@ -724,12 +728,18 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 storage_type,
                 key,
                 unwrap,
+                on_missing,
             } = value.as_ref()
             {
                 let key = generate_expr(key);
                 let storage = storage_method(*storage_type);
                 let ty: syn::Type = syn::parse_str(target_type).expect("checked by guard");
-                if *unwrap {
+                if let Some(err) = on_missing {
+                    // Recovered fallible get: the turbofish pins the value type the
+                    // `.ok_or(..)` return can't infer on its own (Address/UDT).
+                    let err = generate_expr(err);
+                    quote! { env.storage().#storage().get::<_, #ty>(&#key).ok_or(#err) }
+                } else if *unwrap {
                     quote! { env.storage().#storage().get::<_, #ty>(&#key).unwrap() }
                 } else {
                     quote! { env.storage().#storage().get::<_, #ty>(&#key) }
@@ -776,6 +786,11 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                     quote! { { compile_error!(#msg_lit); #val } }
                 }
             }
+        }
+
+        SorobanExpr::Try(inner) => {
+            let inner = generate_expr(inner);
+            quote! { #inner? }
         }
 
         SorobanExpr::VecTryIterFold { vec, init } => {
@@ -2052,6 +2067,7 @@ mod generate_expr_tests {
             storage_type: StorageType::Persistent,
             key: boxed(key.clone()),
             unwrap: true,
+            on_missing: None,
         };
         let out = collapse(&s(generate_expr(&g)));
         assert!(out.contains(". persistent ()"), "got: {out}");
@@ -2062,6 +2078,7 @@ mod generate_expr_tests {
             storage_type: StorageType::Temporary,
             key: boxed(key),
             unwrap: false,
+            on_missing: None,
         };
         let out = collapse(&s(generate_expr(&g)));
         assert!(out.contains(". temporary ()"), "got: {out}");

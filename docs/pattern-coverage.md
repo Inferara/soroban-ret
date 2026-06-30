@@ -183,14 +183,15 @@ count, like the corpus-soundness gate.
 
 Current baseline: **63 functions / 474 cases executed; 63 contracts checked
 (39 fixtures + all 24 mainnet corpus, of which 22 do not yet recompile and are
-reported as `not_recompilable`), 87.3 % behavioral match, 60 known
-divergences** — each a genuine decompiler limitation
-the harness surfaced: `test_alloc::num_list` loses its populate-loop and returns
-an empty `Vec`; `unknown-oracle` returns a host error instead of the original's
-contract error on empty-storage paths. (Previously 75 / 82.3 %; the
-`checked_add`/`checked_sub` → `.ok_or(..)` recovery in the lifter eliminated
-`test_add_u64`'s 15 overflow-trap divergences, and the `test_sub_u64` fixture
-verifies `checked_sub` at 0 divergences.)
+reported as `not_recompilable`), 99.2 % behavioral match, 4 known
+divergences** — the sole remaining decompiler limitation the harness surfaced:
+`test_alloc::num_list` loses its populate-loop and returns an empty `Vec`.
+(Previously 60 / 87.3 %; the fallible-storage-get recovery in the lifter
+eliminated `unknown-oracle`'s 56 empty-storage divergences — getters whose value
+and missing-key contract-error branch were lost to a `has`/`extend_ttl` +
+`todo!()` husk now recover `env.storage().<dur>().get(&key).ok_or(Error::Variant)`
+with the error code read from the helper's bytecode. Before that, 75 / 82.3 % → 60
+came from the `checked_add`/`checked_sub` → `.ok_or(..)` recovery.)
 
 **Coverage is intrinsically limited** (by design): only functions invocable with
 generated scalar arguments and no required storage/auth state are executed;
