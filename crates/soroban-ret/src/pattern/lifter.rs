@@ -13032,13 +13032,19 @@ fn checked_result_shape(return_type: &Option<ScSpecTypeDef>) -> Option<(u32, ScS
 /// The single contract-error `Val` constant the SDK preloads on the error path,
 /// returned as its contract error code. `None` if there is no Error-tagged
 /// constant, or more than one distinct one (ambiguous → bail).
+///
+/// An Error `Val` carries the error *type* in bits 8–15 (0 = Contract) and the
+/// code in bits 32–63. Only `ScErrorType::Contract` constants are real
+/// `#[contracterror]` codes; a non-Contract error (host/WasmVm/etc.) must NOT be
+/// mistaken for a contract code, so it is skipped (and if it were the only
+/// Error-tagged const, recovery bails — `None`).
 fn find_checked_error_code(body: &[crate::wasm::ir::WasmInstr]) -> Option<u32> {
     use crate::wasm::ir::WasmInstr;
     let mut found: Option<u32> = None;
     for instr in body {
         if let WasmInstr::I64Const(c) = instr {
             let v = *c as u64;
-            if v & 0xff == TAG_ERROR {
+            if v & 0xff == TAG_ERROR && (v >> 8) & 0xff == 0 {
                 let code = (v >> 32) as u32;
                 match found {
                     Some(prev) if prev != code => return None,
@@ -13071,7 +13077,12 @@ fn checked_error_expr(registry: &TypeRegistry, err_type: &ScSpecTypeDef, code: u
     let enum_name = match err_type {
         ScSpecTypeDef::Udt(u) => u.name.to_utf8_string().ok(),
         // Raw `soroban_sdk::Error`: codegen substitutes the sole error enum when
-        // there is exactly one, else leaves it as `soroban_sdk::Error`.
+        // there is exactly one, else leaves it as `soroban_sdk::Error`. With two
+        // or more enums we deliberately do NOT guess a variant via
+        // `lookup_error_variant` (first-match across all enums): two enums can
+        // share a code (e.g. both `=1`), so a guess would fabricate the wrong
+        // `E::Variant`. The declared type is the opaque `Error`, so the honest,
+        // type-correct rendering is `Error::from_contract_error(code)` below.
         ScSpecTypeDef::Error if registry.error_enums.len() == 1 => {
             registry.error_enums.keys().next().cloned()
         }
@@ -13470,6 +13481,119 @@ mod tests {
             recover_checked_arith_from_body(&body, &three, &result_u64_error(), &empty_registry())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn checked_arith_skips_non_contract_error_const() {
+        use crate::wasm::ir::WasmInstr::*;
+        // Error-tagged Val whose error-TYPE sub-field (bits 8-15) is non-zero
+        // (`0x01` = a non-Contract error, e.g. WasmVm). `find_checked_error_code`
+        // must skip it — its `val >> 32` is NOT a contract error code — so with no
+        // genuine contract-error const present, recovery bails (no wrong code
+        // smuggled into `.ok_or(..)`).
+        const NON_CONTRACT_ERR: i64 = 0x1_0000_0103; // tag 0x03, type 0x01, code 1
+        assert_eq!(0x103u64 & 0xff, TAG_ERROR);
+        assert_ne!((0x103u64 >> 8) & 0xff, 0);
+        let params = [u64_param("a"), u64_param("b")];
+        assert!(
+            recover_checked_arith_from_body(
+                &[I64Add, I64LtU, I64Const(NON_CONTRACT_ERR)],
+                &params,
+                &result_u64_error(),
+                &empty_registry()
+            )
+            .is_none()
+        );
+    }
+
+    /// Registry holding the named `#[contracterror]` enums, each `(variant, code)`.
+    fn registry_with_error_enums(
+        enums: &[(&str, &[(&str, u32)])],
+    ) -> crate::spec::registry::TypeRegistry {
+        let mut reg = empty_registry();
+        for (name, cases) in enums {
+            let cases: Vec<_> = cases
+                .iter()
+                .map(|(vname, value)| stellar_xdr::ScSpecUdtErrorEnumCaseV0 {
+                    doc: Default::default(),
+                    name: (*vname).try_into().unwrap(),
+                    value: *value,
+                })
+                .collect();
+            reg.error_enums.insert(
+                (*name).to_string(),
+                stellar_xdr::ScSpecUdtErrorEnumV0 {
+                    doc: Default::default(),
+                    lib: Default::default(),
+                    name: (*name).try_into().unwrap(),
+                    cases: cases.try_into().unwrap(),
+                },
+            );
+        }
+        reg
+    }
+
+    fn recovered_ok_or_arg(stmt: Option<SorobanStmt>) -> SorobanExpr {
+        let Some(SorobanStmt::Expr(SorobanExpr::MethodCall { args, .. })) = stmt else {
+            panic!("not a recovered tail expr: {stmt:?}");
+        };
+        let [arg] = args.as_slice() else {
+            panic!("ok_or takes exactly one arg");
+        };
+        arg.clone()
+    }
+
+    #[test]
+    fn checked_error_raw_error_resolves_sole_enum_variant() {
+        use crate::wasm::ir::WasmInstr::*;
+        // Declared error type is the raw `soroban_sdk::Error`, but there is exactly
+        // ONE error enum → codegen substitutes it, so the `.ok_or(..)` arg names
+        // that enum's variant for the recovered code (mirrors return-type rendering).
+        let body = vec![I64Add, I64LtU, I64Const(ERR_VAL)];
+        let params = [u64_param("a"), u64_param("b")];
+        let reg = registry_with_error_enums(&[("Error", &[("Overflow", 1)])]);
+        assert!(matches!(
+            recovered_ok_or_arg(recover_checked_arith_from_body(
+                &body,
+                &params,
+                &result_u64_error(),
+                &reg
+            )),
+            SorobanExpr::ContractError {
+                error_code: 1,
+                error_type: Some(t),
+                variant_name: Some(v),
+            } if t == "Error" && v == "Overflow"
+        ));
+    }
+
+    #[test]
+    fn checked_error_raw_error_with_multiple_enums_is_unguessed() {
+        use crate::wasm::ir::WasmInstr::*;
+        // Declared error type is the raw `soroban_sdk::Error` and TWO enums share
+        // code 1. We deliberately do NOT guess a variant (that would fabricate the
+        // wrong `E::Variant`); the honest rendering is `Error::from_contract_error(1)`
+        // — i.e. ContractError with no type/variant. Locks in this choice against a
+        // regression toward the ambiguous `lookup_error_variant` path.
+        let body = vec![I64Add, I64LtU, I64Const(ERR_VAL)];
+        let params = [u64_param("a"), u64_param("b")];
+        let reg = registry_with_error_enums(&[
+            ("Error", &[("Overflow", 1)]),
+            ("MyError", &[("Boom", 1)]),
+        ]);
+        assert!(matches!(
+            recovered_ok_or_arg(recover_checked_arith_from_body(
+                &body,
+                &params,
+                &result_u64_error(),
+                &reg
+            )),
+            SorobanExpr::ContractError {
+                error_code: 1,
+                error_type: None,
+                variant_name: None,
+            }
+        ));
     }
 
     #[test]
