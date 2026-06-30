@@ -2254,7 +2254,10 @@ mod generate_expr_tests {
             1,
             "only the real arg should get .into_val(): {out}"
         );
-        assert!(out.contains("todo !"), "lost arg should stay a bare todo!(): {out}");
+        assert!(
+            out.contains("todo !"),
+            "lost arg should stay a bare todo!(): {out}"
+        );
     }
 
     #[test]

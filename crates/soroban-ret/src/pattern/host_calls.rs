@@ -1057,13 +1057,17 @@ mod tests {
             &hf(HostModule::Address, "address_to_strkey"),
             vec![SorobanExpr::Param("a".into())],
         );
-        assert!(matches!(out, SorobanExpr::AddressToStrkey(b) if matches!(*b, SorobanExpr::Param(ref p) if p == "a")));
+        assert!(
+            matches!(out, SorobanExpr::AddressToStrkey(b) if matches!(*b, SorobanExpr::Param(ref p) if p == "a"))
+        );
 
         let out = lift_host_call(
             &hf(HostModule::Address, "strkey_to_address"),
             vec![SorobanExpr::Param("sk".into())],
         );
-        assert!(matches!(out, SorobanExpr::StrkeyToAddress(b) if matches!(*b, SorobanExpr::Param(ref p) if p == "sk")));
+        assert!(
+            matches!(out, SorobanExpr::StrkeyToAddress(b) if matches!(*b, SorobanExpr::Param(ref p) if p == "sk"))
+        );
     }
 
     #[test]

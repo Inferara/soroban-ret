@@ -1409,7 +1409,10 @@ mod tests {
             &[get()]
         ));
         // Plain `-> Address` ending in a get: the get is the return value.
-        assert!(!codegen_synthesizes_tail(&Some(ScSpecTypeDef::Address), &[get()]));
+        assert!(!codegen_synthesizes_tail(
+            &Some(ScSpecTypeDef::Address),
+            &[get()]
+        ));
         // `Result<u128, E>` ending in an if-without-else (lost `()` tail): a
         // `todo!()` value tail is synthesized → the body does not supply the tail.
         let if_unit = SorobanStmt::If {
@@ -1422,7 +1425,10 @@ mod tests {
             std::slice::from_ref(&if_unit)
         ));
         // `Void` / explicit `Return` → nothing synthesized.
-        assert!(!codegen_synthesizes_tail(&Some(ScSpecTypeDef::Void), &[get()]));
+        assert!(!codegen_synthesizes_tail(
+            &Some(ScSpecTypeDef::Void),
+            &[get()]
+        ));
         assert!(!codegen_synthesizes_tail(
             &Some(result_ty(ScSpecTypeDef::Void)),
             &[SorobanStmt::Return(None)]

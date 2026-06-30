@@ -9361,7 +9361,9 @@ mod tests {
         // panic-bodied case.
         let guard = SorobanStmt::If {
             condition: SorobanExpr::Ne(
-                Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param("x".into())))),
+                Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param(
+                    "x".into(),
+                )))),
                 Box::new(SorobanExpr::ValTagName("VecObject".into())),
             ),
             then_body: vec![SorobanStmt::Break],
@@ -9380,13 +9382,19 @@ mod tests {
         // bare break/continue bodies are the droppable SDK type-assertion shapes).
         let guard = SorobanStmt::If {
             condition: SorobanExpr::Ne(
-                Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param("x".into())))),
+                Box::new(SorobanExpr::ValTag(Box::new(SorobanExpr::Param(
+                    "x".into(),
+                )))),
                 Box::new(SorobanExpr::ValTagName("VecObject".into())),
             ),
             then_body: vec![SorobanStmt::Expr(SorobanExpr::Param("y".into()))],
             else_body: vec![],
         };
         let out = remove_val_tag_guards(vec![guard]);
-        assert_eq!(out.len(), 1, "guard with a value body must be kept: {out:?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "guard with a value body must be kept: {out:?}"
+        );
     }
 }
