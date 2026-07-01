@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 93.0,
+  "overall_restoration": 92.9,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -77,12 +77,12 @@
     {
       "file": "blend-fixed-pool-CAJJZSGM.wasm",
       "entity": "Blend Fixed Pool",
-      "restoration_pct": 92.1,
+      "restoration_pct": 91.9,
       "spec_functions": 27,
       "fn_clean": 8,
       "fn_partial": 19,
       "fn_logic_lost": 0,
-      "artifacts_total": 149,
+      "artifacts_total": 154,
       "wasm_size": 57328,
       "error": null
     },
@@ -101,12 +101,12 @@
     {
       "file": "blend-yieldblox-pool-CCCCIQSD.wasm",
       "entity": "Blend Yieldblox Pool",
-      "restoration_pct": 92.1,
+      "restoration_pct": 91.9,
       "spec_functions": 27,
       "fn_clean": 8,
       "fn_partial": 19,
       "fn_logic_lost": 0,
-      "artifacts_total": 149,
+      "artifacts_total": 154,
       "wasm_size": 57328,
       "error": null
     },
@@ -137,12 +137,12 @@
     {
       "file": "fxdao-liquidity-locking-pool-CDCART6W.wasm",
       "entity": "FxDAO Liquidity locking pool",
-      "restoration_pct": 83.5,
+      "restoration_pct": 83.3,
       "spec_functions": 12,
       "fn_clean": 0,
       "fn_partial": 12,
       "fn_logic_lost": 0,
-      "artifacts_total": 57,
+      "artifacts_total": 58,
       "wasm_size": 14499,
       "error": null
     },
@@ -161,24 +161,24 @@
     {
       "file": "fxdao-vault-CCUN4RXU.wasm",
       "entity": "FxDAO Vault",
-      "restoration_pct": 92.2,
+      "restoration_pct": 91.3,
       "spec_functions": 2,
       "fn_clean": 1,
       "fn_partial": 1,
       "fn_logic_lost": 0,
-      "artifacts_total": 13,
+      "artifacts_total": 14,
       "wasm_size": 10930,
       "error": null
     },
     {
       "file": "lightecho-CDOR3QD2.wasm",
       "entity": "Lightecho",
-      "restoration_pct": 95.4,
+      "restoration_pct": 95.2,
       "spec_functions": 23,
       "fn_clean": 18,
       "fn_partial": 5,
       "fn_logic_lost": 0,
-      "artifacts_total": 22,
+      "artifacts_total": 23,
       "wasm_size": 15293,
       "error": null
     },
