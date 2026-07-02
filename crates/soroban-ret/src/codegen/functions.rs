@@ -409,7 +409,14 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 .iter()
                 .map(|a| {
                     let e = generate_expr(a);
-                    quote! { #e.into_val(&env) }
+                    // A lost arg renders as a bare `todo!()` (`!`), which already
+                    // coerces to the element type; `.into_val()` on `!` does not
+                    // type-check (`Val: TryFromVal<Env, !>`, E0277). Keep it bare.
+                    if matches!(a, SorobanExpr::UnknownVal) {
+                        e
+                    } else {
+                        quote! { #e.into_val(&env) }
+                    }
                 })
                 .collect();
             let type_param = invoke_type_param(return_type);
@@ -427,7 +434,14 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 .iter()
                 .map(|a| {
                     let e = generate_expr(a);
-                    quote! { #e.into_val(&env) }
+                    // A lost arg renders as a bare `todo!()` (`!`), which already
+                    // coerces to the element type; `.into_val()` on `!` does not
+                    // type-check (`Val: TryFromVal<Env, !>`, E0277). Keep it bare.
+                    if matches!(a, SorobanExpr::UnknownVal) {
+                        e
+                    } else {
+                        quote! { #e.into_val(&env) }
+                    }
                 })
                 .collect();
             let type_param = invoke_type_param(return_type);
@@ -2221,6 +2235,29 @@ mod generate_expr_tests {
         assert!(out.contains("env . invoke_contract :: < u64 >"));
         assert!(out.contains("symbol_short ! (\"add\")"));
         assert!(out.contains("x . into_val (& env)"));
+    }
+
+    #[test]
+    fn invoke_contract_lost_arg_stays_bare_todo() {
+        // A lost invoke arg (`UnknownVal`) renders as a bare `todo!()` (`!`), which
+        // coerces to the element type; `.into_val()` on `!` is E0277, so it must NOT
+        // be appended. A real arg still gets `.into_val(&env)`.
+        let e = SorobanExpr::InvokeContract {
+            address: boxed(SorobanExpr::Param("addr".into())),
+            function: boxed(SorobanExpr::SymbolLiteral("f".into())),
+            args: vec![SorobanExpr::UnknownVal, SorobanExpr::Param("x".into())],
+            return_type: None,
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert_eq!(
+            out.matches("into_val").count(),
+            1,
+            "only the real arg should get .into_val(): {out}"
+        );
+        assert!(
+            out.contains("todo !"),
+            "lost arg should stay a bare todo!(): {out}"
+        );
     }
 
     #[test]

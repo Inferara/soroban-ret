@@ -1217,16 +1217,33 @@ fn aquarius_recovers_tokens_sorted_validation_loop() {
         body.contains("TokensNotSorted") && body.contains("DuplicatesNotAllowed"),
         "recovered validation must keep both panic conditions, got:\n{body}"
     );
-    // The mangled loop's todo!()s (induction/bound) must be gone from the validation.
+    // The mangled loop's todo!()s (induction/bound) must be gone from the
+    // recovered validation for-loop. Extract exactly the for-loop block by brace
+    // matching (a robust boundary, independent of whatever code follows it).
     let val_start = body
         .find("for i in 1..tokens.len()")
         .expect("for-loop present");
     let val = &body[val_start..];
-    let val_end = val.find("env.bytes_new").unwrap_or(val.len());
+    let vbrace = val.find('{').expect("no { after for");
+    let mut d = 0i32;
+    let mut vend = vbrace;
+    for (i, c) in val[vbrace..].char_indices() {
+        match c {
+            '{' => d += 1,
+            '}' => {
+                d -= 1;
+                if d == 0 {
+                    vend = vbrace + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
     assert!(
-        !val[..val_end].contains("todo!"),
+        !val[..vend].contains("todo!"),
         "recovered validation loop must have no todo!, got:\n{}",
-        &val[..val_end]
+        &val[..vend]
     );
 }
 
