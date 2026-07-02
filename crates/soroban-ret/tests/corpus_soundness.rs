@@ -70,7 +70,19 @@ use std::process::Command;
 /// becomes the 2nd corpus contract to compile cleanly; the lost-`()` tail spans
 /// 19/24 contracts (E0308 309→265). Zero per-contract regressions — unlike Lever
 /// B these fire on husk-bodied getters with nothing latent to unmask.
-const ERROR_CEILING: u32 = 1134;
+/// → 1042 (Phase-1 host-call lowering + near-miss closeout, -92): (1) E0284 fix —
+/// `annotate_uninferable_gets` now treats a `Result<(), E>` fn's codegen-
+/// synthesized `Ok(())`/`todo!()` tail correctly, so a trailing discarded `.get()`
+/// is `Val`-annotated rather than mistaken for the return (-7). (2) Faithful host-
+/// call lowering: `update_current_contract_wasm` -> `env.deployer()`,
+/// `address_to_strkey`/`strkey_to_address` -> `Address::to_string`/`from_string`,
+/// `bytes_new` -> `Bytes::new(&env)` (-29; `bytes_new`'s aqua-amm -31 unmasks
+/// pre-existing E0308s in reflector x2/soroban-domains, faithful). (3) Husks of
+/// guaranteed-non-compiling constructs: type-impossible `<handle param> != <int>`
+/// (E0308), `Val`-tag guards with a `break`/`continue` body (E0433), and a lost
+/// invoke arg's `.into_val()` on `!` (E0277) (-56). Zero per-contract regressions
+/// except the documented `bytes_new` unmasking; snapshots byte-identical.
+const ERROR_CEILING: u32 = 1042;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

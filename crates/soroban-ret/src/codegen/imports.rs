@@ -485,6 +485,7 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
         SorobanExpr::CollectionNew(ty_name) => match ty_name.as_str() {
             "Vec" => needs.vec_type = true,
             "Map" => needs.map_type = true,
+            "Bytes" => needs.bytes = true,
             _ => {}
         },
         SorobanExpr::StringLiteral(_) => {
