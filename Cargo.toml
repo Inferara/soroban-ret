@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.95.0"
 repository = "https://github.com/Inferara/soroban-ret"
@@ -20,7 +20,7 @@ keywords = ["soroban", "stellar", "decompiler", "wasm", "smart-contract"]
 categories = ["development-tools", "command-line-utilities", "wasm"]
 
 [workspace.dependencies]
-soroban-ret = { version = "0.0.2", path = "crates/soroban-ret" }
+soroban-ret = { version = "0.0.3", path = "crates/soroban-ret" }
 soroban-spec = "26.0.0-rc.1"
 soroban-meta = "26.0.0-rc.1"
 soroban-spec-rust = "26.0.0-rc.1"

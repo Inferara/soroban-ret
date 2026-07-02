@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-ret"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "cov-mark",
  "insta",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-ret-accuracy"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "clap",
  "dirs",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-ret-bench"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "clap",
  "serde",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-ret-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "soroban-ret-equiv"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "soroban-ret",
  "soroban-sdk",
