@@ -18,6 +18,10 @@ calls.
 - **Stage 4** — IR optimizer + post-optimization passes: constant folding, has/get fusion, storage-key recovery, enum-key construction, event-publish recovery, auth/cross-contract repair, dead-code elimination.
 - **Stage 5** — Rust source emitter: type definitions via `soroban-spec-rust`, function bodies, module assembly with `#[contract]`/`#[contractimpl]`, formatting via `prettyplease`.
 
+## Browser Usage
+
+Most parts of the Reverse Engineering Tool can be accessed directly via the [Stellar Security Portal](https://stellarsecurityportal.com/dev-tools).
+
 ## Install
 
 The library and CLI are published as separate crates.
