@@ -20,7 +20,7 @@ calls.
 
 ## Browser Usage
 
-Most parts of the Reverse Engineering Tool can be accessed directly via the [Stellar Security Portal](https://stellarsecurityportal.com/dev-tools)
+Most parts of the Reverse Engineering Tool can be accessed directly via the [Stellar Security Portal](https://stellarsecurityportal.com/dev-tools).
 
 ## Install
 
