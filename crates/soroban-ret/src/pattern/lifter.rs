@@ -1399,6 +1399,61 @@ impl<'a> LiftContext<'a> {
         cov_mark::hit!(sret_success_status_seeded);
     }
 
+    /// For a void helper that received a `result_ptr` frame slot and implements
+    /// the fallible storage-decode protocol — reaches BOTH `has_contract_data`
+    /// and `get_contract_data`, writing `[disc@0, value@8]` with the `Option`
+    /// convention `0 = missing/None, 1 = present/Some` — seed `result_ptr + 0`
+    /// with the [`StackVal::OptionDecodeDisc`] marker when nothing has
+    /// populated it (issue #35).
+    ///
+    /// The marker is deliberately NOT a constant: only the consumer knows
+    /// whether a branch on the discriminant is the `.unwrap()`'s redundant
+    /// None-panic (foldable — the IfElse handler folds the bare-trap shape) or
+    /// real control flow (an `unwrap_or` default arm, a kill-switch check, a
+    /// `panic_with_error!` with a specific code — all of which must survive;
+    /// the marker then degrades to `UnknownVal`, exactly today's honest
+    /// `todo!()`). Note the convention is the INVERSE of the cross-contract
+    /// sret seed above (`0 = Ok` there); the two are mutually exclusive — a
+    /// helper that both invokes and stores is ambiguous and stays unmodeled.
+    fn seed_option_decode_status(&self, id: u32, base: i32, target_idx: u32) {
+        let mut slots = self.frame_slots.borrow_mut();
+        if !matches!(slots.get(&(id, base)), None | Some(StackVal::Unknown)) {
+            return;
+        }
+        let chains_get = function_calls_host_in_chain(
+            self.wasm_module,
+            target_idx,
+            HostModule::Ledger,
+            "get_contract_data",
+            MAX_INLINE_CALL_DEPTH,
+        );
+        let chains_has = function_calls_host_in_chain(
+            self.wasm_module,
+            target_idx,
+            HostModule::Ledger,
+            "has_contract_data",
+            MAX_INLINE_CALL_DEPTH,
+        );
+        let chains_call = function_calls_host_in_chain(
+            self.wasm_module,
+            target_idx,
+            HostModule::Call,
+            "call",
+            MAX_INLINE_CALL_DEPTH,
+        ) || function_calls_host_in_chain(
+            self.wasm_module,
+            target_idx,
+            HostModule::Call,
+            "try_call",
+            MAX_INLINE_CALL_DEPTH,
+        );
+        if !(chains_get && chains_has) || chains_call {
+            return;
+        }
+        slots.insert((id, base), StackVal::OptionDecodeDisc);
+        cov_mark::hit!(option_decode_status_seeded);
+    }
+
     /// Find the loop-carried locals of a structured loop body: body-local locals
     /// (idx >= num_wasm_params) whose value flows across the back edge — i.e.
     /// their post-body abstract value transitively references their own loop-head
@@ -2848,8 +2903,12 @@ impl<'a> LiftContext<'a> {
                                 // Precise marker first (br_table on Ok/Err)…
                                 self.model_sret_discriminant(id, base);
                                 // …then the success-status seed (br_if-guard pattern),
-                                // which only fires when the slot is still unmodeled.
+                                // which only fires when the slot is still unmodeled…
                                 self.seed_sret_success_status(id, base, *target_idx);
+                                // …then the storage-decode Option seed (issue #35),
+                                // for the fallible has+get wrapper class (again only
+                                // when the slot is still unmodeled).
+                                self.seed_option_decode_status(id, base, *target_idx);
                             }
                             if let Some((inlined_stmts, return_expr)) = inline_result.content {
                                 // Checked-arith composite husk drop (all-or-nothing): a void
@@ -4313,6 +4372,29 @@ impl<'a> LiftContext<'a> {
                 } => {
                     // Pop condition from stack
                     let cond_val = self.stack.pop().unwrap_or(StackVal::Unknown);
+
+                    // Issue #35: a fallible storage-decode discriminant guarded
+                    // by a bare trap is the `.unwrap()`'s None-arm re-encoded —
+                    // the same inline already rendered the load as
+                    // `get(..).unwrap()`, which carries the panic-on-missing
+                    // semantics. Fold the guard. ONLY this shape folds: any
+                    // guard with real logic, an else arm, or a specific
+                    // `panic_with_error!` falls through to the generic path,
+                    // where the marker degrades to `UnknownVal` (today's
+                    // honest `todo!()`), never a fabricated fold.
+                    if else_body.is_empty()
+                        && matches!(
+                            then_body[..],
+                            [StructuredBlock::Instruction(
+                                crate::wasm::ir::WasmInstr::Unreachable
+                            )]
+                        )
+                        && is_option_decode_none_check(&cond_val)
+                    {
+                        cov_mark::hit!(option_decode_trap_guard_folded);
+                        i += 1;
+                        continue;
+                    }
 
                     // SDK multi-param marshalling guard:
                     // `if ((tag(a)!=Ta)|(tag(b)!=Tb))==0 { body; return } unreachable`.
@@ -11586,6 +11668,17 @@ enum StackVal {
     /// `let mut` variable. Only ever lives in the throwaway analysis context's
     /// `frame_slots`; if it reaches codegen it degrades to `UnknownVal`.
     FrameSlotPhi(u32, i32),
+    /// The Some/None discriminant of a fallible storage-decode helper's output
+    /// (`[disc@0, value@8]`, `0 = missing/None, 1 = present/Some`), seeded by
+    /// `seed_option_decode_status` (issue #35). Consumed by the IfElse
+    /// handler: an `if disc == 0 { <bare trap> }` guard is the `.unwrap()`'s
+    /// None-arm re-encoded and folds away (the rendered `get(..).unwrap()`
+    /// carries the panic-on-missing semantics). Every OTHER consumer degrades
+    /// to `UnknownVal` — a non-trap branch on the discriminant (an
+    /// `unwrap_or` default arm, a kill-switch check) is REAL control flow
+    /// that must stay, and a `panic_with_error!` guard carries an error code
+    /// the fold would lose.
+    OptionDecodeDisc,
     /// Transitional: `global_get 0` (the WASM stack pointer)
     StackPtrRef,
     /// Transitional: `StackPtrRef - frame_size` before local_tee assigns it.
@@ -12115,6 +12208,29 @@ fn is_weak_local(val: &StackVal) -> bool {
 /// changed across a branch.
 #[allow(dead_code)]
 type LocalSnapshot = Vec<StackVal>;
+
+/// Returns true when a condition value tests a fallible storage-decode
+/// discriminant for the None arm (`disc == 0` / `eqz disc`). Used by the
+/// IfElse handler's trap-guard fold (issue #35); see
+/// [`StackVal::OptionDecodeDisc`].
+fn is_option_decode_none_check(cond: &StackVal) -> bool {
+    match cond {
+        StackVal::Eqz(x) => matches!(x.as_ref(), StackVal::OptionDecodeDisc),
+        StackVal::Compare(a, CmpOp::Eq, b) => {
+            matches!(
+                (a.as_ref(), b.as_ref()),
+                (
+                    StackVal::OptionDecodeDisc,
+                    StackVal::I32(0) | StackVal::I64(0)
+                ) | (
+                    StackVal::I32(0) | StackVal::I64(0),
+                    StackVal::OptionDecodeDisc
+                )
+            )
+        }
+        _ => false,
+    }
+}
 
 /// Returns true when a tracked value is the raw result of an empty-collection
 /// constructor host call (`map_new`/`vec_new`/`bytes_new`). Used by the loop
@@ -13292,6 +13408,7 @@ fn stack_val_to_expr_inner(
         StackVal::LoopPhi(idx) => SorobanExpr::Local(*idx),
         // Analysis-only marker; should never reach codegen. Degrade safely.
         StackVal::FrameSlotPhi(_, _) => SorobanExpr::UnknownVal,
+        StackVal::OptionDecodeDisc => SorobanExpr::UnknownVal,
         StackVal::FrameSlot(id, offset) => {
             // Try to resolve FrameSlot by looking up what was stored at this location.
             // Only static offsets key `frame_slots`; a dynamic (loop-indexed) address
@@ -14511,6 +14628,48 @@ mod tests {
             }
             other => panic!("expected SretResult marker at result_ptr+0, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn option_decode_none_check_matches_disc_zero_tests() {
+        // `eqz disc` and `disc == 0` (either operand order) are the None-arm
+        // tests the trap-guard fold recognizes.
+        let disc = || Box::new(StackVal::OptionDecodeDisc);
+        assert!(is_option_decode_none_check(&StackVal::Eqz(disc())));
+        assert!(is_option_decode_none_check(&StackVal::Compare(
+            disc(),
+            CmpOp::Eq,
+            Box::new(StackVal::I64(0)),
+        )));
+        assert!(is_option_decode_none_check(&StackVal::Compare(
+            Box::new(StackVal::I32(0)),
+            CmpOp::Eq,
+            disc(),
+        )));
+        // The success-arm polarity (`disc != 0`) and non-marker scrutinees are
+        // REAL control flow — never folded.
+        assert!(!is_option_decode_none_check(&StackVal::Compare(
+            disc(),
+            CmpOp::Ne,
+            Box::new(StackVal::I64(0)),
+        )));
+        assert!(!is_option_decode_none_check(&StackVal::Eqz(Box::new(
+            StackVal::Unknown
+        ))));
+        assert!(!is_option_decode_none_check(&StackVal::Compare(
+            disc(),
+            CmpOp::Eq,
+            Box::new(StackVal::I64(1)),
+        )));
+    }
+
+    #[test]
+    fn option_decode_disc_degrades_to_unknown() {
+        // Any consumer other than the trap-guard fold must see the marker as a
+        // lost value (today's honest `todo!()`), never a fabricated constant.
+        let reg = empty_registry();
+        let expr = stack_val_to_expr(&StackVal::OptionDecodeDisc, &[], &reg, None);
+        assert_eq!(expr, SorobanExpr::UnknownVal);
     }
 
     #[test]

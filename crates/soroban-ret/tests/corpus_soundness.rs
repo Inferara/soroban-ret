@@ -128,7 +128,18 @@ use std::process::Command;
 /// (reaching-defs) / #38 (loop-carried collections); an `unwrap_or_else`
 /// default-arm RECOVERY (rendering the true `get(&k).unwrap_or_else(|| …)`)
 /// is the natural #35-family follow-up.
-const ERROR_CEILING: u32 = 1131;
+/// → 1127 (issue #35: fallible storage-decode discriminant modeling, −4).
+/// `seed_option_decode_status` marks the `[disc@0, value@8]` output slot of
+/// void has+get decode helpers with `StackVal::OptionDecodeDisc`; the IfElse
+/// handler folds ONLY the bare-trap `if disc == 0 { unreachable }` consumer
+/// (the `.unwrap()`'s None-arm re-encoded — the rendered `get(..).unwrap()`
+/// keeps the panic-on-missing semantics), while every other consumer degrades
+/// to the honest `todo!()`. Corpus `todo == 0`/`!= 0` scrutinees 199 → 166,
+/// with full clean getter recoveries (blend-emitter `get_backstop` et al.) and
+/// two restored success-arm guards (reflector/soroban-domains bodies that
+/// previously ran UNconditionally — structural fidelity up, +1 honest artifact
+/// each, baseline refreshed). Equivalence stays 100.0%/0.
+const ERROR_CEILING: u32 = 1127;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

@@ -260,6 +260,48 @@ fn test_lost_collections_render_honest_holes() {
 }
 
 #[test]
+fn test_option_decode_trap_guard_folds_to_clean_getter() {
+    // Issue #35: blend-emitter's storage getters go through a void decode
+    // helper writing `[disc@0, value@8]` (`0 = missing`); the caller's
+    // `if disc == 0 { unreachable }` is the `.unwrap()`'s None-panic
+    // re-encoded. Before, the unmodeled disc slot rendered as
+    // `if todo!("unknown value") == 0 { panic!(); }` after every getter and
+    // the value was lost. With the discriminant seeded, the bare-trap guard
+    // folds and the loaded value flows to the return.
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/blend-emitter-CCOQM6S7.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+
+    let sig = source.find("pub fn get_backstop(").unwrap();
+    let end = sig
+        + source[sig..]
+            .find("\n    pub fn ")
+            .unwrap_or(source.len() - sig);
+    let body = &source[sig..end];
+    assert!(
+        body.contains(".get(&symbol_short!(\"Backstop\"))") && body.contains(".unwrap()"),
+        "get_backstop must recover the clean `get(..).unwrap()` getter:\n{body}"
+    );
+    assert!(
+        !body.contains("todo!("),
+        "get_backstop's decode-status guard must fold away, not render as todo:\n{body}"
+    );
+
+    // Negative control: `initialize`'s guard carries REAL logic (the
+    // AlreadyInitialized panic_with_error path) — it must NOT fold; the
+    // discriminant stays an honest hole.
+    let sig = source.find("pub fn initialize(").unwrap();
+    let end = sig
+        + source[sig..]
+            .find("\n    pub fn ")
+            .unwrap_or(source.len() - sig);
+    let body = &source[sig..end];
+    assert!(
+        body.contains("AlreadyInitializedError"),
+        "initialize's already-initialized guard is real control flow and must survive:\n{body}"
+    );
+}
+
+#[test]
 fn test_decompile_blend_backstop_user_balance_body() {
     // `user_balance` is a fallible storage getter: `if has(k) { get + unpack +
     // extend_ttl } else { default }`. `detect_map_unpack_decode_wrapper` used to
