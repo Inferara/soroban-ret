@@ -745,6 +745,13 @@ fn test_decompile_alloc() {
         source.contains("while count != 0") || source.contains("loop"),
         "the vec-building loop must not be dropped:\n{source}"
     );
+    // The lost pushes/return must surface as honest holes. The positive
+    // todo!() check is the load-bearing assertion — the whitespace-sensitive
+    // negative alone would silently pass if codegen's indentation changed.
+    assert!(
+        source.contains("todo!("),
+        "num_list's lost loop content must surface as todo!() holes:\n{source}"
+    );
     assert!(
         !source.contains("Vec::new(&env)\n    }"),
         "num_list must not fabricate an empty-vec return:\n{source}"

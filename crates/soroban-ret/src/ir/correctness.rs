@@ -1441,15 +1441,67 @@ fn scan_storage_loads(stmts: &[SorobanStmt], discarded: &mut bool, escaping: &mu
 }
 
 /// True when the expression is (or wraps) a `StorageGet`.
+///
+/// The traversal covers every compound variant that can carry a value, not
+/// just the common `MethodCall` wrappers: missing an *escaping* load here
+/// (e.g. one buried in an arithmetic op or an invoke argument) would make
+/// [`husk_fabricated_empty_collection_tail`] husk a collection tail that is
+/// actually backed by a real load — an over-conservative hole where the
+/// empty collection is genuine.
 fn expr_contains_storage_get(e: &SorobanExpr) -> bool {
     match e {
         SorobanExpr::StorageGet { .. } => true,
         SorobanExpr::CastAs { value, .. } | SorobanExpr::ValConvert { value, .. } => {
             expr_contains_storage_get(value)
         }
-        SorobanExpr::Try(inner) => expr_contains_storage_get(inner),
+        SorobanExpr::Try(inner)
+        | SorobanExpr::Some(inner)
+        | SorobanExpr::Not(inner)
+        | SorobanExpr::RequireAuth(inner)
+        | SorobanExpr::ErrorFromCode(inner)
+        | SorobanExpr::PanicWithError(inner) => expr_contains_storage_get(inner),
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => expr_contains_storage_get(a) || expr_contains_storage_get(b),
         SorobanExpr::MethodCall { object, args, .. } => {
             expr_contains_storage_get(object) || args.iter().any(expr_contains_storage_get)
+        }
+        SorobanExpr::FieldAccess { object, .. } => expr_contains_storage_get(object),
+        SorobanExpr::InvokeContract {
+            address,
+            function,
+            args,
+            ..
+        }
+        | SorobanExpr::TryInvokeContract {
+            address,
+            function,
+            args,
+            ..
+        } => {
+            expr_contains_storage_get(address)
+                || expr_contains_storage_get(function)
+                || args.iter().any(expr_contains_storage_get)
+        }
+        SorobanExpr::RawHostCall { args, .. } => args.iter().any(expr_contains_storage_get),
+        SorobanExpr::TupleConstruct(elems) | SorobanExpr::VecConstruct(elems) => {
+            elems.iter().any(expr_contains_storage_get)
+        }
+        SorobanExpr::MapConstruct(entries) => entries
+            .iter()
+            .any(|(k, v)| expr_contains_storage_get(k) || expr_contains_storage_get(v)),
+        SorobanExpr::StructConstruct { fields, .. } => {
+            fields.iter().any(|(_, v)| expr_contains_storage_get(v))
         }
         _ => false,
     }
