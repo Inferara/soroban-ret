@@ -633,6 +633,19 @@ struct LiftContext<'a> {
     /// FIRST key's value/error and silently drop the rest); `lift_function_body`
     /// downgrades it to the always-faithful early-return guard form instead.
     fallible_get_count: Rc<RefCell<u32>>,
+    /// Journal of every REAL store to a static frame slot (issue #34 slice):
+    /// unlike `frame_slots` (the current abstract state, which invalidation and
+    /// overwrites erase), this only ever appends. A load whose slot the state
+    /// map lost consults it: exactly ONE recorded def that is provably pure and
+    /// loop-invariant → the load reads that def (a unique reaching definition);
+    /// anything else → `Unknown`, exactly as before. Shared via `Rc` like
+    /// `frame_slots`; throwaway simulation contexts swap in a fresh copy so
+    /// speculative lifts cannot pollute it.
+    slot_defs: Rc<RefCell<SlotDefJournal>>,
+    /// Depth of structured-loop bodies currently being lifted. The journal fill
+    /// never fires at `loop_depth > 0`: a load inside a loop body may observe a
+    /// later iteration's store, which single-pass journaling cannot see.
+    loop_depth: u32,
 }
 
 impl<'a> LiftContext<'a> {
@@ -668,6 +681,8 @@ impl<'a> LiftContext<'a> {
             guard_block_depth: 0,
             fallible_get_recovery: Rc::new(RefCell::new(None)),
             fallible_get_count: Rc::new(RefCell::new(0)),
+            slot_defs: Rc::new(RefCell::new(HashMap::new())),
+            loop_depth: 0,
         }
     }
 
@@ -698,6 +713,8 @@ impl<'a> LiftContext<'a> {
             // Shared so a record made in a nested block reaches the top-level ctx.
             fallible_get_recovery: Rc::clone(&self.fallible_get_recovery),
             fallible_get_count: Rc::clone(&self.fallible_get_count),
+            slot_defs: Rc::clone(&self.slot_defs),
+            loop_depth: self.loop_depth,
         }
     }
 
@@ -736,6 +753,11 @@ impl<'a> LiftContext<'a> {
     /// bound to that variable so later loads read it; otherwise update the
     /// abstract frame-slot map as usual.
     fn store_frame_slot(&mut self, id: u32, slot: i32, value: StackVal) {
+        self.slot_defs
+            .borrow_mut()
+            .entry((id, slot))
+            .or_default()
+            .push(value.clone());
         if let Some(&var_idx) = self.promoted_slots.get(&(id, slot)) {
             let expr = {
                 let slots = self.frame_slots.borrow();
@@ -1415,10 +1437,13 @@ impl<'a> LiftContext<'a> {
     /// `todo!()`). Note the convention is the INVERSE of the cross-contract
     /// sret seed above (`0 = Ok` there); the two are mutually exclusive — a
     /// helper that both invokes and stores is ambiguous and stays unmodeled.
-    fn seed_option_decode_status(&self, id: u32, base: i32, target_idx: u32) {
+    /// Returns `true` when the marker was seeded by THIS call (the gate matched
+    /// and the slot was unmodeled), so the caller can run follow-on modeling
+    /// that is only valid for a freshly-recognized option-decode wrapper.
+    fn seed_option_decode_status(&self, id: u32, base: i32, target_idx: u32) -> bool {
         let mut slots = self.frame_slots.borrow_mut();
         if !matches!(slots.get(&(id, base)), None | Some(StackVal::Unknown)) {
-            return;
+            return false;
         }
         let chains_get = function_calls_host_in_chain(
             self.wasm_module,
@@ -1448,10 +1473,115 @@ impl<'a> LiftContext<'a> {
             MAX_INLINE_CALL_DEPTH,
         );
         if !(chains_get && chains_has) || chains_call {
-            return;
+            return false;
         }
         slots.insert((id, base), StackVal::OptionDecodeDisc);
         cov_mark::hit!(option_decode_status_seeded);
+        true
+    }
+
+    /// After [`seed_option_decode_status`] fires for a fallible has+get storage
+    /// wrapper, link the VALUE slot (`result_ptr + 8`) to the loaded value
+    /// (issue #34 slice). The helper's internal branch join collapsed the store
+    /// to `Unknown`, so every later load of `+8` rendered `todo!()` — even
+    /// though the inline emitted the very `get(..)` that produced the value, as
+    /// a discarded orphan statement. Promote that unique orphan to a
+    /// `let var_N` binding and seed `+8` with the binding, so consumers read
+    /// `var_N`: the once-loaded value. Never re-issue the get at a consumer —
+    /// a second host call could observe a different value across storage
+    /// mutations.
+    ///
+    /// Airtight gates, any failure → byte-identical output:
+    /// - the value slot is still unmodeled;
+    /// - the helper chain decodes nothing (no Int-module conversion, no
+    ///   map/vec unpack) — its `+8` slot therefore holds the raw loaded `Val`,
+    ///   not a scalar limb / error-code layout;
+    /// - the inlined statements contain EXACTLY ONE top-level storage get
+    ///   (an orphan `Expr` or an existing `Let`) with a recovered (non-hole)
+    ///   key.
+    fn link_option_decode_value(
+        &mut self,
+        id: u32,
+        base: i32,
+        target_idx: u32,
+        stmts: &mut [SorobanStmt],
+    ) {
+        {
+            let slots = self.frame_slots.borrow();
+            if !matches!(slots.get(&(id, base + 8)), None | Some(StackVal::Unknown)) {
+                return;
+            }
+        }
+        // Decoding getters (scalar limbs, struct unpack) use a different
+        // out-slot layout — `+8` is an error code or a limb there, never the
+        // raw loaded Val. Any conversion/unpack in the chain → stay honest.
+        if function_calls_module_in_chain(
+            self.wasm_module,
+            target_idx,
+            HostModule::Int,
+            MAX_INLINE_CALL_DEPTH,
+        ) || function_calls_host_in_chain(
+            self.wasm_module,
+            target_idx,
+            HostModule::Map,
+            "map_unpack_to_linear_memory",
+            MAX_INLINE_CALL_DEPTH,
+        ) || function_calls_host_in_chain(
+            self.wasm_module,
+            target_idx,
+            HostModule::Vec,
+            "vec_unpack_to_linear_memory",
+            MAX_INLINE_CALL_DEPTH,
+        ) {
+            return;
+        }
+        // A single top-level storage get, orphan or already-bound.
+        enum GetSite {
+            Orphan(usize),
+            Bound(String),
+        }
+        let mut site: Option<GetSite> = None;
+        for (i, stmt) in stmts.iter().enumerate() {
+            let (key, bound) = match stmt {
+                SorobanStmt::Expr(SorobanExpr::StorageGet { key, .. }) => (key, None),
+                SorobanStmt::Let {
+                    name,
+                    value: SorobanExpr::StorageGet { key, .. },
+                    ..
+                } => (key, Some(name.clone())),
+                _ => continue,
+            };
+            if matches!(key.as_ref(), SorobanExpr::UnknownVal) || site.is_some() {
+                return; // hole-keyed or ambiguous → stay honest
+            }
+            site = Some(match bound {
+                Some(name) => GetSite::Bound(name),
+                None => GetSite::Orphan(i),
+            });
+        }
+        let seed = match site {
+            None => return,
+            Some(GetSite::Bound(name)) => {
+                StackVal::HostCallResult(Box::new(SorobanExpr::NamedLocal(name)))
+            }
+            Some(GetSite::Orphan(i)) => {
+                let var_idx = self.locals.len() as u32;
+                self.locals.push(StackVal::LetBinding(var_idx));
+                let placeholder = SorobanStmt::Expr(SorobanExpr::Void);
+                let SorobanStmt::Expr(get_expr) = std::mem::replace(&mut stmts[i], placeholder)
+                else {
+                    return;
+                };
+                stmts[i] = SorobanStmt::Let {
+                    name: format!("var_{var_idx}"),
+                    mutable: false,
+                    value: get_expr,
+                };
+                StackVal::LetBinding(var_idx)
+            }
+        };
+        self.frame_slots.borrow_mut().insert((id, base + 8), seed);
+        cov_mark::hit!(option_decode_value_linked);
     }
 
     /// Find the loop-carried locals of a structured loop body: body-local locals
@@ -1488,6 +1618,11 @@ impl<'a> LiftContext<'a> {
         // Detach shared mutable state so this throwaway pass can't perturb the
         // real lift's enum-variant disambiguation counter.
         sim.enum_match_counter = Rc::new(RefCell::new(HashMap::new()));
+        // Detach the store journal too: speculative stores must not pollute the
+        // real lift's unique-reaching-def index. The sim lifts a loop BODY, so
+        // it also runs at loop depth (no journal fills).
+        sim.slot_defs = Rc::new(RefCell::new(self.slot_defs.borrow().clone()));
+        sim.loop_depth += 1;
         for &l in &written {
             if let Some(slot) = sim.locals.get_mut(l as usize) {
                 *slot = StackVal::LoopPhi(l);
@@ -1537,6 +1672,8 @@ impl<'a> LiftContext<'a> {
         sim.frame_slots = Rc::new(RefCell::new(seeded));
         sim.next_frame_id = Rc::new(RefCell::new(*self.next_frame_id.borrow()));
         sim.enum_match_counter = Rc::new(RefCell::new(HashMap::new()));
+        sim.slot_defs = Rc::new(RefCell::new(self.slot_defs.borrow().clone()));
+        sim.loop_depth += 1;
         // Also seed body-written locals with LoopPhi so an accumulator that adds
         // the counter (`acc += i`) stays symbolic — otherwise the counter's
         // pre-loop constant would make the slot look like a pure `acc + const`
@@ -2830,7 +2967,7 @@ impl<'a> LiftContext<'a> {
                             } else {
                                 None
                             };
-                            let inline_result = lift_inline_call(
+                            let mut inline_result = lift_inline_call(
                                 self.wasm_module,
                                 self.registry,
                                 *target_idx,
@@ -2908,7 +3045,35 @@ impl<'a> LiftContext<'a> {
                                 // …then the storage-decode Option seed (issue #35),
                                 // for the fallible has+get wrapper class (again only
                                 // when the slot is still unmodeled).
-                                self.seed_option_decode_status(id, base, *target_idx);
+                                let option_seeded =
+                                    self.seed_option_decode_status(id, base, *target_idx);
+                                // A freshly-recognized option-decode wrapper also
+                                // left the loaded value at `+8` — link it to the
+                                // inlined get's binding (issue #34 slice).
+                                if option_seeded
+                                    && let Some((inlined_stmts, _)) = inline_result.content.as_mut()
+                                {
+                                    self.link_option_decode_value(
+                                        id,
+                                        base,
+                                        *target_idx,
+                                        inlined_stmts,
+                                    );
+                                }
+                                if std::env::var("DBG_SLOTMISS").is_ok() {
+                                    let slots = self.frame_slots.borrow();
+                                    let disc = slots.get(&(id, base));
+                                    if matches!(disc, None | Some(StackVal::Unknown)) {
+                                        eprintln!(
+                                            "[UNMODELED_OUTPTR] helper={} frame={} base={} disc={:?} val8={:?}",
+                                            target_idx,
+                                            id,
+                                            base,
+                                            disc.map(std::mem::discriminant),
+                                            slots.get(&(id, base + 8)).map(std::mem::discriminant),
+                                        );
+                                    }
+                                }
                             }
                             if let Some((inlined_stmts, return_expr)) = inline_result.content {
                                 // Checked-arith composite husk drop (all-or-nothing): a void
@@ -3523,12 +3688,48 @@ impl<'a> LiftContext<'a> {
                         (None, Some(slot)) if self.promoted_slots.contains_key(&(id, slot)) => {
                             StackVal::LetBinding(self.promoted_slots[&(id, slot)])
                         }
-                        (None, Some(slot)) => self
-                            .frame_slots
-                            .borrow()
-                            .get(&(id, slot))
-                            .cloned()
-                            .unwrap_or(StackVal::Unknown),
+                        (None, Some(slot)) => {
+                            let mut v = self
+                                .frame_slots
+                                .borrow()
+                                .get(&(id, slot))
+                                .cloned()
+                                .unwrap_or(StackVal::Unknown);
+                            if matches!(v, StackVal::Unknown) {
+                                let missing = !self.frame_slots.borrow().contains_key(&(id, slot));
+                                if std::env::var("DBG_SLOTMISS").is_ok() {
+                                    let kind = if missing { "missing" } else { "stored-unknown" };
+                                    let journal = self.slot_defs.borrow();
+                                    let defs = journal.get(&(id, slot));
+                                    eprintln!(
+                                        "[SLOTMISS] frame={id} off={slot} kind={kind} defs={} unique_pure={}",
+                                        defs.map_or(0, |d| d.len()),
+                                        defs.is_some_and(|d| d.len() == 1
+                                            && stack_val_is_loop_invariant_pure(&d[0]))
+                                    );
+                                }
+                                // Unique-reaching-def fill (issue #34 slice): the
+                                // state map lost this slot (invalidation /
+                                // conservative merge), but the journal proves the
+                                // function performed exactly ONE store to it, of a
+                                // pure loop-invariant value. That store is the
+                                // unique reaching definition, so the load reads
+                                // it. Any other journal state — zero defs, several
+                                // defs, an impure or loop-varying value, or a load
+                                // inside a loop body — keeps today's `Unknown`.
+                                if missing && self.loop_depth == 0 {
+                                    let journal = self.slot_defs.borrow();
+                                    if let Some(defs) = journal.get(&(id, slot))
+                                        && let [only_def] = defs.as_slice()
+                                        && stack_val_is_loop_invariant_pure(only_def)
+                                    {
+                                        cov_mark::hit!(unique_slot_def_filled);
+                                        v = only_def.clone();
+                                    }
+                                }
+                            }
+                            v
+                        }
                         // Dynamic (loop-indexed) offset: read the value a matching
                         // indexed store left in the side table.
                         (Some(term), Some(base)) => self
@@ -4247,6 +4448,7 @@ impl<'a> LiftContext<'a> {
 
                     let mut loop_ctx = self.child_context();
                     loop_ctx.loop_carried_locals = carried;
+                    loop_ctx.loop_depth += 1;
                     loop_ctx.lift_structured_loop(body);
                     let loop_stmts = loop_ctx.stmts;
                     self.memory_stores = loop_ctx.memory_stores;
@@ -4368,7 +4570,7 @@ impl<'a> LiftContext<'a> {
                 StructuredBlock::IfElse {
                     then_body,
                     else_body,
-                    ..
+                    block_type,
                 } => {
                     // Pop condition from stack
                     let cond_val = self.stack.pop().unwrap_or(StackVal::Unknown);
@@ -4485,6 +4687,45 @@ impl<'a> LiftContext<'a> {
                         );
                     }
 
+                    // Value-producing `if (result T)`: the wasm construct pushes one
+                    // value from whichever arm ran, but the generic handler drops both
+                    // arm stacks, so every consumer of the result reads `Unknown` —
+                    // even when the arms are the SDK's small/object Val encode or
+                    // decode split of the SAME source value (`(x << 8) | tag` vs
+                    // `obj_from_u64(x)`), where the joined value is provably that
+                    // conversion. Push the join only when equivalence is proven;
+                    // any other shape leaves the stack exactly as before (the
+                    // consumer keeps seeing what it saw today), so this is additive.
+                    if std::env::var("DBG_JOIN").is_ok()
+                        && matches!(block_type, crate::wasm::ir::BlockType::Value(_))
+                    {
+                        eprintln!(
+                            "[DBG_JOIN] value-if: tt={} et={} parent_len={} then_len={} else_len={} tv={:?} ev={:?}",
+                            then_terminates,
+                            else_terminates,
+                            self.stack.len(),
+                            then_ctx.stack.len(),
+                            else_ctx.stack.len(),
+                            then_ctx.stack.last(),
+                            else_ctx.stack.last(),
+                        );
+                    }
+                    if matches!(block_type, crate::wasm::ir::BlockType::Value(_))
+                        && !then_terminates
+                        && !else_terminates
+                        && then_ctx.stack.len() == self.stack.len() + 1
+                        && else_ctx.stack.len() == self.stack.len() + 1
+                        && then_ctx.stack[..self.stack.len()] == self.stack[..]
+                        && else_ctx.stack[..self.stack.len()] == self.stack[..]
+                        && let Some(joined) = self.join_if_result_values(
+                            then_ctx.stack.last().unwrap(),
+                            else_ctx.stack.last().unwrap(),
+                        )
+                    {
+                        cov_mark::hit!(if_result_value_joined);
+                        self.stack.push(joined);
+                    }
+
                     // Only emit If when there's meaningful content
                     if !then_stmts.is_empty() || !else_stmts.is_empty() {
                         self.stmts.push(SorobanStmt::If {
@@ -4497,6 +4738,45 @@ impl<'a> LiftContext<'a> {
             }
             i += 1;
         }
+    }
+
+    /// Join the two arm values of a value-producing `if (result T)` when they are
+    /// provably the same value. Two shapes qualify:
+    ///
+    /// 1. Structurally identical pure values (both arms computed the same thing).
+    /// 2. The SDK's small/object Val split: one arm is the host-object conversion
+    ///    of a source (`obj_from_u64(x)` / `obj_to_u64(x)` → `ValConvert { x }`),
+    ///    the other the small-value form of the SAME source (`(x << 8) | tag`,
+    ///    or `x` passed through where the shift-decode already stripped). The
+    ///    join is the conversion — both arms encode/decode one value, the split
+    ///    is host-representation plumbing with no Rust-level meaning.
+    ///
+    /// Purity is required so the joined expression can be re-read at the
+    /// consumer without duplicating a side effect. Anything else → `None`, and
+    /// the caller pushes nothing (byte-identical to the pre-join behavior).
+    fn join_if_result_values(&self, tv: &StackVal, ev: &StackVal) -> Option<StackVal> {
+        if tv == ev && stack_val_is_pure(tv) {
+            return Some(tv.clone());
+        }
+        for (conv, small) in [(tv, ev), (ev, tv)] {
+            if let StackVal::HostCallResult(expr) = conv
+                && let SorobanExpr::ValConvert { value, .. } = expr.as_ref()
+                && expr_is_pure_source(value)
+            {
+                let src = strip_val_encode(small.clone());
+                if stack_val_is_pure(&src)
+                    && stack_val_to_expr(
+                        &src,
+                        self.params,
+                        self.registry,
+                        Some(&self.frame_slots.borrow()),
+                    ) == **value
+                {
+                    return Some(conv.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Recognize the `Vec`-front `Option` idiom that an `Option<T>`-returning
@@ -5836,6 +6116,7 @@ impl<'a> LiftContext<'a> {
                 StructuredBlock::Loop { body, .. } => {
                     // Nested loop
                     let mut inner_ctx = self.child_context();
+                    inner_ctx.loop_depth += 1;
                     inner_ctx.lift_structured_loop(body);
                     let inner_stmts = inner_ctx.stmts;
                     self.found_host_calls |= inner_ctx.found_host_calls;
@@ -10179,6 +10460,38 @@ fn detect_write_allowance_wrapper(
 
 /// Check if a function's call chain (up to `depth` levels) reaches a specific
 /// host function. Generalizes `function_calls_host` with depth recursion.
+/// True if `func_idx` (transitively, depth-capped) calls ANY import from the
+/// given host module. Used as an exclusion gate: e.g. a storage getter that
+/// touches the Int module decodes its loaded `Val` into scalar limbs, so its
+/// out-slot layout is NOT the raw `[disc@0, val@8]` shape.
+fn function_calls_module_in_chain(
+    module: &WasmModule,
+    func_idx: u32,
+    host_module: HostModule,
+    depth: u32,
+) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let Some(func) = module.get_function(func_idx) else {
+        return false;
+    };
+    for instr in &func.body {
+        if let crate::wasm::ir::WasmInstr::Call(target) = instr {
+            if let Some(host_fn) = module.imports.get_by_index(*target) {
+                if host_fn.module == host_module {
+                    return true;
+                }
+            } else if depth > 1
+                && function_calls_module_in_chain(module, *target, host_module, depth - 1)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn function_calls_host_in_chain(
     module: &WasmModule,
     func_idx: u32,
@@ -11551,6 +11864,66 @@ fn recognize_val_shape(val: &StackVal) -> Option<ValShape> {
 /// the clean expression from the Val-encoded stack top. Only small-value tags
 /// are stripped: an object construction `(handle << 32) | object_tag` carries an
 /// opaque handle, not a Rust-level value, so it is left as `Unknown`.
+/// A stack value whose expression form can be re-evaluated at any consumer
+/// without duplicating a side effect: constants, parameters, let-bound locals,
+/// and arithmetic/conversion trees over those. Host-call results are impure
+/// except the `ValConvert` conversion wrapper over a pure source (a pure
+/// re-tagging of a value, not an effect).
+fn stack_val_is_pure(v: &StackVal) -> bool {
+    match v {
+        StackVal::I32(_)
+        | StackVal::I64(_)
+        | StackVal::Param(_)
+        | StackVal::WasmParam(_)
+        | StackVal::LetBinding(_) => true,
+        StackVal::BinOp(a, _, b) | StackVal::Compare(a, _, b) => {
+            stack_val_is_pure(a) && stack_val_is_pure(b)
+        }
+        StackVal::Eqz(a) => stack_val_is_pure(a),
+        StackVal::I128Limb { value, .. } => stack_val_is_pure(value),
+        StackVal::HostCallResult(e) => {
+            matches!(e.as_ref(), SorobanExpr::ValConvert { value, .. } if expr_is_pure_source(value))
+        }
+        _ => false,
+    }
+}
+
+/// Stricter than [`stack_val_is_pure`]: also LOOP-INVARIANT. Used by the
+/// unique-reaching-def journal fill, where the single recorded store may sit
+/// inside a loop the load is not part of — a value derived from a let-bound
+/// local could then be a loop counter, varying per iteration. Constants,
+/// parameters, and arithmetic over those cannot vary; `LetBinding` /
+/// `HostCallResult` are excluded.
+fn stack_val_is_loop_invariant_pure(v: &StackVal) -> bool {
+    match v {
+        StackVal::I32(_) | StackVal::I64(_) | StackVal::Param(_) | StackVal::WasmParam(_) => true,
+        StackVal::BinOp(a, _, b) | StackVal::Compare(a, _, b) => {
+            stack_val_is_loop_invariant_pure(a) && stack_val_is_loop_invariant_pure(b)
+        }
+        StackVal::Eqz(a) => stack_val_is_loop_invariant_pure(a),
+        StackVal::I128Limb { value, .. } => stack_val_is_loop_invariant_pure(value),
+        _ => false,
+    }
+}
+
+/// Expression-level purity for a `ValConvert` source: a parameter, literal, or
+/// local binding — never a call, storage read, or collection build.
+fn expr_is_pure_source(e: &SorobanExpr) -> bool {
+    matches!(
+        e,
+        SorobanExpr::Param(_)
+            | SorobanExpr::Local(_)
+            | SorobanExpr::NamedLocal(_)
+            | SorobanExpr::U32Literal(_)
+            | SorobanExpr::I32Literal(_)
+            | SorobanExpr::U64Literal(_)
+            | SorobanExpr::I64Literal(_)
+            | SorobanExpr::U128Literal(_)
+            | SorobanExpr::I128Literal(_)
+            | SorobanExpr::BoolLiteral(_)
+    )
+}
+
 fn strip_val_encode(val: StackVal) -> StackVal {
     // Construction `(inner << N) | small_tag` → inner (centralized recognition).
     if let Some(ValShape::Construct { payload, tag, .. }) = recognize_val_shape(&val)
@@ -13229,6 +13602,10 @@ type FrameSlotMap = HashMap<(u32, i32), StackVal>;
 /// `(frame_id, symbolic_term, static_base)` to the stored `StackVal`.
 type DynamicSlotMap = HashMap<(u32, SymTerm, i32), StackVal>;
 
+/// Type alias for the append-only store journal: every REAL store to a static
+/// `(frame_id, offset)` slot, in program order (see `LiftContext::slot_defs`).
+type SlotDefJournal = HashMap<(u32, i32), Vec<StackVal>>;
+
 /// Convert a stack value to a SorobanExpr, decoding packed Soroban Val constants.
 ///
 /// When `frame_slots` is provided, FrameSlot values are resolved by looking up
@@ -14661,6 +15038,270 @@ mod tests {
             CmpOp::Eq,
             Box::new(StackVal::I64(1)),
         )));
+    }
+
+    #[test]
+    fn if_result_join_encode_split_joins_to_conversion() {
+        // The SDK's small/object Val encode split of ONE source: then-arm
+        // `(p << 8) | U64Small`, else-arm `obj_from_u64(p)` → the join is the
+        // conversion (both arms encode the same value; the split is host
+        // plumbing).
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+
+        let p = || StackVal::Param("amount".to_string());
+        let small = StackVal::BinOp(
+            Box::new(StackVal::BinOp(
+                Box::new(p()),
+                BinOper::Shl,
+                Box::new(StackVal::I64(8)),
+            )),
+            BinOper::Or,
+            Box::new(StackVal::I64(6)),
+        );
+        let conv = StackVal::HostCallResult(Box::new(SorobanExpr::ValConvert {
+            value: Box::new(SorobanExpr::Param("amount".to_string())),
+            target_type: "u64".to_string(),
+        }));
+        // Both arm orders join to the conversion.
+        assert_eq!(ctx.join_if_result_values(&small, &conv), Some(conv.clone()));
+        assert_eq!(ctx.join_if_result_values(&conv, &small), Some(conv.clone()));
+        // Identical pure arms join to themselves.
+        assert_eq!(ctx.join_if_result_values(&p(), &p()), Some(p()));
+    }
+
+    #[test]
+    fn if_result_join_refuses_unproven_arms() {
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+
+        // An Unknown source can't be proven equal to anything.
+        let small_unknown = StackVal::BinOp(
+            Box::new(StackVal::BinOp(
+                Box::new(StackVal::Unknown),
+                BinOper::Shl,
+                Box::new(StackVal::I64(8)),
+            )),
+            BinOper::Or,
+            Box::new(StackVal::I64(6)),
+        );
+        let conv_unknown = StackVal::HostCallResult(Box::new(SorobanExpr::ValConvert {
+            value: Box::new(SorobanExpr::UnknownVal),
+            target_type: "u64".to_string(),
+        }));
+        assert_eq!(
+            ctx.join_if_result_values(&small_unknown, &conv_unknown),
+            None
+        );
+        // Different sources never join.
+        let conv_other = StackVal::HostCallResult(Box::new(SorobanExpr::ValConvert {
+            value: Box::new(SorobanExpr::Param("other".to_string())),
+            target_type: "u64".to_string(),
+        }));
+        let small_amount = StackVal::BinOp(
+            Box::new(StackVal::BinOp(
+                Box::new(StackVal::Param("amount".to_string())),
+                BinOper::Shl,
+                Box::new(StackVal::I64(8)),
+            )),
+            BinOper::Or,
+            Box::new(StackVal::I64(6)),
+        );
+        assert_eq!(ctx.join_if_result_values(&small_amount, &conv_other), None);
+        // Identical IMPURE arms (a storage get) never join: re-reading the
+        // expression at the consumer would duplicate a host call.
+        let get = StackVal::HostCallResult(Box::new(SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral("K".to_string())),
+            unwrap: true,
+            on_missing: None,
+        }));
+        assert_eq!(ctx.join_if_result_values(&get, &get), None);
+        // Path-dependent constants (a Result discriminant) never join.
+        assert_eq!(
+            ctx.join_if_result_values(&StackVal::I64(0), &StackVal::I64(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn unique_slot_def_fill_recovers_invalidated_slot() {
+        use crate::wasm::ir::WasmInstr;
+        // A store journals its def; when invalidation later drops the slot from
+        // the state map, a load still recovers the value through the journal —
+        // it is the function's unique reaching definition.
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.stack.push(StackVal::Param("key".to_string()));
+        ctx.lift_instruction(&WasmInstr::I64Store(16));
+        // Simulate invalidation (the state map loses the slot; the journal keeps it).
+        ctx.frame_slots.borrow_mut().remove(&(0, 16));
+
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.lift_instruction(&WasmInstr::I64Load(16));
+        assert_eq!(ctx.stack.pop(), Some(StackVal::Param("key".to_string())));
+    }
+
+    #[test]
+    fn unique_slot_def_fill_stays_honest_otherwise() {
+        use crate::wasm::ir::WasmInstr;
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+
+        // Two defs → ambiguous → Unknown.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        for p in ["a", "b"] {
+            ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+            ctx.stack.push(StackVal::Param(p.to_string()));
+            ctx.lift_instruction(&WasmInstr::I64Store(16));
+        }
+        ctx.frame_slots.borrow_mut().remove(&(0, 16));
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.lift_instruction(&WasmInstr::I64Load(16));
+        assert_eq!(ctx.stack.pop(), Some(StackVal::Unknown));
+
+        // Inside a loop body → the load may observe a later iteration's store
+        // → Unknown.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.stack.push(StackVal::Param("a".to_string()));
+        ctx.lift_instruction(&WasmInstr::I64Store(16));
+        ctx.frame_slots.borrow_mut().remove(&(0, 16));
+        ctx.loop_depth = 1;
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.lift_instruction(&WasmInstr::I64Load(16));
+        assert_eq!(ctx.stack.pop(), Some(StackVal::Unknown));
+
+        // A loop-varying def (`LetBinding` — possibly a loop counter) → Unknown.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.stack.push(StackVal::LetBinding(3));
+        ctx.lift_instruction(&WasmInstr::I64Store(16));
+        ctx.frame_slots.borrow_mut().remove(&(0, 16));
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.lift_instruction(&WasmInstr::I64Load(16));
+        assert_eq!(ctx.stack.pop(), Some(StackVal::Unknown));
+
+        // A slot that holds a stored `Unknown` (the last store was genuinely
+        // unknown-valued) is NOT filled from an earlier journal entry.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.stack.push(StackVal::Param("a".to_string()));
+        ctx.lift_instruction(&WasmInstr::I64Store(16));
+        ctx.frame_slots
+            .borrow_mut()
+            .insert((0, 16), StackVal::Unknown);
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.lift_instruction(&WasmInstr::I64Load(16));
+        assert_eq!(ctx.stack.pop(), Some(StackVal::Unknown));
+    }
+
+    #[test]
+    fn link_option_decode_value_promotes_orphan_get() {
+        // The unique inlined orphan `Expr(get)` becomes a `let var_N` binding
+        // and the value slot reads that binding — never a re-issued get.
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+
+        let get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral("Admin".to_string())),
+            unwrap: true,
+            on_missing: None,
+        };
+        let mut stmts = vec![SorobanStmt::Expr(get.clone())];
+        ctx.link_option_decode_value(0, 0, 999, &mut stmts);
+
+        let SorobanStmt::Let { name, value, .. } = &stmts[0] else {
+            panic!("orphan get should be promoted to a Let, got {:?}", stmts[0]);
+        };
+        assert_eq!(*value, get);
+        let idx: u32 = name
+            .strip_prefix("var_")
+            .and_then(|s| s.parse().ok())
+            .expect("synthetic var_N name");
+        assert_eq!(
+            ctx.frame_slots.borrow().get(&(0, 8)),
+            Some(&StackVal::LetBinding(idx))
+        );
+    }
+
+    #[test]
+    fn link_option_decode_value_stays_honest_otherwise() {
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+
+        let get = |key: &str| SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral(key.to_string())),
+            unwrap: true,
+            on_missing: None,
+        };
+        // Two gets → ambiguous → no seed, statements untouched.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        let mut stmts = vec![SorobanStmt::Expr(get("A")), SorobanStmt::Expr(get("B"))];
+        ctx.link_option_decode_value(0, 0, 999, &mut stmts);
+        assert!(matches!(stmts[0], SorobanStmt::Expr(_)));
+        assert!(ctx.frame_slots.borrow().get(&(0, 8)).is_none());
+
+        // A hole-keyed get → no seed.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        let mut stmts = vec![SorobanStmt::Expr(SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::UnknownVal),
+            unwrap: true,
+            on_missing: None,
+        })];
+        ctx.link_option_decode_value(0, 0, 999, &mut stmts);
+        assert!(matches!(stmts[0], SorobanStmt::Expr(_)));
+        assert!(ctx.frame_slots.borrow().get(&(0, 8)).is_none());
+
+        // An already-bound get reuses ITS name (no rewrite, no fresh local).
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        let mut stmts = vec![SorobanStmt::Let {
+            name: "admin".to_string(),
+            mutable: false,
+            value: get("Admin"),
+        }];
+        ctx.link_option_decode_value(0, 0, 999, &mut stmts);
+        match ctx.frame_slots.borrow().get(&(0, 8)) {
+            Some(StackVal::HostCallResult(e)) => {
+                assert_eq!(**e, SorobanExpr::NamedLocal("admin".to_string()));
+            }
+            other => panic!("expected NamedLocal seed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_invariant_purity_excludes_bindings_and_calls() {
+        // `LetBinding` may name a loop counter; host-call results are effects.
+        // Constants, params, and arithmetic over them are invariant.
+        assert!(stack_val_is_loop_invariant_pure(&StackVal::I64(7)));
+        assert!(stack_val_is_loop_invariant_pure(&StackVal::Param(
+            "p".to_string()
+        )));
+        assert!(stack_val_is_loop_invariant_pure(&StackVal::BinOp(
+            Box::new(StackVal::Param("p".to_string())),
+            BinOper::Add,
+            Box::new(StackVal::I64(1)),
+        )));
+        assert!(!stack_val_is_loop_invariant_pure(&StackVal::LetBinding(2)));
+        assert!(!stack_val_is_loop_invariant_pure(
+            &StackVal::HostCallResult(Box::new(SorobanExpr::LedgerTimestamp))
+        ));
+        assert!(!stack_val_is_loop_invariant_pure(&StackVal::Unknown));
     }
 
     #[test]
