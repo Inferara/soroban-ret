@@ -561,6 +561,14 @@ struct FallibleGetRecord {
     err_type: ScSpecTypeDef,
 }
 
+/// Debug-flag caches, read once per process: `std::env::var` takes a
+/// process-global lock, and these guards sit on the per-frame-slot-load and
+/// per-`IfElse` hot paths (greptile P2).
+static DBG_SLOTMISS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_SLOTMISS").is_ok());
+static DBG_JOIN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_JOIN").is_ok());
+
 struct LiftContext<'a> {
     wasm_module: &'a WasmModule,
     registry: &'a TypeRegistry,
@@ -1351,9 +1359,22 @@ impl<'a> LiftContext<'a> {
         if coeff <= 0 {
             return;
         }
+        let mut removed: Vec<(u32, i32)> = Vec::new();
         self.frame_slots.borrow_mut().retain(|&(sid, off), _| {
-            !(sid == id && off >= base && (off - base).rem_euclid(coeff) == 0)
+            let aliased = sid == id && off >= base && (off - base).rem_euclid(coeff) == 0;
+            if aliased {
+                removed.push((sid, off));
+            }
+            !aliased
         });
+        // Poison the store journal for every invalidated slot: the dynamic
+        // write may have overwritten it at runtime with a value the static
+        // journal never saw, so the unique-reaching-def fill must refuse to
+        // resurrect the stale pre-invalidation store (greptile P1).
+        let mut journal = self.slot_defs.borrow_mut();
+        for key in removed {
+            journal.entry(key).or_default().push(StackVal::Unknown);
+        }
     }
 
     /// Model the `Result` discriminant of an sret (struct-return) call: a void
@@ -3060,7 +3081,7 @@ impl<'a> LiftContext<'a> {
                                         inlined_stmts,
                                     );
                                 }
-                                if std::env::var("DBG_SLOTMISS").is_ok() {
+                                if *DBG_SLOTMISS {
                                     let slots = self.frame_slots.borrow();
                                     let disc = slots.get(&(id, base));
                                     if matches!(disc, None | Some(StackVal::Unknown)) {
@@ -3697,7 +3718,7 @@ impl<'a> LiftContext<'a> {
                                 .unwrap_or(StackVal::Unknown);
                             if matches!(v, StackVal::Unknown) {
                                 let missing = !self.frame_slots.borrow().contains_key(&(id, slot));
-                                if std::env::var("DBG_SLOTMISS").is_ok() {
+                                if *DBG_SLOTMISS {
                                     let kind = if missing { "missing" } else { "stored-unknown" };
                                     let journal = self.slot_defs.borrow();
                                     let defs = journal.get(&(id, slot));
@@ -4696,9 +4717,7 @@ impl<'a> LiftContext<'a> {
                     // conversion. Push the join only when equivalence is proven;
                     // any other shape leaves the stack exactly as before (the
                     // consumer keeps seeing what it saw today), so this is additive.
-                    if std::env::var("DBG_JOIN").is_ok()
-                        && matches!(block_type, crate::wasm::ir::BlockType::Value(_))
-                    {
+                    if *DBG_JOIN && matches!(block_type, crate::wasm::ir::BlockType::Value(_)) {
                         eprintln!(
                             "[DBG_JOIN] value-if: tt={} et={} parent_len={} then_len={} else_len={} tv={:?} ev={:?}",
                             then_terminates,
@@ -15200,6 +15219,30 @@ mod tests {
         ctx.frame_slots
             .borrow_mut()
             .insert((0, 16), StackVal::Unknown);
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.lift_instruction(&WasmInstr::I64Load(16));
+        assert_eq!(ctx.stack.pop(), Some(StackVal::Unknown));
+
+        // A dynamic (loop-indexed) aliasing write both evicts the slot AND
+        // poisons its journal: the dynamic store may have overwritten the
+        // value at runtime, so the fill must NOT resurrect the stale static
+        // store (greptile P1).
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.stack.push(StackVal::Param("a".to_string()));
+        ctx.lift_instruction(&WasmInstr::I64Store(16));
+        // Dynamic store through `frame + i*8` — aliases offset 16.
+        ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
+        ctx.stack.push(StackVal::WasmParam(0));
+        ctx.lift_instruction(&WasmInstr::I32Const(8));
+        ctx.lift_instruction(&WasmInstr::I32Mul);
+        ctx.lift_instruction(&WasmInstr::I32Add);
+        ctx.stack.push(StackVal::Param("b".to_string()));
+        ctx.lift_instruction(&WasmInstr::I64Store(0));
+        assert!(
+            !ctx.frame_slots.borrow().contains_key(&(0, 16)),
+            "aliasing write evicts the static slot"
+        );
         ctx.stack.push(StackVal::FrameSlot(0, SlotOffset::at(0)));
         ctx.lift_instruction(&WasmInstr::I64Load(16));
         assert_eq!(ctx.stack.pop(), Some(StackVal::Unknown));
