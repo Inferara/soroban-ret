@@ -82,7 +82,30 @@ use std::process::Command;
 /// (E0308), `Val`-tag guards with a `break`/`continue` body (E0433), and a lost
 /// invoke arg's `.into_val()` on `!` (E0277) (-56). Zero per-contract regressions
 /// except the documented `bytes_new` unmasking; snapshots byte-identical.
-const ERROR_CEILING: u32 = 1042;
+/// → 1064 (blend-backstop `user_balance` body recovery, +22 — the FIRST net rise
+/// in this ceiling's history, and a deliberate exception to the "drive it down"
+/// rule above). Root cause: `detect_map_unpack_decode_wrapper` mis-claimed
+/// *fallible* storage getters (those that branch on `has_contract_data` with a
+/// missing-key default), emitting synthetic field accesses at a wrong output
+/// layout and silently dropping the `has`/default/`extend_ttl` protocol — so
+/// `user_balance` collapsed to a bare, misleading `panic!()`. Fix A now refuses
+/// such helpers (they inline generically, preserving control flow); Fix B splices
+/// the SDK multi-param tag-guard `if` at an entrypoint so the then-branch tail
+/// value survives (a depth-0 `Return`-in-`if` was dropped, emptying the body);
+/// Fix C stubs a value-returning body that collapsed to a lone `panic!()` after
+/// host calls were observed to `todo!()`. Removing the mis-claim is a *net
+/// structural win* (band artifacts 107→38, blend pools 154→109 ×2, comet 58→33;
+/// several contracts gain clean functions), but it UNMASKS pre-existing lost-key
+/// `todo!()`s in the two getters that were being hidden behind wrong-but-clean
+/// field accesses: aqua-rewards +26, soroban-domains +24. Every added error was
+/// verified to be a genuine `todo!("unknown value")` (zero new fabricated
+/// Maps/keys/types; no cleanly-recovered function regressed) — deceptively-clean
+/// wrong output traded for honest holes, the opposite of "more wrong". The
+/// alternative (narrowing Fix A to blend-backstop's exact shape) was rejected
+/// because it would preserve known-wrong-but-clean output elsewhere purely to
+/// keep this metric green. Closing the exposed getters is Phase-2 dataflow work
+/// (reaching-defs / consumer-type), not a soundness regression.
+const ERROR_CEILING: u32 = 1064;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

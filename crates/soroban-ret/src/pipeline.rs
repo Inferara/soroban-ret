@@ -373,6 +373,26 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         {
             func.body.clear();
         }
+
+        // Honesty guard for the lone-`panic!()` collapse: a value-returning body
+        // that reduced to exactly `panic!()` even though the lift observed host
+        // calls is not a genuine diverging panic wrapper (those lift from an
+        // `unreachable`-only wasm body that reaches no host function) — its real
+        // content was lost. A bare `panic!()` reads as intentional contract
+        // behavior; emit the honest stub instead.
+        if func.had_host_calls
+            && func
+                .return_type
+                .as_ref()
+                .is_some_and(|t| !matches!(t, ScSpecTypeDef::Void))
+            && matches!(
+                func.body.as_slice(),
+                [SorobanStmt::Expr(SorobanExpr::Panic)]
+            )
+        {
+            cov_mark::hit!(lone_panic_collapse_stubbed);
+            func.body.clear();
+        }
     }
 
     // Soroban-specific post-optimization passes (4b–4e).
