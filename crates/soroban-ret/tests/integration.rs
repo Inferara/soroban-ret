@@ -245,11 +245,13 @@ fn test_decompile_blend_backstop_user_balance_body() {
     // The misleading `panic!()` is gone: a lost value is an honest `todo!()`
     // hole, never a fabricated diverging panic. (`panic!()` as a substring would
     // also match `panic_with_error!`, so check the exact bare-panic statement.)
+    // Bound the slice at the *next* `pub fn` so the test is not coupled to which
+    // sibling function happens to follow `user_balance`.
     let sig = source.find("pub fn user_balance").unwrap();
-    let end = source[sig..]
-        .find("pub fn pool_data")
-        .map(|r| sig + r)
-        .unwrap();
+    let end = source[sig + 1..]
+        .find("pub fn ")
+        .map(|r| sig + 1 + r)
+        .unwrap_or(source.len());
     let body = &source[sig..end];
     assert!(
         !body.contains("panic!()"),
