@@ -139,7 +139,15 @@ use std::process::Command;
 /// two restored success-arm guards (reflector/soroban-domains bodies that
 /// previously ran UNconditionally — structural fidelity up, +1 honest artifact
 /// each, baseline refreshed). Equivalence stays 100.0%/0.
-const ERROR_CEILING: u32 = 1127;
+/// → 1124 (issue #34 groundwork, −3). Three additive lift-time capabilities:
+/// a provable value join for `if (result T)` arms (the SDK's small/object Val
+/// encode/decode split of one source), a value-slot link binding a fallible
+/// getter's `+8` slot to its inlined `get(..)`'s `let` binding, and a
+/// unique-reaching-def journal fill for slots the state map lost. Recovers
+/// reflector's `config.history_retention_period` set-value and a `fee_config
+/// .len()` binding (−3 net); surfaces 2 previously-dropped honest husk
+/// statements (+3 `todo!()`, corpus 1357→1360 — completeness, not loss).
+const ERROR_CEILING: u32 = 1124;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
