@@ -4283,6 +4283,50 @@ impl<'a> LiftContext<'a> {
                 } => {
                     // Pop condition from stack
                     let cond_val = self.stack.pop().unwrap_or(StackVal::Unknown);
+
+                    // SDK multi-param marshalling guard:
+                    // `if ((tag(a)!=Ta)|(tag(b)!=Tb))==0 { body; return } unreachable`.
+                    // The composite condition is tautological for declared param
+                    // types (see `is_param_tag_guard_composite`) and the SDK's
+                    // `#[contract]` wrapper regenerates it on recompile, so splice
+                    // the body inline instead of wrapping it in an `if`. Crucially,
+                    // adopt the branch's value stack: the body's tail value is the
+                    // function's return, which the generic path below would discard
+                    // (a `Return` at depth 0 emits no statement), collapsing pure
+                    // getters to an empty `if` + trap → `panic!()` (blend-backstop
+                    // `user_balance`). The failure trap is marshalling too — skip it.
+                    if self.inline_depth == 0
+                        && else_body.is_empty()
+                        && matches!(
+                            then_body.last(),
+                            Some(StructuredBlock::Instruction(
+                                crate::wasm::ir::WasmInstr::Return
+                            ))
+                        )
+                        && matches!(
+                            &blocks[i + 1..],
+                            [StructuredBlock::Instruction(
+                                crate::wasm::ir::WasmInstr::Unreachable
+                            )] | [StructuredBlock::SafetyNetUnreachable]
+                        )
+                        && is_param_tag_guard_composite(
+                            &blocks[..i],
+                            self.params,
+                            self.num_wasm_params,
+                        )
+                    {
+                        cov_mark::hit!(param_tag_guard_composite_spliced);
+                        let mut then_ctx = self.child_context();
+                        then_ctx.lift_structured(then_body);
+                        self.stack = then_ctx.stack;
+                        self.locals = then_ctx.locals;
+                        self.memory_stores = then_ctx.memory_stores;
+                        self.found_host_calls |= then_ctx.found_host_calls;
+                        self.stmts.extend(then_ctx.stmts);
+                        i += 2;
+                        continue;
+                    }
+
                     let condition = stack_val_to_expr(
                         &cond_val,
                         self.params,
@@ -9077,6 +9121,21 @@ fn detect_map_unpack_decode_wrapper(
         return None;
     }
 
+    // A helper that checks `has_contract_data` is a *fallible* storage getter
+    // (`if has { get + unpack + extend_ttl } else { default }`), not a decode
+    // wrapper: claiming it here replaces the whole protocol with bare field
+    // accesses, silently dropping the missing-key default branch and the TTL
+    // bump (blend-backstop `user_balance`). Let it inline generically so that
+    // control flow survives.
+    if func
+        .body
+        .iter()
+        .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_host(module, *t, HostModule::Ledger, "has_contract_data", 0)))
+    {
+        cov_mark::hit!(map_unpack_decode_skips_fallible_getter);
+        return None;
+    }
+
     // Find a Call to map_unpack_to_linear_memory — either directly (host import) or
     // indirectly through a thunk (detected by detect_map_unpack_thunk).
     let mut has_map_unpack = false;
@@ -12815,6 +12874,103 @@ fn is_tag_check_condition(val: &StackVal) -> bool {
     };
     (matches!(recognize_val_shape(a), Some(ValShape::TagOf(_))) && to_u64(b).is_some())
         || (matches!(recognize_val_shape(b), Some(ValShape::TagOf(_))) && to_u64(a).is_some())
+}
+
+/// Numeric Val tag uniquely determined by a declared spec param type — the
+/// lifter-level sibling of the optimizer's `unique_val_tag` (which maps to tag
+/// *names* for already-lifted `get_tag` comparisons). Only types whose Val
+/// encoding admits exactly one tag qualify; small/object-ambiguous types
+/// (u64, i128, Symbol, bool, …) return `None`.
+fn unique_numeric_val_tag(td: &ScSpecTypeDef) -> Option<u64> {
+    Some(match td {
+        ScSpecTypeDef::Address => TAG_ADDRESS_OBJECT,
+        ScSpecTypeDef::Vec(_) => TAG_VEC_OBJECT,
+        ScSpecTypeDef::Map(_) => TAG_MAP_OBJECT,
+        ScSpecTypeDef::Bytes | ScSpecTypeDef::BytesN(_) => TAG_BYTES_OBJECT,
+        ScSpecTypeDef::String => TAG_STRING_OBJECT,
+        ScSpecTypeDef::U32 => TAG_U32,
+        ScSpecTypeDef::I32 => TAG_I32,
+        _ => return None,
+    })
+}
+
+/// Recognize the multi-param SDK marshalling guard computation preceding an
+/// entrypoint `if`: `((p_a & 255) != T_a) | ((p_b & 255) != T_b) | …; i32.eqz`,
+/// i.e. "all params carry their declared Val tag". The `i32.or` collapses the
+/// composite to `Unknown` on the value stack (its leaves are unrecoverable
+/// there), so this matches the *raw instruction* window instead. True only when
+/// EVERY or-ed leaf is `local.get <param>; i64.const 255; i64.and; i64.const
+/// <tag>; i64.ne` with `<tag>` the tag uniquely determined by that param's
+/// declared spec type ([`unique_numeric_val_tag`]) — the whole composite is then
+/// tautological for host-validated arguments, the same rationale as the
+/// optimizer's `fold_tautological_tag_guards`. Requires ≥ 2 leaves: the
+/// single-check form lifts cleanly as `ValTag(Param)` and stays on the existing
+/// paths.
+fn is_param_tag_guard_composite(
+    preceding: &[super::structurize::StructuredBlock],
+    params: &[FnParam],
+    num_wasm_params: u32,
+) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    // Reversed instruction window ending at the `if`'s condition; stops at the
+    // first non-instruction sibling (frame-setup noise before the guard is
+    // simply never reached by the backward match).
+    let instrs: Vec<&WasmInstr> = preceding
+        .iter()
+        .rev()
+        .map_while(|b| match b {
+            super::structurize::StructuredBlock::Instruction(i) => Some(i),
+            _ => None,
+        })
+        .collect();
+
+    let mut pos = 0;
+    if !matches!(instrs.first(), Some(WasmInstr::I32Eqz)) {
+        return false;
+    }
+    pos += 1;
+
+    // Backward shape: Eqz, Or, G_k, Or, G_{k-1}, …, Or, G_2, G_1 where each
+    // reversed group G is [I64Ne, I64Const(tag), I64And, I64Const(255), LocalGet(p)].
+    let mut groups = 0usize;
+    loop {
+        let saw_or = matches!(instrs.get(pos), Some(WasmInstr::I32Or));
+        if saw_or {
+            pos += 1;
+        }
+        match (
+            instrs.get(pos),
+            instrs.get(pos + 1),
+            instrs.get(pos + 2),
+            instrs.get(pos + 3),
+            instrs.get(pos + 4),
+        ) {
+            (
+                Some(WasmInstr::I64Ne),
+                Some(WasmInstr::I64Const(tag)),
+                Some(WasmInstr::I64And),
+                Some(WasmInstr::I64Const(255)),
+                Some(WasmInstr::LocalGet(p)),
+            ) => {
+                if *p >= num_wasm_params {
+                    return false;
+                }
+                let Some(param) = params.get(*p as usize) else {
+                    return false;
+                };
+                if unique_numeric_val_tag(&param.type_def) != Some(*tag as u64) {
+                    return false;
+                }
+                pos += 5;
+                groups += 1;
+            }
+            _ => return false,
+        }
+        if !saw_or {
+            break;
+        }
+    }
+    groups >= 2
 }
 
 /// Narrow I32Literal(0/1) to BoolLiteral when the function's return type is bool.

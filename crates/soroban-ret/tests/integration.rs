@@ -218,6 +218,46 @@ fn test_decompile_unknown_oracle_fallible_gets() {
 }
 
 #[test]
+fn test_decompile_blend_backstop_user_balance_body() {
+    // `user_balance` is a fallible storage getter: `if has(k) { get + unpack +
+    // extend_ttl } else { default }`. `detect_map_unpack_decode_wrapper` used to
+    // mis-claim its `get_user_balance` helper as a pure decode wrapper, emitting
+    // wrong-layout field accesses and dropping the whole protocol, so the body
+    // collapsed to a bare, misleading `panic!()`. Three fixes restore it: the
+    // detector now refuses fallible getters (they inline generically), the SDK
+    // multi-param tag-guard `if` is spliced so the then-branch survives, and a
+    // value-returning body that collapsed to a lone `panic!()` is stubbed honest.
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/blend-backstop-CAQQR5SW.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+
+    // The real persistent-storage protocol is recovered, NOT a bare `panic!()`.
+    assert_in_fn(
+        &source,
+        "pub fn user_balance",
+        &[
+            ".persistent()",
+            ".has(&BackstopDataKey::UserBalance)",
+            ".get::<_, Val>(&BackstopDataKey::UserBalance)",
+            ".extend_ttl(&BackstopDataKey::UserBalance",
+        ],
+    );
+
+    // The misleading `panic!()` is gone: a lost value is an honest `todo!()`
+    // hole, never a fabricated diverging panic. (`panic!()` as a substring would
+    // also match `panic_with_error!`, so check the exact bare-panic statement.)
+    let sig = source.find("pub fn user_balance").unwrap();
+    let end = source[sig..]
+        .find("pub fn pool_data")
+        .map(|r| sig + r)
+        .unwrap();
+    let body = &source[sig..end];
+    assert!(
+        !body.contains("panic!()"),
+        "user_balance must not collapse to a bare panic!() — lost content is todo!():\n{body}"
+    );
+}
+
+#[test]
 fn test_decompile_add_u128() {
     let wasm = include_bytes!("../../../tests/fixtures/test_add_u128.wasm");
     let source = decompile(wasm).expect("decompilation failed");
