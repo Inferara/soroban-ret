@@ -28,9 +28,9 @@ fn optimize_stmts_to_fixpoint(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -
     let mut current = optimize_stmts_inner(stmts, preserve_orphans);
     let mut converged = false;
     for iteration in 1..MAX_ITERATIONS {
-        let prev_repr = format!("{:?}", &current);
+        let prev_repr = format!("{:?}", current);
         let next = optimize_stmts_inner(current.clone(), preserve_orphans);
-        let next_repr = format!("{:?}", &next);
+        let next_repr = format!("{:?}", next);
         current = next;
         if prev_repr == next_repr {
             log::trace!(
