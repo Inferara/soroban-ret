@@ -218,6 +218,48 @@ fn test_decompile_unknown_oracle_fallible_gets() {
 }
 
 #[test]
+fn test_lost_collections_render_honest_holes() {
+    // Issue #36: a LOST `Map`/`Vec` used to render as a fabricated EMPTY one
+    // (`Map::new(&env)`), which compiles and reads as an intentional empty
+    // collection — silent-wrong output the soundness ratchet cannot see.
+    //
+    // digicus `get_repos` is the canonical collapse: the helper is
+    // `get("repos").unwrap_or_else(|| Map::new(&env))`, and branch-sequential
+    // lifting made the default arm the extracted value, fabricating
+    // `Map::new(&env).keys()` (always-empty). The lost value must be an honest
+    // `todo!()` hole instead.
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/digicus-CCZLARB4.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+
+    let sig = source.find("pub fn get_repos(").unwrap();
+    let end = sig
+        + source[sig..]
+            .find("\n    pub fn ")
+            .unwrap_or(source.len() - sig);
+    let body = &source[sig..end];
+    assert!(
+        !body.contains("Map::new(&env)") && !body.contains("Map::<_, Val>::new(&env)"),
+        "get_repos must not fabricate an empty map for the lost storage value:\n{body}"
+    );
+    assert!(
+        body.contains("todo!("),
+        "get_repos' lost map must surface as an honest todo!() hole:\n{body}"
+    );
+
+    // The FAITHFUL counterpart must survive: blend-backstop `reward_zone` is
+    // `if has(RZ) { return get(&RZ).unwrap(); } Vec::new(&env)` — the loaded
+    // value escapes through the early return, so the trailing empty vec is a
+    // genuine per-path default arm, not a fabrication.
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/blend-backstop-CAQQR5SW.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    assert_in_fn(
+        &source,
+        "pub fn reward_zone",
+        &[".get(&symbol_short!(\"RZ\"))", "Vec::new(&env)"],
+    );
+}
+
+#[test]
 fn test_decompile_blend_backstop_user_balance_body() {
     // `user_balance` is a fallible storage getter: `if has(k) { get + unpack +
     // extend_ttl } else { default }`. `detect_map_unpack_decode_wrapper` used to
@@ -686,6 +728,11 @@ fn test_decompile_macros() {
 
 #[test]
 fn test_decompile_alloc() {
+    // `num_list(count)` builds `[0, 1, …, count-1]` by pushing in a loop. The
+    // loop-carried pushes are still lost (issue #38 frontier), but the LOSS
+    // must surface as honest `todo!()` holes — issue #36: before, the whole
+    // loop was dropped and the fn fabricated a bare `Vec::new(&env)` return,
+    // silently-wrong "always empty" output that read as intentional.
     let wasm = include_bytes!("../../../tests/fixtures/test_alloc.wasm");
     let source = decompile(wasm).expect("decompilation failed");
     assert!(source.contains("pub fn num_list"), "missing num_list fn");
@@ -693,9 +740,15 @@ fn test_decompile_alloc() {
         source.contains("-> Vec<u32>"),
         "missing Vec<u32> return type"
     );
-    assert!(source.contains("Vec::new(&env)"), "missing Vec::new(&env)");
     assert!(source.contains("count: u32"), "missing count param");
-    assert!(!source.contains("todo!("), "unexpected todo! artifact");
+    assert!(
+        source.contains("while count != 0") || source.contains("loop"),
+        "the vec-building loop must not be dropped:\n{source}"
+    );
+    assert!(
+        !source.contains("Vec::new(&env)\n    }"),
+        "num_list must not fabricate an empty-vec return:\n{source}"
+    );
 }
 
 #[test]
@@ -984,10 +1037,12 @@ const ALL_FIXTURES: &[(&str, &[u8])] = &[
         "contract_with_constructor",
         include_bytes!("../../../tests/fixtures/contract_with_constructor.wasm"),
     ),
-    (
-        "test_alloc",
-        include_bytes!("../../../tests/fixtures/test_alloc.wasm"),
-    ),
+    // NOTE: test_alloc is intentionally NOT here. Its `num_list` builds a vec
+    // in a loop; the loop's pushes are still lost, and before issue #36 the
+    // output fabricated a bare `Vec::new(&env)` return — deceptively clean,
+    // silently wrong (always-empty). The honest output carries `todo!()`
+    // holes, so it cannot pass the no-artifacts gate until loop-carried
+    // collection recovery lands (issue #38).
     (
         "test_events_ref",
         include_bytes!("../../../tests/fixtures/test_events_ref.wasm"),
@@ -1214,8 +1269,13 @@ fn aquarius_estimate_swap_recovers_first_index_of_unwrap() {
         !body.contains("LiquidityPoolType::ConstantProduct"),
         "the first_index_of tag must not be mislabeled as a LiquidityPoolType match, got:\n{body}"
     );
+    // Narrowed from a body-wide no-todo assert (issue #36): the body now
+    // legitimately carries honest holes where an always-empty
+    // `Map::<_, Val>::new(&env)` receiver used to be fabricated. The #12
+    // regression this guards is the first_index_of RECEIVER/dispatch decaying
+    // back to a lost value.
     assert!(
-        !body.contains("todo!(\"unknown value\")"),
+        !body.contains("first_index_of(todo!") && !body.contains("match todo!"),
         "the recovered first_index_of dispatch should leave no unknown-value todo!, got:\n{body}"
     );
 }

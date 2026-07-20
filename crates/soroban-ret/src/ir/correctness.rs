@@ -1354,6 +1354,107 @@ pub fn husk_type_mismatched_ok_literal(
     stmts
 }
 
+/// Issue #36: husk a fabricated empty-collection function tail.
+///
+/// Shape: the function's tail value is a bare `Map::new`/`Vec::new`
+/// constructor while the body also contains a *discarded* storage load — a
+/// `get(&key)` whose value went nowhere. That pairing is the residue of
+/// `get(&key).unwrap_or_else(|| Map::new(&env))` collapsing to its default
+/// arm: the loaded value was lost, so the "always empty" tail is silent-wrong
+/// (it compiles and reads as an intentional empty collection). Retreat to the
+/// honest hole.
+///
+/// The faithful variant is excluded on two signals: a `return` that carries a
+/// storage-loaded value (`if has { return get(&k).unwrap(); } Vec::new(&env)`
+/// — the empty constructor is then a genuine per-path default arm), and a
+/// `let`/assignment binding a load (the value may reach the tail through the
+/// binding). Only a provably discarded load triggers the husk.
+pub fn husk_fabricated_empty_collection_tail(mut stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    let tail_is_empty_collection = matches!(
+        stmts.last(),
+        Some(SorobanStmt::Expr(SorobanExpr::CollectionNew(_)))
+            | Some(SorobanStmt::Return(Some(SorobanExpr::CollectionNew(_))))
+    );
+    if !tail_is_empty_collection {
+        return stmts;
+    }
+    let mut discarded_load = false;
+    let mut escaping_load = false;
+    scan_storage_loads(
+        &stmts[..stmts.len() - 1],
+        &mut discarded_load,
+        &mut escaping_load,
+    );
+    if discarded_load && !escaping_load {
+        match stmts.last_mut() {
+            Some(SorobanStmt::Expr(e)) | Some(SorobanStmt::Return(Some(e))) => {
+                *e = SorobanExpr::UnknownVal;
+            }
+            _ => unreachable!("guarded by tail_is_empty_collection"),
+        }
+    }
+    stmts
+}
+
+/// Classify storage loads in a statement tree: `discarded` = a load whose
+/// value is dropped (`Expr` statement position); `escaping` = a load whose
+/// value flows onward (returned, or bound by a `let`/assignment).
+fn scan_storage_loads(stmts: &[SorobanStmt], discarded: &mut bool, escaping: &mut bool) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(e) => {
+                if expr_contains_storage_get(e) {
+                    *discarded = true;
+                }
+            }
+            SorobanStmt::Return(Some(e)) => {
+                if expr_contains_storage_get(e) {
+                    *escaping = true;
+                }
+            }
+            SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+                if expr_contains_storage_get(value) {
+                    *escaping = true;
+                }
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                scan_storage_loads(then_body, discarded, escaping);
+                scan_storage_loads(else_body, discarded, escaping);
+            }
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms.iter() {
+                    scan_storage_loads(&arm.body, discarded, escaping);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::For { body, .. }
+            | SorobanStmt::Block(body) => {
+                scan_storage_loads(body, discarded, escaping);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True when the expression is (or wraps) a `StorageGet`.
+fn expr_contains_storage_get(e: &SorobanExpr) -> bool {
+    match e {
+        SorobanExpr::StorageGet { .. } => true,
+        SorobanExpr::CastAs { value, .. } | SorobanExpr::ValConvert { value, .. } => {
+            expr_contains_storage_get(value)
+        }
+        SorobanExpr::Try(inner) => expr_contains_storage_get(inner),
+        SorobanExpr::MethodCall { object, args, .. } => {
+            expr_contains_storage_get(object) || args.iter().any(expr_contains_storage_get)
+        }
+        _ => false,
+    }
+}
+
 fn husk_mismatched_returns(stmts: &mut [SorobanStmt], ok_class: &str) {
     for stmt in stmts.iter_mut() {
         match stmt {
@@ -1887,6 +1988,73 @@ mod tests {
         assert!(
             matches!(&out[0], SorobanStmt::Expr(SorobanExpr::CollectionNew(_))),
             "bare Map::new in a typed context must stay un-annotated: {out:?}"
+        );
+    }
+
+    // --- husk_fabricated_empty_collection_tail ----------------------------
+
+    fn discarded_get(key: &str) -> SorobanStmt {
+        SorobanStmt::Expr(get(key))
+    }
+
+    #[test]
+    fn husks_empty_collection_tail_after_discarded_load() {
+        // `get(&k).unwrap();  Map::new(&env)` — the loaded value was lost, so
+        // the "always empty" tail is the collapsed default arm → honest hole.
+        let out = husk_fabricated_empty_collection_tail(vec![
+            discarded_get("k"),
+            SorobanStmt::Expr(map_new()),
+        ]);
+        assert!(
+            matches!(&out[1], SorobanStmt::Expr(SorobanExpr::UnknownVal)),
+            "fabricated empty tail must husk to todo!(): {out:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_empty_collection_tail_when_load_escapes_via_return() {
+        // `if has { return get(&k).unwrap(); }  Vec::new(&env)` — the load
+        // escapes through the early return; the empty vec is a genuine
+        // per-path default arm (blend reward_zone shape).
+        let out = husk_fabricated_empty_collection_tail(vec![
+            SorobanStmt::If {
+                condition: SorobanExpr::Param("has".into()),
+                then_body: vec![discarded_get("k"), SorobanStmt::Return(Some(get("k")))],
+                else_body: vec![],
+            },
+            SorobanStmt::Expr(SorobanExpr::CollectionNew("Vec".into())),
+        ]);
+        assert!(
+            matches!(&out[1], SorobanStmt::Expr(SorobanExpr::CollectionNew(_))),
+            "faithful default arm must be kept: {out:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_empty_collection_tail_without_storage_load() {
+        // A storage-free constructor tail is a genuine empty collection.
+        let out = husk_fabricated_empty_collection_tail(vec![SorobanStmt::Expr(map_new())]);
+        assert!(
+            matches!(&out[0], SorobanStmt::Expr(SorobanExpr::CollectionNew(_))),
+            "genuine empty construction must be kept: {out:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_empty_collection_tail_when_load_is_bound() {
+        // `let x = get(&k);  Map::new(&env)` — the load is bound, its value
+        // may reach the tail through the binding; not provably discarded.
+        let out = husk_fabricated_empty_collection_tail(vec![
+            SorobanStmt::Let {
+                name: "x".into(),
+                mutable: false,
+                value: get("k"),
+            },
+            SorobanStmt::Expr(map_new()),
+        ]);
+        assert!(
+            matches!(&out[1], SorobanStmt::Expr(SorobanExpr::CollectionNew(_))),
+            "bound load must not trigger the husk: {out:?}"
         );
     }
 

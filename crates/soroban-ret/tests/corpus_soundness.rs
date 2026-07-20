@@ -105,7 +105,30 @@ use std::process::Command;
 /// because it would preserve known-wrong-but-clean output elsewhere purely to
 /// keep this metric green. Closing the exposed getters is Phase-2 dataflow work
 /// (reaching-defs / consumer-type), not a soundness regression.
-const ERROR_CEILING: u32 = 1064;
+/// → 1131 (issue #36: lost collections no longer fabricated as empty
+/// `Map::new`/`Vec::new`, +67 — the second deliberate honesty rise). A lost
+/// `Map`/`Vec` used to render as an EMPTY one wherever a stale `map_new`/
+/// `vec_new` def survived an unmodeled phi (an inlined `get(&k).unwrap_or_else
+/// (|| vec![])` helper collapsing to its default arm; a loop's `map_put`
+/// reassignment chain invisible post-loop; a zero-arg invoke's empty args vec
+/// wrapped as a fabricated argument). Empty collections COMPILE, so this
+/// ratchet could never see them: `Map::<_, Val>::new(&env).contains_key(k)`
+/// (always-false), `set(&key, &Map::new(&env))` (stores fabricated empty) all
+/// read as intentional. Corpus fabrications 121 → 33 (every survivor verified
+/// a genuine construction: accumulators feeding now-lost loops, per-path
+/// default arms whose loaded value escapes via `return get(&k).unwrap()`,
+/// fresh-vec builds). The +67 is fully audited: aqua-amm +54 = +53 E0599
+/// "method not found in `!`" (honest `todo!()` receivers where the fabricated
+/// empty map/vec sat) +1 E0277 `into_val` on `!`; digicus +5 (same class, and
+/// its old E0283 — CAUSED by a fabricated map — disappeared); reflector +2 x2,
+/// blend +2/+1/+1 same class. All other error buckets byte-identical; zero new
+/// fabrication. test_alloc's "clean" fixture status was itself the bug (a
+/// fabricated always-empty `Vec::new(&env)` return) and is now honestly
+/// artifacted — see integration.rs. Recovering these values for real is #34
+/// (reaching-defs) / #38 (loop-carried collections); an `unwrap_or_else`
+/// default-arm RECOVERY (rendering the true `get(&k).unwrap_or_else(|| …)`)
+/// is the natural #35-family follow-up.
+const ERROR_CEILING: u32 = 1131;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

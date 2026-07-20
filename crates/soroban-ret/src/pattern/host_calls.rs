@@ -397,6 +397,12 @@ fn unwrap_invoke_args(args_vec: SorobanExpr) -> Vec<SorobanExpr> {
     match args_vec {
         SorobanExpr::VecConstruct(elems) => elems,
         SorobanExpr::TupleConstruct(elems) if elems.len() != 1 => elems,
+        // A raw empty-vec handle as the args operand is a ZERO-argument
+        // invoke: the SDK builds `Vec::<Val>::new(&env)` when the callee
+        // takes no arguments. Wrapping it as a single argument would
+        // fabricate `vec![&env, Vec::new(&env).into_val(&env)]` — an
+        // argument that does not exist (issue #36).
+        SorobanExpr::CollectionNew(ref c) if c == "Vec" => Vec::new(),
         other => vec![other],
     }
 }

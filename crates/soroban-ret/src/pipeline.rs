@@ -819,6 +819,18 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
     for func in &mut contract_module.functions {
         let returns_value = !matches!(&func.return_type, None | Some(ScSpecTypeDef::Void));
         let body = std::mem::take(&mut func.body);
+        // Issue #36: a bare empty-collection tail alongside a discarded storage
+        // load is the collapsed default arm of `get(&k).unwrap_or_else(|| …)` —
+        // the loaded value was lost, so the "always empty" tail is silent-wrong.
+        // Husk to `todo!()` BEFORE the annotation passes below see the tail.
+        // Value-returning functions only: in a void fn the trailing
+        // `Map::new(&env);` is a discarded statement (a genuine constructor
+        // trace), not a claimed return value.
+        let body = if returns_value {
+            crate::ir::correctness::husk_fabricated_empty_collection_tail(body)
+        } else {
+            body
+        };
         // A get in tail position is the inferable return value ONLY if the body
         // actually supplies the tail. When codegen synthesizes the tail (`Ok(())`
         // for `Result<(), E>`, or a `todo!()` value tail for a lost-value fn), the

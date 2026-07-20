@@ -4223,6 +4223,36 @@ impl<'a> LiftContext<'a> {
                         }
                     }
 
+                    // Issue #36: invalidate stale empty-collection defs the loop
+                    // body reassigns. Soroban collections are immutable host
+                    // objects — `map.set`/`vec.push_back` lower to
+                    // `local = map_put(local, ..)` reassignment chains — so a
+                    // parent local still holding the pre-loop `map_new`/`vec_new`
+                    // result after the body wrote that local is one arm of an
+                    // unmodeled phi. Post-loop reads would clone the empty
+                    // constructor into every use site (silent-wrong: it
+                    // compiles). Retreat to the honest hole. The scan is
+                    // syntactic (`local.set`/`local.tee` anywhere in the nested
+                    // body) because the write usually sits inside a guard whose
+                    // child context never propagates it back up. Locals promoted
+                    // to `let mut` by the carried-local recovery above are
+                    // LetBinding by now and thus not touched.
+                    {
+                        use crate::wasm::ir::WasmInstr;
+                        let mut body_instrs = Vec::new();
+                        collect_instrs(body, &mut body_instrs);
+                        for instr in &body_instrs {
+                            if let WasmInstr::LocalSet(idx) | WasmInstr::LocalTee(idx) = instr {
+                                let i = *idx as usize;
+                                if i < self.locals.len() && is_empty_collection_val(&self.locals[i])
+                                {
+                                    cov_mark::hit!(lost_collection_loop_overwrite);
+                                    self.locals[i] = StackVal::Unknown;
+                                }
+                            }
+                        }
+                    }
+
                     // Apply register-rotation propagation: after a 2-iteration
                     // copy loop, local[TARGET] = local[SOURCE] (pre-loop value).
                     if let Some((target, source)) = rotation
@@ -7218,6 +7248,58 @@ fn lift_inline_call(
         return_expr = Some(elems[0].clone());
     }
 
+    // Issue #36: an extracted empty-collection value (`Map::new`/`Vec::new`/
+    // `Bytes::new`) that is one arm of an unmodeled phi — canonically
+    // `get(&key).unwrap_or_else(|| vec![...])`, where the default arm wins the
+    // single-value extraction while the loaded value escapes another way.
+    // Cloning the empty constructor into every caller use site is silent-wrong
+    // (it compiles, so the soundness ratchet can't see it); retreat to the
+    // honest hole. Two proofs of divergence:
+    //   1. Another return path carries a different value (a nested
+    //      `Return(Some(≠))`, or a `Return(None)` — an exit whose value could
+    //      not be captured).
+    //   2. The helper reaches `get_contract_data`: the collection may be the
+    //      storage-loaded one via a local-phi + br join, which leaves no
+    //      nested Return behind (branch-sequential lift makes the fall-through
+    //      default constructor the local's last write).
+    // All-paths-agree empty constructions in storage-free helpers are
+    // untouched.
+    // The empty constructor may hide behind a `let var_N = Map::new(&env)`
+    // materialisation (the returned expr is then `Local(N)`); resolve one
+    // level through the inlined Lets for gate evaluation. A local that is
+    // later re-assigned (`Assign var_N = …`) was properly phi-materialised
+    // and is NOT stale — skip those.
+    let gate_value = match &return_expr {
+        Some(SorobanExpr::Local(idx)) => {
+            let name = format!("var_{}", idx);
+            let reassigned = ctx
+                .stmts
+                .iter()
+                .any(|s| matches!(s, SorobanStmt::Assign { target, .. } if *target == name));
+            if reassigned {
+                None
+            } else {
+                Some(resolve_locals_in_expr(SorobanExpr::Local(*idx), &ctx.stmts))
+            }
+        }
+        Some(other) => Some(other.clone()),
+        None => None,
+    };
+    if let Some(ret) = &gate_value
+        && matches!(ret, SorobanExpr::CollectionNew(_))
+        && (has_divergent_nested_return(&ctx.stmts, ret)
+            || func_reaches_host(
+                wasm_module,
+                target_idx,
+                HostModule::Ledger,
+                "get_contract_data",
+                0,
+            ))
+    {
+        cov_mark::hit!(lost_collection_multipath_return);
+        return_expr = None;
+    }
+
     // Convert Return→Break inside Loop bodies of inlined content. Returns in
     // loop bodies cause the optimizer's dead-code removal to treat the Loop as
     // a terminator, stripping subsequent statements from the parent function.
@@ -7229,6 +7311,33 @@ fn lift_inline_call(
         memory_stores: ctx.memory_stores,
         stack_result: None,
     }
+}
+
+/// Recursively scan inlined statements for a return path whose value differs
+/// from `expected`: a `Return(Some(expr))` with a different expression, or a
+/// `Return(None)` (an exit whose value could not be captured). Used by
+/// [`lift_inline_call`] to detect multi-path helper returns that its
+/// single-value extraction cannot faithfully represent (issue #36).
+fn has_divergent_nested_return(stmts: &[SorobanStmt], expected: &SorobanExpr) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        SorobanStmt::Return(Some(expr)) => expr != expected,
+        SorobanStmt::Return(None) => true,
+        SorobanStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            has_divergent_nested_return(then_body, expected)
+                || has_divergent_nested_return(else_body, expected)
+        }
+        SorobanStmt::Match { arms, .. } => arms
+            .iter()
+            .any(|arm| has_divergent_nested_return(&arm.body, expected)),
+        SorobanStmt::Loop { body } | SorobanStmt::For { body, .. } | SorobanStmt::Block(body) => {
+            has_divergent_nested_return(body, expected)
+        }
+        _ => false,
+    })
 }
 
 /// Resolve `Local(N)` references in an expression by looking up the corresponding
@@ -12006,6 +12115,18 @@ fn is_weak_local(val: &StackVal) -> bool {
 /// changed across a branch.
 #[allow(dead_code)]
 type LocalSnapshot = Vec<StackVal>;
+
+/// Returns true when a tracked value is the raw result of an empty-collection
+/// constructor host call (`map_new`/`vec_new`/`bytes_new`). Used by the loop
+/// handler to invalidate such defs when a loop body overwrites the local
+/// (issue #36): keeping the pre-loop empty constructor across a mutation chain
+/// fabricates an empty `Map`/`Vec` at every post-loop use site.
+fn is_empty_collection_val(val: &StackVal) -> bool {
+    matches!(
+        val,
+        StackVal::HostCallResult(expr) if matches!(expr.as_ref(), SorobanExpr::CollectionNew(_))
+    )
+}
 
 /// Returns true for StackVal variants that carry meaningful semantic content
 /// worth preserving across branches via phi-merge. Raw constants (I32, I64)
