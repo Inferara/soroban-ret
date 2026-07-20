@@ -17,7 +17,7 @@
     {
       "file": "aqua-rewards-CCY2PXGM.wasm",
       "entity": "Aqua Rewards",
-      "restoration_pct": 92.0,
+      "restoration_pct": 92.1,
       "spec_functions": 76,
       "fn_clean": 19,
       "fn_partial": 57,
@@ -197,24 +197,24 @@
     {
       "file": "reflector-CAFJZQWS.wasm",
       "entity": "Reflector",
-      "restoration_pct": 94.1,
+      "restoration_pct": 94.2,
       "spec_functions": 23,
       "fn_clean": 14,
       "fn_partial": 9,
       "fn_logic_lost": 0,
-      "artifacts_total": 73,
+      "artifacts_total": 71,
       "wasm_size": 19418,
       "error": null
     },
     {
       "file": "reflector-CALI2BYU.wasm",
       "entity": "Reflector",
-      "restoration_pct": 94.1,
+      "restoration_pct": 94.2,
       "spec_functions": 23,
       "fn_clean": 14,
       "fn_partial": 9,
       "fn_logic_lost": 0,
-      "artifacts_total": 73,
+      "artifacts_total": 71,
       "wasm_size": 19418,
       "error": null
     },

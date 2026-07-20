@@ -147,7 +147,14 @@ use std::process::Command;
 /// reflector's `config.history_retention_period` set-value and a `fee_config
 /// .len()` binding (−3 net); surfaces 2 previously-dropped honest husk
 /// statements (+3 `todo!()`, corpus 1357→1360 — completeness, not loss).
-const ERROR_CEILING: u32 = 1124;
+/// → 1120 (issue #34 tranche 2, −4). Defaulting-u128-getter recovery
+/// (`detect_defaulting_u128_getter` + append-only seed →
+/// `get::<_, u128>(&key).unwrap_or(0)`, aqua `TokenShare`), pure TryFromVal
+/// decode-helper payload seeding (`detect_tryfromval_decode_helper`,
+/// u64/u128/i128 classes, disc stays honest), and reference-wrapping
+/// `HostCallResult` purity — reflector ×2 resolve a lost `&todo!()` storage
+/// key to its real `var_3_2` binding (−2 todos each; corpus 1360→1356).
+const ERROR_CEILING: u32 = 1120;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

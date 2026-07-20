@@ -203,6 +203,18 @@ fn generate_expr_prec(expr: &SorobanExpr, parent_prec: u8, is_right: bool) -> To
 ///
 /// Operators get outer parentheses (safe for any context: function args, `&expr`, etc.).
 /// Inner sub-expressions use precedence-aware parenthesization to avoid redundant nesting.
+/// Whether a `StorageGet.on_missing` expression is an error (renders
+/// `.ok_or(err)`) as opposed to a plain default value (renders
+/// `.unwrap_or(default)`). The fallible-get recovery always stores a
+/// `ContractError` (possibly behind `ErrorFromCode`); the defaulting-getter
+/// recovery stores the default literal.
+fn is_contract_error_expr(e: &SorobanExpr) -> bool {
+    matches!(
+        e,
+        SorobanExpr::ContractError { .. } | SorobanExpr::ErrorFromCode(_)
+    )
+}
+
 pub fn generate_expr(expr: &SorobanExpr) -> TokenStream {
     generate_expr_prec(expr, u8::MAX, false)
 }
@@ -304,9 +316,15 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
         } => {
             let key = generate_expr(key);
             let storage = storage_method(*storage_type);
-            if let Some(err) = on_missing {
-                let err = generate_expr(err);
-                quote! { env.storage().#storage().get(&#key).ok_or(#err) }
+            if let Some(miss) = on_missing {
+                let miss_expr = generate_expr(miss);
+                if is_contract_error_expr(miss) {
+                    quote! { env.storage().#storage().get(&#key).ok_or(#miss_expr) }
+                } else {
+                    // A recovered defaulting getter: the missing-key path
+                    // yields a plain default value, not an error.
+                    quote! { env.storage().#storage().get(&#key).unwrap_or(#miss_expr) }
+                }
             } else if *unwrap {
                 quote! { env.storage().#storage().get(&#key).unwrap() }
             } else {
@@ -748,11 +766,15 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 let key = generate_expr(key);
                 let storage = storage_method(*storage_type);
                 let ty: syn::Type = syn::parse_str(target_type).expect("checked by guard");
-                if let Some(err) = on_missing {
+                if let Some(miss) = on_missing {
                     // Recovered fallible get: the turbofish pins the value type the
-                    // `.ok_or(..)` return can't infer on its own (Address/UDT).
-                    let err = generate_expr(err);
-                    quote! { env.storage().#storage().get::<_, #ty>(&#key).ok_or(#err) }
+                    // `.ok_or(..)` / `.unwrap_or(..)` return can't infer on its own.
+                    let miss_expr = generate_expr(miss);
+                    if is_contract_error_expr(miss) {
+                        quote! { env.storage().#storage().get::<_, #ty>(&#key).ok_or(#miss_expr) }
+                    } else {
+                        quote! { env.storage().#storage().get::<_, #ty>(&#key).unwrap_or(#miss_expr) }
+                    }
                 } else if *unwrap {
                     quote! { env.storage().#storage().get::<_, #ty>(&#key).unwrap() }
                 } else {
@@ -3239,5 +3261,40 @@ mod generate_stmt_tests {
         assert!(out.contains("Tag :: VecObject"), "got: {out}");
         assert!(out.contains("!="), "got: {out}");
         assert!(!out.contains("todo !"), "got: {out}");
+    }
+
+    #[test]
+    fn on_missing_renders_ok_or_for_errors_and_unwrap_or_for_defaults() {
+        // The fallible-get recovery stores a ContractError → `.ok_or(err)`;
+        // the defaulting-getter recovery stores the default → `.unwrap_or(d)`.
+        let get = |miss: SorobanExpr| SorobanExpr::StorageGet {
+            storage_type: crate::ir::soroban_ir::StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral("K".to_string())),
+            unwrap: false,
+            on_missing: Some(Box::new(miss)),
+        };
+        let err_out = generate_expr(&get(SorobanExpr::ContractError {
+            error_code: 7,
+            error_type: Some("Error".to_string()),
+            variant_name: Some("Missing".to_string()),
+        }))
+        .to_string();
+        assert!(err_out.contains("ok_or"), "got: {err_out}");
+        assert!(!err_out.contains("unwrap_or"), "got: {err_out}");
+
+        let default_out = generate_expr(&get(SorobanExpr::U128Literal(0))).to_string();
+        assert!(default_out.contains("unwrap_or"), "got: {default_out}");
+        assert!(!default_out.contains("ok_or"), "got: {default_out}");
+
+        // The turbofish vehicle keeps the same split.
+        let cast = SorobanExpr::CastAs {
+            value: Box::new(get(SorobanExpr::U128Literal(0))),
+            target_type: "u128".to_string(),
+        };
+        let cast_out = generate_expr(&cast).to_string();
+        assert!(
+            cast_out.contains("get :: < _ , u128 >") && cast_out.contains("unwrap_or"),
+            "got: {cast_out}"
+        );
     }
 }

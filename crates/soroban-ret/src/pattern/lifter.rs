@@ -1605,6 +1605,160 @@ impl<'a> LiftContext<'a> {
         cov_mark::hit!(option_decode_value_linked);
     }
 
+    /// Seed the out slots of a recognized defaulting-u128 getter (issue #34
+    /// tranche 2): a void has+get helper that writes the decoded u128 as
+    /// `[lo@0, hi@8]` with 0 for both limbs when the key is missing — the SDK
+    /// shape of `get::<_, u128>(&key).unwrap_or(0)` (an accumulator read).
+    /// The helper's internal tag-split join collapsed both limb stores to
+    /// `Unknown`; instead of modeling the joins, rewrite the unique inlined
+    /// get into the faithful defaulting form bound to a `let var_N`, and seed
+    /// BOTH limb slots as that binding's `I128Limb` halves so the existing
+    /// (lo, hi) re-pair machinery reconstructs `var_N` at every consumer.
+    ///
+    /// The caller must have proven the helper class first
+    /// ([`detect_defaulting_u128_getter`]); this method adds the state gates:
+    /// both limb slots still unmodeled, and EXACTLY ONE top-level storage get
+    /// with a recovered key among the inlined statements. Any failure →
+    /// byte-identical output. Returns whether the slots were seeded.
+    fn seed_defaulting_u128_getter(
+        &mut self,
+        id: u32,
+        base: i32,
+        stmts: &mut Vec<SorobanStmt>,
+    ) -> bool {
+        // NOTE: no "slot still unmodeled" gate here, deliberately. The inline
+        // of this very call just wrote both slots, and its branch-sequential
+        // simulation of the helper's internal default/decode split leaves
+        // MISMATCHED halves (e.g. the literal-0 default at `+0` beside the
+        // decoded hi limb at `+8`) that can never re-pair. The detector proved
+        // the helper's semantic — both slots are exactly the limbs of
+        // `get(..).unwrap_or(0)` — so replacing the simulation artifacts with
+        // that proven value is strictly more faithful.
+        let Some(protocol) = collect_getter_protocol(stmts) else {
+            return false;
+        };
+        let (storage_type, key) = protocol.get;
+        // Resolve a local-variable key through the husk's own binding.
+        let key = match &key {
+            SorobanExpr::Local(n) => {
+                let name = format!("var_{n}");
+                match unique_binding_value(&protocol.bindings, &name) {
+                    Some(v) => v,
+                    None => return false,
+                }
+            }
+            SorobanExpr::NamedLocal(name) => match unique_binding_value(&protocol.bindings, name) {
+                Some(v) => v,
+                None => return false,
+            },
+            SorobanExpr::UnknownVal => return false,
+            k => k.clone(),
+        };
+        if expr_contains_unknown(&key) {
+            return false;
+        }
+        // APPEND the faithful defaulting get as a fresh binding, leaving the
+        // husk statements untouched. Removing/rewriting them regresses output:
+        // several downstream passes key off the husk's exact shape (return-tail
+        // extraction of a trailing get, `resolve_unknown_key_field_access`'s
+        // binding scan, husk folds). The appended read duplicates the husk's
+        // own adjacent read of the SAME key with no store in between (the
+        // protocol walk proved the husk contains no writes), so it observes
+        // the same value; if no consumer resolves to the binding, dead-store
+        // and orphan-call passes clean it up.
+        let var_idx = self.locals.len() as u32;
+        self.locals.push(StackVal::LetBinding(var_idx));
+        stmts.push(SorobanStmt::Let {
+            name: format!("var_{var_idx}"),
+            mutable: false,
+            value: SorobanExpr::CastAs {
+                value: Box::new(SorobanExpr::StorageGet {
+                    storage_type,
+                    key: Box::new(key),
+                    unwrap: false,
+                    on_missing: Some(Box::new(SorobanExpr::U128Literal(0))),
+                }),
+                target_type: "u128".to_string(),
+            },
+        });
+        let limb_source = StackVal::LetBinding(var_idx);
+        let mut slots = self.frame_slots.borrow_mut();
+        slots.insert(
+            (id, base),
+            StackVal::I128Limb {
+                value: Box::new(limb_source.clone()),
+                hi: false,
+            },
+        );
+        slots.insert(
+            (id, base + 8),
+            StackVal::I128Limb {
+                value: Box::new(limb_source),
+                hi: true,
+            },
+        );
+        cov_mark::hit!(defaulting_u128_getter_seeded);
+        true
+    }
+
+    /// Seed the payload slots of a proven `TryFromVal` decode helper (issue
+    /// #34 tranche 2) with the conversion of its operand. The helper's
+    /// small/object tag split collapsed the payload stores at the lifter's
+    /// joins, but [`detect_tryfromval_decode_helper`] proved the payload slots
+    /// hold exactly `decode(operand)` — so consumers (limb re-pairs, scalar
+    /// reads) resolve to the operand's conversion instead of `todo!()`. The
+    /// operand must be pure (a parameter or binding reference) so re-reading
+    /// it at a consumer duplicates no effect. The discriminant slot is
+    /// path-dependent and stays untouched (honest).
+    fn seed_decode_helper_result(
+        &mut self,
+        id: u32,
+        base: i32,
+        class: DecodeHelperClass,
+        operand: &StackVal,
+    ) {
+        if !stack_val_is_pure(operand) {
+            return;
+        }
+        let target = match class {
+            DecodeHelperClass::U64 => "u64",
+            DecodeHelperClass::U128 => "u128",
+            DecodeHelperClass::I128 => "i128",
+        };
+        let conv = StackVal::HostCallResult(Box::new(SorobanExpr::ValConvert {
+            value: Box::new(stack_val_to_expr(
+                operand,
+                self.params,
+                self.registry,
+                Some(&self.frame_slots.borrow()),
+            )),
+            target_type: target.to_string(),
+        }));
+        let mut slots = self.frame_slots.borrow_mut();
+        match class {
+            DecodeHelperClass::U64 => {
+                slots.insert((id, base + 8), conv);
+            }
+            DecodeHelperClass::U128 | DecodeHelperClass::I128 => {
+                slots.insert(
+                    (id, base + 16),
+                    StackVal::I128Limb {
+                        value: Box::new(conv.clone()),
+                        hi: false,
+                    },
+                );
+                slots.insert(
+                    (id, base + 24),
+                    StackVal::I128Limb {
+                        value: Box::new(conv),
+                        hi: true,
+                    },
+                );
+            }
+        }
+        cov_mark::hit!(decode_helper_result_seeded);
+    }
+
     /// Find the loop-carried locals of a structured loop body: body-local locals
     /// (idx >= num_wasm_params) whose value flows across the back edge — i.e.
     /// their post-body abstract value transitively references their own loop-head
@@ -2988,6 +3142,11 @@ impl<'a> LiftContext<'a> {
                             } else {
                                 None
                             };
+                            // The 2nd argument of a void out-pointer helper is
+                            // the operand a pure decode helper converts —
+                            // captured before `args` moves into the inline
+                            // (issue #34 t2, `seed_decode_helper_result`).
+                            let decode_operand = args.get(1).cloned();
                             let mut inline_result = lift_inline_call(
                                 self.wasm_module,
                                 self.registry,
@@ -3063,11 +3222,38 @@ impl<'a> LiftContext<'a> {
                                 // …then the success-status seed (br_if-guard pattern),
                                 // which only fires when the slot is still unmodeled…
                                 self.seed_sret_success_status(id, base, *target_idx);
+                                // …then the defaulting-u128-getter seed (issue #34
+                                // tranche 2): its `[lo@0, hi@8]` layout has NO
+                                // discriminant, so it must be recognized BEFORE
+                                // the option-decode seed would stamp `+0` with a
+                                // disc marker that is really the lo limb.
+                                let defaulting_seeded =
+                                    detect_defaulting_u128_getter(self.wasm_module, *target_idx)
+                                        && match inline_result.content.as_mut() {
+                                            Some((inlined_stmts, _)) => self
+                                                .seed_defaulting_u128_getter(
+                                                    id,
+                                                    base,
+                                                    inlined_stmts,
+                                                ),
+                                            None => false,
+                                        };
+                                // …then the pure TryFromVal decode-helper seed
+                                // (issue #34 t2): payload slots = decode(operand).
+                                if !defaulting_seeded
+                                    && let Some(class) = detect_tryfromval_decode_helper(
+                                        self.wasm_module,
+                                        *target_idx,
+                                    )
+                                    && let Some(operand) = decode_operand.as_ref()
+                                {
+                                    self.seed_decode_helper_result(id, base, class, operand);
+                                }
                                 // …then the storage-decode Option seed (issue #35),
                                 // for the fallible has+get wrapper class (again only
                                 // when the slot is still unmodeled).
-                                let option_seeded =
-                                    self.seed_option_decode_status(id, base, *target_idx);
+                                let option_seeded = !defaulting_seeded
+                                    && self.seed_option_decode_status(id, base, *target_idx);
                                 // A freshly-recognized option-decode wrapper also
                                 // left the loaded value at `+8` — link it to the
                                 // inlined get's binding (issue #34 slice).
@@ -11109,6 +11295,306 @@ fn fallible_get_const_key(
     None
 }
 
+/// The dissected body of a recognized getter-protocol husk: the single
+/// storage get, the local key bindings that feed it, and the real TTL side
+/// effects to preserve. See [`collect_getter_protocol`].
+struct GetterProtocol {
+    get: (StorageType, SorobanExpr),
+    bindings: Vec<(String, SorobanExpr)>,
+}
+
+/// Dissect an inlined helper body that is EXACTLY a storage-getter protocol:
+/// TTL extensions, pure key-construction bindings, `has` guards, decode
+/// tag-guards (bare `Panic`), and ONE storage get — nothing else. Any other
+/// statement or expression (a set, an event, an auth, an invoke, a second
+/// get, a get hiding inside a condition) makes the whole dissection fail, so
+/// the caller can only replace husks whose every statement is accounted for.
+fn collect_getter_protocol(stmts: &[SorobanStmt]) -> Option<GetterProtocol> {
+    let mut gets: Vec<(StorageType, SorobanExpr)> = Vec::new();
+    let mut bindings: Vec<(String, SorobanExpr)> = Vec::new();
+    if !walk_getter_protocol(stmts, &mut gets, &mut bindings) {
+        return None;
+    }
+    let [(storage_type, key)] = gets.as_slice() else {
+        return None; // zero or several gets → not this protocol
+    };
+    Some(GetterProtocol {
+        get: (*storage_type, key.clone()),
+        bindings,
+    })
+}
+
+fn walk_getter_protocol(
+    stmts: &[SorobanStmt],
+    gets: &mut Vec<(StorageType, SorobanExpr)>,
+    bindings: &mut Vec<(String, SorobanExpr)>,
+) -> bool {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(e) => match e {
+                SorobanExpr::ExtendInstanceAndCodeTtl { .. }
+                | SorobanExpr::StorageExtendTtl { .. } => {}
+                SorobanExpr::StorageGet {
+                    storage_type, key, ..
+                } => gets.push((*storage_type, (**key).clone())),
+                SorobanExpr::StorageHas { .. }
+                | SorobanExpr::Panic
+                | SorobanExpr::UnknownVal
+                | SorobanExpr::Void => {}
+                _ => return false,
+            },
+            SorobanStmt::Let { name, value, .. } => match value {
+                SorobanExpr::StorageGet {
+                    storage_type, key, ..
+                } => gets.push((*storage_type, (**key).clone())),
+                v if protocol_key_value(v) => bindings.push((name.clone(), v.clone())),
+                _ => return false,
+            },
+            SorobanStmt::Assign { value, .. } => {
+                if !protocol_key_value(value) {
+                    return false;
+                }
+            }
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                if !protocol_guard_cond(condition)
+                    || !walk_getter_protocol(then_body, gets, bindings)
+                    || !walk_getter_protocol(else_body, gets, bindings)
+                {
+                    return false;
+                }
+            }
+            SorobanStmt::Block(body) => {
+                if !walk_getter_protocol(body, gets, bindings) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// A value a getter protocol may bind to a local: key material (symbols,
+/// literals, vec/enum construction over key material) or the simulation's own
+/// placeholders. NEVER a storage/host operation — those must surface at
+/// statement level where the walker accounts for them.
+fn protocol_key_value(e: &SorobanExpr) -> bool {
+    match e {
+        SorobanExpr::SymbolLiteral(_)
+        | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::U32Literal(_)
+        | SorobanExpr::I32Literal(_)
+        | SorobanExpr::U64Literal(_)
+        | SorobanExpr::I64Literal(_)
+        | SorobanExpr::U128Literal(_)
+        | SorobanExpr::I128Literal(_)
+        | SorobanExpr::BoolLiteral(_)
+        | SorobanExpr::Param(_)
+        | SorobanExpr::Local(_)
+        | SorobanExpr::NamedLocal(_)
+        | SorobanExpr::UnknownVal
+        | SorobanExpr::Void => true,
+        SorobanExpr::VecConstruct(items) => items.iter().all(protocol_key_value),
+        SorobanExpr::EnumConstruct { fields, .. } => fields.iter().all(protocol_key_value),
+        _ => false,
+    }
+}
+
+/// A condition a getter protocol's guard may test: `has` checks, tag reads,
+/// and boolean/comparison structure over those and key material. A
+/// `StorageGet` anywhere in a condition fails the walk — the value read there
+/// would be lost by the husk replacement.
+fn protocol_guard_cond(e: &SorobanExpr) -> bool {
+    match e {
+        SorobanExpr::StorageHas { .. } => true,
+        SorobanExpr::ValTag(inner) => protocol_guard_cond(inner),
+        SorobanExpr::Not(a) => protocol_guard_cond(a),
+        SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b)
+        | SorobanExpr::And(a, b)
+        | SorobanExpr::Or(a, b) => protocol_guard_cond(a) && protocol_guard_cond(b),
+        other => protocol_key_value(other),
+    }
+}
+
+/// The unique meaningful value bound to `name` in a protocol husk, skipping
+/// the simulation's `UnknownVal` placeholder inits and bare local echoes.
+/// Duplicated identical bindings collapse; two DIFFERENT meaningful values →
+/// `None` (ambiguous — stay honest).
+fn unique_binding_value(bindings: &[(String, SorobanExpr)], name: &str) -> Option<SorobanExpr> {
+    let mut found: Option<SorobanExpr> = None;
+    for (n, v) in bindings {
+        if n != name
+            || matches!(
+                v,
+                SorobanExpr::UnknownVal
+                    | SorobanExpr::Void
+                    | SorobanExpr::Local(_)
+                    | SorobanExpr::NamedLocal(_)
+            )
+        {
+            continue;
+        }
+        match &found {
+            Some(prev) if prev != v => return None,
+            _ => found = Some(v.clone()),
+        }
+    }
+    found
+}
+
+/// The scalar type a pure `TryFromVal` decode helper produces. See
+/// [`detect_tryfromval_decode_helper`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeHelperClass {
+    U64,
+    U128,
+    I128,
+}
+
+/// Recognize a pure `TryFromVal` scalar-decode helper (issue #34 tranche 2):
+/// a void `(out_ptr: i32, val: i64)` function that converts its Val operand
+/// into a scalar and writes a `Result`-shaped struct — `[disc@0, val@8]`
+/// (u64) or `[disc@0, err@8, lo@16, hi@24]` (u128/i128) — with NO other
+/// effects (no storage access, no cross-contract call, no struct unpack).
+/// The small/object tag split inside collapses the payload stores at the
+/// lifter's joins, but the semantic is total on the payload slots: they hold
+/// exactly the decoded operand. The discriminant is path-dependent and is
+/// NOT covered — it stays whatever the lift left (honest).
+fn detect_tryfromval_decode_helper(
+    module: &WasmModule,
+    func_idx: u32,
+) -> Option<DecodeHelperClass> {
+    use crate::wasm::ir::{WasmInstr, WasmType};
+    let func_type = module.get_func_type(func_idx)?;
+    if !func_type.results.is_empty()
+        || func_type.params.as_slice() != [WasmType::I32, WasmType::I64]
+    {
+        return None;
+    }
+    if function_calls_module_in_chain(module, func_idx, HostModule::Ledger, 3)
+        || function_calls_module_in_chain(module, func_idx, HostModule::Call, 3)
+        || function_calls_host_in_chain(
+            module,
+            func_idx,
+            HostModule::Map,
+            "map_unpack_to_linear_memory",
+            3,
+        )
+        || function_calls_host_in_chain(
+            module,
+            func_idx,
+            HostModule::Vec,
+            "vec_unpack_to_linear_memory",
+            3,
+        )
+    {
+        return None;
+    }
+    let int = |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Int, name, 3);
+    let func = module.get_function(func_idx)?;
+    let has_store = |off: u32| {
+        func.body
+            .iter()
+            .any(|i| matches!(i, WasmInstr::I64Store(o) if *o == off))
+    };
+    let u64_decode = int("obj_to_u64");
+    let u128_decode = int("obj_to_u128_hi64") && int("obj_to_u128_lo64");
+    let i128_decode = int("obj_to_i128_hi64") && int("obj_to_i128_lo64");
+    let i64_decode = int("obj_to_i64");
+    match (u64_decode, u128_decode, i128_decode, i64_decode) {
+        (false, true, false, false) if has_store(16) && has_store(24) => {
+            Some(DecodeHelperClass::U128)
+        }
+        (false, false, true, false) if has_store(16) && has_store(24) => {
+            Some(DecodeHelperClass::I128)
+        }
+        (true, false, false, false) if has_store(0) && has_store(8) => Some(DecodeHelperClass::U64),
+        _ => None,
+    }
+}
+
+/// Recognize a "defaulting u128 storage getter" (issue #34 tranche 2): a void
+/// helper taking only an I32 out-pointer that reads storage fallibly and
+/// writes the decoded u128 as `[lo@0, hi@8]`, yielding 0 for BOTH limbs when
+/// the key is missing — the SDK lowering of
+/// `env.storage().<dur>().get::<_, u128>(&key).unwrap_or(0)` (an accumulator
+/// read: aqua's `TotalAccumulatedReward` et al.). Proven from bytecode:
+/// - void, exactly one I32 param (the out-pointer);
+/// - chains BOTH `has_contract_data` and `get_contract_data`, never
+///   `put_contract_data`, and makes no cross-contract call;
+/// - decodes u128 and ONLY u128 (both `obj_to_u128_hi64` + `obj_to_u128_lo64`
+///   reachable; no u64/i64/i128 decode anywhere in the chain);
+/// - pushes the literal-0 default as the first value of an I64-valued block
+///   (the `[Block(result i64), I64Const(0)]` window) — the missing-key lo
+///   limb (the hi limb's default is the zero-initialized local);
+/// - writes both out slots (an `I64Store(0)` and an `I64Store(8)` present).
+///
+/// Any deviation → `false` → the caller leaves today's output byte-identical.
+fn detect_defaulting_u128_getter(module: &WasmModule, func_idx: u32) -> bool {
+    use crate::wasm::ir::{BlockType, WasmInstr, WasmType};
+    let Some(func_type) = module.get_func_type(func_idx) else {
+        return false;
+    };
+    if !func_type.results.is_empty() || func_type.params.as_slice() != [WasmType::I32] {
+        return false;
+    }
+    let ledger =
+        |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Ledger, name, 3);
+    if !ledger("get_contract_data") || !ledger("has_contract_data") || ledger("put_contract_data") {
+        return false;
+    }
+    if function_calls_module_in_chain(module, func_idx, HostModule::Call, 3) {
+        return false;
+    }
+    let int = |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Int, name, 3);
+    if !int("obj_to_u128_hi64") || !int("obj_to_u128_lo64") {
+        return false;
+    }
+    if [
+        "obj_to_u64",
+        "obj_to_i64",
+        "obj_to_i128_hi64",
+        "obj_to_i128_lo64",
+    ]
+    .iter()
+    .any(|n| int(n))
+    {
+        return false;
+    }
+    let Some(func) = module.get_function(func_idx) else {
+        return false;
+    };
+    let has_default_block = func.body.windows(2).any(|w| {
+        matches!(
+            w,
+            [
+                WasmInstr::Block {
+                    block_type: BlockType::Value(WasmType::I64)
+                },
+                WasmInstr::I64Const(0)
+            ]
+        )
+    });
+    let has_lo_store = func
+        .body
+        .iter()
+        .any(|i| matches!(i, WasmInstr::I64Store(0)));
+    let has_hi_store = func
+        .body
+        .iter()
+        .any(|i| matches!(i, WasmInstr::I64Store(8)));
+    has_default_block && has_lo_store && has_hi_store
+}
+
 /// True if `func_idx` (transitively, depth ≤ 3) reaches a helper that performs
 /// real integer arithmetic — `mul`+`div`, or repeated `mul` — i.e. the gas math
 /// of a "computed" getter, as opposed to a plain `get → re-encode` direct getter.
@@ -11900,9 +12386,13 @@ fn stack_val_is_pure(v: &StackVal) -> bool {
         }
         StackVal::Eqz(a) => stack_val_is_pure(a),
         StackVal::I128Limb { value, .. } => stack_val_is_pure(value),
-        StackVal::HostCallResult(e) => {
-            matches!(e.as_ref(), SorobanExpr::ValConvert { value, .. } if expr_is_pure_source(value))
-        }
+        StackVal::HostCallResult(e) => match e.as_ref() {
+            SorobanExpr::ValConvert { value, .. } => expr_is_pure_source(value),
+            // A bare reference the value-link seeds wrap (`var_N` from
+            // `link_option_decode_value`) — re-reading a binding is free.
+            SorobanExpr::NamedLocal(_) | SorobanExpr::Local(_) | SorobanExpr::Param(_) => true,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -15783,6 +16273,304 @@ mod tests {
 
     fn empty_lift_module() -> WasmModule {
         WasmModule::parse(b"\0asm\x01\x00\x00\x00").expect("empty WASM parses")
+    }
+
+    /// Fixture for the issue-#34 tranche-2 detectors. Imports: 0=has, 1=get
+    /// (ledger), 2=obj_to_u128_hi64, 3=obj_to_u128_lo64, 4=obj_to_u64,
+    /// 5=put. Functions: 6 = defaulting u128 getter `[lo@0, hi@8]`;
+    /// 7 = pure u128 TryFromVal decode `[disc@0, err@8, lo@16, hi@24]`;
+    /// 8 = pure u64 TryFromVal decode `[disc@0, val@8]`; 9 = a getter that
+    /// ALSO puts (negative); 10 = a decode of BOTH widths (negative).
+    fn tranche2_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "l" "0" (func (param i64 i64) (result i64)))
+                (import "l" "1" (func (param i64 i64) (result i64)))
+                (import "i" "5" (func (param i64) (result i64)))
+                (import "i" "4" (func (param i64) (result i64)))
+                (import "i" "0" (func (param i64) (result i64)))
+                (import "l" "_" (func (param i64 i64 i64) (result i64)))
+                (func (param i32)                                   ;; 6
+                    (local i64 i64)
+                    local.get 0
+                    block (result i64)
+                        i64.const 0
+                        i64.const 100 i64.const 2 call 0
+                        i32.wrap_i64 i32.eqz br_if 0
+                        drop
+                        i64.const 100 i64.const 2 call 1
+                        local.tee 1
+                        call 2 local.set 2
+                        local.get 1 call 3
+                    end
+                    i64.store
+                    local.get 0 local.get 2 i64.store offset=8)
+                (func (param i32 i64)                               ;; 7
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 call 2 i64.store offset=24
+                    local.get 0 local.get 1 call 3 i64.store offset=16)
+                (func (param i32 i64)                               ;; 8
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 call 4 i64.store offset=8)
+                (func (param i32)                                   ;; 9
+                    (local i64 i64)
+                    local.get 0
+                    block (result i64)
+                        i64.const 0
+                        i64.const 100 i64.const 2 call 0
+                        i32.wrap_i64 i32.eqz br_if 0
+                        drop
+                        i64.const 100 i64.const 2 call 1
+                        local.tee 1
+                        call 2 local.set 2
+                        local.get 1 call 3
+                    end
+                    i64.store
+                    local.get 0 local.get 2 i64.store offset=8
+                    i64.const 100 i64.const 0 i64.const 2 call 5 drop)
+                (func (param i32 i64)                               ;; 10
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 call 2 i64.store offset=24
+                    local.get 0 local.get 1 call 3 i64.store offset=16
+                    local.get 0 local.get 1 call 4 i64.store offset=8)
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn detect_defaulting_u128_getter_classifies() {
+        let m = tranche2_module();
+        assert!(detect_defaulting_u128_getter(&m, 6), "the getter matches");
+        assert!(
+            !detect_defaulting_u128_getter(&m, 9),
+            "a getter that also puts is excluded"
+        );
+        assert!(
+            !detect_defaulting_u128_getter(&m, 7),
+            "a pure decode (2 params, no storage) is not a getter"
+        );
+    }
+
+    #[test]
+    fn detect_tryfromval_decode_helper_classifies() {
+        let m = tranche2_module();
+        assert_eq!(
+            detect_tryfromval_decode_helper(&m, 7),
+            Some(DecodeHelperClass::U128)
+        );
+        assert_eq!(
+            detect_tryfromval_decode_helper(&m, 8),
+            Some(DecodeHelperClass::U64)
+        );
+        assert_eq!(
+            detect_tryfromval_decode_helper(&m, 6),
+            None,
+            "storage access excludes the defaulting getter"
+        );
+        assert_eq!(
+            detect_tryfromval_decode_helper(&m, 10),
+            None,
+            "mixed-width decode is ambiguous"
+        );
+    }
+
+    #[test]
+    fn getter_protocol_walk_accepts_husk_and_rejects_writes() {
+        let key_vec =
+            SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral("TokenShare".to_string())]);
+        let get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::Local(6)),
+            unwrap: true,
+            on_missing: None,
+        };
+        let husk = |tail: Vec<SorobanStmt>| {
+            let mut v = vec![
+                SorobanStmt::Expr(SorobanExpr::ExtendInstanceAndCodeTtl {
+                    threshold: Box::new(SorobanExpr::U32Literal(1)),
+                    extend_to: Box::new(SorobanExpr::U32Literal(2)),
+                }),
+                SorobanStmt::Let {
+                    name: "var_6".to_string(),
+                    mutable: true,
+                    value: SorobanExpr::UnknownVal,
+                },
+                SorobanStmt::Let {
+                    name: "var_6".to_string(),
+                    mutable: false,
+                    value: key_vec.clone(),
+                },
+                SorobanStmt::Expr(SorobanExpr::StorageHas {
+                    storage_type: StorageType::Instance,
+                    key: Box::new(SorobanExpr::Local(6)),
+                }),
+                SorobanStmt::If {
+                    condition: SorobanExpr::Eq(
+                        Box::new(SorobanExpr::StorageHas {
+                            storage_type: StorageType::Instance,
+                            key: Box::new(SorobanExpr::Local(6)),
+                        }),
+                        Box::new(SorobanExpr::I64Literal(1)),
+                    ),
+                    then_body: vec![
+                        SorobanStmt::Expr(get.clone()),
+                        SorobanStmt::If {
+                            condition: SorobanExpr::Ne(
+                                Box::new(SorobanExpr::UnknownVal),
+                                Box::new(SorobanExpr::I32Literal(68)),
+                            ),
+                            then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+                            else_body: vec![],
+                        },
+                    ],
+                    else_body: vec![],
+                },
+            ];
+            v.extend(tail);
+            v
+        };
+
+        let protocol = collect_getter_protocol(&husk(vec![])).expect("husk is the protocol");
+        assert_eq!(protocol.get.0, StorageType::Instance);
+        assert_eq!(
+            unique_binding_value(&protocol.bindings, "var_6"),
+            Some(key_vec.clone()),
+            "the key binding resolves through the UnknownVal init"
+        );
+
+        // A write anywhere fails the whole dissection.
+        let with_set = husk(vec![SorobanStmt::Expr(SorobanExpr::StorageSet {
+            storage_type: StorageType::Instance,
+            key: Box::new(key_vec.clone()),
+            value: Box::new(SorobanExpr::U32Literal(1)),
+        })]);
+        assert!(collect_getter_protocol(&with_set).is_none());
+
+        // A second get is ambiguous.
+        let with_second_get = husk(vec![SorobanStmt::Expr(get.clone())]);
+        assert!(collect_getter_protocol(&with_second_get).is_none());
+    }
+
+    #[test]
+    fn seed_defaulting_getter_appends_binding_and_seeds_limbs() {
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+
+        let key_vec =
+            SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral("TokenShare".to_string())]);
+        let mut stmts = vec![
+            SorobanStmt::Let {
+                name: "var_6".to_string(),
+                mutable: false,
+                value: key_vec.clone(),
+            },
+            SorobanStmt::Expr(SorobanExpr::StorageGet {
+                storage_type: StorageType::Instance,
+                key: Box::new(SorobanExpr::Local(6)),
+                unwrap: true,
+                on_missing: None,
+            }),
+        ];
+        let n_before = stmts.len();
+        assert!(ctx.seed_defaulting_u128_getter(0, 16, &mut stmts));
+        // The husk is untouched; the defaulting binding is APPENDED.
+        assert_eq!(stmts.len(), n_before + 1);
+        let SorobanStmt::Let { value, .. } = stmts.last().unwrap() else {
+            panic!("appended stmt should be a Let, got {:?}", stmts.last());
+        };
+        let SorobanExpr::CastAs { value: get, .. } = value else {
+            panic!("binding should be the u128-annotated get, got {value:?}");
+        };
+        let SorobanExpr::StorageGet {
+            key, on_missing, ..
+        } = get.as_ref()
+        else {
+            panic!("expected StorageGet, got {get:?}");
+        };
+        assert_eq!(**key, key_vec, "the Local(6) key resolved to its binding");
+        assert_eq!(
+            on_missing.as_deref(),
+            Some(&SorobanExpr::U128Literal(0)),
+            "the missing path defaults to 0"
+        );
+        // Both limb slots read the binding.
+        let slots = ctx.frame_slots.borrow();
+        assert!(matches!(
+            slots.get(&(0, 16)),
+            Some(StackVal::I128Limb { hi: false, .. })
+        ));
+        assert!(matches!(
+            slots.get(&(0, 24)),
+            Some(StackVal::I128Limb { hi: true, .. })
+        ));
+    }
+
+    #[test]
+    fn seed_decode_helper_respects_purity_and_layout() {
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+
+        // Pure operand (a binding reference) → u128 limbs seeded at +16/+24.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        ctx.seed_decode_helper_result(0, 0, DecodeHelperClass::U128, &StackVal::LetBinding(3));
+        {
+            let slots = ctx.frame_slots.borrow();
+            assert!(matches!(
+                slots.get(&(0, 16)),
+                Some(StackVal::I128Limb { hi: false, .. })
+            ));
+            assert!(matches!(
+                slots.get(&(0, 24)),
+                Some(StackVal::I128Limb { hi: true, .. })
+            ));
+            assert!(slots.get(&(0, 0)).is_none(), "the disc stays honest");
+        }
+
+        // U64 layout seeds only +8.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        ctx.seed_decode_helper_result(
+            0,
+            0,
+            DecodeHelperClass::U64,
+            &StackVal::Param("v".to_string()),
+        );
+        {
+            let slots = ctx.frame_slots.borrow();
+            assert!(matches!(
+                slots.get(&(0, 8)),
+                Some(StackVal::HostCallResult(_))
+            ));
+            assert!(slots.get(&(0, 16)).is_none());
+        }
+
+        // An impure operand (a raw storage-get result) seeds nothing —
+        // re-reading it at a consumer would duplicate the host call.
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        let impure = StackVal::HostCallResult(Box::new(SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral("K".to_string())),
+            unwrap: true,
+            on_missing: None,
+        }));
+        ctx.seed_decode_helper_result(0, 0, DecodeHelperClass::U128, &impure);
+        assert!(ctx.frame_slots.borrow().is_empty());
+    }
+
+    #[test]
+    fn purity_accepts_reference_wrapping_host_results() {
+        // The value-link seeds wrap plain references (`var_N`); re-reading a
+        // binding is free, so joins/seeds may use them.
+        assert!(stack_val_is_pure(&StackVal::HostCallResult(Box::new(
+            SorobanExpr::NamedLocal("var_3_2".to_string())
+        ))));
+        assert!(!stack_val_is_pure(&StackVal::HostCallResult(Box::new(
+            SorobanExpr::LedgerTimestamp
+        ))));
     }
 
     #[test]
