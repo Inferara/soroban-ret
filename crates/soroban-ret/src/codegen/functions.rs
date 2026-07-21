@@ -318,7 +318,14 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             let storage = storage_method(*storage_type);
             if let Some(miss) = on_missing {
                 let miss_expr = generate_expr(miss);
-                if is_contract_error_expr(miss) {
+                if matches!(miss.as_ref(), SorobanExpr::PanicWithError(_)) {
+                    // A recovered value-position fallible getter: the
+                    // missing-key path panics with the proven contract
+                    // error. Must be LAZY (`unwrap_or_else`) — `ok_or`/
+                    // `unwrap_or` would evaluate the diverging panic
+                    // eagerly and change behavior on the present-key path.
+                    quote! { env.storage().#storage().get(&#key).unwrap_or_else(|| #miss_expr) }
+                } else if is_contract_error_expr(miss) {
                     quote! { env.storage().#storage().get(&#key).ok_or(#miss_expr) }
                 } else {
                     // A recovered defaulting getter: the missing-key path
@@ -770,7 +777,11 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                     // Recovered fallible get: the turbofish pins the value type the
                     // `.ok_or(..)` / `.unwrap_or(..)` return can't infer on its own.
                     let miss_expr = generate_expr(miss);
-                    if is_contract_error_expr(miss) {
+                    if matches!(miss.as_ref(), SorobanExpr::PanicWithError(_)) {
+                        // Lazy: the diverging panic must only run on the
+                        // missing-key path (see the plain-render arm).
+                        quote! { env.storage().#storage().get::<_, #ty>(&#key).unwrap_or_else(|| #miss_expr) }
+                    } else if is_contract_error_expr(miss) {
                         quote! { env.storage().#storage().get::<_, #ty>(&#key).ok_or(#miss_expr) }
                     } else {
                         quote! { env.storage().#storage().get::<_, #ty>(&#key).unwrap_or(#miss_expr) }

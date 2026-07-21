@@ -381,7 +381,8 @@ fn annotate_gets(
                 SorobanStmt::Expr(e)
                     if !this_is_tail && matches!(e, SorobanExpr::StorageGet { .. }) =>
                 {
-                    SorobanStmt::Expr(annotate_with(e, "Val"))
+                    let ty = uninferable_get_type(&e);
+                    SorobanStmt::Expr(annotate_with(e, ty))
                 }
                 // Get bound to a never-referenced local — its `V` is unconstrained.
                 SorobanStmt::Let {
@@ -389,10 +390,11 @@ fn annotate_gets(
                     mutable,
                     value,
                 } if matches!(value, SorobanExpr::StorageGet { .. }) && !used.contains(&name) => {
+                    let ty = uninferable_get_type(&value);
                     SorobanStmt::Let {
                         name,
                         mutable,
-                        value: annotate_with(value, "Val"),
+                        value: annotate_with(value, ty),
                     }
                 }
                 SorobanStmt::If {
@@ -445,6 +447,23 @@ fn annotate_with(get: SorobanExpr, ty: &str) -> SorobanExpr {
     SorobanExpr::CastAs {
         value: Box::new(get),
         target_type: ty.to_string(),
+    }
+}
+
+/// The annotation type for an un-inferable get. Plain gets take `Val`; a
+/// recovered defaulting-map getter (`on_missing: Map::new`) must take a
+/// `Map` type instead — a `Val` turbofish would clash with the
+/// `unwrap_or(Map::new(&env))` default (E0308), while `Map<Val, Val>` lets
+/// the default's generics infer from the turbofish.
+fn uninferable_get_type(get: &SorobanExpr) -> &'static str {
+    match get {
+        SorobanExpr::StorageGet {
+            on_missing: Some(miss),
+            ..
+        } if matches!(miss.as_ref(), SorobanExpr::CollectionNew(c) if c == "Map") => {
+            "Map<soroban_sdk::Val, soroban_sdk::Val>"
+        }
+        _ => "Val",
     }
 }
 

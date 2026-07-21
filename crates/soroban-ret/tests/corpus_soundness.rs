@@ -172,7 +172,24 @@ use std::process::Command;
 /// inside real storage protocol that was previously hidden behind single
 /// whole-body `todo!("decompiled return value")` collapses. Zero new
 /// fabrication; corpus todos 1217→1230 measured by the same unmask.
-const ERROR_CEILING: u32 = 1143;
+/// → 1123 (issue #34 tranche 6: value-returning getter classes, −20,
+/// aqua-rewards only). Two zero-parameter `() -> i64` getter classes are
+/// recognized at their call sites and NEVER inlined — the helper's value
+/// used to die at its internal block-result joins: the fallible value
+/// getter (`get(&K).unwrap_or_else(|| panic_with_error!(env, E))`, the
+/// TryFromVal tag guard's constant naming the type — 77 pins `Address`)
+/// and the defaulting map getter (`get(&K).unwrap_or(Map::new(&env))`,
+/// the empty map being the helper's own proven `select` arm, not a
+/// fabrication). The value is bound ONCE and consumers reference the
+/// binding — a per-consumer re-read clone would silently drop map
+/// mutations (`.set` on a fresh temporary compiles); on the immutable
+/// binding a mutator is a loud E0596. Fixes aqua's 8 cross-contract
+/// invoke targets (`&todo!()` → the TokenShare share-token `Address`
+/// read), `get_gauges`-class tails (full clean typed recovery), and
+/// REMOVES the mis-structured `if has(&k) { return get(&k).unwrap() }`
+/// early-returns the generic inline used to fabricate from the helper's
+/// internal return. Corpus todos 1230→1208.
+const ERROR_CEILING: u32 = 1123;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

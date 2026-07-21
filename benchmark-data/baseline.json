@@ -17,12 +17,12 @@
     {
       "file": "aqua-rewards-CCY2PXGM.wasm",
       "entity": "Aqua Rewards",
-      "restoration_pct": 91.8,
+      "restoration_pct": 92.3,
       "spec_functions": 76,
-      "fn_clean": 17,
-      "fn_partial": 59,
+      "fn_clean": 18,
+      "fn_partial": 58,
       "fn_logic_lost": 0,
-      "artifacts_total": 398,
+      "artifacts_total": 376,
       "wasm_size": 54833,
       "error": null
     },
