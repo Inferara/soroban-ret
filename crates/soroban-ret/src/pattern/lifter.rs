@@ -1151,43 +1151,13 @@ impl<'a> LiftContext<'a> {
     /// returns `false` and the call falls through to normal inlining (`todo!`,
     /// never a fabricated value).
     fn try_push_descriptor_key(&mut self, target_idx: u32, first_arg_i32: Option<i32>) -> bool {
-        use crate::wasm::ir::WasmType;
         let Some(ptr) = first_arg_i32 else {
             return false;
         };
-        if ptr <= 1024 {
-            return false; // not a data-section pointer
-        }
-        let Some(ft) = self.wasm_module.get_func_type(target_idx) else {
+        let Some(key) = descriptor_key_from_ptr(self.wasm_module, target_idx, ptr) else {
             return false;
         };
-        if ft.params.as_slice() != [WasmType::I32] || ft.results.as_slice() != [WasmType::I64] {
-            return false;
-        }
-        if !func_reaches_symbol_encoder(self.wasm_module, target_idx, 0) {
-            return false;
-        }
-        // The descriptor pointer addresses a 1-byte enum discriminant (win #4's
-        // zero-extend reads the byte-or-0 of the covering segment); require the
-        // address to lie in real static data so we never resolve runtime memory.
-        let disc = self
-            .wasm_module
-            .data_sections
-            .read_bytes_zero_extended(ptr as u32, 1)
-            .map(|b| b[0] as usize);
-        let Some(d) = disc else {
-            return false;
-        };
-        let strings = extract_data_strings(self.wasm_module, target_idx);
-        let Some(name) = strings.get(d) else {
-            return false;
-        };
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return false;
-        }
-        self.stack.push(StackVal::HostCallResult(Box::new(
-            SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral(name.clone())]),
-        )));
+        self.stack.push(StackVal::HostCallResult(Box::new(key)));
         true
     }
 
@@ -3170,9 +3140,16 @@ impl<'a> LiftContext<'a> {
                             {
                                 let storage_type =
                                     load_info.storage_type.unwrap_or(StorageType::Instance);
+                                // Use the wrapper's own proven constant key when
+                                // its body reads exactly one (issue #34 t3);
+                                // otherwise the honest `todo!()` key as before.
+                                let key = load_info
+                                    .const_key
+                                    .clone()
+                                    .unwrap_or(SorobanExpr::UnknownVal);
                                 let struct_expr = SorobanExpr::StorageGet {
                                     storage_type,
-                                    key: Box::new(SorobanExpr::UnknownVal),
+                                    key: Box::new(key),
                                     unwrap: true,
                                     on_missing: None,
                                 };
@@ -8157,6 +8134,43 @@ fn is_small_symbol_encoder(func: &crate::wasm::ir::WasmFunction) -> bool {
 /// `MAX_INLINE_CALL_DEPTH`, so the wrapper's result degrades to `UnknownVal`. The
 /// decompiled effect is `Symbol::new(read_string(str_ptr, str_len))` written via
 /// `result_ptr` — recovered directly in `try_lower_symbol_builder`.
+/// Evaluate a constant *descriptor-pointer* DataKey constructor call
+/// (`(i32) -> i64`, `call <ctor>(<static ptr>)`): the pointer addresses a
+/// 1-byte enum discriminant in static data; the constructor br_tables over it
+/// and builds `Vec[Symbol(<variant>)]` from linear-memory strings. Returns
+/// the proven key expression, or `None` on any deviation (non-static pointer,
+/// wrong shape, unresolvable variant name). Extracted from
+/// [`LiftContext::try_push_descriptor_key`] so load-struct-wrapper detection
+/// can recover the same key from a helper's own body (issue #34 tranche 3).
+fn descriptor_key_from_ptr(module: &WasmModule, target_idx: u32, ptr: i32) -> Option<SorobanExpr> {
+    use crate::wasm::ir::WasmType;
+    if ptr <= 1024 {
+        return None; // not a data-section pointer
+    }
+    let ft = module.get_func_type(target_idx)?;
+    if ft.params.as_slice() != [WasmType::I32] || ft.results.as_slice() != [WasmType::I64] {
+        return None;
+    }
+    if !func_reaches_symbol_encoder(module, target_idx, 0) {
+        return None;
+    }
+    // The descriptor pointer addresses a 1-byte enum discriminant (win #4's
+    // zero-extend reads the byte-or-0 of the covering segment); require the
+    // address to lie in real static data so we never resolve runtime memory.
+    let disc = module
+        .data_sections
+        .read_bytes_zero_extended(ptr as u32, 1)
+        .map(|b| b[0] as usize)?;
+    let strings = extract_data_strings(module, target_idx);
+    let name = strings.get(disc)?;
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral(
+        name.clone(),
+    )]))
+}
+
 fn is_symbol_from_lm_builder(module: &WasmModule, func_idx: u32) -> bool {
     use crate::wasm::ir::WasmType;
     let Some(ft) = module.get_func_type(func_idx) else {
@@ -8903,6 +8917,29 @@ impl DkEval<'_> {
     }
 }
 
+/// True when the body contains the verbatim limb-forwarding call window
+/// `[local.get L, local.get 1, local.get 2, local.get 3, local.get 4,
+/// call target]` — the delegation wrapper passing its own four i64 limb
+/// params unchanged to the core (with a fresh scratch out-pointer `L`).
+/// Anything else (reordered, transformed, or partial forwarding) fails, so
+/// the wrapper provably computes exactly what the core computes.
+fn forwards_limb_params_verbatim(func: &crate::wasm::ir::WasmFunction, target: u32) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    func.body.windows(6).any(|w| {
+        matches!(
+            w,
+            [
+                WasmInstr::LocalGet(_),
+                WasmInstr::LocalGet(1),
+                WasmInstr::LocalGet(2),
+                WasmInstr::LocalGet(3),
+                WasmInstr::LocalGet(4),
+                WasmInstr::Call(t)
+            ] if *t == target
+        )
+    })
+}
+
 /// Where an i128 soft-arith helper writes its result limbs relative to the output
 /// pointer (param 0). Unchecked helpers (the SDK's inline soft-arith) write the
 /// value directly as `{lo@0, hi@8}`; checked (`Result<i128,E>`-returning) helpers
@@ -9004,7 +9041,164 @@ fn detect_i128_intrinsic_inner(
     {
         return Some(layout(I128Op::DivCeil));
     }
+    // Plain delegation wrapper: NO arithmetic of its own (blend's `232`-shape —
+    // scratch-buffer adapter around a divmod core that keeps only the
+    // quotient). Verified by execution against the mainnet blend pools: the
+    // core (`227`) is compiler-rt-style unsigned 128÷128 divmod writing
+    // `[q_lo@0, q_hi@8, r@16..]`; the wrapper forwards its four limb params
+    // verbatim and copies back only `[0, 8]` — so it IS the core's operation
+    // at the standard unchecked layout. Airtight: requires zero own
+    // mul/div/select/xor, exactly one classifiable callee, the literal
+    // `[local.get L, local.get 1..4, call]` verbatim-forwarding window, and
+    // no post-division rounding fixup (the DivCeil branch above claims that
+    // shape — this one must never shadow it).
+    if fp.mul == 0
+        && fp.div == 0
+        && fp.select == 0
+        && fp.xor == 0
+        && fp.calls.len() == 1
+        && forwards_limb_params_verbatim(func, fp.calls[0])
+        && !has_inexact_increment(func)
+        && delegation_copies_core_result(func, fp.calls[0])
+    {
+        let core = detect_i128_intrinsic_inner(module, fp.calls[0], depth + 1)?;
+        cov_mark::hit!(i128_delegation_wrapper_classified);
+        return Some(layout(core.op));
+    }
     None
+}
+
+/// Abstract values for the delegation-wrapper copy-back verifier.
+#[derive(Clone, PartialEq, Debug)]
+enum DelegVal {
+    /// The wrapper's own out-pointer (param 0).
+    OutPtr,
+    /// The scratch buffer forwarded to the core as ITS out-pointer.
+    Scratch,
+    /// `Scratch + 8` (the computed-address form of the hi-limb slot).
+    ScratchOff8,
+    /// The core's result limbs, loaded from the scratch after the call.
+    CoreLo,
+    CoreHi,
+    /// A small i32 constant (address arithmetic operand).
+    ConstI32(i32),
+    Other,
+}
+
+/// Prove — by linear abstract interpretation over the whole (straight-line)
+/// body — that a delegation wrapper RETURNS the core's result: after the
+/// forwarded call, the only stores through the out-pointer are
+/// `out[0] = scratch[0]` (the core's lo limb) and `out[8] = scratch[8]`
+/// (hi), possibly via single i64 temp locals; and if the wrapper forwards
+/// its own out-pointer directly, that it never overwrites the result. Any
+/// control flow, unrecognized instruction, store of a non-core value
+/// through out, swapped limbs, or read of the core's other output slots
+/// (a divmod remainder) fails the proof (greptile P1 on PR #43).
+fn delegation_copies_core_result(func: &crate::wasm::ir::WasmFunction, core: u32) -> bool {
+    use crate::wasm::ir::WasmInstr as WI;
+    let n_params = 5; // gated upstream: (i32, i64, i64, i64, i64)
+    let mut locals: Vec<DelegVal> = vec![DelegVal::Other; n_params + func.locals.len()];
+    locals[0] = DelegVal::OutPtr;
+    let mut stack: Vec<DelegVal> = Vec::new();
+    let mut call_seen = false;
+    // Which abstract pointer the core received as its out: Scratch (fresh
+    // buffer, results must be copied out) or OutPtr (direct — results are
+    // already in place and must not be overwritten).
+    let mut core_out: Option<DelegVal> = None;
+    let mut stored_lo = false;
+    let mut stored_hi = false;
+    for ins in &func.body {
+        match ins {
+            // Frame prologue/epilogue and address arithmetic.
+            WI::GlobalGet(_) => stack.push(DelegVal::Other),
+            WI::GlobalSet(_) => {
+                stack.pop();
+            }
+            WI::I32Const(c) => stack.push(DelegVal::ConstI32(*c)),
+            WI::I32Sub => {
+                stack.pop();
+                stack.pop();
+                // `global.get 0; i32.const N; i32.sub` — the scratch allocation.
+                stack.push(DelegVal::Scratch);
+            }
+            WI::I32Add => {
+                let b = stack.pop();
+                let a = stack.pop();
+                stack.push(match (a, b) {
+                    (Some(DelegVal::Scratch), Some(DelegVal::ConstI32(8)))
+                    | (Some(DelegVal::ConstI32(8)), Some(DelegVal::Scratch)) => {
+                        DelegVal::ScratchOff8
+                    }
+                    _ => DelegVal::Other,
+                });
+            }
+            WI::LocalGet(i) => {
+                stack.push(locals.get(*i as usize).cloned().unwrap_or(DelegVal::Other))
+            }
+            WI::LocalSet(i) => {
+                let v = stack.pop().unwrap_or(DelegVal::Other);
+                if let Some(slot) = locals.get_mut(*i as usize) {
+                    *slot = v;
+                }
+            }
+            WI::LocalTee(i) => {
+                let v = stack.last().cloned().unwrap_or(DelegVal::Other);
+                if let Some(slot) = locals.get_mut(*i as usize) {
+                    *slot = v;
+                }
+            }
+            WI::Call(t) if *t == core && !call_seen => {
+                if stack.len() < n_params {
+                    return false;
+                }
+                let args = stack.split_off(stack.len() - n_params);
+                match args.first() {
+                    Some(DelegVal::Scratch) => core_out = Some(DelegVal::Scratch),
+                    Some(DelegVal::OutPtr) => core_out = Some(DelegVal::OutPtr),
+                    _ => return false,
+                }
+                call_seen = true;
+            }
+            WI::I64Load(off) => {
+                let addr = stack.pop().unwrap_or(DelegVal::Other);
+                if !call_seen || core_out != Some(DelegVal::Scratch) {
+                    return false; // no reads before the call / in direct mode
+                }
+                stack.push(match (addr, off) {
+                    (DelegVal::Scratch, 0) => DelegVal::CoreLo,
+                    (DelegVal::Scratch, 8) | (DelegVal::ScratchOff8, 0) => DelegVal::CoreHi,
+                    _ => return false, // remainder slots / unknown source
+                });
+            }
+            WI::I64Store(off) => {
+                let value = stack.pop().unwrap_or(DelegVal::Other);
+                let addr = stack.pop().unwrap_or(DelegVal::Other);
+                if addr != DelegVal::OutPtr {
+                    return false; // stores anywhere else are unmodeled
+                }
+                match (off, value) {
+                    (0, DelegVal::CoreLo) => stored_lo = true,
+                    (8, DelegVal::CoreHi) => stored_hi = true,
+                    _ => return false, // swapped limbs / non-core value
+                }
+            }
+            // The function-level terminator. A NESTED block's End is
+            // unreachable here — Block/Loop/If all fail the whitelist below.
+            WI::End => {}
+            // Anything else — control flow, arithmetic, other calls,
+            // constants stored as i64 — is outside the proven shape.
+            _ => return false,
+        }
+    }
+    match core_out {
+        // Scratch mode: both limbs must have been copied out.
+        Some(DelegVal::Scratch) => stored_lo && stored_hi,
+        // Direct mode: the core wrote out[0,8] itself; the body proved it
+        // never loaded or stored anything after (those arms return false
+        // unless in scratch mode).
+        Some(DelegVal::OutPtr) => !stored_lo && !stored_hi,
+        _ => false,
+    }
 }
 
 /// True if the body contains the "+1 when the division was inexact" idiom that
@@ -9491,6 +9685,152 @@ struct LoadStructWrapperInfo {
     #[allow(dead_code)]
     type_name: Option<String>,
     storage_type: Option<StorageType>,
+    /// The storage key the wrapper reads, when its body proves exactly ONE
+    /// constant key (a descriptor-pointer DataKey constructor call or an
+    /// immediate `I64Const` key Val). `None` when zero or several candidates —
+    /// the synthesized field accesses then keep the honest `todo!()` key.
+    const_key: Option<SorobanExpr>,
+}
+
+/// True when `f` is a storage-read probe a key Val can flow into as
+/// `(key, storage_type)`: the `has_contract_data` / `get_contract_data`
+/// import itself, or a thin internal wrapper with the `(i64, i64)` key +
+/// storage-type signature (≤1 result — `has` wrappers return an i32 bool,
+/// `get` wrappers the i64 Val) that reaches one of them within 2 calls.
+fn is_storage_probe(module: &WasmModule, f: u32) -> bool {
+    use crate::wasm::ir::WasmType;
+    if let Some(hf) = module.imports.get_by_index(f) {
+        return hf.module == HostModule::Ledger
+            && matches!(hf.name.as_str(), "get_contract_data" | "has_contract_data");
+    }
+    let Some(ft) = module.get_func_type(f) else {
+        return false;
+    };
+    if ft.params.as_slice() != [WasmType::I64, WasmType::I64] || ft.results.len() > 1 {
+        return false;
+    }
+    func_reaches_host(module, f, HostModule::Ledger, "get_contract_data", 2)
+        || func_reaches_host(module, f, HostModule::Ledger, "has_contract_data", 2)
+}
+
+/// Convert a [`DkEval`] result into a fully-CONSTANT storage-key expression:
+/// a `Symbol` Val, or a `Vec` of symbols headed by one (the SDK's unit-variant
+/// `Vec[Symbol]` wrapping). Unlike `dk_result_to_key_expr` there are no caller
+/// payloads to embed — any non-symbol element means the key has a runtime
+/// component and is NOT a constant key.
+fn dk_result_to_const_key(result: &DkVal) -> Option<SorobanExpr> {
+    let sym_of = |v: &DkVal| -> Option<String> {
+        match v {
+            DkVal::I64(raw) => crate::wasm::data::DataSection::decode_symbol_val(*raw as u64),
+            DkVal::SymObj(name) => Some(name.clone()),
+            _ => None,
+        }
+    };
+    match result {
+        DkVal::I64(_) | DkVal::SymObj(_) => Some(SorobanExpr::SymbolLiteral(sym_of(result)?)),
+        DkVal::VecVal(elems) => {
+            let mut out = Vec::with_capacity(elems.len());
+            for e in elems {
+                out.push(SorobanExpr::SymbolLiteral(sym_of(e)?));
+            }
+            if out.is_empty() {
+                return None;
+            }
+            Some(SorobanExpr::VecConstruct(out))
+        }
+        _ => None,
+    }
+}
+
+/// Recover the single constant storage key a load-struct wrapper's body reads,
+/// if provable (issue #34 tranche 3). Two bytecode idioms:
+///
+/// 1. `[I32Const(x), Call(ctor)]` where `ctor: (i32) -> i64` reaches the
+///    symbol encoder — a DataKey constructor taking either an immediate
+///    variant selector or a static descriptor pointer. Resolved by
+///    micro-executing the constructor's real bytecode ([`DkEval`]) with the
+///    constant argument; static-data loads read the real data section.
+/// 2. `I64Const` key Val two instructions before a `get_contract_data` /
+///    `has_contract_data` import call (the `key; storage_type; call` window,
+///    same as [`fallible_get_const_key`]).
+///
+/// All candidates across the body must agree on ONE key (structurally equal);
+/// zero or conflicting candidates → `None` → today's `todo!()` key.
+fn load_struct_const_key(
+    module: &WasmModule,
+    registry: &TypeRegistry,
+    func: &crate::wasm::ir::WasmFunction,
+) -> Option<SorobanExpr> {
+    use crate::wasm::ir::{WasmInstr, WasmType};
+    let mut found: Option<SorobanExpr> = None;
+    let mut put = |k: SorobanExpr| -> bool {
+        match &found {
+            Some(prev) if *prev != k => false, // conflict → ambiguous
+            _ => {
+                found = Some(k);
+                true
+            }
+        }
+    };
+    // The ctor's RESULT must provably be a storage key: the instructions
+    // right after the ctor call must consume it as `(key, storage_type)` of
+    // a has/get — `(local.tee k)? ; i64.const <st> ; call <storage-probe>`.
+    // A constant symbol built for anything else (an event topic, an error
+    // string) never matches this window and produces no candidate
+    // (greptile P1 on PR #43).
+    let ctor_result_feeds_storage = |call_pos: usize| -> bool {
+        let mut j = call_pos + 1;
+        if matches!(func.body.get(j), Some(WasmInstr::LocalTee(_))) {
+            j += 1;
+        }
+        matches!(func.body.get(j), Some(WasmInstr::I64Const(_)))
+            && matches!(func.body.get(j + 1), Some(WasmInstr::Call(f)) if is_storage_probe(module, *f))
+    };
+    for (i, w) in func.body.windows(2).enumerate() {
+        let key = match w {
+            [WasmInstr::I32Const(x), WasmInstr::Call(t)]
+                if module.imports.get_by_index(*t).is_none()
+                    && module.get_func_type(*t).is_some_and(|ft| {
+                        ft.params.as_slice() == [WasmType::I32]
+                            && ft.results.as_slice() == [WasmType::I64]
+                    })
+                    && func_reaches_symbol_encoder(module, *t, 0)
+                    && ctor_result_feeds_storage(i + 1) =>
+            {
+                let mut ev = DkEval {
+                    module,
+                    mem: HashMap::new(),
+                    sp: DkVal::StackPtr(0),
+                    steps: 0,
+                };
+                match ev.eval_call(*t, vec![DkVal::I32(*x)], 0) {
+                    Some(Some(result)) => dk_result_to_const_key(&result),
+                    _ => None,
+                }
+            }
+            [_, WasmInstr::Call(t)] => module
+                .imports
+                .get_by_index(*t)
+                .filter(|hf| {
+                    hf.module == HostModule::Ledger
+                        && matches!(hf.name.as_str(), "get_contract_data" | "has_contract_data")
+                })
+                .and_then(|_| match func.body.get(i.checked_sub(1)?) {
+                    Some(WasmInstr::I64Const(raw)) => {
+                        let k = try_decode_val(*raw, registry);
+                        (!matches!(k, SorobanExpr::UnknownVal | SorobanExpr::Void)).then_some(k)
+                    }
+                    _ => None,
+                }),
+            _ => None,
+        };
+        if let Some(k) = key
+            && !put(k)
+        {
+            return None;
+        }
+    }
+    found
 }
 
 /// Detect if a function is a "load struct" wrapper that reads a struct from
@@ -9654,12 +9994,14 @@ fn detect_load_struct_wrapper(
     }
 
     let storage_type = detect_storage_type_in_body(module, &func.body);
+    let const_key = load_struct_const_key(module, registry, func);
 
     cov_mark::hit!(detect_load_struct_wrapper_hit);
     Some(LoadStructWrapperInfo {
         offset_to_field,
         type_name,
         storage_type,
+        const_key,
     })
 }
 
@@ -16442,6 +16784,188 @@ mod tests {
         WasmModule::parse(&wasm).expect("module parses")
     }
 
+    /// Fixture for the issue-#34 tranche-3 recognizers. Imports: 0=has, 1=get
+    /// (ledger). Functions: 2 = `(i32,i32)->i64` small-symbol builder (reads
+    /// name bytes from LM); 3 = `(i32)->i64` immediate-selector DataKey ctor
+    /// (br_table over the selector → symbol via 2); 4 = load-struct wrapper
+    /// whose key is `ctor(0)`; 5 = wrapper reading TWO different keys
+    /// (`ctor(0)` and `ctor(1)`) → ambiguous; 6 = divmod-style core (5-param,
+    /// div_u); 7 = plain delegation wrapper forwarding limbs verbatim to 6;
+    /// 8 = transforming wrapper (doubles a limb before calling 6);
+    /// 9 = wrapper storing a PARAM (not the core's result) to out;
+    /// 10 = wrapper copying the core's REMAINDER slots `[16, 24]`.
+    /// Data: "AdmCfg" at 2000, "UsrCfg" at 2006.
+    fn tranche3_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "l" "0" (func (param i64 i64) (result i64)))
+                (import "l" "1" (func (param i64 i64) (result i64)))
+                (memory 1)
+                (data (i32.const 2000) "AdmCfgUsrCfg")
+                (func (;2;) (param i32 i32) (result i64)
+                    (local i64 i32)
+                    ;; the char-class constants the small-symbol shape gate
+                    ;; keys on (is_small_symbol_encoder): '_', '0', 'A', 'a'
+                    i32.const 95 drop
+                    i32.const 48 drop
+                    i32.const 65 drop
+                    i32.const 97 drop
+                    loop
+                        local.get 3 local.get 1 i32.lt_u
+                        if
+                            local.get 2 i64.const 6 i64.shl
+                            local.get 0 local.get 3 i32.add i32.load8_u
+                            i64.extend_i32_u i64.const 32 i64.sub i64.or
+                            local.set 2
+                            local.get 3 i32.const 1 i32.add local.set 3
+                            br 1
+                        end
+                    end
+                    local.get 2 i64.const 8 i64.shl i64.const 14 i64.or)
+                (func (;3;) (param i32) (result i64)
+                    block
+                        block
+                            local.get 0 br_table 0 1 0
+                        end
+                        i32.const 2000 i32.const 6 call 2
+                        return
+                    end
+                    i32.const 2006 i32.const 6 call 2)
+                (func (;4;) (param i32)
+                    (local i64)
+                    i32.const 0 call 3 local.tee 1
+                    i64.const 2 call 0 drop
+                    local.get 1 i64.const 2 call 1
+                    local.set 1
+                    local.get 0 local.get 1 i64.store)
+                (func (;5;) (param i32)
+                    (local i64)
+                    i32.const 0 call 3
+                    i64.const 2 call 0 drop
+                    i32.const 1 call 3
+                    i64.const 2 call 1 local.set 1
+                    local.get 0 local.get 1 i64.store)
+                (func (;6;) (param i32 i64 i64 i64 i64)
+                    local.get 0
+                    local.get 1 local.get 3 i64.div_u
+                    i64.store
+                    local.get 0 i64.const 0 i64.store offset=8)
+                (func (;7;) (param i32 i64 i64 i64 i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 5 global.set 0
+                    local.get 5
+                    local.get 1 local.get 2 local.get 3 local.get 4
+                    call 6
+                    local.get 0 local.get 5 i64.load i64.store
+                    local.get 0 local.get 5 i64.load offset=8 i64.store offset=8
+                    local.get 5 i32.const 16 i32.add global.set 0)
+                (func (;8;) (param i32 i64 i64 i64 i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 5 global.set 0
+                    local.get 5
+                    local.get 1 i64.const 1 i64.shl
+                    local.get 2 local.get 3 local.get 4
+                    call 6
+                    local.get 0 local.get 5 i64.load i64.store
+                    local.get 5 i32.const 16 i32.add global.set 0)
+                (func (;9;) (param i32 i64 i64 i64 i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 5 global.set 0
+                    local.get 5
+                    local.get 1 local.get 2 local.get 3 local.get 4
+                    call 6
+                    local.get 0 local.get 1 i64.store
+                    local.get 0 local.get 5 i64.load offset=8 i64.store offset=8
+                    local.get 5 i32.const 16 i32.add global.set 0)
+                (func (;10;) (param i32 i64 i64 i64 i64)
+                    (local i32)
+                    global.get 0 i32.const 32 i32.sub local.tee 5 global.set 0
+                    local.get 5
+                    local.get 1 local.get 2 local.get 3 local.get 4
+                    call 6
+                    local.get 0 local.get 5 i64.load offset=16 i64.store
+                    local.get 0 local.get 5 i64.load offset=24 i64.store offset=8
+                    local.get 5 i32.const 32 i32.add global.set 0)
+                (func (;11;) (param i32)
+                    i32.const 0 call 3 drop
+                    local.get 0 i64.const 0 i64.store)
+                (global (mut i32) (i32.const 8192))
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn dk_result_to_const_key_accepts_only_constant_symbols() {
+        // A raw small-symbol Val / SymObj / vec of symbols → key; any
+        // non-symbol element → not a constant key.
+        let adm = encode_symbol_small("AdmCfg").expect("encodes");
+        assert_eq!(
+            dk_result_to_const_key(&DkVal::I64(adm)),
+            Some(SorobanExpr::SymbolLiteral("AdmCfg".to_string()))
+        );
+        assert_eq!(
+            dk_result_to_const_key(&DkVal::SymObj("LongSymbolName".to_string())),
+            Some(SorobanExpr::SymbolLiteral("LongSymbolName".to_string()))
+        );
+        assert_eq!(
+            dk_result_to_const_key(&DkVal::VecVal(vec![DkVal::I64(adm)])),
+            Some(SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral(
+                "AdmCfg".to_string()
+            )]))
+        );
+        assert_eq!(
+            dk_result_to_const_key(&DkVal::VecVal(vec![DkVal::I64(adm), DkVal::Arg(1)])),
+            None,
+            "a runtime payload element means the key is not constant"
+        );
+        assert_eq!(dk_result_to_const_key(&DkVal::VecVal(vec![])), None);
+    }
+
+    #[test]
+    fn load_struct_const_key_executes_ctor_and_rejects_ambiguity() {
+        let m = tranche3_module();
+        let reg = empty_registry();
+        // Wrapper 4: key = ctor(0), micro-executed → Symbol("AdmCfg").
+        let f4 = m.get_function(4).expect("func 4");
+        assert_eq!(
+            load_struct_const_key(&m, &reg, f4),
+            Some(SorobanExpr::SymbolLiteral("AdmCfg".to_string()))
+        );
+        // Wrapper 5 reads two DIFFERENT keys → ambiguous → None.
+        let f5 = m.get_function(5).expect("func 5");
+        assert_eq!(load_struct_const_key(&m, &reg, f5), None);
+        // greptile P1 shape: a ctor whose result does NOT feed a storage
+        // probe (dropped here) is no key candidate → None.
+        let f11 = m.get_function(11).expect("func 11");
+        assert_eq!(load_struct_const_key(&m, &reg, f11), None);
+    }
+
+    #[test]
+    fn i128_delegation_wrapper_inherits_core_op() {
+        let m = tranche3_module();
+        // The core itself: div_u present → Div.
+        assert_eq!(
+            detect_i128_intrinsic(&m, 6).map(|i| i.op),
+            Some(I128Op::Div)
+        );
+        // Verbatim-forwarding wrapper inherits Div (blend `232` shape).
+        assert_eq!(
+            detect_i128_intrinsic(&m, 7).map(|i| i.op),
+            Some(I128Op::Div)
+        );
+        // A wrapper that TRANSFORMS a limb before delegating must NOT classify
+        // — it computes something other than the core's operation.
+        assert!(detect_i128_intrinsic(&m, 8).is_none());
+        // greptile P1 shapes: the wrapper must provably RETURN the core's
+        // result. Storing a param instead of the loaded core limb, or copying
+        // the core's REMAINDER slots (a Rem, not the core's op), never
+        // classifies.
+        assert!(detect_i128_intrinsic(&m, 9).is_none());
+        assert!(detect_i128_intrinsic(&m, 10).is_none());
+    }
+
     #[test]
     fn detect_defaulting_u128_getter_classifies() {
         let m = tranche2_module();
@@ -17163,8 +17687,10 @@ mod tests {
         );
         assert_eq!(
             detect_i128_intrinsic(&m, 2).map(|i| i.op),
-            None,
-            "a plain forwarder without the increment is not a DivCeil"
+            Some(I128Op::Div),
+            "a verbatim forwarder without the increment inherits the core's \
+             op (issue #34 t3 delegation rule, execution-verified against the \
+             blend divmod core) — crucially NOT DivCeil"
         );
     }
 
