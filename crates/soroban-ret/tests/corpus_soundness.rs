@@ -154,7 +154,25 @@ use std::process::Command;
 /// u64/u128/i128 classes, disc stays honest), and reference-wrapping
 /// `HostCallResult` purity — reflector ×2 resolve a lost `&todo!()` storage
 /// key to its real `var_3_2` binding (−2 todos each; corpus 1360→1356).
-const ERROR_CEILING: u32 = 1120;
+/// → 1143 (issue #34 tranche 5: fallible-struct-getter call-site recovery,
+/// +23 — the third deliberate honesty rise, aqua-rewards only; every other
+/// contract byte-identical, soroswap — the PR-#44 gap-fabrication
+/// counterexample — included). The t4-banked recognizer is wired as an
+/// early-recognizer arm (binding + limb/field seeds + proven TTL bumps, no
+/// inlining), and the aqua `PoolRewardConfig` key now resolves by EXECUTING
+/// the descriptor ctor's real bytecode over its proven-zero gap row
+/// (`gap_row_proven_zero` + `DkEval.gap_zero`; DkEval's stores refusing
+/// absolute addresses is what makes a completed eval a proof the row is
+/// never written). The +23 decomposes, fully audited: +8 rustc
+/// error-RECOVERY unmasks — the `todo!() + todo!()` unit-arith loops are
+/// byte-identical in both outputs, previously suppressed by the broken
+/// untyped `vp_value.expired_at` reads this tranche fixes (now typed
+/// `get::<_, PoolRewardConfig>(..).unwrap_or(zero).expired_at`); +15 honest
+/// holes (lost-key `&todo!()` triples, one un-inferable surfaced `Map::new`)
+/// inside real storage protocol that was previously hidden behind single
+/// whole-body `todo!("decompiled return value")` collapses. Zero new
+/// fabrication; corpus todos 1217→1230 measured by the same unmask.
+const ERROR_CEILING: u32 = 1143;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
