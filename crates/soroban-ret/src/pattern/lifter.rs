@@ -11460,6 +11460,53 @@ enum DecodeHelperClass {
     I128,
 }
 
+/// The set of distinct `i64.store` offsets in a function body, or `None` if
+/// the body also contains an `i32.store` (a bookkeeping/struct writer — not
+/// one of the fixed scalar out-slot layouts these detectors prove).
+fn i64_store_offsets(func: &crate::wasm::ir::WasmFunction) -> Option<Vec<u32>> {
+    use crate::wasm::ir::WasmInstr;
+    let mut offs: Vec<u32> = Vec::new();
+    for i in &func.body {
+        match i {
+            WasmInstr::I64Store(o) => {
+                if !offs.contains(o) {
+                    offs.push(*o);
+                }
+            }
+            WasmInstr::I32Store(_) | WasmInstr::I32Store8(_) | WasmInstr::I32Store16(_) => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    offs.sort_unstable();
+    Some(offs)
+}
+
+/// True when the body decodes ITS OWN `val` parameter with the named
+/// Int-module import: an adjacent `[local.get 1, call <import>]` window, with
+/// local 1 never reassigned anywhere in the body (no `local.set/tee 1`). This
+/// is a dataflow proof, not a reachability co-occurrence — the decode's
+/// operand is provably the parameter (greptile P1 on PR #42).
+fn decodes_own_param(
+    module: &WasmModule,
+    func: &crate::wasm::ir::WasmFunction,
+    name: &str,
+) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    if func
+        .body
+        .iter()
+        .any(|i| matches!(i, WasmInstr::LocalSet(1) | WasmInstr::LocalTee(1)))
+    {
+        return false;
+    }
+    func.body.windows(2).any(|w| {
+        matches!(w, [WasmInstr::LocalGet(1), WasmInstr::Call(t)]
+            if module.imports.get_by_index(*t).is_some_and(|hf| hf.module == HostModule::Int && hf.name == name))
+    })
+}
+
 /// Recognize a pure `TryFromVal` scalar-decode helper (issue #34 tranche 2):
 /// a void `(out_ptr: i32, val: i64)` function that converts its Val operand
 /// into a scalar and writes a `Result`-shaped struct — `[disc@0, val@8]`
@@ -11469,11 +11516,17 @@ enum DecodeHelperClass {
 /// lifter's joins, but the semantic is total on the payload slots: they hold
 /// exactly the decoded operand. The discriminant is path-dependent and is
 /// NOT covered — it stays whatever the lift left (honest).
+///
+/// Dataflow-proven, not co-occurrence (greptile P1s on PR #42): the decode
+/// calls must consume the `val` PARAMETER directly (`[local.get 1, call]`
+/// windows, local 1 never reassigned), and the body's `i64.store` offsets
+/// must be a subset of the claimed layout (any extra store, or any
+/// `i32.store`, disqualifies).
 fn detect_tryfromval_decode_helper(
     module: &WasmModule,
     func_idx: u32,
 ) -> Option<DecodeHelperClass> {
-    use crate::wasm::ir::{WasmInstr, WasmType};
+    use crate::wasm::ir::WasmType;
     let func_type = module.get_func_type(func_idx)?;
     if !func_type.results.is_empty()
         || func_type.params.as_slice() != [WasmType::I32, WasmType::I64]
@@ -11499,25 +11552,55 @@ fn detect_tryfromval_decode_helper(
     {
         return None;
     }
-    let int = |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Int, name, 3);
     let func = module.get_function(func_idx)?;
-    let has_store = |off: u32| {
-        func.body
-            .iter()
-            .any(|i| matches!(i, WasmInstr::I64Store(o) if *o == off))
-    };
-    let u64_decode = int("obj_to_u64");
-    let u128_decode = int("obj_to_u128_hi64") && int("obj_to_u128_lo64");
-    let i128_decode = int("obj_to_i128_hi64") && int("obj_to_i128_lo64");
-    let i64_decode = int("obj_to_i64");
-    match (u64_decode, u128_decode, i128_decode, i64_decode) {
-        (false, true, false, false) if has_store(16) && has_store(24) => {
+    let store_offs = i64_store_offsets(func)?;
+    let subset_of = |allowed: &[u32]| store_offs.iter().all(|o| allowed.contains(o));
+    // Exclusions stay chain-wide (broader is safer); the POSITIVE decode
+    // evidence must be the body's own `[local.get 1, call]` windows.
+    let chain =
+        |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Int, name, 3);
+    let own = |name: &str| decodes_own_param(module, func, name);
+    let u64_decode = own("obj_to_u64");
+    let u128_decode = own("obj_to_u128_hi64") && own("obj_to_u128_lo64");
+    let i128_decode = own("obj_to_i128_hi64") && own("obj_to_i128_lo64");
+    let wide = [
+        "obj_to_u128_hi64",
+        "obj_to_u128_lo64",
+        "obj_to_i128_hi64",
+        "obj_to_i128_lo64",
+    ];
+    match (u64_decode, u128_decode, i128_decode) {
+        (false, true, false)
+            if !chain("obj_to_u64")
+                && !chain("obj_to_i64")
+                && !chain("obj_to_i128_hi64")
+                && !chain("obj_to_i128_lo64")
+                && store_offs.contains(&16)
+                && store_offs.contains(&24)
+                && subset_of(&[0, 8, 16, 24]) =>
+        {
             Some(DecodeHelperClass::U128)
         }
-        (false, false, true, false) if has_store(16) && has_store(24) => {
+        (false, false, true)
+            if !chain("obj_to_u64")
+                && !chain("obj_to_i64")
+                && !chain("obj_to_u128_hi64")
+                && !chain("obj_to_u128_lo64")
+                && store_offs.contains(&16)
+                && store_offs.contains(&24)
+                && subset_of(&[0, 8, 16, 24]) =>
+        {
             Some(DecodeHelperClass::I128)
         }
-        (true, false, false, false) if has_store(0) && has_store(8) => Some(DecodeHelperClass::U64),
+        (true, false, false)
+            if !chain("obj_to_i64")
+                && wide.iter().all(|n| !chain(n))
+                && store_offs.contains(&0)
+                && store_offs.contains(&8)
+                && subset_of(&[0, 8]) =>
+        {
+            Some(DecodeHelperClass::U64)
+        }
         _ => None,
     }
 }
@@ -11531,12 +11614,16 @@ fn detect_tryfromval_decode_helper(
 /// - void, exactly one I32 param (the out-pointer);
 /// - chains BOTH `has_contract_data` and `get_contract_data`, never
 ///   `put_contract_data`, and makes no cross-contract call;
-/// - decodes u128 and ONLY u128 (both `obj_to_u128_hi64` + `obj_to_u128_lo64`
-///   reachable; no u64/i64/i128 decode anywhere in the chain);
+/// - decodes u128 and ONLY u128, IN ITS OWN BODY (direct `obj_to_u128_hi64`
+///   and `obj_to_u128_lo64` calls; no u64/i64/i128 decode anywhere in the
+///   chain) — the decode belongs to this function's flow, not a nested
+///   callee's (greptile P1 on PR #42);
 /// - pushes the literal-0 default as the first value of an I64-valued block
 ///   (the `[Block(result i64), I64Const(0)]` window) — the missing-key lo
 ///   limb (the hi limb's default is the zero-initialized local);
-/// - writes both out slots (an `I64Store(0)` and an `I64Store(8)` present).
+/// - writes EXACTLY the two out slots and nothing else: the body's
+///   `i64.store` offsets are exactly `{0, 8}` and it has no `i32.store`
+///   (an extra store would mean a layout this detector does not prove).
 ///
 /// Any deviation → `false` → the caller leaves today's output byte-identical.
 fn detect_defaulting_u128_getter(module: &WasmModule, func_idx: u32) -> bool {
@@ -11555,24 +11642,21 @@ fn detect_defaulting_u128_getter(module: &WasmModule, func_idx: u32) -> bool {
     if function_calls_module_in_chain(module, func_idx, HostModule::Call, 3) {
         return false;
     }
-    let int = |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Int, name, 3);
-    if !int("obj_to_u128_hi64") || !int("obj_to_u128_lo64") {
-        return false;
-    }
-    if [
-        "obj_to_u64",
-        "obj_to_i64",
-        "obj_to_i128_hi64",
-        "obj_to_i128_lo64",
-    ]
-    .iter()
-    .any(|n| int(n))
-    {
-        return false;
-    }
     let Some(func) = module.get_function(func_idx) else {
         return false;
     };
+    // The u128 decode must be in THIS function's own flow (direct import
+    // calls), and its exclusions chain-wide (broader is safer).
+    let direct_int = |name: &str| {
+        func.body.iter().any(|i| {
+            matches!(i, WasmInstr::Call(t)
+                if module.imports.get_by_index(*t).is_some_and(
+                    |hf| hf.module == HostModule::Int && hf.name == name))
+        })
+    };
+    if !direct_int("obj_to_u128_hi64") || !direct_or_chain_excludes(module, func_idx, direct_int) {
+        return false;
+    }
     let has_default_block = func.body.windows(2).any(|w| {
         matches!(
             w,
@@ -11584,15 +11668,26 @@ fn detect_defaulting_u128_getter(module: &WasmModule, func_idx: u32) -> bool {
             ]
         )
     });
-    let has_lo_store = func
-        .body
-        .iter()
-        .any(|i| matches!(i, WasmInstr::I64Store(0)));
-    let has_hi_store = func
-        .body
-        .iter()
-        .any(|i| matches!(i, WasmInstr::I64Store(8)));
-    has_default_block && has_lo_store && has_hi_store
+    // The body writes EXACTLY the `[lo@0, hi@8]` layout and nothing else.
+    let stores_exact = i64_store_offsets(func).is_some_and(|offs| offs == [0, 8]);
+    has_default_block && stores_exact
+}
+
+/// Second half of the defaulting-getter decode gate, split for readability:
+/// the lo-limb decode is also direct, and no other-width decode exists
+/// anywhere in the chain.
+fn direct_or_chain_excludes(
+    module: &WasmModule,
+    func_idx: u32,
+    direct_int: impl Fn(&str) -> bool,
+) -> bool {
+    let chain =
+        |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Int, name, 3);
+    direct_int("obj_to_u128_lo64")
+        && !chain("obj_to_u64")
+        && !chain("obj_to_i64")
+        && !chain("obj_to_i128_hi64")
+        && !chain("obj_to_i128_lo64")
 }
 
 /// True if `func_idx` (transitively, depth ≤ 3) reaches a helper that performs
@@ -16333,6 +16428,14 @@ mod tests {
                     local.get 0 local.get 1 call 2 i64.store offset=24
                     local.get 0 local.get 1 call 3 i64.store offset=16
                     local.get 0 local.get 1 call 4 i64.store offset=8)
+                (func (param i32 i64)                               ;; 11
+                    local.get 1 i64.const 8 i64.shr_u local.set 1
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 call 4 i64.store offset=8)
+                (func (param i32 i64)                               ;; 12
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 call 4 i64.store offset=8
+                    local.get 0 i64.const 7 i64.store offset=32)
             )"#,
         )
         .expect("wat parses");
@@ -16373,6 +16476,18 @@ mod tests {
             detect_tryfromval_decode_helper(&m, 10),
             None,
             "mixed-width decode is ambiguous"
+        );
+        // greptile P1 shapes: the decode must consume the UNMODIFIED `val`
+        // parameter, and the stores must be exactly the claimed layout.
+        assert_eq!(
+            detect_tryfromval_decode_helper(&m, 11),
+            None,
+            "a reassigned val param breaks the operand proof"
+        );
+        assert_eq!(
+            detect_tryfromval_decode_helper(&m, 12),
+            None,
+            "an extra store is a layout this detector does not prove"
         );
     }
 
