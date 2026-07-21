@@ -12444,37 +12444,8 @@ fn detect_fallible_value_getter(
     let instance_ttl_bumps = collect_proven_instance_ttl_bumps(module, func)?;
     let storage_type = detect_storage_type_in_chain(module, func_idx, 3)?;
     let key = load_struct_const_key(module, registry, func)?;
-    // Exactly one TryFromVal tag guard; its constant is the loaded type.
-    let mut tag: Option<u8> = None;
-    for w in func.body.windows(5) {
-        if let [
-            WI::I64Const(255),
-            WI::I64And,
-            WI::I64Const(t),
-            WI::I64Ne,
-            WI::BrIf(_),
-        ] = w
-            && (!(64..=77).contains(t) || tag.replace(*t as u8).is_some())
-        {
-            return None;
-        }
-    }
-    let tag = tag?;
-    // Exactly one constant-Error fail window.
-    let mut error_val: Option<i64> = None;
-    for w in func.body.windows(2) {
-        if let [WI::I64Const(e), WI::Call(f)] = w
-            && (*e as u64) & 0xff == TAG_ERROR
-            && func_reaches_host(module, *f, HostModule::Context, "fail_with_error", 0)
-            && error_val.replace(*e).is_some()
-        {
-            return None;
-        }
-    }
-    let error = try_decode_val(error_val?, registry);
-    // The returned value is the get's result: unique get-tee, unique
-    // tee'd-local return, no reassignment between (flat order is execution
-    // order under the no-Loop gate).
+    // Unique get-tee: the get's result captured in local `k` AND left on
+    // the operand stack (tee) for the guard that must follow.
     let mut get_tee: Option<(usize, u32)> = None;
     for (i, w) in func.body.windows(2).enumerate() {
         if let [WI::Call(g), WI::LocalTee(k)] = w
@@ -12485,6 +12456,56 @@ fn detect_fallible_value_getter(
         }
     }
     let (tee_pos, k) = get_tee?;
+    // The get is has-GUARDED: a unique window where a conditional consumes
+    // the has result — directly (`[call has, if/br_if]`, the i32-wrapper
+    // shape) or through the Bool-Val compare (`[call has, i64.const 1,
+    // i64.eq, if/br_if]`, the direct-import shape) — positioned before the
+    // get, so the missing-key path provably branches around it (flat order
+    // is execution order under the no-Loop gate). Without this, a helper
+    // getting unconditionally would trap on a missing key where the
+    // reconstruction panics with E (greptile P1 on PR #46).
+    let is_branch = |i: &crate::wasm::ir::WasmInstr| matches!(i, WI::If { .. } | WI::BrIf(_));
+    let mut has_guard: Option<usize> = None;
+    for (i, w) in func.body.windows(4).enumerate() {
+        let guarded = match w {
+            [WI::Call(h), g, _, _] if is_branch(g) => Some(h),
+            [WI::Call(h), WI::I64Const(1), WI::I64Eq, g] if is_branch(g) => Some(h),
+            _ => None,
+        };
+        if let Some(h) = guarded
+            && func_reaches_host(module, *h, HostModule::Ledger, "has_contract_data", 0)
+            && has_guard.replace(i).is_some()
+        {
+            return None;
+        }
+    }
+    if !has_guard.is_some_and(|h| h < tee_pos) {
+        return None;
+    }
+    // Exactly one TryFromVal tag guard, and it must IMMEDIATELY follow the
+    // get-tee: the tee leaves the loaded value on the stack, so adjacency
+    // IS the value linkage — the guard provably inspects the get's result,
+    // not some unrelated Val (greptile P1 on PR #46).
+    let mut tag_guard: Option<(usize, u8)> = None;
+    for (i, w) in func.body.windows(5).enumerate() {
+        if let [
+            WI::I64Const(255),
+            WI::I64And,
+            WI::I64Const(t),
+            WI::I64Ne,
+            WI::BrIf(_),
+        ] = w
+            && (!(64..=77).contains(t) || tag_guard.replace((i, *t as u8)).is_some())
+        {
+            return None;
+        }
+    }
+    let (guard_pos, tag) = tag_guard?;
+    if guard_pos != tee_pos + 1 {
+        return None;
+    }
+    // Unique tee'd-local return, after the tee, with no reassignment
+    // between — the returned value IS the get's result.
     let mut ret_pos: Option<usize> = None;
     for (i, w) in func.body.windows(2).enumerate() {
         match w {
@@ -12505,6 +12526,27 @@ fn detect_fallible_value_getter(
     {
         return None;
     }
+    // Exactly one constant-Error fail window, and it must sit AFTER the
+    // success return in flat order: under the no-Loop gate, everything
+    // past the `return` executes only on paths that did not return — the
+    // refusal continuation — so the fail is path-linked to the
+    // missing-key/wrong-tag branches, not some unrelated prior path
+    // (greptile P1 on PR #46).
+    let mut fail: Option<(usize, i64)> = None;
+    for (i, w) in func.body.windows(2).enumerate() {
+        if let [WI::I64Const(e), WI::Call(f)] = w
+            && (*e as u64) & 0xff == TAG_ERROR
+            && func_reaches_host(module, *f, HostModule::Context, "fail_with_error", 0)
+            && fail.replace((i, *e)).is_some()
+        {
+            return None;
+        }
+    }
+    let (fail_pos, error_val) = fail?;
+    if fail_pos <= ret_pos {
+        return None;
+    }
+    let error = try_decode_val(error_val, registry);
     cov_mark::hit!(fallible_value_getter_detected);
     Some(FallibleValueGetterInfo {
         storage_type,
@@ -12609,6 +12651,32 @@ fn detect_defaulting_map_getter(
     let (get_pos, v) = get_tee?;
     let (has_pos, c) = has_tee?;
     if v == c {
+        return None;
+    }
+    // The has flag GUARDS the get: the has-tee must feed `[i32.eqz,
+    // br_if]` directly (the tee leaves the flag on the stack), and the get
+    // must come after — so the missing-key path provably branches around
+    // the get before it could trap (greptile P1 on PR #46).
+    if !matches!(
+        (func.body.get(has_pos + 1), func.body.get(has_pos + 2)),
+        (Some(WI::I32Eqz), Some(WI::BrIf(_)))
+    ) || has_pos >= get_pos
+    {
+        return None;
+    }
+    // The tag guard inspects the GET's value: it must immediately follow
+    // the get-tee, consuming the teed value left on the stack (greptile
+    // P1 on PR #46 — adjacency IS the value linkage).
+    if !matches!(
+        func.body.get(get_pos + 1..get_pos + 6),
+        Some([
+            WI::I64Const(255),
+            WI::I64And,
+            WI::I64Const(76),
+            WI::I64Eq,
+            WI::BrIf(_)
+        ])
+    ) {
         return None;
     }
     // The tail select consumes exactly (v, map_new(), c).
@@ -18131,14 +18199,18 @@ mod tests {
         assert!(detect_fallible_struct_getter(&m, &reg, 14).is_none());
     }
 
-    /// Fixture for the VALUE-RETURNING fallible getter (issue #34 t6,
-    /// [`detect_fallible_value_getter`]): imports 0=has, 1=get,
-    /// 2=fail_with_error, 3=instance-TTL bump; func 4 = small-symbol
-    /// encoder, 5 = DataKey ctor (selector → "TokenAddr"/"Other"), 6 = thin
-    /// TTL wrapper (100, 200), 7 = fail wrapper, 8 = THE getter
-    /// (`bump; if has(K) { v = get(K); tag(v)==77 || trap; return v }
-    /// fail(Error 501)`), 9 = a caller returning the getter's value, 10 = a
-    /// NEGATIVE variant returning a constant instead of the get result.
+    /// Fixture for the VALUE-RETURNING getter classes (issue #34 t6,
+    /// [`detect_fallible_value_getter`] / [`detect_defaulting_map_getter`]):
+    /// imports 0=has, 1=get, 2=fail_with_error, 3=instance-TTL bump,
+    /// 4=map_new; func 5 = small-symbol encoder, 6 = DataKey ctor
+    /// (selector → "TokenAddr"/"Other"), 7 = thin TTL wrapper (100, 200),
+    /// 8 = fail wrapper, 9 = has wrapper (`(i64,i64) -> i32`), 10 = THE
+    /// fallible value getter (Bool-Val-compare has shape), 11 = its
+    /// caller, 12 = NEGATIVE: returns a constant instead of the get
+    /// result, 13 = THE defaulting map getter (has-wrapper shape, select
+    /// tail), 14 = its caller, 15 = NEGATIVE: the has flag does not guard
+    /// the get (`i32.eqz` fed to `drop`, not `br_if`), 16 = NEGATIVE: the
+    /// tag guard is not adjacent to the get-tee.
     fn value_getter_module() -> WasmModule {
         let wasm = wat::parse_str(
             r#"(module
@@ -18146,9 +18218,10 @@ mod tests {
                 (import "l" "1" (func (param i64 i64) (result i64)))
                 (import "x" "5" (func (param i64) (result i64)))
                 (import "l" "8" (func (param i64 i64) (result i64)))
+                (import "m" "_" (func (result i64)))
                 (memory 1)
                 (data (i32.const 2000) "TokenAddrOther")
-                (func (;4;) (param i32 i32) (result i64)
+                (func (;5;) (param i32 i32) (result i64)
                     (local i64 i32)
                     i32.const 95 drop
                     i32.const 48 drop
@@ -18166,27 +18239,29 @@ mod tests {
                         end
                     end
                     local.get 2 i64.const 8 i64.shl i64.const 14 i64.or)
-                (func (;5;) (param i32) (result i64)
+                (func (;6;) (param i32) (result i64)
                     block
                         block
                             local.get 0 br_table 0 1 0
                         end
-                        i32.const 2000 i32.const 9 call 4
+                        i32.const 2000 i32.const 9 call 5
                         return
                     end
-                    i32.const 2009 i32.const 5 call 4)
-                (func (;6;)
+                    i32.const 2009 i32.const 5 call 5)
+                (func (;7;)
                     i64.const 429496729604
                     i64.const 858993459204
                     call 3
                     drop)
-                (func (;7;) (param i64)
+                (func (;8;) (param i64)
                     local.get 0 call 2 drop)
-                (func (;8;) (result i64)
+                (func (;9;) (param i64 i64) (result i32)
+                    local.get 0 local.get 1 call 0 i64.const 1 i64.eq)
+                (func (;10;) (result i64)
                     (local i64)
-                    call 6
+                    call 7
                     block
-                        i32.const 0 call 5 local.tee 0
+                        i32.const 0 call 6 local.tee 0
                         i64.const 2 call 0
                         i64.const 1 i64.eq
                         if
@@ -18197,15 +18272,15 @@ mod tests {
                         end
                     end
                     i64.const 2151778615299
-                    call 7
+                    call 8
                     unreachable)
-                (func (;9;) (result i64)
-                    call 8)
-                (func (;10;) (result i64)
+                (func (;11;) (result i64)
+                    call 10)
+                (func (;12;) (result i64)
                     (local i64)
-                    call 6
+                    call 7
                     block
-                        i32.const 0 call 5 local.tee 0
+                        i32.const 0 call 6 local.tee 0
                         i64.const 2 call 0
                         i64.const 1 i64.eq
                         if
@@ -18216,7 +18291,58 @@ mod tests {
                         end
                     end
                     i64.const 2151778615299
+                    call 8
+                    unreachable)
+                (func (;13;) (result i64)
+                    (local i64 i64 i32)
                     call 7
+                    block
+                        i32.const 0 call 6 local.tee 0
+                        i64.const 2 call 9 local.tee 2
+                        i32.eqz br_if 0
+                        local.get 0 i64.const 2 call 1 local.tee 1
+                        i64.const 255 i64.and i64.const 76 i64.eq br_if 0
+                        unreachable
+                    end
+                    local.get 1
+                    call 4
+                    local.get 2
+                    select)
+                (func (;14;) (result i64)
+                    call 13)
+                (func (;15;) (result i64)
+                    (local i64 i64 i32)
+                    call 7
+                    block
+                        i32.const 0 call 6 local.tee 0
+                        i64.const 2 call 9 local.tee 2
+                        i32.eqz drop
+                        local.get 0 i64.const 2 call 1 local.tee 1
+                        i64.const 255 i64.and i64.const 76 i64.eq br_if 0
+                        unreachable
+                    end
+                    local.get 1
+                    call 4
+                    local.get 2
+                    select)
+                (func (;16;) (result i64)
+                    (local i64)
+                    call 7
+                    block
+                        i32.const 0 call 6 local.tee 0
+                        i64.const 2 call 0
+                        i64.const 1 i64.eq
+                        if
+                            local.get 0 i64.const 2 call 1 local.tee 0
+                            drop
+                            local.get 0
+                            i64.const 255 i64.and i64.const 77 i64.ne br_if 1
+                            local.get 0
+                            return
+                        end
+                    end
+                    i64.const 2151778615299
+                    call 8
                     unreachable)
             )"#,
         )
@@ -18228,7 +18354,7 @@ mod tests {
     fn detect_fallible_value_getter_classifies_and_refuses() {
         let m = value_getter_module();
         let reg = empty_registry();
-        let info = detect_fallible_value_getter(&m, &reg, 8).expect("the value getter classifies");
+        let info = detect_fallible_value_getter(&m, &reg, 10).expect("the value getter classifies");
         assert_eq!(info.storage_type, StorageType::Instance);
         assert_eq!(
             info.key,
@@ -18242,23 +18368,95 @@ mod tests {
         assert_eq!(error_code, 501);
         // The value linkage is proven, not assumed: a variant returning a
         // CONSTANT instead of the get result refuses.
-        assert!(detect_fallible_value_getter(&m, &reg, 10).is_none());
+        assert!(detect_fallible_value_getter(&m, &reg, 12).is_none());
+        // The tag guard must be ADJACENT to the get-tee (value linkage).
+        assert!(detect_fallible_value_getter(&m, &reg, 16).is_none());
         // Wrong shapes never classify: the ctor and the encoder.
+        assert!(detect_fallible_value_getter(&m, &reg, 6).is_none());
         assert!(detect_fallible_value_getter(&m, &reg, 5).is_none());
-        assert!(detect_fallible_value_getter(&m, &reg, 4).is_none());
+    }
+
+    #[test]
+    fn defaulting_map_getter_classifies_and_refuses() {
+        let m = value_getter_module();
+        let reg = empty_registry();
+        let info = detect_defaulting_map_getter(&m, &reg, 13).expect("the map getter classifies");
+        assert_eq!(info.storage_type, StorageType::Instance);
+        assert_eq!(
+            info.key,
+            SorobanExpr::SymbolLiteral("TokenAddr".to_string())
+        );
+        assert_eq!(info.instance_ttl_bumps, vec![(100, 200)]);
+        // The has flag must GUARD the get: the eqz-fed-to-drop variant
+        // (an unconditional get that would trap on a missing key) refuses.
+        assert!(detect_defaulting_map_getter(&m, &reg, 15).is_none());
+        // The fallible sibling never cross-classifies (ne-guard, no select
+        // tail) — and vice versa.
+        assert!(detect_defaulting_map_getter(&m, &reg, 10).is_none());
+        assert!(detect_fallible_value_getter(&m, &reg, 13).is_none());
+    }
+
+    #[test]
+    fn defaulting_map_getter_recovers_at_call_site() {
+        // End-to-end: lifting the caller (func 14) binds the defaulting
+        // map get once and returns the binding.
+        cov_mark::check!(defaulting_map_getter_recovered);
+        let m = value_getter_module();
+        let reg = empty_registry();
+        let result = lift_inline_call(
+            &m,
+            &reg,
+            14,
+            Vec::new(),
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+        );
+        let (stmts, return_expr) = result.content.expect("the recovery is effectful");
+        let binding_idx = stmts
+            .iter()
+            .find_map(|s| match s {
+                SorobanStmt::Let {
+                    name,
+                    value:
+                        SorobanExpr::StorageGet {
+                            storage_type: StorageType::Instance,
+                            key,
+                            unwrap: false,
+                            on_missing: Some(miss),
+                        },
+                    ..
+                } => {
+                    assert_eq!(**key, SorobanExpr::SymbolLiteral("TokenAddr".to_string()));
+                    assert_eq!(
+                        miss.as_ref(),
+                        &SorobanExpr::CollectionNew("Map".to_string()),
+                        "the missing path is the proven empty-map default"
+                    );
+                    name.strip_prefix("var_")
+                        .and_then(|n| n.parse::<u32>().ok())
+                }
+                _ => None,
+            })
+            .expect("the map get is bound: {stmts:?}");
+        assert_eq!(
+            return_expr,
+            Some(SorobanExpr::Local(binding_idx)),
+            "the caller returns the binding"
+        );
     }
 
     #[test]
     fn fallible_value_getter_recovers_at_call_site() {
-        // End-to-end: lifting the caller (func 9) reconstructs the TTL bump
-        // and returns the faithful Address-pinned defaulting get.
+        // End-to-end: lifting the caller (func 11) reconstructs the TTL
+        // bump and returns the faithful Address-pinned defaulting get.
         cov_mark::check!(fallible_value_getter_recovered);
         let m = value_getter_module();
         let reg = empty_registry();
         let result = lift_inline_call(
             &m,
             &reg,
-            9,
+            11,
             Vec::new(),
             0,
             Rc::new(RefCell::new(HashMap::new())),
