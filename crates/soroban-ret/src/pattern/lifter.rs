@@ -8293,39 +8293,68 @@ fn descriptor_key_from_ptr(module: &WasmModule, target_idx: u32, ptr: i32) -> Op
 /// blindly-probed zero-fill PR #44 rejected as fabrication).
 ///
 /// The proof is module-wide materialization discipline: a WASM store needs
-/// a pointer, and rustc/LLVM materialize static addresses as direct
-/// `i32.const` relocations (the one codegen assumption here — static
-/// addresses are never assembled from unrelated-constant arithmetic). So
-/// the range stays zero if:
+/// a pointer, and every pointer a rustc/LLVM module can aim at a static
+/// row originates from an `i32.const` relocation of that object's base (a
+/// non-stack-pointer global would be the only other channel — refused
+/// outright below). So the range stays zero if:
 /// - the module has no bulk-memory or atomic-store instruction anywhere
 ///   (those write through addresses this scan cannot see; the parser
 ///   preserves them as [`WasmInstr::Unknown`]);
+/// - the module never reads a global other than the shadow stack pointer
+///   (`global.get 0`) — a pointer-holding global could smuggle the row
+///   address past the constant scan;
 /// - every module-wide `I32Const(c)` with `c` in `[x - 15, end)` — the
 ///   row itself plus the widest store-immediate slop that could still land
 ///   in it from below — is EXACTLY `x` and immediately followed by
 ///   `Call(ctor)`: the address is only ever materialized as this one
 ///   ctor's argument, never as a store base, an arithmetic seed, or
-///   another function's argument.
+///   another function's argument;
+/// - no `I32Const(c)` within ±4096 of the row feeds an `i32.add`/`i32.sub`
+///   within its next two instructions — the derived-pointer shape
+///   (`i32.const base; … ; i32.add` reaching the row from a farther
+///   constant, in either direction) is refused wholesale (greptile P1 on
+///   PR #45). Longer derivation chains through locals are out of model:
+///   LLVM materializes each static object's address directly and never
+///   assembles it from another object's relocation.
 ///
 /// What the ctor itself does with the pointer is NOT assumed: the caller
 /// evaluates the ctor's real bytecode under [`DkEval`], whose stores
 /// REQUIRE shadow-stack addresses — an absolute store anywhere in the
 /// trace bails the whole eval. A completed eval therefore proves the ctor
 /// never writes the row, and (its trace being input-determined) that no
-/// call of it ever will — closing the loop with zero residual assumptions.
+/// call of it ever will.
 fn gap_row_proven_zero(module: &WasmModule, ctor: u32, x: u32, end: u32) -> bool {
     use crate::wasm::ir::WasmInstr as WI;
     let lo = x.saturating_sub(15);
+    let band_lo = x.saturating_sub(4096);
+    let band_hi = end.saturating_add(4096);
     for func in &module.functions {
         for (i, instr) in func.body.iter().enumerate() {
             match instr {
                 WI::Unknown(s) if s.contains("Memory") || s.contains("Store") => {
                     return false;
                 }
+                WI::GlobalGet(g) if *g != 0 => {
+                    return false;
+                }
                 WI::I32Const(c)
                     if (lo..end).contains(&(*c as u32))
                         && (*c as u32 != x
                             || !matches!(func.body.get(i + 1), Some(WI::Call(t)) if *t == ctor)) =>
+                {
+                    return false;
+                }
+                // Only plausible static-base constants (> 1024, the same
+                // data-pointer threshold used module-wide) participate in
+                // the derived-pointer refusal — small constants are
+                // offsets/immediates, not object bases.
+                WI::I32Const(c)
+                    if *c > 1024
+                        && (band_lo..band_hi).contains(&(*c as u32))
+                        && func.body[i + 1..]
+                            .iter()
+                            .take(2)
+                            .any(|n| matches!(n, WI::I32Add | WI::I32Sub)) =>
                 {
                     return false;
                 }
@@ -12439,11 +12468,40 @@ const TTL_EXTEND_FAMILY: [&str; 5] = [
 /// Any OTHER route to the family — a different family import called directly, or
 /// an internal callee whose depth-3 chain reaches any family name without
 /// being the thin wrapper — returns `None`.
+///
+/// POSITION is proven, not just operands: a proven bump must sit in the
+/// body's straight-line PREFIX (before the first control-flow instruction),
+/// which dominates every path — so hoisting it to an unconditional
+/// statement preserves semantics exactly. A bump inside or after any
+/// branch (e.g. only on the key-present arm) refuses the whole recognition:
+/// reconstructing it unconditionally would bump the TTL on paths that never
+/// did (greptile P1 on PR #45).
 fn collect_proven_instance_ttl_bumps(
     module: &WasmModule,
     func: &crate::wasm::ir::WasmFunction,
 ) -> Option<Vec<(u32, u32)>> {
     use crate::wasm::ir::WasmInstr as WI;
+    // Index of the first control-flow instruction: calls at or past it are
+    // no longer dominated by function entry as straight-line code.
+    let first_control_flow = func
+        .body
+        .iter()
+        .position(|i| {
+            matches!(
+                i,
+                WI::Block { .. }
+                    | WI::Loop { .. }
+                    | WI::If { .. }
+                    | WI::Else
+                    | WI::Br(_)
+                    | WI::BrIf(_)
+                    | WI::BrTable { .. }
+                    | WI::Return
+                    | WI::Unreachable
+                    | WI::CallIndirect(_)
+            )
+        })
+        .unwrap_or(func.body.len());
     let decode_u32_val = |v: i64| {
         let v = v as u64;
         ((v & 0xff) == TAG_U32).then_some((v >> 32) as u32)
@@ -12482,7 +12540,11 @@ fn collect_proven_instance_ttl_bumps(
         let WI::Call(t) = instr else { continue };
         if let Some(hf) = module.imports.get_by_index(*t) {
             if is_instance_bump(hf) {
-                // Direct call: both operands must be constant TAG_U32 Vals.
+                // Direct call: both operands must be constant TAG_U32 Vals,
+                // and the call must dominate (straight-line prefix).
+                if i >= first_control_flow {
+                    return None;
+                }
                 let window = (i >= 2).then(|| (&func.body[i - 2], &func.body[i - 1]));
                 let Some((WI::I64Const(a), WI::I64Const(b))) = window else {
                     return None;
@@ -12494,6 +12556,9 @@ fn collect_proven_instance_ttl_bumps(
                 return None;
             }
         } else if let Some(bump) = as_thin_const_wrapper(*t) {
+            if i >= first_control_flow {
+                return None;
+            }
             bumps.push(bump);
         } else if TTL_EXTEND_FAMILY
             .iter()
@@ -17720,6 +17785,8 @@ mod tests {
                 (func (;5;) (param i32) (result i64)
                     local.get 0 i32.const 7 i32.store
                     i32.const 2000 i32.const 6 call 0)
+                (func (;6;) (result i32)
+                    i32.const 16000 i32.const 16 i32.add)
             )"#,
         )
         .expect("wat parses");
@@ -17739,6 +17806,24 @@ mod tests {
         // 5016: a below-slop neighbor constant (5010) escapes the call
         // window → refused (it could be a store base reaching the row).
         assert!(!gap_row_proven_zero(&m, 1, 5016, 5032));
+        // 16016: a band constant feeding i32.add — the derived-pointer
+        // shape that could reach the row from a farther base → refused.
+        assert!(!gap_row_proven_zero(&m, 1, 16016, 16032));
+        // A module reading any non-stack-pointer global refuses every gap
+        // proof — a pointer-holding global could smuggle the row address
+        // past the constant scan.
+        let glob = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (global (mut i32) (i32.const 8192))
+                (global (mut i32) (i32.const 0))
+                (func (;0;) (result i32) global.get 1)
+                (func (;1;) (param i32) (result i64) i64.const 0)
+            )"#,
+        )
+        .expect("wat parses");
+        let glob = WasmModule::parse(&glob).expect("module parses");
+        assert!(!gap_row_proven_zero(&glob, 1, 3016, 3032));
         // A module containing bulk-memory ops refuses every gap proof.
         let bulk = wat::parse_str(
             r#"(module
@@ -17825,6 +17910,28 @@ mod tests {
         assert_eq!(
             collect_proven_instance_ttl_bumps(&m, m.get_function(10).unwrap()),
             Some(vec![])
+        );
+        // POSITION is proven: the same wrapper call placed INSIDE a block
+        // (after control flow — e.g. only on the key-present arm) is no
+        // longer dominated by entry, so hoisting it unconditionally would
+        // change ledger-rent behavior → the whole proof refuses.
+        use crate::wasm::ir::{BlockType, WasmInstr as WI};
+        let conditional_bump = crate::wasm::ir::WasmFunction {
+            index: 99,
+            type_index: 0,
+            locals: vec![],
+            body: vec![
+                WI::Block {
+                    block_type: BlockType::Empty,
+                },
+                WI::Call(12),
+                WI::End,
+                WI::End,
+            ],
+        };
+        assert_eq!(
+            collect_proven_instance_ttl_bumps(&m, &conditional_bump),
+            None
         );
     }
 
