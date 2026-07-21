@@ -9811,11 +9811,21 @@ fn load_struct_const_key(
                 };
                 match ev.eval_call(*t, vec![DkVal::I32(*x)], 0) {
                     Some(Some(result)) => dk_result_to_const_key(&result),
-                    // A dispatcher too large for the micro-evaluator (aqua's
-                    // 13-arm ctor is ~6k instructions): fall back to the
-                    // static descriptor-pointer read — the disc byte at `x`
-                    // indexes the ctor's own variant-name table.
-                    _ => descriptor_key_from_ptr(module, *t, *x),
+                    // The static descriptor-pointer fallback applies ONLY
+                    // when the evaluator refused because the dispatcher is
+                    // too large (aqua's 13-arm ctor is ~6k instructions) —
+                    // for THAT shape, `x` is by construction a descriptor
+                    // pointer. Any other eval failure (unsupported
+                    // instruction, depth, control flow) proves nothing about
+                    // `x`, and reading a byte through it could fabricate a
+                    // variant from unrelated data (greptile P1 on PR #44).
+                    _ if module
+                        .get_function(*t)
+                        .is_some_and(|f| f.body.len() > DK_MAX_BODY) =>
+                    {
+                        descriptor_key_from_ptr(module, *t, *x)
+                    }
+                    _ => None,
                 }
             }
             [_, WasmInstr::Call(t)] => module
@@ -11854,6 +11864,19 @@ fn decodes_own_param(
         .iter()
         .position(|i| matches!(i, WasmInstr::LocalSet(1) | WasmInstr::LocalTee(1)))
         .unwrap_or(usize::MAX);
+    // Flat position proves execution order only without back-edges: a loop
+    // that decodes local 1 and reassigns it later in the body would decode
+    // the REPLACEMENT on iterations 2+, so any `loop` + reassignment voids
+    // the position proof (greptile P1 on PR #44). Loop-free bodies (all the
+    // real SDK decoders) keep the position-aware acceptance.
+    if first_reassign != usize::MAX
+        && func
+            .body
+            .iter()
+            .any(|i| matches!(i, WasmInstr::Loop { .. }))
+    {
+        return false;
+    }
     func.body.windows(2).enumerate().any(|(i, w)| {
         i < first_reassign
             && matches!(w, [WasmInstr::LocalGet(1), WasmInstr::Call(t)]
@@ -16973,6 +16996,13 @@ mod tests {
                     local.get 0 i64.const 0 i64.store
                     local.get 1 call 4 local.set 1
                     local.get 0 local.get 1 i64.store offset=8)
+                (func (param i32 i64)                               ;; 14
+                    loop
+                        local.get 1 call 4 local.set 1
+                        local.get 1 i64.const 0 i64.ne br_if 0
+                    end
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 i64.store offset=8)
             )"#,
         )
         .expect("wat parses");
@@ -17090,6 +17120,19 @@ mod tests {
                     (local i64)
                     i32.const 0 call 3 local.tee 1
                     i64.const 2 call 12 drop
+                    local.get 1 i64.const 2 call 1 local.set 1
+                    local.get 0 local.get 1 i64.store)
+                (func (;14;) (param i32) (result i64)
+                    (local i32)
+                    loop
+                        local.get 1 i32.const 1 i32.add local.tee 1
+                        i32.const 3 i32.lt_u br_if 0
+                    end
+                    i32.const 2000 i32.const 6 call 2)
+                (func (;15;) (param i32)
+                    (local i64)
+                    i32.const 2000 call 14 local.tee 1
+                    i64.const 2 call 0 drop
                     local.get 1 i64.const 2 call 1 local.set 1
                     local.get 0 local.get 1 i64.store)
                 (global (mut i32) (i32.const 8192))
@@ -17274,6 +17317,13 @@ mod tests {
             load_struct_const_key(&m, &reg, f13),
             Some(SorobanExpr::SymbolLiteral("AdmCfg".to_string()))
         );
+        // greptile P1 shape: a SMALL ctor whose eval fails structurally (a
+        // loop) with an in-segment argument must NOT fall back to the
+        // descriptor-pointer read — that byte is unrelated data, and
+        // interpreting it would fabricate a variant. The fallback is gated
+        // to the oversize-dispatcher condition only.
+        let f15 = m.get_function(15).expect("func 15");
+        assert_eq!(load_struct_const_key(&m, &reg, f15), None);
     }
 
     #[test]
@@ -17354,6 +17404,9 @@ mod tests {
             detect_tryfromval_decode_helper(&m, 13),
             Some(DecodeHelperClass::U64)
         );
+        // …and a LOOP with a reassignment voids the flat-position proof
+        // entirely (iterations 2+ decode the replacement value).
+        assert_eq!(detect_tryfromval_decode_helper(&m, 14), None);
     }
 
     #[test]
