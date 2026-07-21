@@ -8157,6 +8157,12 @@ fn descriptor_key_from_ptr(module: &WasmModule, target_idx: u32, ptr: i32) -> Op
     // The descriptor pointer addresses a 1-byte enum discriminant (win #4's
     // zero-extend reads the byte-or-0 of the covering segment); require the
     // address to lie in real static data so we never resolve runtime memory.
+    // The descriptor pointer addresses a 1-byte enum discriminant; require
+    // the address to lie in REAL initialized static data. A constant pointer
+    // in a segment gap was probed as "zero-initialized BSS → variant 0" and
+    // REJECTED by corpus audit: such gaps can hold mutable statics written at
+    // runtime, and resolving them fabricated keys that surfaced as wrong
+    // substitutions (soroswap events with DataKeys in Address/value fields).
     let disc = module
         .data_sections
         .read_bytes_zero_extended(ptr as u32, 1)
@@ -9709,8 +9715,8 @@ fn is_storage_probe(module: &WasmModule, f: u32) -> bool {
     if ft.params.as_slice() != [WasmType::I64, WasmType::I64] || ft.results.len() > 1 {
         return false;
     }
-    func_reaches_host(module, f, HostModule::Ledger, "get_contract_data", 2)
-        || func_reaches_host(module, f, HostModule::Ledger, "has_contract_data", 2)
+    func_reaches_host(module, f, HostModule::Ledger, "get_contract_data", 0)
+        || func_reaches_host(module, f, HostModule::Ledger, "has_contract_data", 0)
 }
 
 /// Convert a [`DkEval`] result into a fully-CONSTANT storage-key expression:
@@ -9805,6 +9811,20 @@ fn load_struct_const_key(
                 };
                 match ev.eval_call(*t, vec![DkVal::I32(*x)], 0) {
                     Some(Some(result)) => dk_result_to_const_key(&result),
+                    // The static descriptor-pointer fallback applies ONLY
+                    // when the evaluator refused because the dispatcher is
+                    // too large (aqua's 13-arm ctor is ~6k instructions) —
+                    // for THAT shape, `x` is by construction a descriptor
+                    // pointer. Any other eval failure (unsupported
+                    // instruction, depth, control flow) proves nothing about
+                    // `x`, and reading a byte through it could fabricate a
+                    // variant from unrelated data (greptile P1 on PR #44).
+                    _ if module
+                        .get_function(*t)
+                        .is_some_and(|f| f.body.len() > DK_MAX_BODY) =>
+                    {
+                        descriptor_key_from_ptr(module, *t, *x)
+                    }
                     _ => None,
                 }
             }
@@ -11826,26 +11846,41 @@ fn i64_store_offsets(func: &crate::wasm::ir::WasmFunction) -> Option<Vec<u32>> {
 }
 
 /// True when the body decodes ITS OWN `val` parameter with the named
-/// Int-module import: an adjacent `[local.get 1, call <import>]` window, with
-/// local 1 never reassigned anywhere in the body (no `local.set/tee 1`). This
-/// is a dataflow proof, not a reachability co-occurrence — the decode's
-/// operand is provably the parameter (greptile P1 on PR #42).
+/// Int-module import: an adjacent `[local.get 1, call <import>]` window that
+/// occurs BEFORE any reassignment of local 1 (`local.set/tee 1`). This is a
+/// dataflow proof, not a reachability co-occurrence — the decode's operand is
+/// provably the parameter (greptile P1 on PR #42). Position-aware rather than
+/// body-wide: real SDK decoders commonly REUSE local 1 for the decoded result
+/// after the last decode window (aqua's u64/u128 decoders), which must not
+/// disqualify the pre-reassignment windows.
 fn decodes_own_param(
     module: &WasmModule,
     func: &crate::wasm::ir::WasmFunction,
     name: &str,
 ) -> bool {
     use crate::wasm::ir::WasmInstr;
-    if func
+    let first_reassign = func
         .body
         .iter()
-        .any(|i| matches!(i, WasmInstr::LocalSet(1) | WasmInstr::LocalTee(1)))
+        .position(|i| matches!(i, WasmInstr::LocalSet(1) | WasmInstr::LocalTee(1)))
+        .unwrap_or(usize::MAX);
+    // Flat position proves execution order only without back-edges: a loop
+    // that decodes local 1 and reassigns it later in the body would decode
+    // the REPLACEMENT on iterations 2+, so any `loop` + reassignment voids
+    // the position proof (greptile P1 on PR #44). Loop-free bodies (all the
+    // real SDK decoders) keep the position-aware acceptance.
+    if first_reassign != usize::MAX
+        && func
+            .body
+            .iter()
+            .any(|i| matches!(i, WasmInstr::Loop { .. }))
     {
         return false;
     }
-    func.body.windows(2).any(|w| {
-        matches!(w, [WasmInstr::LocalGet(1), WasmInstr::Call(t)]
-            if module.imports.get_by_index(*t).is_some_and(|hf| hf.module == HostModule::Int && hf.name == name))
+    func.body.windows(2).enumerate().any(|(i, w)| {
+        i < first_reassign
+            && matches!(w, [WasmInstr::LocalGet(1), WasmInstr::Call(t)]
+                if module.imports.get_by_index(*t).is_some_and(|hf| hf.module == HostModule::Int && hf.name == name))
     })
 }
 
@@ -11945,6 +11980,183 @@ fn detect_tryfromval_decode_helper(
         }
         _ => None,
     }
+}
+
+/// Info for a recognized fallible STRUCT getter (issue #34 tranche 4). See
+/// [`detect_fallible_struct_getter`].
+///
+/// Not yet consumed in the pipeline: the recognition is proven (aqua's
+/// func-235 resolves to `PoolRewardConfig` / `Instance` / the
+/// `Vec[Symbol("PoolRewardConfig")]` key), but the SEEDING was measured to
+/// destabilize husk collapse when wired at the call site (an appended
+/// binding is dropped by return-extraction paths while its field-access
+/// seeds survive, and suppressing the husk unmasks partially-lifted bodies
+/// elsewhere). Wiring it needs the splice-order redesign tracked on issue
+/// #34 — the detector and its tests are banked here so that tranche starts
+/// from proven recognition.
+#[allow(dead_code)]
+struct FallibleStructGetterInfo {
+    storage_type: StorageType,
+    key: SorobanExpr,
+    type_name: String,
+    /// The struct's u128 field (decoded to out slots `[0, 8]`) and u64 field
+    /// (out slot `16`) — the rustc layout for a `{u128, u64}` struct.
+    u128_field: String,
+    u64_field: String,
+    /// Spec-declared field order, for rendering the zero-default construct.
+    spec_fields: Vec<(String, ScSpecTypeDef)>,
+}
+
+/// Recognize a "fallible struct getter" (issue #34 tranche 4): a void
+/// `(i32 out)` helper implementing
+/// `env.storage().<dur>().get::<_, T>(&KEY).unwrap_or(T { .. zeros })` for a
+/// TWO-field struct `T { u128, u64 }` — the aqua `PoolRewardConfig` /
+/// `PoolRewardData` class rooting the reward-math chains. The SDK shape:
+/// `if !has(KEY) { out = zeros } else { get(KEY) → MapObject tag check →
+/// map_unpack(LM field names) → per-field TryFromVal decodes → out }`.
+///
+/// Every element is bytecode-proven; any deviation → `None` → today's
+/// output byte-identical:
+/// - void, exactly one I32 param (the out-pointer);
+/// - chains `has_contract_data` AND `get_contract_data`, never
+///   `put_contract_data`, and no cross-contract call — so the appended
+///   re-get at the call site observes the same storage state;
+/// - unpacks via `map_unpack_to_linear_memory` (import or thunk) with an LM
+///   field-name descriptor matching a registry struct of EXACTLY two fields,
+///   one `u128` + one `u64` (the only layout this recovers: rustc places the
+///   u128 at `[0, 8]` and the u64 at `16`, confirmed by the out stores);
+/// - calls EXACTLY one `U128`-class and one `U64`-class TryFromVal decode
+///   helper ([`detect_tryfromval_decode_helper`]), each once — the
+///   class↔field linking is therefore unique, no instruction tracing needed;
+/// - the zero-default window `[i64.const 0, local.set, i64.const 0, br]`
+///   (the missing-key path zeroing both u128 limbs; the u64 default is the
+///   zero-initialized local);
+/// - out stores at offsets 0, 8 AND 16 present;
+/// - the storage key is a proven constant ([`load_struct_const_key`]).
+#[allow(dead_code)]
+fn detect_fallible_struct_getter(
+    module: &WasmModule,
+    registry: &TypeRegistry,
+    func_idx: u32,
+) -> Option<FallibleStructGetterInfo> {
+    use crate::wasm::ir::{WasmInstr, WasmType};
+    let func_type = module.get_func_type(func_idx)?;
+    if !func_type.results.is_empty() || func_type.params.as_slice() != [WasmType::I32] {
+        return None;
+    }
+    let ledger =
+        |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Ledger, name, 3);
+    if !ledger("has_contract_data") || !ledger("get_contract_data") || ledger("put_contract_data") {
+        return None;
+    }
+    if function_calls_module_in_chain(module, func_idx, HostModule::Call, 3) {
+        return None;
+    }
+    let func = module.get_function(func_idx)?;
+    // Unpacks the loaded map (directly or through the SDK's marshalling thunk).
+    let has_map_unpack = func.body.iter().any(|i| {
+        matches!(i, WasmInstr::Call(t)
+            if module.imports.get_by_index(*t).map_or_else(
+                || detect_map_unpack_thunk(module, *t),
+                |hf| hf.module == HostModule::Map && hf.name == "map_unpack_to_linear_memory"))
+    });
+    if !has_map_unpack {
+        return None;
+    }
+    // The LM field-name descriptor: an I32Const pointer whose string-slice
+    // array of length 2 names a registry struct.
+    let mut found: Option<(String, Vec<String>)> = None;
+    for instr in &func.body {
+        let WasmInstr::I32Const(ptr) = instr else {
+            continue;
+        };
+        if *ptr <= 1024 {
+            continue;
+        }
+        if let Some(names) = module.data_sections.read_string_slice_array(*ptr as u32, 2)
+            && names.len() == 2
+            && let Some(tn) = find_type_by_field_names(registry, &names, None)
+        {
+            if found.as_ref().is_some_and(|(t, _)| *t != tn) {
+                return None; // two different struct descriptors → ambiguous
+            }
+            found = Some((tn, names));
+        }
+    }
+    let (type_name, _names) = found?;
+    let spec = registry.structs.get(&type_name)?;
+    let spec_fields: Vec<(String, ScSpecTypeDef)> = spec
+        .fields
+        .iter()
+        .filter_map(|f| Some((f.name.to_utf8_string().ok()?, f.type_.clone())))
+        .collect();
+    if spec_fields.len() != 2 {
+        return None;
+    }
+    let u128_field = spec_fields
+        .iter()
+        .find(|(_, t)| matches!(t, ScSpecTypeDef::U128))?
+        .0
+        .clone();
+    let u64_field = spec_fields
+        .iter()
+        .find(|(_, t)| matches!(t, ScSpecTypeDef::U64))?
+        .0
+        .clone();
+    // Exactly one decode helper per width class, each called exactly once —
+    // the class↔field link is unique.
+    let mut u128_calls = 0usize;
+    let mut u64_calls = 0usize;
+    for instr in &func.body {
+        if let WasmInstr::Call(t) = instr
+            && module.imports.get_by_index(*t).is_none()
+        {
+            match detect_tryfromval_decode_helper(module, *t) {
+                Some(DecodeHelperClass::U128) => u128_calls += 1,
+                Some(DecodeHelperClass::U64) => u64_calls += 1,
+                Some(DecodeHelperClass::I128) => return None,
+                None => {}
+            }
+        }
+    }
+    if u128_calls != 1 || u64_calls != 1 {
+        return None;
+    }
+    // The missing-key path zeroes both u128 limbs and exits.
+    let has_zero_default = func.body.windows(4).any(|w| {
+        matches!(
+            w,
+            [
+                WasmInstr::I64Const(0),
+                WasmInstr::LocalSet(_),
+                WasmInstr::I64Const(0),
+                WasmInstr::Br(_)
+            ]
+        )
+    });
+    if !has_zero_default {
+        return None;
+    }
+    // All three out slots are written.
+    let has_store = |off: u32| {
+        func.body
+            .iter()
+            .any(|i| matches!(i, WasmInstr::I64Store(o) if *o == off))
+    };
+    if !has_store(0) || !has_store(8) || !has_store(16) {
+        return None;
+    }
+    let storage_type = detect_storage_type_in_chain(module, func_idx, 3)?;
+    let key = load_struct_const_key(module, registry, func)?;
+    cov_mark::hit!(fallible_struct_getter_detected);
+    Some(FallibleStructGetterInfo {
+        storage_type,
+        key,
+        type_name,
+        u128_field,
+        u64_field,
+        spec_fields,
+    })
 }
 
 /// Recognize a "defaulting u128 storage getter" (issue #34 tranche 2): a void
@@ -16717,7 +16929,9 @@ mod tests {
     /// 5=put. Functions: 6 = defaulting u128 getter `[lo@0, hi@8]`;
     /// 7 = pure u128 TryFromVal decode `[disc@0, err@8, lo@16, hi@24]`;
     /// 8 = pure u64 TryFromVal decode `[disc@0, val@8]`; 9 = a getter that
-    /// ALSO puts (negative); 10 = a decode of BOTH widths (negative).
+    /// ALSO puts (negative); 10 = a decode of BOTH widths (negative);
+    /// 13 = u64 decode that REUSES the val local for its result after the
+    /// decode window (aqua's real decoder shape — must still classify).
     fn tranche2_module() -> WasmModule {
         let wasm = wat::parse_str(
             r#"(module
@@ -16778,6 +16992,17 @@ mod tests {
                     local.get 0 i64.const 0 i64.store
                     local.get 0 local.get 1 call 4 i64.store offset=8
                     local.get 0 i64.const 7 i64.store offset=32)
+                (func (param i32 i64)                               ;; 13
+                    local.get 0 i64.const 0 i64.store
+                    local.get 1 call 4 local.set 1
+                    local.get 0 local.get 1 i64.store offset=8)
+                (func (param i32 i64)                               ;; 14
+                    loop
+                        local.get 1 call 4 local.set 1
+                        local.get 1 i64.const 0 i64.ne br_if 0
+                    end
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 i64.store offset=8)
             )"#,
         )
         .expect("wat parses");
@@ -16889,11 +17114,155 @@ mod tests {
                 (func (;11;) (param i32)
                     i32.const 0 call 3 drop
                     local.get 0 i64.const 0 i64.store)
+                (func (;12;) (param i64 i64) (result i32)
+                    local.get 0 local.get 1 call 0 i64.const 1 i64.eq)
+                (func (;13;) (param i32)
+                    (local i64)
+                    i32.const 0 call 3 local.tee 1
+                    i64.const 2 call 12 drop
+                    local.get 1 i64.const 2 call 1 local.set 1
+                    local.get 0 local.get 1 i64.store)
+                (func (;14;) (param i32) (result i64)
+                    (local i32)
+                    loop
+                        local.get 1 i32.const 1 i32.add local.tee 1
+                        i32.const 3 i32.lt_u br_if 0
+                    end
+                    i32.const 2000 i32.const 6 call 2)
+                (func (;15;) (param i32)
+                    (local i64)
+                    i32.const 2000 call 14 local.tee 1
+                    i64.const 2 call 0 drop
+                    local.get 1 i64.const 2 call 1 local.set 1
+                    local.get 0 local.get 1 i64.store)
                 (global (mut i32) (i32.const 8192))
             )"#,
         )
         .expect("wat parses");
         WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    fn struct_getter_registry() -> crate::spec::registry::TypeRegistry {
+        let mut reg = empty_registry();
+        let field = |name: &str, t: ScSpecTypeDef| stellar_xdr::ScSpecUdtStructFieldV0 {
+            doc: "".try_into().unwrap(),
+            name: name.try_into().unwrap(),
+            type_: t,
+        };
+        reg.structs.insert(
+            "RewardCfg".to_string(),
+            stellar_xdr::ScSpecUdtStructV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: "RewardCfg".try_into().unwrap(),
+                fields: vec![
+                    field("expired", ScSpecTypeDef::U64),
+                    field("tps", ScSpecTypeDef::U128),
+                ]
+                .try_into()
+                .unwrap(),
+            },
+        );
+        reg
+    }
+
+    /// Self-contained fixture for [`detect_fallible_struct_getter`] (issue
+    /// #34 t4): imports 0=has, 1=get, 2=map_unpack, 3=obj_to_u64,
+    /// 4=obj_to_u128_hi64, 5=obj_to_u128_lo64; func 6 = small-symbol
+    /// encoder, 7 = DataKey ctor (selector → "CfgKey"), 8 = u64 decoder,
+    /// 9 = u128 decoder, 10 = THE fallible struct getter. Data: field names
+    /// "expired"/"tps" + their `(ptr, len)` descriptor array + "CfgKey".
+    fn struct_getter_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "l" "0" (func (param i64 i64) (result i64)))
+                (import "l" "1" (func (param i64 i64) (result i64)))
+                (import "m" "a" (func (param i64 i32 i32 i32 i32) (result i64)))
+                (import "i" "0" (func (param i64) (result i64)))
+                (import "i" "5" (func (param i64) (result i64)))
+                (import "i" "4" (func (param i64) (result i64)))
+                (memory 1)
+                (data (i32.const 2000) "expiredtpsCfgKey")
+                (data (i32.const 2016) "\d0\07\00\00\07\00\00\00\d7\07\00\00\03\00\00\00")
+                (func (;6;) (param i32 i32) (result i64)
+                    (local i64 i32)
+                    i32.const 95 drop
+                    i32.const 48 drop
+                    i32.const 65 drop
+                    i32.const 97 drop
+                    loop
+                        local.get 3 local.get 1 i32.lt_u
+                        if
+                            local.get 2 i64.const 6 i64.shl
+                            local.get 0 local.get 3 i32.add i32.load8_u
+                            i64.extend_i32_u i64.const 32 i64.sub i64.or
+                            local.set 2
+                            local.get 3 i32.const 1 i32.add local.set 3
+                            br 1
+                        end
+                    end
+                    local.get 2 i64.const 8 i64.shl i64.const 14 i64.or)
+                (func (;7;) (param i32) (result i64)
+                    block
+                        block
+                            local.get 0 br_table 0 1 0
+                        end
+                        i32.const 2010 i32.const 6 call 6
+                        return
+                    end
+                    i32.const 2010 i32.const 6 call 6)
+                (func (;8;) (param i32 i64)
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 call 3 i64.store offset=8)
+                (func (;9;) (param i32 i64)
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 call 4 i64.store offset=24
+                    local.get 0 local.get 1 call 5 i64.store offset=16)
+                (func (;10;) (param i32)
+                    (local i64 i64)
+                    block (result i64)
+                        i32.const 0 call 7 local.tee 1
+                        i64.const 2 call 0
+                        i32.wrap_i64 i32.eqz
+                        if
+                            i64.const 0 local.set 2
+                            i64.const 0
+                            br 1
+                        end
+                        local.get 1 i64.const 2 call 1 local.set 1
+                        local.get 1 i32.const 2016 i32.const 2 local.get 0 i32.const 2 call 2 drop
+                        i32.const 4096 local.get 1 call 8
+                        i32.const 4096 local.get 1 call 9
+                        i64.const 5
+                    end
+                    drop
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 i64.const 0 i64.store offset=8
+                    local.get 0 i64.const 0 i64.store offset=16)
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn detect_fallible_struct_getter_classifies_and_resolves() {
+        let m = struct_getter_module();
+        let reg = struct_getter_registry();
+        let info = detect_fallible_struct_getter(&m, &reg, 10)
+            .expect("the fallible struct getter classifies");
+        assert_eq!(info.type_name, "RewardCfg");
+        assert_eq!(info.u128_field, "tps");
+        assert_eq!(info.u64_field, "expired");
+        assert_eq!(info.storage_type, StorageType::Instance);
+        assert_eq!(
+            info.key,
+            SorobanExpr::SymbolLiteral("CfgKey".to_string()),
+            "the ctor call micro-executes to the storage key"
+        );
+        // Wrong shapes never classify: a bare decoder, and the ctor itself.
+        assert!(detect_fallible_struct_getter(&m, &reg, 8).is_none());
+        assert!(detect_fallible_struct_getter(&m, &reg, 7).is_none());
     }
 
     #[test]
@@ -16940,6 +17309,21 @@ mod tests {
         // probe (dropped here) is no key candidate → None.
         let f11 = m.get_function(11).expect("func 11");
         assert_eq!(load_struct_const_key(&m, &reg, f11), None);
+        // The probe may be a thin INTERNAL `(i64, i64)` has/get wrapper
+        // (the corpus routes has/get through such thunks) — func 13 feeds
+        // the ctor result into wrapper 12.
+        let f13 = m.get_function(13).expect("func 13");
+        assert_eq!(
+            load_struct_const_key(&m, &reg, f13),
+            Some(SorobanExpr::SymbolLiteral("AdmCfg".to_string()))
+        );
+        // greptile P1 shape: a SMALL ctor whose eval fails structurally (a
+        // loop) with an in-segment argument must NOT fall back to the
+        // descriptor-pointer read — that byte is unrelated data, and
+        // interpreting it would fabricate a variant. The fallback is gated
+        // to the oversize-dispatcher condition only.
+        let f15 = m.get_function(15).expect("func 15");
+        assert_eq!(load_struct_const_key(&m, &reg, f15), None);
     }
 
     #[test]
@@ -17013,6 +17397,16 @@ mod tests {
             None,
             "an extra store is a layout this detector does not prove"
         );
+        // Position-aware operand proof: reusing the val local for the RESULT
+        // after the decode window (aqua's real u64/u128 decoders) is fine —
+        // only a reassignment BEFORE the window breaks the proof.
+        assert_eq!(
+            detect_tryfromval_decode_helper(&m, 13),
+            Some(DecodeHelperClass::U64)
+        );
+        // …and a LOOP with a reassignment voids the flat-position proof
+        // entirely (iterations 2+ decode the replacement value).
+        assert_eq!(detect_tryfromval_decode_helper(&m, 14), None);
     }
 
     #[test]
