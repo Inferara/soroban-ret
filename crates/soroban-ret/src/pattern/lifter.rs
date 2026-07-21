@@ -1220,6 +1220,7 @@ impl<'a> LiftContext<'a> {
             mem: HashMap::new(),
             sp: DkVal::StackPtr(0),
             steps: 0,
+            gap_zero: None,
         };
         let Some(Some(result)) = ev.eval_call(target_idx, dk_args, 0) else {
             if dbg {
@@ -2499,6 +2500,110 @@ impl<'a> LiftContext<'a> {
                                 }
                             }
                             self.found_host_calls = true;
+                            true
+                        } else if let Some(getter) = detect_fallible_struct_getter(
+                            self.wasm_module,
+                            self.registry,
+                            *target_idx,
+                        ) && let Some(StackVal::FrameSlot(out_id, out_base)) =
+                            args.first()
+                            && out_base.is_static()
+                        {
+                            // Fallible STRUCT getter (issue #34 tranche 5): the helper
+                            // is proven to be `get::<_, T>(&KEY).unwrap_or(T { zeros })`
+                            // for a two-field `{u128, u64}` struct, preceded by proven
+                            // constant instance TTL bumps. Reconstruct it at ONE point:
+                            // emit the TTL statements and a `let` binding of the
+                            // defaulting get, seed the out slots as the binding's
+                            // fields, and skip inlining entirely. Inlining this shape
+                            // only yields an unresolvable husk (its internal
+                            // default/decode joins collapse every out slot to Unknown),
+                            // and the hybrid designs that raced seeds against husk
+                            // splicing were measured failures (PR #44) — with no husk,
+                            // the collapse heuristics see one coherent statement
+                            // stream. A non-frame out-pointer falls through to generic
+                            // inlining (today's behavior).
+                            let (out_id, out_base) = (*out_id, out_base.base);
+                            for (threshold, extend_to) in &getter.instance_ttl_bumps {
+                                self.stmts.push(SorobanStmt::Expr(
+                                    SorobanExpr::ExtendInstanceAndCodeTtl {
+                                        threshold: Box::new(SorobanExpr::U32Literal(*threshold)),
+                                        extend_to: Box::new(SorobanExpr::U32Literal(*extend_to)),
+                                    },
+                                ));
+                            }
+                            let zeros = SorobanExpr::StructConstruct {
+                                type_name: getter.type_name.clone(),
+                                fields: getter
+                                    .spec_fields
+                                    .iter()
+                                    .map(|(name, ty)| {
+                                        let zero = match ty {
+                                            ScSpecTypeDef::U128 => SorobanExpr::U128Literal(0),
+                                            _ => SorobanExpr::U64Literal(0),
+                                        };
+                                        (name.clone(), zero)
+                                    })
+                                    .collect(),
+                            };
+                            let var_idx = self.locals.len() as u32;
+                            self.locals.push(StackVal::LetBinding(var_idx));
+                            // The CastAs wrap is the reusable `get::<_, T>`
+                            // turbofish vehicle (t2's pattern): if cleanup
+                            // later demotes an unconsumed binding to a bare
+                            // expression, the get keeps its value type
+                            // (`unwrap_or(T { .. })` needs `T`, so the
+                            // `Val`-annotating fallback pass must never
+                            // claim it).
+                            self.stmts.push(SorobanStmt::Let {
+                                name: format!("var_{var_idx}"),
+                                mutable: false,
+                                value: SorobanExpr::CastAs {
+                                    value: Box::new(SorobanExpr::StorageGet {
+                                        storage_type: getter.storage_type,
+                                        key: Box::new(getter.key.clone()),
+                                        unwrap: false,
+                                        on_missing: Some(Box::new(zeros)),
+                                    }),
+                                    target_type: getter.type_name.clone(),
+                                },
+                            });
+                            // Reference the binding as `Local(N)` — the form
+                            // every counting/substitution pass understands
+                            // (`NamedLocal` references are invisible to
+                            // `count_local_uses`, and the dead-store pass
+                            // would demote the binding while its field
+                            // seeds survive — unbound `var_N`).
+                            let field = |name: &str| {
+                                StackVal::HostCallResult(Box::new(SorobanExpr::FieldAccess {
+                                    object: Box::new(SorobanExpr::Local(var_idx)),
+                                    field: name.to_string(),
+                                }))
+                            };
+                            // The proven out layout: u128 limbs at [0, 8], u64 at 16.
+                            // Both limb slots tag the SAME field expression, so the
+                            // existing (lo, hi) re-pair machinery reconstructs
+                            // `var_N.<u128_field>` whole at every consumer.
+                            let u128_val = field(&getter.u128_field);
+                            let mut slots = self.frame_slots.borrow_mut();
+                            slots.insert(
+                                (out_id, out_base),
+                                StackVal::I128Limb {
+                                    value: Box::new(u128_val.clone()),
+                                    hi: false,
+                                },
+                            );
+                            slots.insert(
+                                (out_id, out_base + 8),
+                                StackVal::I128Limb {
+                                    value: Box::new(u128_val),
+                                    hi: true,
+                                },
+                            );
+                            slots.insert((out_id, out_base + 16), field(&getter.u64_field));
+                            drop(slots);
+                            self.found_host_calls = true;
+                            cov_mark::hit!(fallible_struct_getter_recovered);
                             true
                         } else if let Some(unpack_info) = detect_map_unpack_decode_wrapper(
                             self.wasm_module,
@@ -8163,6 +8268,9 @@ fn descriptor_key_from_ptr(module: &WasmModule, target_idx: u32, ptr: i32) -> Op
     // REJECTED by corpus audit: such gaps can hold mutable statics written at
     // runtime, and resolving them fabricated keys that surfaced as wrong
     // substitutions (soroswap events with DataKeys in Address/value fields).
+    // (The PROVEN gap case — a linker-elided all-zero descriptor row — is
+    // handled by executing the ctor's real bytecode instead:
+    // [`gap_row_proven_zero`] + `DkEval.gap_zero`.)
     let disc = module
         .data_sections
         .read_bytes_zero_extended(ptr as u32, 1)
@@ -8175,6 +8283,87 @@ fn descriptor_key_from_ptr(module: &WasmModule, target_idx: u32, ptr: i32) -> Op
     Some(SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral(
         name.clone(),
     )]))
+}
+
+/// Prove that the data-segment GAP `[x, end)` holds WASM's zero-initialized
+/// memory at EVERY point of every execution — i.e. it is a constant
+/// descriptor row whose all-zero data segment the linker elided (aqua's
+/// `PoolRewardConfig` row sits between its `\x01` and `\x06` neighbors
+/// exactly 16 bytes apart), not a runtime-written mutable static (the
+/// blindly-probed zero-fill PR #44 rejected as fabrication).
+///
+/// The proof is module-wide materialization discipline: a WASM store needs
+/// a pointer, and every pointer a rustc/LLVM module can aim at a static
+/// row originates from an `i32.const` relocation of that object's base (a
+/// non-stack-pointer global would be the only other channel — refused
+/// outright below). So the range stays zero if:
+/// - the module has no bulk-memory or atomic-store instruction anywhere
+///   (those write through addresses this scan cannot see; the parser
+///   preserves them as [`WasmInstr::Unknown`]);
+/// - the module never reads a global other than the shadow stack pointer
+///   (`global.get 0`) — a pointer-holding global could smuggle the row
+///   address past the constant scan;
+/// - every module-wide `I32Const(c)` with `c` in `[x - 15, end)` — the
+///   row itself plus the widest store-immediate slop that could still land
+///   in it from below — is EXACTLY `x` and immediately followed by
+///   `Call(ctor)`: the address is only ever materialized as this one
+///   ctor's argument, never as a store base, an arithmetic seed, or
+///   another function's argument;
+/// - no `I32Const(c)` within ±4096 of the row feeds an `i32.add`/`i32.sub`
+///   within its next two instructions — the derived-pointer shape
+///   (`i32.const base; … ; i32.add` reaching the row from a farther
+///   constant, in either direction) is refused wholesale (greptile P1 on
+///   PR #45). Longer derivation chains through locals are out of model:
+///   LLVM materializes each static object's address directly and never
+///   assembles it from another object's relocation.
+///
+/// What the ctor itself does with the pointer is NOT assumed: the caller
+/// evaluates the ctor's real bytecode under [`DkEval`], whose stores
+/// REQUIRE shadow-stack addresses — an absolute store anywhere in the
+/// trace bails the whole eval. A completed eval therefore proves the ctor
+/// never writes the row, and (its trace being input-determined) that no
+/// call of it ever will.
+fn gap_row_proven_zero(module: &WasmModule, ctor: u32, x: u32, end: u32) -> bool {
+    use crate::wasm::ir::WasmInstr as WI;
+    let lo = x.saturating_sub(15);
+    let band_lo = x.saturating_sub(4096);
+    let band_hi = end.saturating_add(4096);
+    for func in &module.functions {
+        for (i, instr) in func.body.iter().enumerate() {
+            match instr {
+                WI::Unknown(s) if s.contains("Memory") || s.contains("Store") => {
+                    return false;
+                }
+                WI::GlobalGet(g) if *g != 0 => {
+                    return false;
+                }
+                WI::I32Const(c)
+                    if (lo..end).contains(&(*c as u32))
+                        && (*c as u32 != x
+                            || !matches!(func.body.get(i + 1), Some(WI::Call(t)) if *t == ctor)) =>
+                {
+                    return false;
+                }
+                // Only plausible static-base constants (> 1024, the same
+                // data-pointer threshold used module-wide) participate in
+                // the derived-pointer refusal — small constants are
+                // offsets/immediates, not object bases.
+                WI::I32Const(c)
+                    if *c > 1024
+                        && (band_lo..band_hi).contains(&(*c as u32))
+                        && func.body[i + 1..]
+                            .iter()
+                            .take(2)
+                            .any(|n| matches!(n, WI::I32Add | WI::I32Sub)) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+    }
+    cov_mark::hit!(gap_row_proven_zero);
+    true
 }
 
 fn is_symbol_from_lm_builder(module: &WasmModule, func_idx: u32) -> bool {
@@ -8524,6 +8713,11 @@ struct DkEval<'m> {
     /// Global 0 (the shadow stack pointer).
     sp: DkVal,
     steps: u32,
+    /// A data-segment gap `[start, end)` PROVEN to hold zero-initialized
+    /// memory at every execution point ([`gap_row_proven_zero`]) — a
+    /// linker-elided all-zero descriptor row. Static loads inside it read
+    /// `0`; everything else about gap memory stays out of model.
+    gap_zero: Option<(u32, u32)>,
 }
 
 impl DkEval<'_> {
@@ -8546,10 +8740,26 @@ impl DkEval<'_> {
             }
             // Static data reads (e.g. variant-name tables); never shadow-stack.
             DkVal::I32(a) if *a > 1024 => {
-                let bytes = self
+                let start = (*a as u32).checked_add(offset)?;
+                let bytes = match self
                     .module
                     .data_sections
-                    .read_bytes_zero_extended((*a as u32).checked_add(offset)?, width)?;
+                    .read_bytes_zero_extended(start, width)
+                {
+                    Some(b) => b,
+                    // A read entirely inside the PROVEN-zero gap row (a
+                    // linker-elided all-zero descriptor) observes WASM's
+                    // zero-initialized memory. Unproven gaps stay out of
+                    // model, exactly as before.
+                    None if self.gap_zero.is_some_and(|(lo, hi)| {
+                        start >= lo && start.checked_add(width).is_some_and(|e| e <= hi)
+                    }) =>
+                    {
+                        cov_mark::hit!(dk_gap_zero_read);
+                        vec![0u8; width as usize]
+                    }
+                    None => return None,
+                };
                 let mut v: u64 = 0;
                 for (i, b) in bytes.iter().enumerate() {
                     v |= (*b as u64) << (8 * i);
@@ -8637,6 +8847,41 @@ impl DkEval<'_> {
                 (true, true) => return None,
                 (false, false) => {}
             }
+        }
+
+        // The 3-param VOID symbol builder `(i32 out, i32 str_ptr, i32
+        // str_len)` — the SDK's long-symbol out-pointer protocol. Same
+        // modeling as `try_lower_symbol_builder`: the `0` success
+        // discriminant at `out+0`, the symbol Val at `out+8`; the symbol
+        // name comes from real static data under the same alnum gates.
+        if ft.params.as_slice() == [WasmType::I32, WasmType::I32, WasmType::I32]
+            && ft.results.is_empty()
+            && is_symbol_from_lm_builder(self.module, target)
+        {
+            let (DkVal::StackPtr(o), DkVal::I32(ptr), DkVal::I32(len)) =
+                (&args[0], &args[1], &args[2])
+            else {
+                return None;
+            };
+            if *ptr <= 1024 || *len <= 0 || *len > 32 {
+                return None;
+            }
+            let name = self
+                .module
+                .data_sections
+                .read_string(*ptr as u32, *len as u32)?;
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            let sym = if name.len() <= 9 {
+                DkVal::I64(encode_symbol_small(&name)?)
+            } else {
+                DkVal::SymObj(name)
+            };
+            let o = *o;
+            self.store(o, DkVal::I32(0), 4);
+            self.store(o.checked_add(8)?, sym, 8);
+            return Some(());
         }
 
         if let Some(v) = self.eval_call(target, args, depth + 1)? {
@@ -9803,11 +10048,39 @@ fn load_struct_const_key(
                     && func_reaches_symbol_encoder(module, *t, 0)
                     && ctor_result_feeds_storage(i + 1) =>
             {
+                // When the ctor's argument is a pointer into a data-segment
+                // GAP, the eval can only proceed if the gap is the PROVEN
+                // linker-elided all-zero descriptor row: bounded by the next
+                // real segment, materialized module-wide only as this ctor's
+                // argument ([`gap_row_proven_zero`]). The eval then runs the
+                // ctor's REAL bytecode over zero bytes — no descriptor-shape
+                // assumption — and DkEval's stores refusing absolute
+                // addresses proves the row is never written.
+                let gap_zero = (*x > 1024
+                    && module
+                        .data_sections
+                        .read_bytes_zero_extended(*x as u32, 1)
+                        .is_none())
+                .then(|| {
+                    let next_seg = module
+                        .data_sections
+                        .segments
+                        .iter()
+                        .map(|s| s.offset)
+                        .filter(|o| *o > *x as u32)
+                        .min()
+                        .unwrap_or(u32::MAX);
+                    let end = next_seg.min((*x as u32).saturating_add(32));
+                    (end > *x as u32 && gap_row_proven_zero(module, *t, *x as u32, end))
+                        .then_some((*x as u32, end))
+                })
+                .flatten();
                 let mut ev = DkEval {
                     module,
                     mem: HashMap::new(),
                     sp: DkVal::StackPtr(0),
                     steps: 0,
+                    gap_zero,
                 };
                 match ev.eval_call(*t, vec![DkVal::I32(*x)], 0) {
                     Some(Some(result)) => dk_result_to_const_key(&result),
@@ -11985,16 +12258,13 @@ fn detect_tryfromval_decode_helper(
 /// Info for a recognized fallible STRUCT getter (issue #34 tranche 4). See
 /// [`detect_fallible_struct_getter`].
 ///
-/// Not yet consumed in the pipeline: the recognition is proven (aqua's
-/// func-235 resolves to `PoolRewardConfig` / `Instance` / the
-/// `Vec[Symbol("PoolRewardConfig")]` key), but the SEEDING was measured to
-/// destabilize husk collapse when wired at the call site (an appended
-/// binding is dropped by return-extraction paths while its field-access
-/// seeds survive, and suppressing the husk unmasks partially-lifted bodies
-/// elsewhere). Wiring it needs the splice-order redesign tracked on issue
-/// #34 — the detector and its tests are banked here so that tranche starts
-/// from proven recognition.
-#[allow(dead_code)]
+/// Consumed by the early-recognizer arm in the `Call` handler (issue #34
+/// tranche 5): the arm reconstructs the getter at its call site — proven
+/// TTL bumps, then a `let` binding of the defaulting get, then out-slot
+/// seeds referencing the binding's fields — and skips inlining entirely,
+/// so the collapse heuristics see one coherent statement stream and no
+/// husk ever exists to race the seeds (the two hybrid designs measured
+/// and rejected in PR #44).
 struct FallibleStructGetterInfo {
     storage_type: StorageType,
     key: SorobanExpr,
@@ -12005,6 +12275,12 @@ struct FallibleStructGetterInfo {
     u64_field: String,
     /// Spec-declared field order, for rendering the zero-default construct.
     spec_fields: Vec<(String, ScSpecTypeDef)>,
+    /// Proven instance TTL bumps `(threshold, extend_to)`, in body order —
+    /// the SDK's `bump_instance`-style prologue. Every TTL-family
+    /// reachability in the helper is either proven into this list or the
+    /// whole recognition is refused ([`collect_proven_instance_ttl_bumps`]),
+    /// so reconstructing exactly these statements never drops a bump.
+    instance_ttl_bumps: Vec<(u32, u32)>,
 }
 
 /// Recognize a "fallible struct getter" (issue #34 tranche 4): a void
@@ -12032,8 +12308,9 @@ struct FallibleStructGetterInfo {
 ///   (the missing-key path zeroing both u128 limbs; the u64 default is the
 ///   zero-initialized local);
 /// - out stores at offsets 0, 8 AND 16 present;
-/// - the storage key is a proven constant ([`load_struct_const_key`]).
-#[allow(dead_code)]
+/// - the storage key is a proven constant ([`load_struct_const_key`]);
+/// - every TTL-extension reachability is a proven constant instance bump
+///   ([`collect_proven_instance_ttl_bumps`]).
 fn detect_fallible_struct_getter(
     module: &WasmModule,
     registry: &TypeRegistry,
@@ -12148,6 +12425,7 @@ fn detect_fallible_struct_getter(
     }
     let storage_type = detect_storage_type_in_chain(module, func_idx, 3)?;
     let key = load_struct_const_key(module, registry, func)?;
+    let instance_ttl_bumps = collect_proven_instance_ttl_bumps(module, func)?;
     cov_mark::hit!(fallible_struct_getter_detected);
     Some(FallibleStructGetterInfo {
         storage_type,
@@ -12156,7 +12434,140 @@ fn detect_fallible_struct_getter(
         u128_field,
         u64_field,
         spec_fields,
+        instance_ttl_bumps,
     })
+}
+
+/// The ledger TTL-extension host family. Reconstructing a getter without its
+/// TTL bumps would silently change ledger rent behavior (the issue-#33
+/// lesson: never drop a side effect the bytecode proves), so any
+/// reachability of these that [`collect_proven_instance_ttl_bumps`] cannot
+/// prove as a constant instance bump refuses the whole recognition.
+const TTL_EXTEND_FAMILY: [&str; 5] = [
+    "extend_contract_data_ttl",
+    "extend_current_contract_instance_and_code_ttl",
+    "extend_contract_instance_and_code_ttl",
+    "extend_contract_instance_ttl",
+    "extend_contract_code_ttl",
+];
+
+/// Prove every TTL-extension side effect of `func` as a constant *instance*
+/// bump, returning the `(threshold, extend_to)` pairs in body order — or
+/// `None` if any TTL-family call cannot be proven (a keyed
+/// `extend_contract_data_ttl`, non-constant thresholds, a bump buried in an
+/// unproven callee).
+///
+/// Two proven shapes, both requiring TAG_U32-encoded `i64.const` operands
+/// (decoded as `value >> 32`):
+/// - a direct `[i64.const T, i64.const E, call $l8]` window on
+///   `extend_current_contract_instance_and_code_ttl`;
+/// - a call to a thin constant wrapper: a `() -> ()` function whose whole
+///   body is that window plus `drop` (the SDK's `bump_instance` shape —
+///   aqua's func 77).
+///
+/// Any OTHER route to the family — a different family import called directly, or
+/// an internal callee whose depth-3 chain reaches any family name without
+/// being the thin wrapper — returns `None`.
+///
+/// POSITION is proven, not just operands: a proven bump must sit in the
+/// body's straight-line PREFIX (before the first control-flow instruction),
+/// which dominates every path — so hoisting it to an unconditional
+/// statement preserves semantics exactly. A bump inside or after any
+/// branch (e.g. only on the key-present arm) refuses the whole recognition:
+/// reconstructing it unconditionally would bump the TTL on paths that never
+/// did (greptile P1 on PR #45).
+fn collect_proven_instance_ttl_bumps(
+    module: &WasmModule,
+    func: &crate::wasm::ir::WasmFunction,
+) -> Option<Vec<(u32, u32)>> {
+    use crate::wasm::ir::WasmInstr as WI;
+    // Index of the first control-flow instruction: calls at or past it are
+    // no longer dominated by function entry as straight-line code.
+    let first_control_flow = func
+        .body
+        .iter()
+        .position(|i| {
+            matches!(
+                i,
+                WI::Block { .. }
+                    | WI::Loop { .. }
+                    | WI::If { .. }
+                    | WI::Else
+                    | WI::Br(_)
+                    | WI::BrIf(_)
+                    | WI::BrTable { .. }
+                    | WI::Return
+                    | WI::Unreachable
+                    | WI::CallIndirect(_)
+            )
+        })
+        .unwrap_or(func.body.len());
+    let decode_u32_val = |v: i64| {
+        let v = v as u64;
+        ((v & 0xff) == TAG_U32).then_some((v >> 32) as u32)
+    };
+    let is_instance_bump = |hf: &crate::wasm::imports::HostFunction| {
+        hf.module == HostModule::Ledger
+            && hf.name == "extend_current_contract_instance_and_code_ttl"
+    };
+    // A thin constant wrapper: `() -> ()`, body exactly the const window +
+    // the dropped result (function bodies end with the bare `End`).
+    let as_thin_const_wrapper = |t: u32| -> Option<(u32, u32)> {
+        let ft = module.get_func_type(t)?;
+        if !ft.params.is_empty() || !ft.results.is_empty() {
+            return None;
+        }
+        match module.get_function(t)?.body.as_slice() {
+            [WI::I64Const(a), WI::I64Const(b), WI::Call(imp), WI::Drop]
+            | [
+                WI::I64Const(a),
+                WI::I64Const(b),
+                WI::Call(imp),
+                WI::Drop,
+                WI::End,
+            ] if module
+                .imports
+                .get_by_index(*imp)
+                .is_some_and(is_instance_bump) =>
+            {
+                Some((decode_u32_val(*a)?, decode_u32_val(*b)?))
+            }
+            _ => None,
+        }
+    };
+    let mut bumps = Vec::new();
+    for (i, instr) in func.body.iter().enumerate() {
+        let WI::Call(t) = instr else { continue };
+        if let Some(hf) = module.imports.get_by_index(*t) {
+            if is_instance_bump(hf) {
+                // Direct call: both operands must be constant TAG_U32 Vals,
+                // and the call must dominate (straight-line prefix).
+                if i >= first_control_flow {
+                    return None;
+                }
+                let window = (i >= 2).then(|| (&func.body[i - 2], &func.body[i - 1]));
+                let Some((WI::I64Const(a), WI::I64Const(b))) = window else {
+                    return None;
+                };
+                bumps.push((decode_u32_val(*a)?, decode_u32_val(*b)?));
+            } else if hf.module == HostModule::Ledger
+                && TTL_EXTEND_FAMILY.contains(&hf.name.as_str())
+            {
+                return None;
+            }
+        } else if let Some(bump) = as_thin_const_wrapper(*t) {
+            if i >= first_control_flow {
+                return None;
+            }
+            bumps.push(bump);
+        } else if TTL_EXTEND_FAMILY
+            .iter()
+            .any(|n| function_calls_host_in_chain(module, *t, HostModule::Ledger, n, 3))
+        {
+            return None;
+        }
+    }
+    Some(bumps)
 }
 
 /// Recognize a "defaulting u128 storage getter" (issue #34 tranche 2): a void
@@ -17166,11 +17577,18 @@ mod tests {
         reg
     }
 
-    /// Self-contained fixture for [`detect_fallible_struct_getter`] (issue
-    /// #34 t4): imports 0=has, 1=get, 2=map_unpack, 3=obj_to_u64,
-    /// 4=obj_to_u128_hi64, 5=obj_to_u128_lo64; func 6 = small-symbol
-    /// encoder, 7 = DataKey ctor (selector → "CfgKey"), 8 = u64 decoder,
-    /// 9 = u128 decoder, 10 = THE fallible struct getter. Data: field names
+    /// Self-contained fixture for [`detect_fallible_struct_getter`] and its
+    /// call-site recovery arm (issue #34 t4/t5): imports 0=has, 1=get,
+    /// 2=map_unpack, 3=obj_to_u64, 4=obj_to_u128_hi64, 5=obj_to_u128_lo64,
+    /// 6=extend_current_contract_instance_and_code_ttl,
+    /// 7=extend_contract_data_ttl; func 8 = small-symbol encoder, 9 =
+    /// DataKey ctor (selector → "CfgKey"), 10 = u64 decoder, 11 = u128
+    /// decoder, 12 = thin constant instance-TTL wrapper (threshold 100,
+    /// extend_to 200), 13 = THE fallible struct getter (bumps the instance
+    /// TTL via 12, then has/get/unpack/decode), 14 = a getter variant with
+    /// an UNPROVEN keyed TTL extension (must refuse), 15 = a caller that
+    /// frames an out pointer, calls 13, and returns the u64 field slot, 16 =
+    /// a non-constant direct instance bump (must refuse). Data: field names
     /// "expired"/"tps" + their `(ptr, len)` descriptor array + "CfgKey".
     fn struct_getter_module() -> WasmModule {
         let wasm = wat::parse_str(
@@ -17181,10 +17599,13 @@ mod tests {
                 (import "i" "0" (func (param i64) (result i64)))
                 (import "i" "5" (func (param i64) (result i64)))
                 (import "i" "4" (func (param i64) (result i64)))
+                (import "l" "8" (func (param i64 i64) (result i64)))
+                (import "l" "7" (func (param i64 i64 i64 i64) (result i64)))
                 (memory 1)
+                (global (mut i32) (i32.const 8192))
                 (data (i32.const 2000) "expiredtpsCfgKey")
                 (data (i32.const 2016) "\d0\07\00\00\07\00\00\00\d7\07\00\00\03\00\00\00")
-                (func (;6;) (param i32 i32) (result i64)
+                (func (;8;) (param i32 i32) (result i64)
                     (local i64 i32)
                     i32.const 95 drop
                     i32.const 48 drop
@@ -17202,26 +17623,32 @@ mod tests {
                         end
                     end
                     local.get 2 i64.const 8 i64.shl i64.const 14 i64.or)
-                (func (;7;) (param i32) (result i64)
+                (func (;9;) (param i32) (result i64)
                     block
                         block
                             local.get 0 br_table 0 1 0
                         end
-                        i32.const 2010 i32.const 6 call 6
+                        i32.const 2010 i32.const 6 call 8
                         return
                     end
-                    i32.const 2010 i32.const 6 call 6)
-                (func (;8;) (param i32 i64)
+                    i32.const 2010 i32.const 6 call 8)
+                (func (;10;) (param i32 i64)
                     local.get 0 i64.const 0 i64.store
                     local.get 0 local.get 1 call 3 i64.store offset=8)
-                (func (;9;) (param i32 i64)
+                (func (;11;) (param i32 i64)
                     local.get 0 i64.const 0 i64.store
                     local.get 0 local.get 1 call 4 i64.store offset=24
                     local.get 0 local.get 1 call 5 i64.store offset=16)
-                (func (;10;) (param i32)
+                (func (;12;)
+                    i64.const 429496729604
+                    i64.const 858993459204
+                    call 6
+                    drop)
+                (func (;13;) (param i32)
                     (local i64 i64)
+                    call 12
                     block (result i64)
-                        i32.const 0 call 7 local.tee 1
+                        i32.const 0 call 9 local.tee 1
                         i64.const 2 call 0
                         i32.wrap_i64 i32.eqz
                         if
@@ -17231,14 +17658,47 @@ mod tests {
                         end
                         local.get 1 i64.const 2 call 1 local.set 1
                         local.get 1 i32.const 2016 i32.const 2 local.get 0 i32.const 2 call 2 drop
-                        i32.const 4096 local.get 1 call 8
-                        i32.const 4096 local.get 1 call 9
+                        i32.const 4096 local.get 1 call 10
+                        i32.const 4096 local.get 1 call 11
                         i64.const 5
                     end
                     drop
                     local.get 0 i64.const 0 i64.store
                     local.get 0 i64.const 0 i64.store offset=8
                     local.get 0 i64.const 0 i64.store offset=16)
+                (func (;14;) (param i32)
+                    (local i64 i64)
+                    i64.const 2 i64.const 2 i64.const 429496729604 i64.const 858993459204
+                    call 7
+                    drop
+                    block (result i64)
+                        i32.const 0 call 9 local.tee 1
+                        i64.const 2 call 0
+                        i32.wrap_i64 i32.eqz
+                        if
+                            i64.const 0 local.set 2
+                            i64.const 0
+                            br 1
+                        end
+                        local.get 1 i64.const 2 call 1 local.set 1
+                        local.get 1 i32.const 2016 i32.const 2 local.get 0 i32.const 2 call 2 drop
+                        i32.const 4096 local.get 1 call 10
+                        i32.const 4096 local.get 1 call 11
+                        i64.const 5
+                    end
+                    drop
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 i64.const 0 i64.store offset=8
+                    local.get 0 i64.const 0 i64.store offset=16)
+                (func (;15;) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 32 i32.sub local.tee 0 global.set 0
+                    local.get 0 call 13
+                    local.get 0 i64.load offset=16
+                    local.get 0 i32.const 32 i32.add global.set 0)
+                (func (;16;)
+                    (local i64)
+                    local.get 0 local.get 0 call 6 drop)
             )"#,
         )
         .expect("wat parses");
@@ -17249,7 +17709,7 @@ mod tests {
     fn detect_fallible_struct_getter_classifies_and_resolves() {
         let m = struct_getter_module();
         let reg = struct_getter_registry();
-        let info = detect_fallible_struct_getter(&m, &reg, 10)
+        let info = detect_fallible_struct_getter(&m, &reg, 13)
             .expect("the fallible struct getter classifies");
         assert_eq!(info.type_name, "RewardCfg");
         assert_eq!(info.u128_field, "tps");
@@ -17260,9 +17720,305 @@ mod tests {
             SorobanExpr::SymbolLiteral("CfgKey".to_string()),
             "the ctor call micro-executes to the storage key"
         );
+        assert_eq!(
+            info.instance_ttl_bumps,
+            vec![(100, 200)],
+            "the thin-wrapper instance bump is proven with decoded constants"
+        );
         // Wrong shapes never classify: a bare decoder, and the ctor itself.
-        assert!(detect_fallible_struct_getter(&m, &reg, 8).is_none());
-        assert!(detect_fallible_struct_getter(&m, &reg, 7).is_none());
+        assert!(detect_fallible_struct_getter(&m, &reg, 10).is_none());
+        assert!(detect_fallible_struct_getter(&m, &reg, 9).is_none());
+        // An unproven TTL-family call (keyed extend_contract_data_ttl)
+        // refuses the whole recognition — reconstructing without it would
+        // silently drop a ledger side effect.
+        assert!(detect_fallible_struct_getter(&m, &reg, 14).is_none());
+    }
+
+    /// Fixture for the proven-zero gap lever ([`gap_row_proven_zero`] +
+    /// `DkEval.gap_zero`): func 0 = small-symbol encoder, 1 = descriptor
+    /// ctor (`disc = *(ptr)` → br_table → "GapKey"/"AltKey"), 2 = the only
+    /// materialization of gap constant 3016 (a clean `[i32.const, call 1]`
+    /// window), 3 = a bad use of gap constant 4016 (followed by a load, not
+    /// a call), 4 = a bad below-slop neighbor of gap 5016 (5010 followed by
+    /// drop), 5 = a ctor that STORES through its pointer (must bail eval).
+    /// Data ends at 3004; addresses 3016/4016/5016 are all gaps.
+    fn gap_ctor_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (data (i32.const 2000) "GapKeyAltKey")
+                (data (i32.const 3000) "\01")
+                (func (;0;) (param i32 i32) (result i64)
+                    (local i64 i32)
+                    i32.const 95 drop
+                    i32.const 48 drop
+                    i32.const 65 drop
+                    i32.const 97 drop
+                    loop
+                        local.get 3 local.get 1 i32.lt_u
+                        if
+                            local.get 2 i64.const 6 i64.shl
+                            local.get 0 local.get 3 i32.add i32.load8_u
+                            i64.extend_i32_u i64.const 32 i64.sub i64.or
+                            local.set 2
+                            local.get 3 i32.const 1 i32.add local.set 3
+                            br 1
+                        end
+                    end
+                    local.get 2 i64.const 8 i64.shl i64.const 14 i64.or)
+                (func (;1;) (param i32) (result i64)
+                    block
+                        block
+                            local.get 0 i32.load br_table 0 1 0
+                        end
+                        i32.const 2000 i32.const 6 call 0
+                        return
+                    end
+                    i32.const 2006 i32.const 6 call 0)
+                (func (;2;) (result i64)
+                    i32.const 3016 call 1)
+                (func (;3;) (result i32)
+                    i32.const 4016 i32.load)
+                (func (;4;)
+                    i32.const 5010 drop
+                    i32.const 5016 call 1 drop)
+                (func (;5;) (param i32) (result i64)
+                    local.get 0 i32.const 7 i32.store
+                    i32.const 2000 i32.const 6 call 0)
+                (func (;6;) (result i32)
+                    i32.const 16000 i32.const 16 i32.add)
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn gap_row_proven_zero_gates() {
+        let m = gap_ctor_module();
+        // 3016: only materialized as ctor 1's argument → proven.
+        assert!(gap_row_proven_zero(&m, 1, 3016, 3032));
+        // The proof is ctor-specific: the same row claimed for a different
+        // callee is refused (the pointer demonstrably feeds func 1).
+        assert!(!gap_row_proven_zero(&m, 0, 3016, 3032));
+        // 4016: the constant is followed by a load, not a call → refused.
+        assert!(!gap_row_proven_zero(&m, 1, 4016, 4032));
+        // 5016: a below-slop neighbor constant (5010) escapes the call
+        // window → refused (it could be a store base reaching the row).
+        assert!(!gap_row_proven_zero(&m, 1, 5016, 5032));
+        // 16016: a band constant feeding i32.add — the derived-pointer
+        // shape that could reach the row from a farther base → refused.
+        assert!(!gap_row_proven_zero(&m, 1, 16016, 16032));
+        // A module reading any non-stack-pointer global refuses every gap
+        // proof — a pointer-holding global could smuggle the row address
+        // past the constant scan.
+        let glob = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (global (mut i32) (i32.const 8192))
+                (global (mut i32) (i32.const 0))
+                (func (;0;) (result i32) global.get 1)
+                (func (;1;) (param i32) (result i64) i64.const 0)
+            )"#,
+        )
+        .expect("wat parses");
+        let glob = WasmModule::parse(&glob).expect("module parses");
+        assert!(!gap_row_proven_zero(&glob, 1, 3016, 3032));
+        // A module containing bulk-memory ops refuses every gap proof.
+        let bulk = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (func (;0;) (result i64) i32.const 3016 call 1)
+                (func (;1;) (param i32) (result i64) i64.const 0)
+                (func (;2;) (param i32 i32 i32)
+                    local.get 0 local.get 1 local.get 2 memory.copy)
+            )"#,
+        )
+        .expect("wat parses");
+        let bulk = WasmModule::parse(&bulk).expect("module parses");
+        assert!(!gap_row_proven_zero(&bulk, 1, 3016, 3032));
+    }
+
+    #[test]
+    fn dk_eval_reads_proven_zero_gap_and_bails_on_absolute_store() {
+        let m = gap_ctor_module();
+        let eval = |target: u32, arg: i32, gap_zero: Option<(u32, u32)>| {
+            let mut ev = DkEval {
+                module: &m,
+                mem: HashMap::new(),
+                sp: DkVal::StackPtr(0),
+                steps: 0,
+                gap_zero,
+            };
+            ev.eval_call(target, vec![DkVal::I32(arg)], 0)
+        };
+        // The proven gap reads zero → disc 0 → the ctor's real bytecode
+        // selects the variant-0 arm and builds "GapKey".
+        cov_mark::check!(dk_gap_zero_read);
+        let result = eval(1, 3016, Some((3016, 3032))).expect("eval completes");
+        assert_eq!(
+            dk_result_to_const_key(&result.expect("ctor returns a value")),
+            Some(SorobanExpr::SymbolLiteral("GapKey".to_string()))
+        );
+        // Without the proof the gap load stays out of model → eval bails.
+        assert_eq!(eval(1, 3016, None), None);
+        // A read outside the proven range bails too.
+        assert_eq!(eval(1, 4016, Some((3016, 3032))), None);
+        // The store-through-pointer ctor bails EVEN with the proof — DkEval
+        // stores require shadow-stack addresses, which is what makes a
+        // completed eval a proof that the row is never written.
+        assert_eq!(eval(5, 3016, Some((3016, 3032))), None);
+    }
+
+    #[test]
+    fn gap_lever_never_bypasses_storage_consumption_gate() {
+        // A getter-shaped body whose proven-gap ctor result does NOT feed a
+        // storage probe (func 0 is the symbol encoder) must produce no key
+        // candidate — the gap lever only changes how the eval reads the
+        // descriptor, never which ctor results qualify as storage keys.
+        let m = gap_ctor_module();
+        let reg = empty_registry();
+        use crate::wasm::ir::WasmInstr as WI;
+        let getter = crate::wasm::ir::WasmFunction {
+            index: 99,
+            type_index: 0,
+            locals: vec![],
+            body: vec![
+                WI::I32Const(3016),
+                WI::Call(1),
+                WI::LocalTee(1),
+                WI::I64Const(2),
+                WI::Call(0),
+                WI::End,
+            ],
+        };
+        assert_eq!(load_struct_const_key(&m, &reg, &getter), None);
+    }
+
+    #[test]
+    fn collect_instance_ttl_bumps_proves_windows_and_refuses_nonconst() {
+        let m = struct_getter_module();
+        // The thin wrapper's own body is the direct-import const window.
+        let bumps = collect_proven_instance_ttl_bumps(&m, m.get_function(12).unwrap());
+        assert_eq!(bumps, Some(vec![(100, 200)]));
+        // A direct instance bump with NON-constant operands proves nothing.
+        assert_eq!(
+            collect_proven_instance_ttl_bumps(&m, m.get_function(16).unwrap()),
+            None
+        );
+        // No TTL calls at all → empty proof, not a refusal.
+        assert_eq!(
+            collect_proven_instance_ttl_bumps(&m, m.get_function(10).unwrap()),
+            Some(vec![])
+        );
+        // POSITION is proven: the same wrapper call placed INSIDE a block
+        // (after control flow — e.g. only on the key-present arm) is no
+        // longer dominated by entry, so hoisting it unconditionally would
+        // change ledger-rent behavior → the whole proof refuses.
+        use crate::wasm::ir::{BlockType, WasmInstr as WI};
+        let conditional_bump = crate::wasm::ir::WasmFunction {
+            index: 99,
+            type_index: 0,
+            locals: vec![],
+            body: vec![
+                WI::Block {
+                    block_type: BlockType::Empty,
+                },
+                WI::Call(12),
+                WI::End,
+                WI::End,
+            ],
+        };
+        assert_eq!(
+            collect_proven_instance_ttl_bumps(&m, &conditional_bump),
+            None
+        );
+    }
+
+    #[test]
+    fn fallible_struct_getter_recovers_at_call_site() {
+        // End-to-end through the Call handler: lifting the caller (func 15)
+        // must reconstruct the getter at ONE point — the proven TTL bump,
+        // the defaulting-get binding, and the u64 field slot flowing into
+        // the caller's return — with the getter never inlined.
+        cov_mark::check!(fallible_struct_getter_recovered);
+        let m = struct_getter_module();
+        let reg = struct_getter_registry();
+        let result = lift_inline_call(
+            &m,
+            &reg,
+            15,
+            Vec::new(),
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+        );
+        let (stmts, return_expr) = result.content.expect("the recovery is effectful");
+        assert!(
+            stmts.iter().any(|s| matches!(
+                s,
+                SorobanStmt::Expr(SorobanExpr::ExtendInstanceAndCodeTtl { threshold, extend_to })
+                    if **threshold == SorobanExpr::U32Literal(100)
+                        && **extend_to == SorobanExpr::U32Literal(200)
+            )),
+            "the proven instance TTL bump is reconstructed: {stmts:?}"
+        );
+        let binding_name = stmts
+            .iter()
+            .find_map(|s| match s {
+                SorobanStmt::Let {
+                    name,
+                    value:
+                        SorobanExpr::CastAs {
+                            value: get,
+                            target_type,
+                        },
+                    ..
+                } => {
+                    let SorobanExpr::StorageGet {
+                        storage_type: StorageType::Instance,
+                        key,
+                        unwrap: false,
+                        on_missing: Some(default),
+                    } = get.as_ref()
+                    else {
+                        return None;
+                    };
+                    assert_eq!(
+                        target_type, "RewardCfg",
+                        "the turbofish pins the value type"
+                    );
+                    assert_eq!(**key, SorobanExpr::SymbolLiteral("CfgKey".to_string()));
+                    let SorobanExpr::StructConstruct { type_name, fields } = default.as_ref()
+                    else {
+                        panic!("expected the zero-default construct, got {default:?}");
+                    };
+                    assert_eq!(type_name, "RewardCfg");
+                    assert_eq!(
+                        fields,
+                        &vec![
+                            ("expired".to_string(), SorobanExpr::U64Literal(0)),
+                            ("tps".to_string(), SorobanExpr::U128Literal(0)),
+                        ],
+                        "the missing-key default zeroes every spec field"
+                    );
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .expect("the defaulting get is bound: {stmts:?}");
+        let binding_idx: u32 = binding_name
+            .strip_prefix("var_")
+            .and_then(|n| n.parse().ok())
+            .expect("binding is a var_N local");
+        assert_eq!(
+            return_expr,
+            Some(SorobanExpr::FieldAccess {
+                object: Box::new(SorobanExpr::Local(binding_idx)),
+                field: "expired".to_string(),
+            }),
+            "the caller's u64 slot read resolves to the binding's field"
+        );
     }
 
     #[test]
@@ -18457,6 +19213,7 @@ mod tests {
                 mem: HashMap::new(),
                 sp: DkVal::StackPtr(0),
                 steps: 0,
+                gap_zero: None,
             };
             ev.eval_call(disp, vec![sel, payload], 0)
         };
