@@ -451,18 +451,22 @@ fn annotate_with(get: SorobanExpr, ty: &str) -> SorobanExpr {
 }
 
 /// The annotation type for an un-inferable get. Plain gets take `Val`; a
-/// recovered defaulting-map getter (`on_missing: Map::new`) must take a
-/// `Map` type instead — a `Val` turbofish would clash with the
-/// `unwrap_or(Map::new(&env))` default (E0308), while `Map<Val, Val>` lets
-/// the default's generics infer from the turbofish.
+/// recovered defaulting-collection getter (`on_missing: Map::new`/`Vec::new`)
+/// must take a matching collection type — a `Val` turbofish would clash
+/// with the `unwrap_or(C::new(&env))` default (E0308), while a fully-`Val`
+/// element type lets the default's generics infer from the turbofish.
 fn uninferable_get_type(get: &SorobanExpr) -> &'static str {
     match get {
         SorobanExpr::StorageGet {
             on_missing: Some(miss),
             ..
-        } if matches!(miss.as_ref(), SorobanExpr::CollectionNew(c) if c == "Map") => {
-            "Map<soroban_sdk::Val, soroban_sdk::Val>"
-        }
+        } => match miss.as_ref() {
+            SorobanExpr::CollectionNew(c) if c == "Map" => {
+                "Map<soroban_sdk::Val, soroban_sdk::Val>"
+            }
+            SorobanExpr::CollectionNew(c) if c == "Vec" => "Vec<soroban_sdk::Val>",
+            _ => "Val",
+        },
         _ => "Val",
     }
 }

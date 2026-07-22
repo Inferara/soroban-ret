@@ -2573,16 +2573,17 @@ impl<'a> LiftContext<'a> {
                             true
                         } else if num_results == 1
                             && args.is_empty()
-                            && let Some(getter) = detect_defaulting_map_getter(
+                            && let Some(getter) = detect_defaulting_collection_getter(
                                 self.wasm_module,
                                 self.registry,
                                 *target_idx,
                             )
                         {
-                            // Defaulting map getter (issue #34 tranche 6):
-                            // `get(&KEY).unwrap_or(Map::new(&env))` — the
-                            // empty-map default is the helper's own proven
-                            // `select` arm, not a fabrication. Same
+                            // Defaulting collection getter (issue #34
+                            // tranche 6 map / tranche 7 vec):
+                            // `get(&KEY).unwrap_or(C::new(&env))` — the
+                            // empty-collection default is the helper's own
+                            // proven `select` arm, not a fabrication. Same
                             // reconstruction as the fallible sibling: TTL
                             // statements + the get as the call's value.
                             for (threshold, extend_to) in &getter.instance_ttl_bumps {
@@ -2595,7 +2596,8 @@ impl<'a> LiftContext<'a> {
                             }
                             // Bind once and push the binding (see the
                             // fallible sibling above): a per-consumer
-                            // re-read would silently drop map mutations.
+                            // re-read would silently drop collection
+                            // mutations.
                             let var_idx = self.locals.len() as u32;
                             self.locals.push(StackVal::LetBinding(var_idx));
                             self.stmts.push(SorobanStmt::Let {
@@ -2606,13 +2608,13 @@ impl<'a> LiftContext<'a> {
                                     key: Box::new(getter.key.clone()),
                                     unwrap: false,
                                     on_missing: Some(Box::new(SorobanExpr::CollectionNew(
-                                        "Map".to_string(),
+                                        getter.collection_type.to_string(),
                                     ))),
                                 },
                             });
                             self.stack.push(StackVal::LetBinding(var_idx));
                             self.found_host_calls = true;
-                            cov_mark::hit!(defaulting_map_getter_recovered);
+                            cov_mark::hit!(defaulting_collection_getter_recovered);
                             true
                         } else if let Some(getter) = detect_fallible_struct_getter(
                             self.wasm_module,
@@ -12557,41 +12559,75 @@ fn detect_fallible_value_getter(
     })
 }
 
-/// Info for a recognized DEFAULTING map getter (issue #34 tranche 6, the
-/// sibling of [`detect_fallible_value_getter`]). See
-/// [`detect_defaulting_map_getter`].
-struct DefaultingMapGetterInfo {
+/// The empty-collection kind a defaulting collection getter defaults to:
+/// its VecObject/MapObject tag, `<mod>.<host>` constructor, and the
+/// `CollectionNew` type name codegen renders (issue #34 tranche 7).
+#[derive(Clone, Copy)]
+struct CollectionKind {
+    tag: i64,
+    ctor_module: HostModule,
+    ctor_name: &'static str,
+    type_name: &'static str,
+}
+
+const COLLECTION_KINDS: [CollectionKind; 2] = [
+    CollectionKind {
+        tag: 76, // MapObject
+        ctor_module: HostModule::Map,
+        ctor_name: "map_new",
+        type_name: "Map",
+    },
+    CollectionKind {
+        tag: 75, // VecObject
+        ctor_module: HostModule::Vec,
+        ctor_name: "vec_new",
+        type_name: "Vec",
+    },
+];
+
+/// Info for a recognized DEFAULTING collection getter (issue #34 tranche 6
+/// map / tranche 7 vec, the sibling of [`detect_fallible_value_getter`]).
+/// See [`detect_defaulting_collection_getter`].
+struct DefaultingCollectionGetterInfo {
     storage_type: StorageType,
     key: SorobanExpr,
+    /// The empty-collection type name codegen emits as the `unwrap_or`
+    /// default (`"Map"` or `"Vec"`) — proven from the tag guard + ctor.
+    collection_type: &'static str,
     instance_ttl_bumps: Vec<(u32, u32)>,
 }
 
-/// Recognize a "defaulting map getter" (issue #34 tranche 6): a
-/// zero-parameter `() -> i64` helper implementing
-/// `env.storage().<dur>().get::<_, Map<..>>(&KEY).unwrap_or(Map::new(&env))`
-/// — aqua's `RewardGaugesMap` reader. The SDK shape:
+/// Recognize a "defaulting collection getter" (issue #34 tranche 6 map /
+/// tranche 7 vec): a zero-parameter `() -> i64` helper implementing
+/// `env.storage().<dur>().get::<_, C<..>>(&KEY).unwrap_or(C::new(&env))`
+/// for a collection `C` ∈ {Map, Vec} — aqua's `RewardGaugesMap` (map) and
+/// the DataKey-5 vec reader. The SDK shape:
 /// `[bump]; block { flag = has(KEY); if !flag br; v = get(KEY);
-/// if tag(v) == Map br; unreachable }; select(v, map_new(), flag)`.
-/// The empty-map default is PROVEN, not fabricated: the bytecode
+/// if tag(v) == C br; unreachable }; select(v, C_new(), flag)`.
+/// The empty-collection default is PROVEN, not fabricated: the bytecode
 /// unconditionally constructs it as the select's missing arm (`unwrap_or`
-/// renders the same eager evaluation; an unobserved `map_new` has no
-/// effect). Every element is bytecode-proven; any deviation → `None`:
+/// renders the same eager evaluation; an unobserved `map_new`/`vec_new`
+/// has no effect). Every element is bytecode-proven; any deviation → `None`:
 /// - internal, zero params, one i64 result, no `Loop`;
 /// - chains has + get, never put, no cross-contract call;
 /// - proven constant key + storage type + instance TTL bumps (as in the
 ///   fallible-value sibling);
 /// - exactly one tag guard, the INVERTED `[i64.const 255, i64.and,
-///   i64.const 76, i64.eq, br_if]` (success exits; fall-through traps) —
-///   MapObject only;
-/// - the body TAIL is exactly `[local.get v, call map_new, local.get c,
+///   i64.const TAG, i64.eq, br_if]` (success exits; fall-through traps),
+///   where TAG is the Map/Vec object tag — the SAME tag whose constructor
+///   the select's default arm calls (a MapObject guard with a `vec_new`
+///   default, or vice versa, is not this shape);
+/// - the body TAIL is exactly `[local.get v, call C_new, local.get c,
 ///   select]` where `v` is the unique get-tee'd local and `c` the unique
-///   has-tee'd local, neither reassigned after its tee, and `map_new` is
-///   the host import or a thin wrapper reaching it.
-fn detect_defaulting_map_getter(
+///   has-tee'd local, neither reassigned after its tee, and `C_new` is the
+///   host constructor import or a thin wrapper reaching it;
+/// - the has flag guards the get, and the tag guard is adjacent to the
+///   get-tee (the value-linkage / path-linkage proofs from PR #46).
+fn detect_defaulting_collection_getter(
     module: &WasmModule,
     registry: &TypeRegistry,
     func_idx: u32,
-) -> Option<DefaultingMapGetterInfo> {
+) -> Option<DefaultingCollectionGetterInfo> {
     use crate::wasm::ir::{WasmInstr as WI, WasmType};
     let ft = module.get_func_type(func_idx)?;
     if !ft.params.is_empty() || ft.results.as_slice() != [WasmType::I64] {
@@ -12612,8 +12648,9 @@ fn detect_defaulting_map_getter(
     let instance_ttl_bumps = collect_proven_instance_ttl_bumps(module, func)?;
     let storage_type = detect_storage_type_in_chain(module, func_idx, 3)?;
     let key = load_struct_const_key(module, registry, func)?;
-    // Exactly one INVERTED MapObject tag guard (success-exit polarity).
-    let mut guards = 0usize;
+    // Exactly one INVERTED collection-tag guard (success-exit polarity); its
+    // tag selects which collection kind (Map/Vec) this getter defaults to.
+    let mut guard_tag: Option<i64> = None;
     for w in func.body.windows(5) {
         if let [
             WI::I64Const(255),
@@ -12623,15 +12660,16 @@ fn detect_defaulting_map_getter(
             WI::BrIf(_),
         ] = w
         {
-            if !matches!(w[3], WI::I64Eq) || *t != 76 {
+            if !matches!(w[3], WI::I64Eq) || !COLLECTION_KINDS.iter().any(|k| k.tag == *t) {
                 return None; // any other guard shape → not this class
             }
-            guards += 1;
+            if guard_tag.replace(*t).is_some() {
+                return None;
+            }
         }
     }
-    if guards != 1 {
-        return None;
-    }
+    let guard_tag = guard_tag?;
+    let kind = COLLECTION_KINDS.iter().find(|k| k.tag == guard_tag)?;
     // Unique get-tee and has-tee locals.
     let mut get_tee: Option<(usize, u32)> = None;
     let mut has_tee: Option<(usize, u32)> = None;
@@ -12666,21 +12704,23 @@ fn detect_defaulting_map_getter(
     }
     // The tag guard inspects the GET's value: it must immediately follow
     // the get-tee, consuming the teed value left on the stack (greptile
-    // P1 on PR #46 — adjacency IS the value linkage).
+    // P1 on PR #46 — adjacency IS the value linkage). Its tag is the
+    // collection kind's.
     if !matches!(
         func.body.get(get_pos + 1..get_pos + 6),
         Some([
             WI::I64Const(255),
             WI::I64And,
-            WI::I64Const(76),
+            WI::I64Const(t),
             WI::I64Eq,
             WI::BrIf(_)
-        ])
+        ]) if *t == kind.tag
     ) {
         return None;
     }
-    // The tail select consumes exactly (v, map_new(), c).
-    let is_map_new = |t: u32| {
+    // The tail select consumes exactly (v, C_new(), c) — and `C_new` must
+    // be the constructor for the SAME kind the tag guard proved.
+    let is_kind_ctor = |t: u32| {
         module.imports.get_by_index(t).map_or_else(
             || {
                 module.get_function(t).is_some_and(|f| {
@@ -12688,17 +12728,17 @@ fn detect_defaulting_map_getter(
                         && f.body.iter().any(|i| {
                             matches!(i, WI::Call(m)
                             if module.imports.get_by_index(*m).is_some_and(|hf|
-                                hf.module == HostModule::Map && hf.name == "map_new"))
+                                hf.module == kind.ctor_module && hf.name == kind.ctor_name))
                         })
                 })
             },
-            |hf| hf.module == HostModule::Map && hf.name == "map_new",
+            |hf| hf.module == kind.ctor_module && hf.name == kind.ctor_name,
         )
     };
     let tail_ok = matches!(func.body.as_slice(),
         [.., WI::LocalGet(a), WI::Call(mn), WI::LocalGet(b), WI::Select]
         | [.., WI::LocalGet(a), WI::Call(mn), WI::LocalGet(b), WI::Select, WI::End]
-            if *a == v && *b == c && is_map_new(*mn));
+            if *a == v && *b == c && is_kind_ctor(*mn));
     if !tail_ok {
         return None;
     }
@@ -12712,10 +12752,11 @@ fn detect_defaulting_map_getter(
     if reassigned(v, get_pos) || reassigned(c, has_pos) {
         return None;
     }
-    cov_mark::hit!(defaulting_map_getter_detected);
-    Some(DefaultingMapGetterInfo {
+    cov_mark::hit!(defaulting_collection_getter_detected);
+    Some(DefaultingCollectionGetterInfo {
         storage_type,
         key,
+        collection_type: kind.type_name,
         instance_ttl_bumps,
     })
 }
@@ -18380,8 +18421,10 @@ mod tests {
     fn defaulting_map_getter_classifies_and_refuses() {
         let m = value_getter_module();
         let reg = empty_registry();
-        let info = detect_defaulting_map_getter(&m, &reg, 13).expect("the map getter classifies");
+        let info =
+            detect_defaulting_collection_getter(&m, &reg, 13).expect("the map getter classifies");
         assert_eq!(info.storage_type, StorageType::Instance);
+        assert_eq!(info.collection_type, "Map");
         assert_eq!(
             info.key,
             SorobanExpr::SymbolLiteral("TokenAddr".to_string())
@@ -18389,10 +18432,10 @@ mod tests {
         assert_eq!(info.instance_ttl_bumps, vec![(100, 200)]);
         // The has flag must GUARD the get: the eqz-fed-to-drop variant
         // (an unconditional get that would trap on a missing key) refuses.
-        assert!(detect_defaulting_map_getter(&m, &reg, 15).is_none());
+        assert!(detect_defaulting_collection_getter(&m, &reg, 15).is_none());
         // The fallible sibling never cross-classifies (ne-guard, no select
         // tail) — and vice versa.
-        assert!(detect_defaulting_map_getter(&m, &reg, 10).is_none());
+        assert!(detect_defaulting_collection_getter(&m, &reg, 10).is_none());
         assert!(detect_fallible_value_getter(&m, &reg, 13).is_none());
     }
 
@@ -18400,7 +18443,7 @@ mod tests {
     fn defaulting_map_getter_recovers_at_call_site() {
         // End-to-end: lifting the caller (func 14) binds the defaulting
         // map get once and returns the binding.
-        cov_mark::check!(defaulting_map_getter_recovered);
+        cov_mark::check!(defaulting_collection_getter_recovered);
         let m = value_getter_module();
         let reg = empty_registry();
         let result = lift_inline_call(
@@ -18443,6 +18486,72 @@ mod tests {
             return_expr,
             Some(SorobanExpr::Local(binding_idx)),
             "the caller returns the binding"
+        );
+    }
+
+    /// Compact fixture for the VEC-defaulting getter (issue #34 t7): the
+    /// tag-75 / vec_new sibling of the map getter. Imports 0=has, 1=get,
+    /// 2=vec_new; func 3 = the getter (`if has(K) { v=get(K);
+    /// tag(v)==75 br }; select(v, vec_new(), c)`), 4 = its caller. Key is
+    /// a bare Val-encoded symbol two before the get import (the
+    /// `fallible_get_const_key` window), so no ctor is needed.
+    fn vec_getter_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "l" "0" (func (param i64 i64) (result i64)))
+                (import "l" "1" (func (param i64 i64) (result i64)))
+                (import "v" "_" (func (result i64)))
+                (memory 1)
+                (func (;3;) (result i64)
+                    (local i64 i64 i32)
+                    block
+                        i64.const 275146723598473 i64.const 2 call 0 local.tee 2
+                        i32.eqz br_if 0
+                        i64.const 275146723598473 i64.const 2 call 1 local.tee 1
+                        i64.const 255 i64.and i64.const 75 i64.eq br_if 0
+                        unreachable
+                    end
+                    local.get 1
+                    call 2
+                    local.get 2
+                    select)
+                (func (;4;) (result i64)
+                    call 3)
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn defaulting_vec_getter_classifies_and_recovers() {
+        cov_mark::check!(defaulting_collection_getter_recovered);
+        let m = vec_getter_module();
+        let reg = empty_registry();
+        let info =
+            detect_defaulting_collection_getter(&m, &reg, 3).expect("the vec getter classifies");
+        assert_eq!(info.collection_type, "Vec", "tag 75 + vec_new → Vec");
+        // A MapObject-kind cross-check would need tag 76 + map_new; the
+        // detector pins the kind to the tag guard's constant.
+        let result = lift_inline_call(
+            &m,
+            &reg,
+            4,
+            Vec::new(),
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+        );
+        let (stmts, _) = result.content.expect("the recovery is effectful");
+        assert!(
+            stmts.iter().any(|s| matches!(
+                s,
+                SorobanStmt::Let {
+                    value: SorobanExpr::StorageGet { on_missing: Some(miss), .. },
+                    ..
+                } if matches!(miss.as_ref(), SorobanExpr::CollectionNew(c) if c == "Vec")
+            )),
+            "the missing path is the proven empty-vec default: {stmts:?}"
         );
     }
 
