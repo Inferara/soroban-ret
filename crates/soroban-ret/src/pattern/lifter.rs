@@ -570,6 +570,45 @@ static DBG_JOIN: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_JOIN").is_ok());
 static DBG_SLOTJOIN: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_SLOTJOIN").is_ok());
+static DBG_SLOTREAD: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_SLOTREAD").is_ok());
+
+/// Issue #34 phase 2: classification of a frame slot whose abstract value was
+/// produced by the then arm of a shared-map `IfElse` join, from the
+/// perspective of code that reads it afterwards. PR #48 proved the write-side
+/// conflict class is empty (divergent = 0) and left "then-survives" as a
+/// 42,587-case *upper bound* because value snapshots cannot see reads. This
+/// taint tracks the actual reads: the generic load path degrades a read that
+/// observes a tainted value to `Unknown` (the sound-join read poison), and
+/// `DBG_SLOTREAD` reports each poisoned read's class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotTaintKind {
+    /// Set between the arms: the then arm wrote this slot, the else arm is
+    /// about to be lifted against the same map. An else-arm read observing
+    /// this value is a phantom cross-arm read (at runtime the else path never
+    /// sees then-path writes).
+    CrossArm,
+    /// Set at the join when neither arm terminated and the else arm never
+    /// overwrote the slot: downstream code reading it observes the then value
+    /// unconditionally, but at runtime the slot holds the pre-if value on
+    /// else executions.
+    Conditional,
+    /// Set at the join when the THEN arm terminated (returned/trapped): all
+    /// fall-through code runs on the else path, so a downstream read of a
+    /// surviving then-write observes a value from a path that provably did
+    /// not fall through.
+    DeadThen,
+}
+
+/// A tainted slot: the classification plus the exact value the then arm
+/// wrote. Reads are poisoned only when the observed value still EQUALS the
+/// tainted value — a recognizer seed or any other writer that has since
+/// replaced the value makes the read self-consistent, not a join leak.
+#[derive(Clone, Debug)]
+struct SlotTaint {
+    kind: SlotTaintKind,
+    val: StackVal,
+}
 
 struct LiftContext<'a> {
     wasm_module: &'a WasmModule,
@@ -656,6 +695,24 @@ struct LiftContext<'a> {
     /// never fires at `loop_depth > 0`: a load inside a loop body may observe a
     /// later iteration's store, which single-pass journaling cannot see.
     loop_depth: u32,
+    /// Ordered log of every generic static-slot store (issue #34 phase 2):
+    /// `(key, previous_value, new_value)` in simulation order. Unlike
+    /// `slot_defs` (per-key, unordered across keys) this preserves the
+    /// interleaving needed to segment writes by `IfElse` arm, and the recorded
+    /// previous value gives each arm's writes their pre-if baseline without
+    /// snapshotting the whole map. Drives the sound-join slot poison (live)
+    /// and the `DBG_SLOTREAD` taint measurement. Recognizer seeds that insert
+    /// into `frame_slots` directly are deliberately NOT logged — the poison's
+    /// current-value equality check leaves them untouched. Shared via `Rc`
+    /// like `slot_defs`; throwaway simulation contexts swap in a detached
+    /// copy.
+    slot_write_log: Rc<RefCell<SlotWriteLog>>,
+    /// Slots currently holding a value the abstract state took from a then
+    /// arm (see [`SlotTaintKind`]). A generic load that observes a tainted
+    /// slot's exact value degrades it to `Unknown` (and reports the class
+    /// under `DBG_SLOTREAD`); any store clears the taint. Shared/detached
+    /// like `slot_write_log`.
+    slot_taints: Rc<RefCell<HashMap<(u32, i32), SlotTaint>>>,
 }
 
 impl<'a> LiftContext<'a> {
@@ -693,6 +750,8 @@ impl<'a> LiftContext<'a> {
             fallible_get_count: Rc::new(RefCell::new(0)),
             slot_defs: Rc::new(RefCell::new(HashMap::new())),
             loop_depth: 0,
+            slot_write_log: Rc::new(RefCell::new(Vec::new())),
+            slot_taints: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -725,6 +784,8 @@ impl<'a> LiftContext<'a> {
             fallible_get_count: Rc::clone(&self.fallible_get_count),
             slot_defs: Rc::clone(&self.slot_defs),
             loop_depth: self.loop_depth,
+            slot_write_log: Rc::clone(&self.slot_write_log),
+            slot_taints: Rc::clone(&self.slot_taints),
         }
     }
 
@@ -763,6 +824,20 @@ impl<'a> LiftContext<'a> {
     /// bound to that variable so later loads read it; otherwise update the
     /// abstract frame-slot map as usual.
     fn store_frame_slot(&mut self, id: u32, slot: i32, value: StackVal) {
+        if !self.promoted_slots.contains_key(&(id, slot)) {
+            // Ordered write log for the IfElse join poison: record what the
+            // slot held before this store so the join can tell a net no-op
+            // rewrite from a genuine then-arm value. Promoted (loop-carried)
+            // slots are excluded: their store renders a real `var_N = ..`
+            // assignment, so the abstract binding is sound on every path.
+            let prev = self.frame_slots.borrow().get(&(id, slot)).cloned();
+            self.slot_write_log
+                .borrow_mut()
+                .push(((id, slot), prev, value.clone()));
+            // After this store the slot holds a value this path produced
+            // itself, so any join taint is lifted.
+            self.slot_taints.borrow_mut().remove(&(id, slot));
+        }
         self.slot_defs
             .borrow_mut()
             .entry((id, slot))
@@ -1770,6 +1845,9 @@ impl<'a> LiftContext<'a> {
         // real lift's unique-reaching-def index. The sim lifts a loop BODY, so
         // it also runs at loop depth (no journal fills).
         sim.slot_defs = Rc::new(RefCell::new(self.slot_defs.borrow().clone()));
+        // Same for the read-journal measurement state (issue #34 phase 2).
+        sim.slot_write_log = Rc::new(RefCell::new(self.slot_write_log.borrow().clone()));
+        sim.slot_taints = Rc::new(RefCell::new(self.slot_taints.borrow().clone()));
         sim.loop_depth += 1;
         for &l in &written {
             if let Some(slot) = sim.locals.get_mut(l as usize) {
@@ -1821,6 +1899,8 @@ impl<'a> LiftContext<'a> {
         sim.next_frame_id = Rc::new(RefCell::new(*self.next_frame_id.borrow()));
         sim.enum_match_counter = Rc::new(RefCell::new(HashMap::new()));
         sim.slot_defs = Rc::new(RefCell::new(self.slot_defs.borrow().clone()));
+        sim.slot_write_log = Rc::new(RefCell::new(self.slot_write_log.borrow().clone()));
+        sim.slot_taints = Rc::new(RefCell::new(self.slot_taints.borrow().clone()));
         sim.loop_depth += 1;
         // Also seed body-written locals with LoopPhi so an accumulator that adds
         // the counter (`acc += i`) stays symbolic — otherwise the counter's
@@ -4101,6 +4181,48 @@ impl<'a> LiftContext<'a> {
                                 .get(&(id, slot))
                                 .cloned()
                                 .unwrap_or(StackVal::Unknown);
+                            // Sound-join read poison (issue #34 phase 2
+                            // repair): this generic load is the dataflow read
+                            // of record. If the slot is tainted by a join and
+                            // the observed value is STILL the then arm's
+                            // value, this read consumes a phantom — the else
+                            // path (`CrossArm`), the runtime-conditional
+                            // fall-through (`Conditional`), or a path that
+                            // provably returned (`DeadThen`) never produced
+                            // it. Degrade the read to `Unknown` (today's
+                            // honest `todo!()`). `Unknown` never poisons
+                            // (nothing was observed), and a taint whose value
+                            // another writer has since replaced never poisons
+                            // (the `val` equality check) — recognizer seeds
+                            // and else-arm stores keep their audited values.
+                            // The census (`DBG_SLOTREAD`) measured 15 such
+                            // reads corpus-wide, every one already degrading
+                            // honestly downstream, so this closes the latent
+                            // phantom-read hazard with no recovery cost. The
+                            // `stack_val_to_expr` FrameSlot-resolution path is
+                            // deliberately NOT poisoned: those resolutions
+                            // happen under recognizer control, where adopted
+                            // then-arm values are part of audited shapes.
+                            if !matches!(v, StackVal::Unknown)
+                                && let Some(t) = self.slot_taints.borrow().get(&(id, slot))
+                                && t.val == v
+                            {
+                                cov_mark::hit!(join_tainted_read_poisoned);
+                                if *DBG_SLOTREAD {
+                                    let tag = match t.kind {
+                                        SlotTaintKind::CrossArm => "else-rbw",
+                                        SlotTaintKind::Conditional => "cond-read",
+                                        SlotTaintKind::DeadThen => "dead-then-read",
+                                    };
+                                    let mut vdbg = format!("{v:?}");
+                                    vdbg.truncate(160);
+                                    eprintln!(
+                                        "[SLOTREAD] {tag} frame=({id},{slot}) loop={} inline={} v={vdbg}",
+                                        self.loop_depth, self.inline_depth
+                                    );
+                                }
+                                v = StackVal::Unknown;
+                            }
                             if matches!(v, StackVal::Unknown) {
                                 let missing = !self.frame_slots.borrow().contains_key(&(id, slot));
                                 if *DBG_SLOTMISS {
@@ -5064,6 +5186,11 @@ impl<'a> LiftContext<'a> {
                     // changing the semantics.
                     let pre_slots = DBG_SLOTJOIN.then(|| self.frame_slots.borrow().clone());
 
+                    // Write-log position before the then arm: everything the
+                    // log gains between here and the post-then position is a
+                    // then-arm store (issue #34 phase 2 sound-join analysis).
+                    let pre_wpos = self.slot_write_log.borrow().len();
+
                     // Lift then branch with child context
                     let mut then_ctx = self.child_context();
                     then_ctx.lift_structured(then_body);
@@ -5071,10 +5198,79 @@ impl<'a> LiftContext<'a> {
 
                     let then_slots = DBG_SLOTJOIN.then(|| self.frame_slots.borrow().clone());
 
+                    // Collapse the then segment of the write log to per-key
+                    // `(pre_if_value, final_then_value)`: the FIRST entry's
+                    // recorded previous value is what the slot held before the
+                    // `if`, the LAST entry's new value is what the then arm
+                    // left behind. Keys whose final value merely restores the
+                    // pre-if value are net no-ops — an else-path or downstream
+                    // read observing them is sound — and are dropped here.
+                    let then_writes: Vec<((u32, i32), StackVal)> = {
+                        let log = self.slot_write_log.borrow();
+                        let mut per_key: SlotWriteLog = Vec::new();
+                        for (k, prev, new) in &log[pre_wpos..] {
+                            match per_key.iter_mut().find(|(pk, _, _)| pk == k) {
+                                Some((_, _, last)) => *last = new.clone(),
+                                None => per_key.push((*k, prev.clone(), new.clone())),
+                            }
+                        }
+                        per_key
+                            .into_iter()
+                            .filter(|(_, first_prev, last_new)| {
+                                first_prev.as_ref() != Some(last_new)
+                            })
+                            .map(|(k, _, last_new)| (k, last_new))
+                            .collect()
+                    };
+
+                    // Stamp the surviving then-arm values as `CrossArm`
+                    // taints before the else arm lifts against the same
+                    // shared map: a generic else-arm load that observes one
+                    // reads a value the else path never produced, and the
+                    // load path degrades it to `Unknown` (census: zero such
+                    // reads corpus-wide, so this is a pure safety net).
+                    {
+                        let mut taints = self.slot_taints.borrow_mut();
+                        for (k, val) in &then_writes {
+                            taints.insert(
+                                *k,
+                                SlotTaint {
+                                    kind: SlotTaintKind::CrossArm,
+                                    val: val.clone(),
+                                },
+                            );
+                        }
+                    }
+
                     // Lift else branch with child context
                     let mut else_ctx = self.child_context();
                     else_ctx.lift_structured(else_body);
                     let mut else_stmts = else_ctx.stmts;
+
+                    // Reclassify surviving `CrossArm` taints at the join. A
+                    // taint an else-arm store already cleared stays cleared
+                    // (the slot is self-produced on the else path).
+                    {
+                        let then_term = then_stmts.iter().any(is_terminator_stmt);
+                        let else_term = else_stmts.iter().any(is_terminator_stmt);
+                        let mut taints = self.slot_taints.borrow_mut();
+                        for (k, _) in &then_writes {
+                            let Some(t) = taints.get_mut(k) else { continue };
+                            if t.kind != SlotTaintKind::CrossArm {
+                                continue;
+                            }
+                            if else_term {
+                                // Fall-through implies the then path ran (or
+                                // nothing falls through at all): the value is
+                                // unconditionally valid downstream.
+                                taints.remove(k);
+                            } else if then_term {
+                                t.kind = SlotTaintKind::DeadThen;
+                            } else {
+                                t.kind = SlotTaintKind::Conditional;
+                            }
+                        }
+                    }
 
                     if let (Some(pre), Some(then_s)) = (pre_slots, then_slots) {
                         let post = self.frame_slots.borrow();
@@ -15733,6 +15929,11 @@ type DynamicSlotMap = HashMap<(u32, SymTerm, i32), StackVal>;
 /// `(frame_id, offset)` slot, in program order (see `LiftContext::slot_defs`).
 type SlotDefJournal = HashMap<(u32, i32), Vec<StackVal>>;
 
+/// Type alias for the ordered static-slot write log: `(key, previous_value,
+/// new_value)` per generic store, in simulation order (see
+/// `LiftContext::slot_write_log`).
+type SlotWriteLog = Vec<((u32, i32), Option<StackVal>, StackVal)>;
+
 /// Convert a stack value to a SorobanExpr, decoding packed Soroban Val constants.
 ///
 /// When `frame_slots` is provided, FrameSlot values are resolved by looking up
@@ -20358,5 +20559,122 @@ mod tests {
             )),
             "the br_if should still be present and unrewritten"
         );
+    }
+
+    /// Fixture for the IfElse sound-join read poison (issue #34 phase 2).
+    /// Every function allocates a shadow-stack frame (`global.get 0` −16 →
+    /// `local.tee 1`), conditionally writes slot +8 inside an `if`, then
+    /// loads the slot after the join and returns it. No host calls, so
+    /// `lift_inline_call` surfaces the raw post-join `StackVal` as
+    /// `stack_result`. Functions: 0 = conditional then-write (if without
+    /// else); 1 = dead-then (the then arm stores and RETURNS); 2 = both arms
+    /// write (else overwrite — last-write-wins is today's semantics, sound
+    /// on the fall-through the abstract state tracks); 3 = net no-op (the
+    /// then arm re-stores the pre-if value); 4 = else arm traps (fall-through
+    /// implies the then path ran).
+    fn join_poison_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (global (mut i32) (i32.const 1048576))
+                (memory 1)
+                (func (;0;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 0 i32.wrap_i64
+                    if
+                        local.get 1 i64.const 42 i64.store offset=8
+                    end
+                    local.get 1 i64.load offset=8)
+                (func (;1;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 0 i32.wrap_i64
+                    if
+                        local.get 1 i64.const 42 i64.store offset=8
+                        i64.const 7
+                        return
+                    end
+                    local.get 1 i64.load offset=8)
+                (func (;2;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 0 i32.wrap_i64
+                    if
+                        local.get 1 i64.const 42 i64.store offset=8
+                    else
+                        local.get 1 i64.const 99 i64.store offset=8
+                    end
+                    local.get 1 i64.load offset=8)
+                (func (;3;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 1 i64.const 7 i64.store offset=8
+                    local.get 0 i32.wrap_i64
+                    if
+                        local.get 1 i64.const 7 i64.store offset=8
+                    end
+                    local.get 1 i64.load offset=8)
+                (func (;4;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 0 i32.wrap_i64
+                    if
+                        local.get 1 i64.const 42 i64.store offset=8
+                    else
+                        unreachable
+                    end
+                    local.get 1 i64.load offset=8)
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    /// Lift one `join_poison_module` function and return the raw post-join
+    /// tail value.
+    fn join_poison_result(idx: u32) -> StackVal {
+        let m = join_poison_module();
+        let reg = empty_registry();
+        let result = lift_inline_call(
+            &m,
+            &reg,
+            idx,
+            vec![StackVal::Unknown],
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+        );
+        result.stack_result.expect("the tail load leaves a value")
+    }
+
+    #[test]
+    fn join_conditional_then_write_read_poisoned() {
+        // `if c { slot = 42 }; read slot` — the abstract state holds 42
+        // unconditionally, the runtime only on then executions. The post-join
+        // read must degrade to Unknown, not fabricate 42.
+        cov_mark::check!(join_tainted_read_poisoned);
+        assert!(matches!(join_poison_result(0), StackVal::Unknown));
+    }
+
+    #[test]
+    fn join_dead_then_write_read_poisoned() {
+        // `if c { slot = 42; return 7 }; read slot` — every execution that
+        // reaches the read took the else path, where the slot was never
+        // written. Reading 42 would fabricate a value from a returned path.
+        cov_mark::check!(join_tainted_read_poisoned);
+        assert!(matches!(join_poison_result(1), StackVal::Unknown));
+    }
+
+    #[test]
+    fn join_sound_reads_not_poisoned() {
+        // Else overwrite: the else arm's store lifts the taint; the read
+        // observes the else value exactly as today (last-write-wins).
+        assert!(matches!(join_poison_result(2), StackVal::I64(99)));
+        // Net no-op: the then arm re-stores the pre-if value, so observing
+        // it is indistinguishable from the pre-state — never tainted.
+        assert!(matches!(join_poison_result(3), StackVal::I64(7)));
+        // Else terminates: fall-through implies the then path ran, so the
+        // then value is unconditionally valid downstream.
+        assert!(matches!(join_poison_result(4), StackVal::I64(42)));
     }
 }
