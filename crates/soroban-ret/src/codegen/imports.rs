@@ -357,9 +357,19 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
             scan_expr(b, needs);
         }
         SorobanExpr::Not(a) => scan_expr(a, needs),
-        SorobanExpr::StorageGet { key, .. }
-        | SorobanExpr::StorageHas { key, .. }
-        | SorobanExpr::StorageRemove { key, .. } => {
+        SorobanExpr::StorageGet {
+            key, on_missing, ..
+        } => {
+            scan_expr(key, needs);
+            // The recovered defaulting getters put their empty-collection /
+            // error default in `on_missing` (`unwrap_or(Vec::new(&env))`
+            // etc.); it can be the only Vec/Map expression in the function,
+            // so its imports must be scanned too (greptile P1 on PR #47).
+            if let Some(miss) = on_missing {
+                scan_expr(miss, needs);
+            }
+        }
+        SorobanExpr::StorageHas { key, .. } | SorobanExpr::StorageRemove { key, .. } => {
             scan_expr(key, needs);
         }
         SorobanExpr::StorageSet { key, value, .. } => {
@@ -469,9 +479,21 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
         SorobanExpr::CastAs { value, target_type } => {
             // A storage-get type annotation (`CastAs { StorageGet, T }`) lowers to
             // `get::<_, T>` (annotate_uninferable_gets), naming `T` explicitly.
-            match target_type.as_str() {
+            // A defaulting-collection getter's discarded copy is annotated
+            // `Vec<Val>` / `Map<Val, Val>`, which needs the collection import
+            // even when the function has no other Vec/Map (greptile P1 on
+            // PR #47). Match a leading `Vec`/`Map`/`Bytes` type-name token so a
+            // generic argument (`Vec<soroban_sdk::Val>`) still counts.
+            let head = target_type
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            match head {
                 "Val" => needs.val = true,
                 "Address" => needs.address = true,
+                "Vec" => needs.vec_type = true,
+                "Map" => needs.map_type = true,
+                "Bytes" => needs.bytes = true,
                 _ => {}
             }
             scan_expr(value, needs);
@@ -502,6 +524,7 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
 mod tests {
     use super::*;
     use crate::ir::high_level_ir::{ContractFn, ContractModule};
+    use crate::ir::soroban_ir::StorageType;
     use std::collections::BTreeMap;
 
     fn empty_registry() -> TypeRegistry {
@@ -1044,6 +1067,40 @@ mod tests {
             target_type: "i64".into(),
         });
         assert!(out.contains("symbol_short"), "got: {out}");
+    }
+
+    #[test]
+    fn imports_defaulting_collection_get_pulls_collection_import() {
+        // A discarded Vec-defaulting getter — annotated `get::<_, Vec<Val>>`
+        // over a `StorageGet` whose `on_missing` is `Vec::new` — is the only
+        // Vec/Map expression in its function. Both the turbofish type name
+        // and the `on_missing` default must pull the `Vec` import
+        // (greptile P1 on PR #47).
+        let get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: boxed(SorobanExpr::SymbolLiteral("k".into())),
+            unwrap: false,
+            on_missing: Some(boxed(SorobanExpr::CollectionNew("Vec".into()))),
+        };
+        let annotated = SorobanExpr::CastAs {
+            value: boxed(get),
+            target_type: "Vec<soroban_sdk::Val>".into(),
+        };
+        let out = compute_with_expr(annotated);
+        assert!(out.contains("Vec"), "missing Vec import: {out}");
+
+        // The same via the Map turbofish + Map::new default.
+        let map_get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: boxed(SorobanExpr::SymbolLiteral("k".into())),
+            unwrap: false,
+            on_missing: Some(boxed(SorobanExpr::CollectionNew("Map".into()))),
+        };
+        let out = compute_with_expr(SorobanExpr::CastAs {
+            value: boxed(map_get),
+            target_type: "Map<soroban_sdk::Val, soroban_sdk::Val>".into(),
+        });
+        assert!(out.contains("Map"), "missing Map import: {out}");
     }
 
     #[test]

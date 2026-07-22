@@ -189,7 +189,23 @@ use std::process::Command;
 /// REMOVES the mis-structured `if has(&k) { return get(&k).unwrap() }`
 /// early-returns the generic inline used to fabricate from the helper's
 /// internal return. Corpus todos 1230→1208.
-const ERROR_CEILING: u32 = 1123;
+/// → 1094 (issue #34 tranche 7: the Vec-defaulting getter, the tag-75 /
+/// vec_new sibling of tranche 6's map getter, −29). `detect_defaulting_map_getter`
+/// generalized to `detect_defaulting_collection_getter` over a
+/// `CollectionKind` table — the INVERTED tag guard's constant (75 VecObject
+/// / 76 MapObject) selects the kind, and the select's default-arm
+/// constructor must match it (`vec_new` for 75, `map_new` for 76) — so a
+/// mismatched guard/ctor pair is refused. Recovers aqua's `EmPauseAdmins`
+/// access-control list reader across `enable/disable_emergency_mode` et al.:
+/// the lost `todo!().first_index_of(admin)` receiver becomes the real
+/// `get(&vec![Symbol("EmPauseAdmins")]).unwrap_or(Vec::new(&env))`, and its
+/// sret error path resolves (`panic!()` → the registry-typed
+/// `panic_with_error!(AccessControlError::Unauthorized)`). The empty vec is
+/// the helper's own proven `select` arm (46/46 `Vec::new` are `unwrap_or`
+/// defaults, zero bare fabrications); keys are each module's own proven
+/// const-keys (verified `EmPauseAdmins`/`StableSwapPoolHash` present in the
+/// aqua-amm wasm). Corpus todos 1208→1162.
+const ERROR_CEILING: u32 = 1094;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
