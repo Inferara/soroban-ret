@@ -5094,12 +5094,19 @@ impl<'a> LiftContext<'a> {
                                         k.0, k.1
                                     );
                                 }
-                                // Then wrote, else left it: then's value leaks
-                                // past the join even though the else path
-                                // never produced it.
+                                // Then wrote and the value survives the join.
+                                // Value snapshots cannot distinguish "else
+                                // left it untouched" (a genuine leak: the
+                                // else path never produced the value) from
+                                // "else wrote the SAME value" (a benign
+                                // convergent write) — this class is an UPPER
+                                // BOUND on leaks, not a leak count. The
+                                // read/write-journal instrumentation of the
+                                // next increment measures the true
+                                // population.
                                 Some(pv) if pv == tv && !else_terminated && !then_terminated => {
                                     eprintln!(
-                                        "[SLOTJOIN] then-leak frame=({},{}) then-only write survives join",
+                                        "[SLOTJOIN] then-survives frame=({},{}) (leak upper bound: else untouched OR wrote same)",
                                         k.0, k.1
                                     );
                                 }
