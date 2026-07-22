@@ -568,6 +568,8 @@ static DBG_SLOTMISS: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_SLOTMISS").is_ok());
 static DBG_JOIN: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_JOIN").is_ok());
+static DBG_SLOTJOIN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_SLOTJOIN").is_ok());
 
 struct LiftContext<'a> {
     wasm_module: &'a WasmModule,
@@ -5054,15 +5056,58 @@ impl<'a> LiftContext<'a> {
 
                     let pre_locals = self.locals.clone();
 
+                    // Measurement for the sound slot join (issue #34, next
+                    // phase): both arms share ONE frame-slot map, so the
+                    // else arm observes then-arm writes and the join is
+                    // last-write-wins. Snapshot around the arms to quantify
+                    // where that diverges from a sound per-arm join before
+                    // changing the semantics.
+                    let pre_slots = DBG_SLOTJOIN.then(|| self.frame_slots.borrow().clone());
+
                     // Lift then branch with child context
                     let mut then_ctx = self.child_context();
                     then_ctx.lift_structured(then_body);
                     let mut then_stmts = then_ctx.stmts;
 
+                    let then_slots = DBG_SLOTJOIN.then(|| self.frame_slots.borrow().clone());
+
                     // Lift else branch with child context
                     let mut else_ctx = self.child_context();
                     else_ctx.lift_structured(else_body);
                     let mut else_stmts = else_ctx.stmts;
+
+                    if let (Some(pre), Some(then_s)) = (pre_slots, then_slots) {
+                        let post = self.frame_slots.borrow();
+                        let then_terminated = then_stmts.iter().any(is_terminator_stmt);
+                        let else_terminated = else_stmts.iter().any(is_terminator_stmt);
+                        for (k, tv) in &then_s {
+                            let changed_in_then = pre.get(k) != Some(tv);
+                            if !changed_in_then {
+                                continue;
+                            }
+                            match post.get(k) {
+                                // Both arms wrote k with different values: the
+                                // survivor is the else value — last-write-wins.
+                                Some(pv) if pv != tv && !else_terminated => {
+                                    eprintln!(
+                                        "[SLOTJOIN] divergent frame=({},{}) then!=else (else wins) then_term={then_terminated}",
+                                        k.0, k.1
+                                    );
+                                }
+                                // Then wrote, else left it: then's value leaks
+                                // past the join even though the else path
+                                // never produced it.
+                                Some(pv) if pv == tv && !else_terminated && !then_terminated => {
+                                    eprintln!(
+                                        "[SLOTJOIN] then-leak frame=({},{}) then-only write survives join",
+                                        k.0, k.1
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        drop(post);
+                    }
 
                     // Merge memory stores and found_host_calls from both branches
                     // Use else branch stores (it runs last) to preserve sequential order
