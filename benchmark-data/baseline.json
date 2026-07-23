@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 93.4,
+  "overall_restoration": 93.6,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -17,12 +17,12 @@
     {
       "file": "aqua-rewards-CCY2PXGM.wasm",
       "entity": "Aqua Rewards",
-      "restoration_pct": 93.7,
+      "restoration_pct": 95.2,
       "spec_functions": 76,
-      "fn_clean": 22,
-      "fn_partial": 54,
+      "fn_clean": 23,
+      "fn_partial": 53,
       "fn_logic_lost": 0,
-      "artifacts_total": 331,
+      "artifacts_total": 246,
       "wasm_size": 54833,
       "error": null
     },
@@ -77,12 +77,12 @@
     {
       "file": "blend-fixed-pool-CAJJZSGM.wasm",
       "entity": "Blend Fixed Pool",
-      "restoration_pct": 94.3,
+      "restoration_pct": 94.4,
       "spec_functions": 27,
       "fn_clean": 12,
       "fn_partial": 15,
       "fn_logic_lost": 0,
-      "artifacts_total": 96,
+      "artifacts_total": 102,
       "wasm_size": 57328,
       "error": null
     },
@@ -101,12 +101,12 @@
     {
       "file": "blend-yieldblox-pool-CCCCIQSD.wasm",
       "entity": "Blend Yieldblox Pool",
-      "restoration_pct": 94.3,
+      "restoration_pct": 94.4,
       "spec_functions": 27,
       "fn_clean": 12,
       "fn_partial": 15,
       "fn_logic_lost": 0,
-      "artifacts_total": 96,
+      "artifacts_total": 102,
       "wasm_size": 57328,
       "error": null
     },
@@ -233,12 +233,12 @@
     {
       "file": "soroswap-CA4HEQTL.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 91.3,
+      "restoration_pct": 92.6,
       "spec_functions": 12,
-      "fn_clean": 3,
-      "fn_partial": 9,
+      "fn_clean": 4,
+      "fn_partial": 8,
       "fn_logic_lost": 0,
-      "artifacts_total": 22,
+      "artifacts_total": 19,
       "wasm_size": 9894,
       "error": null
     },
