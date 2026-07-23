@@ -268,7 +268,37 @@ use std::process::Command;
 /// 0/1-plausible for Bool/numeric slots. `child_exprs`/`child_exprs_mut`
 /// walkers gained the missing EnumConstruct/MapConstruct arms (construct
 /// payloads were invisible to every walker-based pass before).
-const ERROR_CEILING: u32 = 734;
+/// → 478 (issue #34 tranche 14: never-value rendering discipline, −256;
+/// digicus becomes the THIRD clean-compiling contract, zero per-contract
+/// regressions). One principle, five renders: a `!`-rooted ("never") value —
+/// an already-lost `todo!()` and anything provably downstream of one — must
+/// render so the `!` can coerce, because every other position is a
+/// GUARANTEED rustc error with identical runtime behavior (the todo panics
+/// first either way). (1) Operators: `todo!() == 0`, `a - todo!()` fall back
+/// `!`→`()` in operator traits (E0277 "can't compare `()` with `i32`") →
+/// whole expression is `todo!()`; right-operand collapse only when the left
+/// operand is effect-free (never skips a real side effect); `&&`/`||`
+/// excluded (they type-check). (2) By-ref args: `&todo!()` is `&!` and does
+/// NOT coerce (E0308 "expected `&Address`, found `&!`") → render bare at
+/// concrete-typed sites (invoke address/function, crypto, prng, strkey).
+/// (3) Generic storage ops can't infer from `!`: `set`/`get`/`has`/`remove`/
+/// `extend_ttl` with a never key/value render it bare AND pin that generic
+/// to `Val` (`set::<_, soroban_sdk::Val>(&k, todo!())`). (4) Unbound locals
+/// (E0425 — `let var_2 = var_2.append(..)` self-reference residue of a lost
+/// accumulation loop; uses after a branch-scoped binding's join) substitute
+/// `UnknownVal`: the defining flow was not threaded, so the value at the use
+/// IS unknown. (5) Locals whose EVERY binding is `!`-rooted (fixpoint, so
+/// never-ness flows through `let b = a.len();`) husk their uses — the
+/// binding panics before any use runs; a local with one real binding is
+/// untouched (its `let` unifies to the real type). `child_exprs(_mut)`
+/// completed the remaining child-bearing variants (crypto/invoke/event/
+/// prng/ttl/Try/Some/Log — uses inside them were invisible to every walker).
+/// The invoke-arg bare-todo exception broadened from literal `UnknownVal` to
+/// any `!`-rooted arg (a never chain renders as bare `todo!()` via the chain
+/// husk, so appending `.into_val` rebuilt the E0277 it exists to avoid).
+/// aqua-amm 129→64, aqua-rewards 99→49, blend-backstop 32→9, blend pools
+/// 67→43 ×2, reflectors 18→9 ×2, soroswap 14→4/36→29, digicus 1→0 CLEAN.
+const ERROR_CEILING: u32 = 478;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

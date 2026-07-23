@@ -253,6 +253,93 @@ pub enum SorobanExpr {
     },
 }
 
+impl SorobanExpr {
+    /// A `!`-rooted expression: `todo!()`/`panic!()` itself, a method/field
+    /// chain hanging off one, or an arithmetic/comparison operator with a `!`
+    /// operand. All of these are guaranteed rustc errors (method resolution on
+    /// `!` is E0599/E0609; operator traits on `!` fall back to `()` — E0277
+    /// "can't compare `()` with `i32`" and friends), and at runtime the `!`
+    /// root panics before the rest of the expression evaluates — so rendering
+    /// the whole expression as `todo!()` is exact, not lossy.
+    ///
+    /// A right-operand-only `!` counts ONLY when the left operand is
+    /// effect-free: Rust evaluates left-to-right, so collapsing `set(..) - todo!()`
+    /// would skip a real side effect, while `x - todo!()` panics identically.
+    /// `&&`/`||` are deliberately NOT included: `todo!() && b` type-checks
+    /// (plain `bool` coercion, no operator trait), so those renders stand.
+    pub(crate) fn is_never_rooted(&self) -> bool {
+        match self {
+            SorobanExpr::UnknownVal | SorobanExpr::Panic | SorobanExpr::PanicWithError(_) => true,
+            SorobanExpr::MethodCall { object, .. } | SorobanExpr::FieldAccess { object, .. } => {
+                object.is_never_rooted()
+            }
+            // Renders bare (no syntactic type pin), so a `!` root shows through.
+            // `CastAs` is deliberately NOT here: `todo!() as u128` pins a real
+            // type, and methods on it resolve.
+            SorobanExpr::ValConvert { value, .. } => value.is_never_rooted(),
+            SorobanExpr::Add(a, b)
+            | SorobanExpr::Sub(a, b)
+            | SorobanExpr::Mul(a, b)
+            | SorobanExpr::Div(a, b)
+            | SorobanExpr::Rem(a, b)
+            | SorobanExpr::Eq(a, b)
+            | SorobanExpr::Ne(a, b)
+            | SorobanExpr::Lt(a, b)
+            | SorobanExpr::Le(a, b)
+            | SorobanExpr::Gt(a, b)
+            | SorobanExpr::Ge(a, b) => {
+                a.is_never_rooted() || (b.is_never_rooted() && a.is_effect_free())
+            }
+            SorobanExpr::Not(a) => a.is_never_rooted(),
+            _ => false,
+        }
+    }
+
+    /// Conservatively side-effect-free: re-ordering or skipping its evaluation
+    /// is unobservable. Literals, variable references, and pure environment
+    /// reads only — any host call that writes (or that we are not certain
+    /// about) is excluded.
+    pub(crate) fn is_effect_free(&self) -> bool {
+        match self {
+            SorobanExpr::U32Literal(_)
+            | SorobanExpr::I32Literal(_)
+            | SorobanExpr::U64Literal(_)
+            | SorobanExpr::I64Literal(_)
+            | SorobanExpr::U128Literal(_)
+            | SorobanExpr::I128Literal(_)
+            | SorobanExpr::BoolLiteral(_)
+            | SorobanExpr::SymbolLiteral(_)
+            | SorobanExpr::StringLiteral(_)
+            | SorobanExpr::BytesLiteral(_)
+            | SorobanExpr::Void
+            | SorobanExpr::None
+            | SorobanExpr::Param(_)
+            | SorobanExpr::Local(_)
+            | SorobanExpr::NamedLocal(_)
+            | SorobanExpr::Env
+            | SorobanExpr::LedgerSequence
+            | SorobanExpr::LedgerTimestamp
+            | SorobanExpr::CurrentContractAddress => true,
+            SorobanExpr::FieldAccess { object, .. } => object.is_effect_free(),
+            SorobanExpr::CastAs { value, .. } | SorobanExpr::ValConvert { value, .. } => {
+                value.is_effect_free()
+            }
+            SorobanExpr::Not(a) => a.is_effect_free(),
+            // Div/Rem are excluded: divide-by-zero traps, which is an effect.
+            SorobanExpr::Add(a, b)
+            | SorobanExpr::Sub(a, b)
+            | SorobanExpr::Mul(a, b)
+            | SorobanExpr::Eq(a, b)
+            | SorobanExpr::Ne(a, b)
+            | SorobanExpr::Lt(a, b)
+            | SorobanExpr::Le(a, b)
+            | SorobanExpr::Gt(a, b)
+            | SorobanExpr::Ge(a, b) => a.is_effect_free() && b.is_effect_free(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageType {
     Persistent,

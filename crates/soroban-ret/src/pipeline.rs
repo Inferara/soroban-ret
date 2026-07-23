@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use crate::codegen::module::{assemble_generic_module, assemble_module, format_source};
 use crate::ir::correctness::{
     annotate_uninferable_collections, annotate_uninferable_gets, clone_reused_move_params,
-    husk_handle_int_comparisons, husk_type_mismatched_ok_literal,
+    husk_handle_int_comparisons, husk_type_mismatched_ok_literal, husk_unbound_local_uses,
 };
 use crate::ir::optimizer::{
     drop_void_unknown_value_return_guards, fold_tautological_tag_guards, optimize_stmts,
@@ -848,6 +848,11 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
     for func in &mut contract_module.functions {
         let returns_value = !matches!(&func.return_type, None | Some(ScSpecTypeDef::Void));
         let body = std::mem::take(&mut func.body);
+        // Detector 4: uses of unbound locals (E0425 — lost-loop self-reference
+        // residue, cross-scope uses) and of locals every binding of which is
+        // `!`-rooted → honest `UnknownVal`. Runs first so every later pass sees
+        // the husked shapes.
+        let body = husk_unbound_local_uses(body, &func.params);
         // Issue #36: a bare empty-collection tail alongside a discarded storage
         // load is the collapsed default arm of `get(&k).unwrap_or_else(|| …)` —
         // the loaded value was lost, so the "always empty" tail is silent-wrong.
@@ -2727,9 +2732,11 @@ fn crypto_field_width(ty: &ScSpecTypeDef) -> Option<u32> {
     }
 }
 
-/// Immutable sub-expressions of a `SorobanExpr` for the compound variants that can
-/// carry a crypto-call argument or a field reference. Mirrors
-/// `optimizer::expr_children`; variants without relevant sub-expressions yield none.
+/// Immutable sub-expressions of a `SorobanExpr` — complete coverage of every
+/// child-bearing variant, so walker-based passes see the whole tree. (t13
+/// found `EnumConstruct`/`MapConstruct` payloads invisible to all walkers;
+/// t14 completed the remaining variants — crypto/invoke/event/prng/ttl
+/// carriers — after the unbound-local pass missed uses inside them.)
 fn child_exprs(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
     match expr {
         SorobanExpr::Add(a, b)
@@ -2751,6 +2758,18 @@ fn child_exprs(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
         SorobanExpr::ValConvert { value, .. }
         | SorobanExpr::CastAs { value, .. }
         | SorobanExpr::SretResult(value) => vec![value.as_ref()],
+        SorobanExpr::Some(a)
+        | SorobanExpr::ErrorFromCode(a)
+        | SorobanExpr::CryptoSha256(a)
+        | SorobanExpr::CryptoKeccak256(a)
+        | SorobanExpr::PrngReseed(a)
+        | SorobanExpr::PrngBytesNew(a)
+        | SorobanExpr::PrngVecShuffle(a)
+        | SorobanExpr::StrkeyToAddress(a)
+        | SorobanExpr::AddressToStrkey(a)
+        | SorobanExpr::AuthorizeAsCurrContract(a)
+        | SorobanExpr::ValTag(a)
+        | SorobanExpr::Try(a) => vec![a.as_ref()],
         SorobanExpr::MethodCall { object, args, .. } => {
             let mut c = vec![object.as_ref()];
             c.extend(args.iter());
@@ -2760,6 +2779,54 @@ fn child_exprs(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
         | SorobanExpr::StorageHas { key, .. }
         | SorobanExpr::StorageRemove { key, .. } => vec![key.as_ref()],
         SorobanExpr::StorageSet { key, value, .. } => vec![key.as_ref(), value.as_ref()],
+        SorobanExpr::StorageExtendTtl {
+            key,
+            threshold,
+            extend_to,
+            ..
+        } => vec![key.as_ref(), threshold.as_ref(), extend_to.as_ref()],
+        SorobanExpr::ExtendInstanceAndCodeTtl {
+            threshold,
+            extend_to,
+        } => vec![threshold.as_ref(), extend_to.as_ref()],
+        SorobanExpr::RequireAuthForArgs { address, args } => vec![address.as_ref(), args.as_ref()],
+        SorobanExpr::PublishEvent { topics, data, .. } => {
+            let mut c: Vec<&SorobanExpr> = topics.iter().collect();
+            c.push(data.as_ref());
+            c
+        }
+        SorobanExpr::InvokeContract {
+            address,
+            function,
+            args,
+            ..
+        }
+        | SorobanExpr::TryInvokeContract {
+            address,
+            function,
+            args,
+            ..
+        } => {
+            let mut c = vec![address.as_ref(), function.as_ref()];
+            c.extend(args.iter());
+            c
+        }
+        SorobanExpr::CryptoEd25519Verify {
+            public_key,
+            message,
+            signature,
+        } => vec![public_key.as_ref(), message.as_ref(), signature.as_ref()],
+        SorobanExpr::CryptoSecp256k1Recover {
+            msg_digest,
+            signature,
+            recovery_id,
+        } => vec![
+            msg_digest.as_ref(),
+            signature.as_ref(),
+            recovery_id.as_ref(),
+        ],
+        SorobanExpr::PrngU64InRange { low, high } => vec![low.as_ref(), high.as_ref()],
+        SorobanExpr::VecTryIterFold { vec, init } => vec![vec.as_ref(), init.as_ref()],
         SorobanExpr::FieldAccess { object, .. } => vec![object.as_ref()],
         SorobanExpr::TupleConstruct(fields) | SorobanExpr::VecConstruct(fields) => {
             fields.iter().collect()
@@ -2767,13 +2834,13 @@ fn child_exprs(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
         SorobanExpr::StructConstruct { fields, .. } => fields.iter().map(|(_, v)| v).collect(),
         SorobanExpr::EnumConstruct { fields, .. } => fields.iter().collect(),
         SorobanExpr::MapConstruct(entries) => entries.iter().flat_map(|(k, v)| [k, v]).collect(),
-        SorobanExpr::RawHostCall { args, .. } => args.iter().collect(),
+        SorobanExpr::RawHostCall { args, .. } | SorobanExpr::Log(args) => args.iter().collect(),
         _ => vec![],
     }
 }
 
 /// Mutable counterpart of [`child_exprs`].
-fn child_exprs_mut(expr: &mut SorobanExpr) -> Vec<&mut SorobanExpr> {
+pub(crate) fn child_exprs_mut(expr: &mut SorobanExpr) -> Vec<&mut SorobanExpr> {
     match expr {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
@@ -2794,6 +2861,18 @@ fn child_exprs_mut(expr: &mut SorobanExpr) -> Vec<&mut SorobanExpr> {
         SorobanExpr::ValConvert { value, .. }
         | SorobanExpr::CastAs { value, .. }
         | SorobanExpr::SretResult(value) => vec![value.as_mut()],
+        SorobanExpr::Some(a)
+        | SorobanExpr::ErrorFromCode(a)
+        | SorobanExpr::CryptoSha256(a)
+        | SorobanExpr::CryptoKeccak256(a)
+        | SorobanExpr::PrngReseed(a)
+        | SorobanExpr::PrngBytesNew(a)
+        | SorobanExpr::PrngVecShuffle(a)
+        | SorobanExpr::StrkeyToAddress(a)
+        | SorobanExpr::AddressToStrkey(a)
+        | SorobanExpr::AuthorizeAsCurrContract(a)
+        | SorobanExpr::ValTag(a)
+        | SorobanExpr::Try(a) => vec![a.as_mut()],
         SorobanExpr::MethodCall { object, args, .. } => {
             let mut c = vec![object.as_mut()];
             c.extend(args.iter_mut());
@@ -2803,6 +2882,54 @@ fn child_exprs_mut(expr: &mut SorobanExpr) -> Vec<&mut SorobanExpr> {
         | SorobanExpr::StorageHas { key, .. }
         | SorobanExpr::StorageRemove { key, .. } => vec![key.as_mut()],
         SorobanExpr::StorageSet { key, value, .. } => vec![key.as_mut(), value.as_mut()],
+        SorobanExpr::StorageExtendTtl {
+            key,
+            threshold,
+            extend_to,
+            ..
+        } => vec![key.as_mut(), threshold.as_mut(), extend_to.as_mut()],
+        SorobanExpr::ExtendInstanceAndCodeTtl {
+            threshold,
+            extend_to,
+        } => vec![threshold.as_mut(), extend_to.as_mut()],
+        SorobanExpr::RequireAuthForArgs { address, args } => vec![address.as_mut(), args.as_mut()],
+        SorobanExpr::PublishEvent { topics, data, .. } => {
+            let mut c: Vec<&mut SorobanExpr> = topics.iter_mut().collect();
+            c.push(data.as_mut());
+            c
+        }
+        SorobanExpr::InvokeContract {
+            address,
+            function,
+            args,
+            ..
+        }
+        | SorobanExpr::TryInvokeContract {
+            address,
+            function,
+            args,
+            ..
+        } => {
+            let mut c = vec![address.as_mut(), function.as_mut()];
+            c.extend(args.iter_mut());
+            c
+        }
+        SorobanExpr::CryptoEd25519Verify {
+            public_key,
+            message,
+            signature,
+        } => vec![public_key.as_mut(), message.as_mut(), signature.as_mut()],
+        SorobanExpr::CryptoSecp256k1Recover {
+            msg_digest,
+            signature,
+            recovery_id,
+        } => vec![
+            msg_digest.as_mut(),
+            signature.as_mut(),
+            recovery_id.as_mut(),
+        ],
+        SorobanExpr::PrngU64InRange { low, high } => vec![low.as_mut(), high.as_mut()],
+        SorobanExpr::VecTryIterFold { vec, init } => vec![vec.as_mut(), init.as_mut()],
         SorobanExpr::FieldAccess { object, .. } => vec![object.as_mut()],
         SorobanExpr::TupleConstruct(fields) | SorobanExpr::VecConstruct(fields) => {
             fields.iter_mut().collect()
@@ -2812,7 +2939,7 @@ fn child_exprs_mut(expr: &mut SorobanExpr) -> Vec<&mut SorobanExpr> {
         SorobanExpr::MapConstruct(entries) => {
             entries.iter_mut().flat_map(|(k, v)| [k, v]).collect()
         }
-        SorobanExpr::RawHostCall { args, .. } => args.iter_mut().collect(),
+        SorobanExpr::RawHostCall { args, .. } | SorobanExpr::Log(args) => args.iter_mut().collect(),
         _ => vec![],
     }
 }
