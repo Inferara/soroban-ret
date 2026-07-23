@@ -632,6 +632,15 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             if is_never_rooted(object) {
                 return quote! { todo!("unknown value") };
             }
+            // A functional `.append(..)` chain on a fresh `Bytes` (the lifter's
+            // model of the `bytes_append` host fn, which RETURNS a new Bytes)
+            // cannot render as a chain: the SDK's `Bytes::append(&mut self,
+            // &Bytes)` returns `()`, so `.append(a).append(b)` is E0599 on the
+            // second link. Re-render as a block with a mutable accumulator —
+            // the SDK wrapper's own shape, byte-identical semantics.
+            if let Some(toks) = try_bytes_append_chain(expr) {
+                return toks;
+            }
             let obj = generate_expr(object);
             let method_ident = safe_ident(method);
             // `ToXdr::to_xdr(self, env: &Env)` — the env argument is part of
@@ -1780,6 +1789,68 @@ fn ref_arg(e: &SorobanExpr) -> TokenStream {
     } else {
         quote! { &#toks }
     }
+}
+
+/// Render a functional `.append(..)` chain rooted at a fresh `Bytes` as a
+/// block with a mutable accumulator.
+///
+/// The lifter models the `bytes_append` HOST fn functionally (it returns a
+/// new `Bytes`), producing `Bytes::new(&env).append(a).append(b)` — but the
+/// SDK's `Bytes::append(&mut self, other: &Bytes)` returns `()`, so the chain
+/// form is a guaranteed E0599 on every link after the first. The block form
+/// is the SDK wrapper's own reassignment shape — identical semantics:
+///
+/// ```text
+/// { let mut bytes_acc = Bytes::new(&env); bytes_acc.append(&a); …; bytes_acc }
+/// ```
+///
+/// Args: a `Hash<32>` crypto digest coerces via the SDK's own conversions
+/// (`Bytes::from(h.to_bytes())`, identical bytes); a `!`-rooted arg renders
+/// bare (t14 rule); anything else is passed by reference as-is. Gated to
+/// chains whose base is exactly `CollectionNew("Bytes")` — receiver-typed
+/// appends on locals are real mutating statements and are left alone.
+fn try_bytes_append_chain(e: &SorobanExpr) -> Option<TokenStream> {
+    let mut rev_args: Vec<&SorobanExpr> = Vec::new();
+    let mut cur = e;
+    loop {
+        match cur {
+            SorobanExpr::MethodCall {
+                object,
+                method,
+                args,
+            } if method == "append" && args.len() == 1 => {
+                rev_args.push(&args[0]);
+                cur = object;
+            }
+            SorobanExpr::CollectionNew(name) if name == "Bytes" && !rev_args.is_empty() => break,
+            _ => return None,
+        }
+    }
+    let appends: Vec<TokenStream> = rev_args
+        .iter()
+        .rev()
+        .map(|a| {
+            let toks = generate_expr(a);
+            if is_never_rooted(a) {
+                // Bare `!` coerces to the expected `&Bytes`.
+                quote! { bytes_acc.append(#toks); }
+            } else if matches!(
+                a,
+                SorobanExpr::CryptoSha256(_) | SorobanExpr::CryptoKeccak256(_)
+            ) {
+                quote! { bytes_acc.append(&Bytes::from(#toks.to_bytes())); }
+            } else {
+                quote! { bytes_acc.append(&#toks); }
+            }
+        })
+        .collect();
+    Some(quote! {
+        {
+            let mut bytes_acc = Bytes::new(&env);
+            #(#appends)*
+            bytes_acc
+        }
+    })
 }
 
 /// Turbofish pinning a single-generic storage op's key type to `Val` when the
@@ -2936,6 +3007,66 @@ mod generate_expr_tests {
             collapse(&s(generate_expr(&clean))),
             "env . storage () . persistent () . has (& k)"
         );
+    }
+
+    #[test]
+    fn bytes_append_chain_renders_as_accumulator_block() {
+        // `Bytes::new(&env).append(keccak(a)).append(b.to_xdr(&env))` — the
+        // SDK's `append` is `&mut self → ()`, so the chain form can never
+        // compile; it re-renders as a mutable-accumulator block. A Hash<32>
+        // digest arg coerces via the SDK's own `Bytes::from(h.to_bytes())`.
+        let chain = SorobanExpr::MethodCall {
+            object: boxed(SorobanExpr::MethodCall {
+                object: boxed(SorobanExpr::CollectionNew("Bytes".into())),
+                method: "append".into(),
+                args: vec![SorobanExpr::CryptoKeccak256(boxed(SorobanExpr::Param(
+                    "tld".into(),
+                )))],
+            }),
+            method: "append".into(),
+            args: vec![SorobanExpr::MethodCall {
+                object: boxed(SorobanExpr::Param("token".into())),
+                method: "to_xdr".into(),
+                args: vec![],
+            }],
+        };
+        let out = collapse(&s(generate_expr(&chain)));
+        assert!(
+            out.contains("let mut bytes_acc = Bytes :: new (& env)"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(
+                "bytes_acc . append (& Bytes :: from (env . crypto () . keccak256 (& tld) . to_bytes ()))"
+            ),
+            "hash arg should coerce via Bytes::from(h.to_bytes()): {out}"
+        );
+        assert!(
+            out.contains("bytes_acc . append (& token . to_xdr (& env))"),
+            "Bytes-typed arg passes by reference: {out}"
+        );
+        assert!(out.ends_with("bytes_acc }"), "got: {out}");
+        // A single-link chain gets the same treatment (its value is used —
+        // `append` returning `()` would break the consumer).
+        let single = SorobanExpr::MethodCall {
+            object: boxed(SorobanExpr::CollectionNew("Bytes".into())),
+            method: "append".into(),
+            args: vec![SorobanExpr::UnknownVal],
+        };
+        let out = collapse(&s(generate_expr(&single)));
+        assert!(
+            out.contains("bytes_acc . append (todo ! (\"unknown value\"))"),
+            "never arg renders bare: {out}"
+        );
+        // A receiver-typed append on a local is a REAL mutating statement —
+        // untouched.
+        let local_append = SorobanExpr::MethodCall {
+            object: boxed(SorobanExpr::NamedLocal("salt".into())),
+            method: "append".into(),
+            args: vec![SorobanExpr::Param("x".into())],
+        };
+        let out = collapse(&s(generate_expr(&local_append)));
+        assert_eq!(out, "salt . append (x)");
     }
 
     #[test]

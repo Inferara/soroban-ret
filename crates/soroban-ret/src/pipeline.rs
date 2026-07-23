@@ -682,6 +682,35 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         }
         log::trace!("Pipeline pass: stage_4m3 hole_mistyped_construct_fields");
 
+        // Stage 4m4: recover Option-Void comparisons. The SDK's
+        // `Vec::first_index_of`/`last_index_of` return `Option<u32>` — at the
+        // Val level, `None` is the Void word (raw bits == 2) and `Some(i)` is
+        // a `U32Val` (`(i << 32) | 4`, never 2). A bare (un-decoded) index-of
+        // result compared against literal 2 is therefore EXACTLY the `None`
+        // check (`Option<u32>` never legitimately compares to an integer —
+        // today it is E0308), so `x.first_index_of(y) == 2` recovers to
+        // `x.first_index_of(y).is_none()` (and `!=` to `.is_some()`).
+        for func in &mut contract_module.functions {
+            fold_option_void_compares(&mut func.body);
+        }
+        log::trace!("Pipeline pass: stage_4m4 fold_option_void_compares");
+
+        // Stage 4m5: hole surviving PURE-READ raw host-call renders. The
+        // handful of marshalling reads the lifter cannot model
+        // (`map_key_by_pos`/`map_val_by_pos` — by-position map iteration —
+        // and `bytes_front`/`bytes_copy_from_linear_memory`) render as
+        // `env.map().map_key_by_pos(..)` — methods that do not exist on `Env`
+        // (guaranteed E0599 "Env is not an iterator"). Every corpus site's
+        // handle argument is itself already lost (`todo!()`), so the value is
+        // unknown twice over; these calls are functional reads with no chain
+        // state effect, so an honest `UnknownVal` is faithful. Replacing at
+        // the IR level (not render) lets the unbound-local pass see a
+        // `!`-rooted binding and husk its uses.
+        for func in &mut contract_module.functions {
+            hole_pure_raw_host_reads(&mut func.body);
+        }
+        log::trace!("Pipeline pass: stage_4m5 hole_pure_raw_host_reads");
+
         // Re-run variable name propagation + self-assignment removal.
         for func in &mut contract_module.functions {
             let param_names: Vec<String> = func.params.iter().map(|p| p.name.clone()).collect();
@@ -3204,6 +3233,233 @@ fn hole_mistyped_construct_fields(stmts: &mut [SorobanStmt], registry: &TypeRegi
             | SorobanStmt::Block(body)
             | SorobanStmt::For { body, .. } => {
                 hole_mistyped_construct_fields(body, registry);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Stage 4m4: `x.first_index_of(y) == 2` → `x.first_index_of(y).is_none()`
+/// (and `!=` → `.is_some()`).
+///
+/// The SDK's `Vec::first_index_of`/`last_index_of` return `Option<u32>`; at
+/// the Val level `None` is the Void word (raw bits == 2) and `Some(i)` is a
+/// `U32Val` (`(i << 32) | 4`, never equal to 2). The lifter loses the Option
+/// decode when the comparison happens on the raw Val, leaving a comparison
+/// that can never compile (`Option<u32>` vs `{integer}` — E0308) whose intent
+/// is provably the `None` check. Strict gates: the operand must be a BARE
+/// `first_index_of`/`last_index_of` MethodCall (a decoded index would carry
+/// the `.unwrap()` recovery — and a decoded `u32` index equal to 2 encodes as
+/// 8589934596 raw, never 2) and the literal must be exactly 2. Comparisons
+/// against any other literal are left as-is (still honest hard errors).
+fn fold_option_void_compares(stmts: &mut [SorobanStmt]) {
+    // Per-function identifier use counts: `first_index_of(item: impl
+    // Borrow<T>)` CONSUMES its argument, so an identifier arg that appears
+    // anywhere else in the function is moved-then-reused — borrowck rejects
+    // it the moment the surrounding expression type-checks (E0382, previously
+    // masked by the comparison's own type error; the lifter also duplicates
+    // the call as a discarded statement, and admins get `require_auth()`-ed
+    // later). A host-handle `.clone()` is a refcount bump = same value — the
+    // same faithful repair as the DataKey clone lever. Single-use args
+    // (count 1 = this call only) are left untouched, keeping compiling
+    // output byte-identical.
+    let mut use_counts: HashMap<String, u32> = HashMap::new();
+    walk_exprs(stmts, &mut |e| {
+        let name = match e {
+            SorobanExpr::Param(n) | SorobanExpr::NamedLocal(n) => n.clone(),
+            SorobanExpr::Local(i) => format!("var_{i}"),
+            _ => return,
+        };
+        *use_counts.entry(name).or_insert(0) += 1;
+    });
+    fold_option_void_compares_in(stmts, &use_counts);
+}
+
+fn fold_option_void_compares_in(stmts: &mut [SorobanStmt], use_counts: &HashMap<String, u32>) {
+    fn is_bare_index_of(e: &SorobanExpr) -> bool {
+        matches!(
+            e,
+            SorobanExpr::MethodCall { method, .. }
+                if method == "first_index_of" || method == "last_index_of"
+        )
+    }
+    fn is_two(e: &SorobanExpr) -> bool {
+        matches!(
+            e,
+            SorobanExpr::I32Literal(2)
+                | SorobanExpr::U32Literal(2)
+                | SorobanExpr::I64Literal(2)
+                | SorobanExpr::U64Literal(2)
+        )
+    }
+    fn contains_unknown(e: &SorobanExpr) -> bool {
+        e.is_never_rooted() || child_exprs(e).iter().any(|c| contains_unknown(c))
+    }
+    fn fix_expr(e: &mut SorobanExpr, use_counts: &HashMap<String, u32>) {
+        for c in child_exprs_mut(e) {
+            fix_expr(c, use_counts);
+        }
+        // Any bare index-of call (folded below, a discarded duplicate, or
+        // otherwise): clone a multi-use identifier arg so the by-value
+        // `impl Borrow<T>` parameter doesn't move a value with later uses.
+        if let SorobanExpr::MethodCall { method, args, .. } = e
+            && (method == "first_index_of" || method == "last_index_of")
+        {
+            for a in args.iter_mut() {
+                let name = match &a {
+                    SorobanExpr::Param(n) | SorobanExpr::NamedLocal(n) => n.clone(),
+                    SorobanExpr::Local(i) => format!("var_{i}"),
+                    _ => continue,
+                };
+                if use_counts.get(&name).copied().unwrap_or(0) >= 2 {
+                    cov_mark::hit!(index_of_moved_arg_cloned);
+                    let ident = std::mem::replace(a, SorobanExpr::UnknownVal);
+                    *a = SorobanExpr::MethodCall {
+                        object: Box::new(ident),
+                        method: "clone".to_string(),
+                        args: Vec::new(),
+                    };
+                }
+            }
+        }
+        let (call_side, replacement_method) = match e {
+            SorobanExpr::Eq(a, b) => {
+                if is_bare_index_of(a) && is_two(b) {
+                    (a, "is_none")
+                } else if is_bare_index_of(b) && is_two(a) {
+                    (b, "is_none")
+                } else {
+                    return;
+                }
+            }
+            SorobanExpr::Ne(a, b) => {
+                if is_bare_index_of(a) && is_two(b) {
+                    (a, "is_some")
+                } else if is_bare_index_of(b) && is_two(a) {
+                    (b, "is_some")
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        };
+        let SorobanExpr::MethodCall { object, args, .. } = call_side.as_mut() else {
+            unreachable!("guarded by is_bare_index_of");
+        };
+        // Index-of an UNKNOWN item is itself unknown — and un-renderable: a
+        // `!`-rooted or todo-containing arg can't satisfy `impl Borrow<T>`
+        // (`(): Borrow<u32>` after never fallback / `Vec<_>: Borrow<Asset>`
+        // for a lost element). With an effect-free receiver the whole
+        // comparison collapses to an honest `todo!()` — exact, the lost arg
+        // panics before anything else.
+        if args.iter().any(contains_unknown) && object.is_effect_free() {
+            cov_mark::hit!(option_void_compare_unknown_arg_holed);
+            *e = SorobanExpr::UnknownVal;
+            return;
+        }
+        cov_mark::hit!(option_void_compare_folded);
+        let call = std::mem::replace(call_side.as_mut(), SorobanExpr::UnknownVal);
+        *e = SorobanExpr::MethodCall {
+            object: Box::new(call),
+            method: replacement_method.to_string(),
+            args: Vec::new(),
+        };
+    }
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(expr) | SorobanStmt::Return(Some(expr)) => fix_expr(expr, use_counts),
+            SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+                fix_expr(value, use_counts)
+            }
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                fix_expr(condition, use_counts);
+                fold_option_void_compares_in(then_body, use_counts);
+                fold_option_void_compares_in(else_body, use_counts);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                fix_expr(scrutinee, use_counts);
+                for arm in arms {
+                    fold_option_void_compares_in(&mut arm.body, use_counts);
+                }
+            }
+            SorobanStmt::For {
+                start, end, body, ..
+            } => {
+                fix_expr(start, use_counts);
+                fix_expr(end, use_counts);
+                fold_option_void_compares_in(body, use_counts);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                fold_option_void_compares_in(body, use_counts);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Stage 4m5: hole surviving PURE-READ raw host-call renders to `UnknownVal`.
+///
+/// The by-position map iteration reads (`map_key_by_pos`/`map_val_by_pos`)
+/// and the two surviving buf reads (`bytes_front`,
+/// `bytes_copy_from_linear_memory`) have no SDK lowering — they render as
+/// `env.map().map_key_by_pos(..)`, methods that do not exist on `Env`
+/// (guaranteed E0599). All are functional reads with no chain-state effect,
+/// and every corpus site's handle argument is itself already a lost
+/// `todo!()`, so the produced value is unknown twice over — `UnknownVal` is
+/// the honest, exact replacement. Whitelist-only: raw host calls with any
+/// possible effect are left alone (their broken render stays visible).
+fn hole_pure_raw_host_reads(stmts: &mut [SorobanStmt]) {
+    const PURE_READS: &[(&str, &str)] = &[
+        ("Map", "map_key_by_pos"),
+        ("Map", "map_val_by_pos"),
+        ("Buf", "bytes_front"),
+        ("Buf", "bytes_copy_from_linear_memory"),
+    ];
+    fn fix_expr(e: &mut SorobanExpr) {
+        for c in child_exprs_mut(e) {
+            fix_expr(c);
+        }
+        if let SorobanExpr::RawHostCall {
+            module, function, ..
+        } = e
+            && PURE_READS.iter().any(|(m, f)| module == m && function == f)
+        {
+            cov_mark::hit!(pure_raw_host_read_holed);
+            *e = SorobanExpr::UnknownVal;
+        }
+    }
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(expr) | SorobanStmt::Return(Some(expr)) => fix_expr(expr),
+            SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => fix_expr(value),
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                fix_expr(condition);
+                hole_pure_raw_host_reads(then_body);
+                hole_pure_raw_host_reads(else_body);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                fix_expr(scrutinee);
+                for arm in arms {
+                    hole_pure_raw_host_reads(&mut arm.body);
+                }
+            }
+            SorobanStmt::For {
+                start, end, body, ..
+            } => {
+                fix_expr(start);
+                fix_expr(end);
+                hole_pure_raw_host_reads(body);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                hole_pure_raw_host_reads(body);
             }
             _ => {}
         }
@@ -9951,6 +10207,151 @@ mod tests {
         assert!(matches!(
             &stmts[1],
             SorobanStmt::Expr(SorobanExpr::UnknownVal)
+        ));
+    }
+
+    #[test]
+    fn option_void_compare_folds_to_is_none_is_some() {
+        let index_of = |v: &str| SorobanExpr::MethodCall {
+            object: Box::new(SorobanExpr::NamedLocal("admins".into())),
+            method: "first_index_of".into(),
+            args: vec![SorobanExpr::Param(v.into())],
+        };
+        let mut stmts = vec![
+            SorobanStmt::If {
+                condition: SorobanExpr::Eq(
+                    Box::new(index_of("admin")),
+                    Box::new(SorobanExpr::I64Literal(2)),
+                ),
+                then_body: vec![],
+                else_body: vec![],
+            },
+            // Reversed operands + Ne → is_some.
+            SorobanStmt::Expr(SorobanExpr::Ne(
+                Box::new(SorobanExpr::I32Literal(2)),
+                Box::new(index_of("user")),
+            )),
+            // A non-2 literal is NOT a Void check — left alone.
+            SorobanStmt::Expr(SorobanExpr::Eq(
+                Box::new(index_of("other")),
+                Box::new(SorobanExpr::I64Literal(3)),
+            )),
+            // An already-decoded index (`.unwrap()` wrapper) is a real
+            // integer compare — left alone.
+            SorobanStmt::Expr(SorobanExpr::Eq(
+                Box::new(SorobanExpr::MethodCall {
+                    object: Box::new(index_of("x")),
+                    method: "unwrap".into(),
+                    args: vec![],
+                }),
+                Box::new(SorobanExpr::I64Literal(2)),
+            )),
+        ];
+        fold_option_void_compares(&mut stmts);
+        let SorobanStmt::If { condition, .. } = &stmts[0] else {
+            panic!("if expected");
+        };
+        assert!(
+            matches!(condition, SorobanExpr::MethodCall { method, .. } if method == "is_none"),
+            "got: {condition:?}"
+        );
+        let SorobanStmt::Expr(e) = &stmts[1] else {
+            panic!()
+        };
+        assert!(matches!(e, SorobanExpr::MethodCall { method, .. } if method == "is_some"));
+        assert!(matches!(&stmts[2], SorobanStmt::Expr(SorobanExpr::Eq(..))));
+        assert!(matches!(&stmts[3], SorobanStmt::Expr(SorobanExpr::Eq(..))));
+    }
+
+    #[test]
+    fn option_void_compare_clones_moved_args_and_holes_unknown_args() {
+        let index_of = |arg: SorobanExpr| SorobanExpr::MethodCall {
+            object: Box::new(SorobanExpr::NamedLocal("admins".into())),
+            method: "first_index_of".into(),
+            args: vec![arg],
+        };
+        // `admin` is used twice (a discarded duplicate call + the folded
+        // comparison): BOTH by-value args must clone, or the first moves it.
+        let mut stmts = vec![
+            SorobanStmt::Expr(index_of(SorobanExpr::Param("admin".into()))),
+            SorobanStmt::If {
+                condition: SorobanExpr::Eq(
+                    Box::new(index_of(SorobanExpr::Param("admin".into()))),
+                    Box::new(SorobanExpr::I64Literal(2)),
+                ),
+                then_body: vec![],
+                else_body: vec![],
+            },
+            // An unknown (lost) item: index-of-unknown is unknown — the whole
+            // comparison holes rather than emitting `Borrow`-broken code.
+            SorobanStmt::Expr(SorobanExpr::Eq(
+                Box::new(index_of(SorobanExpr::UnknownVal)),
+                Box::new(SorobanExpr::I64Literal(2)),
+            )),
+            // Single-use identifier (`solo` appears nowhere else): untouched.
+            SorobanStmt::Expr(index_of(SorobanExpr::Param("solo".into()))),
+        ];
+        fold_option_void_compares(&mut stmts);
+        let arg_is_clone = |e: &SorobanExpr| {
+            let SorobanExpr::MethodCall { args, .. } = e else {
+                return false;
+            };
+            matches!(&args[0], SorobanExpr::MethodCall { method, .. } if method == "clone")
+        };
+        let SorobanStmt::Expr(dup) = &stmts[0] else {
+            panic!()
+        };
+        assert!(arg_is_clone(dup), "duplicate call arg must clone: {dup:?}");
+        let SorobanStmt::If { condition, .. } = &stmts[1] else {
+            panic!()
+        };
+        let SorobanExpr::MethodCall { object, method, .. } = condition else {
+            panic!("is_none call expected, got {condition:?}");
+        };
+        assert_eq!(method, "is_none");
+        assert!(arg_is_clone(object), "folded call arg must clone");
+        assert!(matches!(
+            &stmts[2],
+            SorobanStmt::Expr(SorobanExpr::UnknownVal)
+        ));
+        let SorobanStmt::Expr(solo) = &stmts[3] else {
+            panic!()
+        };
+        assert!(!arg_is_clone(solo), "single-use arg stays bare: {solo:?}");
+    }
+
+    #[test]
+    fn pure_raw_host_reads_hole_to_unknown() {
+        let raw = |module: &str, function: &str| SorobanExpr::RawHostCall {
+            module: module.into(),
+            function: function.into(),
+            args: vec![SorobanExpr::UnknownVal, SorobanExpr::U32Literal(0)],
+        };
+        let mut stmts = vec![
+            SorobanStmt::Let {
+                name: "k".into(),
+                mutable: false,
+                value: raw("Map", "map_key_by_pos"),
+            },
+            SorobanStmt::Expr(raw("Buf", "bytes_front")),
+            // A raw call OUTSIDE the pure-read whitelist stays visible.
+            SorobanStmt::Expr(raw("Map", "map_put")),
+        ];
+        hole_pure_raw_host_reads(&mut stmts);
+        assert!(matches!(
+            &stmts[0],
+            SorobanStmt::Let {
+                value: SorobanExpr::UnknownVal,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &stmts[1],
+            SorobanStmt::Expr(SorobanExpr::UnknownVal)
+        ));
+        assert!(matches!(
+            &stmts[2],
+            SorobanStmt::Expr(SorobanExpr::RawHostCall { .. })
         ));
     }
 

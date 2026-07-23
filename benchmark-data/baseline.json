@@ -5,12 +5,12 @@
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
       "entity": "Aqua AMM",
-      "restoration_pct": 92.2,
+      "restoration_pct": 92.5,
       "spec_functions": 75,
       "fn_clean": 21,
       "fn_partial": 54,
       "fn_logic_lost": 0,
-      "artifacts_total": 396,
+      "artifacts_total": 379,
       "wasm_size": 44514,
       "error": null
     },
@@ -82,7 +82,7 @@
       "fn_clean": 12,
       "fn_partial": 15,
       "fn_logic_lost": 0,
-      "artifacts_total": 88,
+      "artifacts_total": 85,
       "wasm_size": 57328,
       "error": null
     },
@@ -106,7 +106,7 @@
       "fn_clean": 12,
       "fn_partial": 15,
       "fn_logic_lost": 0,
-      "artifacts_total": 88,
+      "artifacts_total": 85,
       "wasm_size": 57328,
       "error": null
     },
@@ -173,7 +173,7 @@
     {
       "file": "lightecho-CDOR3QD2.wasm",
       "entity": "Lightecho",
-      "restoration_pct": 95.2,
+      "restoration_pct": 94.9,
       "spec_functions": 23,
       "fn_clean": 18,
       "fn_partial": 5,
@@ -221,7 +221,7 @@
     {
       "file": "soroban-domains-CATRNPHY.wasm",
       "entity": "Soroban Domains",
-      "restoration_pct": 91.4,
+      "restoration_pct": 91.5,
       "spec_functions": 15,
       "fn_clean": 4,
       "fn_partial": 11,
