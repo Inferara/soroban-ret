@@ -1313,6 +1313,14 @@ impl<'a> LiftContext<'a> {
             let slots = self.frame_slots.borrow();
             let log = self.slot_write_log.borrow();
             let mut seen: Vec<i32> = Vec::new();
+            // Same-frame stores encountered so far in the reverse walk —
+            // i.e. stores that happened AFTER the walk's current point in
+            // time — as `(offset, width)` byte ranges. A candidate slot
+            // whose range any of them overlaps at a DIFFERENT offset has
+            // had bytes clobbered without its own `(frame, offset)` log/map
+            // entries changing (an `i64.store` at `+4` rewriting half of
+            // the payload at `+8` — greptile P1), so it is refused.
+            let mut later_writes: Vec<(i32, u32)> = Vec::new();
             let total = (0..DESC_BYTES / 8)
                 .filter(|k| slots.contains_key(&(*id, off.base + 8 * k)))
                 .count();
@@ -1321,16 +1329,28 @@ impl<'a> LiftContext<'a> {
                     break;
                 }
                 let (sid, soff) = w.key;
+                if sid != *id {
+                    continue;
+                }
                 let k = soff - off.base;
-                if sid != *id || k < 0 || k >= DESC_BYTES || seen.contains(&k) {
+                if !(0..DESC_BYTES).contains(&k) || seen.contains(&k) {
+                    // Out-of-window and shadowed same-frame stores still
+                    // participate in the overlap test (a store just below
+                    // the window can clobber its first slot).
+                    later_writes.push((soff, w.width));
                     continue;
                 }
                 seen.push(k);
+                let clobbered = later_writes.iter().any(|(j, jw)| {
+                    *j != soff && *j < soff + w.width as i32 && j + *jw as i32 > soff
+                });
                 // Last logged write for this slot: justified only if the
-                // abstract map still holds exactly that value.
-                if slots.get(&w.key) == Some(&w.new) {
+                // abstract map still holds exactly that value AND no later
+                // store overlapped its bytes.
+                if !clobbered && slots.get(&w.key) == Some(&w.new) {
                     fresh.insert(k, (w.new.clone(), w.width));
                 }
+                later_writes.push((soff, w.width));
             }
         }
         if fresh.is_empty() {
@@ -1545,9 +1565,8 @@ impl<'a> LiftContext<'a> {
                             // (blend's SCALAR_12 = 0xE8D4A51000) is NOT a
                             // False Val and must not render as one.
                             let tag = (*v as u64) & 0xff;
-                            if matches!(tag, 0 | 1) && *v != tag as i64 {
-                                SorobanExpr::UnknownVal
-                            } else if !matches!(tag, 0 | 1 | 4..=14) {
+                            let bad_bool = matches!(tag, 0 | 1) && *v != tag as i64;
+                            if bad_bool || !matches!(tag, 0 | 1 | 4..=14) {
                                 SorobanExpr::UnknownVal
                             } else {
                                 let ex = stack_val_to_expr(
@@ -20915,7 +20934,8 @@ mod tests {
     /// (selector + payload stored right before the call); 5 = selector-only
     /// build (payload slot never stored); 6 = unit-variant build; 7 = build
     /// whose selector is stored with `i64.store` (wrong width for the
-    /// ctor's `i32.load`).
+    /// ctor's `i32.load`); 8 = build whose payload bytes a later
+    /// `i64.store` at `+4` partially clobbers (the overlap refusal).
     fn frame_descriptor_module() -> WasmModule {
         let wasm = wat::parse_str(
             r#"(module
@@ -20980,6 +21000,13 @@ mod tests {
                     global.get 0 i32.const 16 i32.sub local.tee 1 drop
                     local.get 1 i64.const 0 i64.store
                     local.get 1 local.get 0 i64.store offset=8
+                    local.get 1 call 3)
+                (func (;8;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 32 i32.sub local.tee 1 drop
+                    local.get 1 i32.const 0 i32.store
+                    local.get 1 local.get 0 i64.store offset=8
+                    local.get 1 i64.const 7 i64.store offset=4
                     local.get 1 call 3)
             )"#,
         )
@@ -21073,6 +21100,16 @@ mod tests {
         // the evaluator's exact-width memory refuses the mismatched read.
         assert!(
             frame_descriptor_result(7, None)
+                .as_ref()
+                .and_then(as_key_vec)
+                .is_none()
+        );
+        // A later `i64.store` at +4 clobbers bytes of the payload stored at
+        // +8 without touching its exact `(frame, offset)` log/map entries —
+        // the overlap test refuses the payload, the ctor's load misses, and
+        // the fold refuses (greptile P1 on PR #50).
+        assert!(
+            frame_descriptor_result(8, None)
                 .as_ref()
                 .and_then(as_key_vec)
                 .is_none()
