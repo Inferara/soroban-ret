@@ -9688,13 +9688,18 @@ impl DkEval<'_> {
                 }
                 WI::I64Load32U(off) => {
                     // A 4-byte zero-extending load: constants extend
-                    // concretely; a symbolic payload passes through — its
-                    // 64-bit zero-extension IS the same abstract value, and
-                    // anything not move-shaped downstream still bails.
+                    // concretely. A symbolic cell REFUSES: the 4-wide store
+                    // that seeded it may have been an `i32.wrap_i64` whose
+                    // identity-preserving lift kept the full 64-bit value in
+                    // the abstract cell, so passing the token through would
+                    // embed the untruncated expression where the runtime
+                    // holds only the low 32 bits (greptile P1). A symbolic
+                    // pass-through needs a proof the source is genuinely
+                    // 32-bit — the tag/type-hinted payloads planned for the
+                    // packing-chain tranche.
                     let addr = stack.pop()?;
                     stack.push(match self.load(&addr, *off, 4)? {
                         DkVal::I32(x) => DkVal::I64(x as u32 as i64),
-                        DkVal::Arg(i) => DkVal::Arg(i),
                         _ => return None,
                     });
                 }
