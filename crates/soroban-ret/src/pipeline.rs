@@ -3562,100 +3562,151 @@ fn unify_bool_locals(stmts: &mut [SorobanStmt]) {
             _ => None,
         }
     }
-    fn collect(
-        stmts: &[SorobanStmt],
-        assigns: &mut HashMap<String, (u32, u32, u32)>, // (bool_typed, zero_one, other)
-    ) {
-        for stmt in stmts {
-            match stmt {
-                SorobanStmt::Let { name, value, .. }
-                | SorobanStmt::Assign {
-                    target: name,
-                    value,
-                } => {
-                    let entry = assigns.entry(name.clone()).or_insert((0, 0, 0));
-                    // A `!`-rooted value is TYPE-NEUTRAL, not bool evidence:
-                    // it renders as a coercing `todo!()`, and a never-rooted
-                    // comparison (`todo!() == x`) says nothing about the
-                    // local's real type (reflector's `version() -> u32` local
-                    // was mis-unified to `false` by exactly this). Count it
-                    // as "other" so the gate refuses the local.
-                    if value.is_never_rooted() {
-                        entry.2 += 1;
-                    } else if crate::ir::optimizer::is_bool_typed(value) {
-                        entry.0 += 1;
-                    } else if is_zero_one(value).is_some() {
-                        entry.1 += 1;
-                    } else {
-                        entry.2 += 1;
+    // Evidence is keyed by LEXICAL BINDING, not by name: the decompiler
+    // reuses local names (`var_2`) across sibling scopes of one function, and
+    // one scope's bool proof must never rewrite a semantically distinct
+    // local's literal. Both walks below traverse the tree in the identical
+    // deterministic order, so a `let` receives the same binding id in each;
+    // an assignment resolves its target through the visible scope stack.
+    struct Walker<'a> {
+        next_id: usize,
+        scopes: Vec<HashMap<String, usize>>,
+        // binding id → (bool_typed, zero_one, other)
+        evidence: HashMap<usize, (u32, u32, u32)>,
+        winners: Option<&'a HashSet<usize>>,
+    }
+    impl Walker<'_> {
+        fn resolve(&self, name: &str) -> Option<usize> {
+            self.scopes.iter().rev().find_map(|f| f.get(name).copied())
+        }
+        fn record(&mut self, id: usize, value: &SorobanExpr) {
+            let entry = self.evidence.entry(id).or_insert((0, 0, 0));
+            // A `!`-rooted value is TYPE-NEUTRAL, not bool evidence: it
+            // renders as a coercing `todo!()`, and a never-rooted comparison
+            // (`todo!() == x`) says nothing about the local's real type
+            // (reflector's `version() -> u32` local was mis-unified to
+            // `false` by exactly this). Count it as "other" so the gate
+            // refuses the binding.
+            if value.is_never_rooted() {
+                entry.2 += 1;
+            } else if crate::ir::optimizer::is_bool_typed(value) {
+                entry.0 += 1;
+            } else if is_zero_one(value).is_some() {
+                entry.1 += 1;
+            } else {
+                entry.2 += 1;
+            }
+        }
+        fn walk(&mut self, stmts: &mut [SorobanStmt]) {
+            for stmt in stmts {
+                match stmt {
+                    SorobanStmt::Let { name, value, .. } => {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        match self.winners {
+                            None => self.record(id, value),
+                            Some(w) => {
+                                if w.contains(&id)
+                                    && let Some(b) = is_zero_one(value)
+                                {
+                                    cov_mark::hit!(bool_local_literal_unified);
+                                    *value = SorobanExpr::BoolLiteral(b);
+                                }
+                            }
+                        }
+                        if let Some(top) = self.scopes.last_mut() {
+                            top.insert(name.clone(), id);
+                        }
                     }
-                }
-                SorobanStmt::If {
-                    then_body,
-                    else_body,
-                    ..
-                } => {
-                    collect(then_body, assigns);
-                    collect(else_body, assigns);
-                }
-                SorobanStmt::Match { arms, .. } => {
-                    for arm in arms {
-                        collect(&arm.body, assigns);
+                    SorobanStmt::Assign { target, value } => {
+                        let Some(id) = self.resolve(target) else {
+                            continue;
+                        };
+                        match self.winners {
+                            None => self.record(id, value),
+                            Some(w) => {
+                                if w.contains(&id)
+                                    && let Some(b) = is_zero_one(value)
+                                {
+                                    cov_mark::hit!(bool_local_literal_unified);
+                                    *value = SorobanExpr::BoolLiteral(b);
+                                }
+                            }
+                        }
                     }
+                    SorobanStmt::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        self.scopes.push(HashMap::new());
+                        self.walk(then_body);
+                        self.scopes.pop();
+                        self.scopes.push(HashMap::new());
+                        self.walk(else_body);
+                        self.scopes.pop();
+                    }
+                    SorobanStmt::Match { arms, .. } => {
+                        for arm in arms {
+                            self.scopes.push(HashMap::new());
+                            if let MatchPattern::EnumVariant { bindings, .. } = &arm.pattern {
+                                for b in bindings {
+                                    let id = self.next_id;
+                                    self.next_id += 1;
+                                    if let Some(top) = self.scopes.last_mut() {
+                                        top.insert(b.clone(), id);
+                                    }
+                                }
+                            }
+                            self.walk(&mut arm.body);
+                            self.scopes.pop();
+                        }
+                    }
+                    SorobanStmt::For { var, body, .. } => {
+                        self.scopes.push(HashMap::new());
+                        // The loop variable is its own binding — an inner
+                        // assign to the same name must not resolve outward.
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        if let Some(top) = self.scopes.last_mut() {
+                            top.insert(var.clone(), id);
+                        }
+                        self.walk(body);
+                        self.scopes.pop();
+                    }
+                    SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                        self.scopes.push(HashMap::new());
+                        self.walk(body);
+                        self.scopes.pop();
+                    }
+                    _ => {}
                 }
-                SorobanStmt::Loop { body }
-                | SorobanStmt::Block(body)
-                | SorobanStmt::For { body, .. } => collect(body, assigns),
-                _ => {}
             }
         }
     }
-    fn rewrite(stmts: &mut [SorobanStmt], bool_locals: &HashSet<String>) {
-        for stmt in stmts {
-            match stmt {
-                SorobanStmt::Let { name, value, .. }
-                | SorobanStmt::Assign {
-                    target: name,
-                    value,
-                } => {
-                    if bool_locals.contains(name)
-                        && let Some(b) = is_zero_one(value)
-                    {
-                        cov_mark::hit!(bool_local_literal_unified);
-                        *value = SorobanExpr::BoolLiteral(b);
-                    }
-                }
-                SorobanStmt::If {
-                    then_body,
-                    else_body,
-                    ..
-                } => {
-                    rewrite(then_body, bool_locals);
-                    rewrite(else_body, bool_locals);
-                }
-                SorobanStmt::Match { arms, .. } => {
-                    for arm in arms {
-                        rewrite(&mut arm.body, bool_locals);
-                    }
-                }
-                SorobanStmt::Loop { body }
-                | SorobanStmt::Block(body)
-                | SorobanStmt::For { body, .. } => rewrite(body, bool_locals),
-                _ => {}
-            }
-        }
-    }
-    let mut assigns = HashMap::new();
-    collect(stmts, &mut assigns);
-    let bool_locals: HashSet<String> = assigns
+    let mut analyze = Walker {
+        next_id: 0,
+        scopes: vec![HashMap::new()],
+        evidence: HashMap::new(),
+        winners: None,
+    };
+    analyze.walk(stmts);
+    let winners: HashSet<usize> = analyze
+        .evidence
         .into_iter()
         .filter(|(_, (bools, zero_ones, others))| *bools >= 1 && *zero_ones >= 1 && *others == 0)
-        .map(|(name, _)| name)
+        .map(|(id, _)| id)
         .collect();
-    if bool_locals.is_empty() {
+    if winners.is_empty() {
         return;
     }
-    rewrite(stmts, &bool_locals);
+    let mut rewrite = Walker {
+        next_id: 0,
+        scopes: vec![HashMap::new()],
+        evidence: HashMap::new(),
+        winners: Some(&winners),
+    };
+    rewrite.walk(stmts);
 }
 
 /// Stage 4m5: hole surviving PURE-READ raw host-call renders to `UnknownVal`.
@@ -10772,6 +10823,22 @@ mod tests {
                 target: "n3".into(),
                 value: SorobanExpr::I32Literal(0),
             },
+            // Two `let`s of the same name (shadowing): one scope's bool
+            // proof must not rewrite the other scope's literal — skipped.
+            SorobanStmt::Let {
+                name: "sh".into(),
+                mutable: false,
+                value: SorobanExpr::BoolLiteral(true),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::Param("c".into()),
+                then_body: vec![SorobanStmt::Let {
+                    name: "sh".into(),
+                    mutable: false,
+                    value: SorobanExpr::I32Literal(1),
+                }],
+                else_body: vec![],
+            },
         ];
         unify_bool_locals(&mut stmts);
         assert!(matches!(
@@ -10795,6 +10862,19 @@ mod tests {
                 ..
             }
         ));
+        let SorobanStmt::If { then_body, .. } = &stmts[7] else {
+            panic!("if expected");
+        };
+        assert!(
+            matches!(
+                &then_body[0],
+                SorobanStmt::Let {
+                    value: SorobanExpr::I32Literal(1),
+                    ..
+                }
+            ),
+            "shadowed name must not be unified"
+        );
     }
 
     #[test]

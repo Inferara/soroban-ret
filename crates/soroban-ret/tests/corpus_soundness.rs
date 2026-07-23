@@ -350,7 +350,17 @@ use std::process::Command;
 /// as a coercing todo!()) and counts as disqualifying evidence — a never-
 /// rooted comparison init mis-unified reflector's `version() -> u32` local
 /// before that guard. soroban-domains −17, lightecho/soroswap tail.
-const ERROR_CEILING: u32 = 332;
+/// → 330 (t16 review follow-up): evidence keyed by LEXICAL BINDING, not by
+/// name — the decompiler reuses `var_2` across sibling scopes of one
+/// function, and the flat name-keyed map merged semantically distinct
+/// locals' evidence (a fabrication vector flagged in review: one scope's
+/// bool proof could rewrite another's genuine integer). A two-walk scheme
+/// (identical deterministic traversal → identical binding ids; assigns
+/// resolve through the visible scope stack, `for` vars and match bindings
+/// registered) both closes the hole AND unifies MORE than the name-merged
+/// version did (each sibling binding now qualifies on its own evidence:
+/// soroban-domains −2 further).
+const ERROR_CEILING: u32 = 330;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
