@@ -10,7 +10,7 @@
       "fn_clean": 21,
       "fn_partial": 54,
       "fn_logic_lost": 0,
-      "artifacts_total": 394,
+      "artifacts_total": 393,
       "wasm_size": 44514,
       "error": null
     },
@@ -22,7 +22,7 @@
       "fn_clean": 23,
       "fn_partial": 53,
       "fn_logic_lost": 0,
-      "artifacts_total": 246,
+      "artifacts_total": 236,
       "wasm_size": 54833,
       "error": null
     },
@@ -82,7 +82,7 @@
       "fn_clean": 12,
       "fn_partial": 15,
       "fn_logic_lost": 0,
-      "artifacts_total": 102,
+      "artifacts_total": 100,
       "wasm_size": 57328,
       "error": null
     },
@@ -106,19 +106,19 @@
       "fn_clean": 12,
       "fn_partial": 15,
       "fn_logic_lost": 0,
-      "artifacts_total": 102,
+      "artifacts_total": 100,
       "wasm_size": 57328,
       "error": null
     },
     {
       "file": "comet-blnd-usdc-amm-CAS3FL6T.wasm",
       "entity": "Comet BLND-USDC AMM",
-      "restoration_pct": 97.6,
+      "restoration_pct": 97.9,
       "spec_functions": 30,
       "fn_clean": 17,
       "fn_partial": 13,
       "fn_logic_lost": 0,
-      "artifacts_total": 20,
+      "artifacts_total": 22,
       "wasm_size": 29046,
       "error": null
     },
@@ -202,7 +202,7 @@
       "fn_clean": 14,
       "fn_partial": 9,
       "fn_logic_lost": 0,
-      "artifacts_total": 71,
+      "artifacts_total": 66,
       "wasm_size": 19418,
       "error": null
     },
@@ -214,7 +214,7 @@
       "fn_clean": 14,
       "fn_partial": 9,
       "fn_logic_lost": 0,
-      "artifacts_total": 71,
+      "artifacts_total": 66,
       "wasm_size": 19418,
       "error": null
     },
@@ -245,7 +245,7 @@
     {
       "file": "soroswap-CAG5LRYQ.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 90.6,
+      "restoration_pct": 90.4,
       "spec_functions": 20,
       "fn_clean": 8,
       "fn_partial": 12,

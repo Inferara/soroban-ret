@@ -557,6 +557,11 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
 
         // Field access
         SorobanExpr::FieldAccess { object, field } => {
+            // Same as the method-call case: a field of a `!`-rooted object
+            // (E0609) panics at the receiver — the access IS `todo!()`.
+            if is_never_rooted(object) {
+                return quote! { todo!("unknown value") };
+            }
             let obj = generate_expr(object);
             if let Ok(idx) = field.parse::<usize>() {
                 let index = syn::Index::from(idx);
@@ -571,8 +576,21 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             method,
             args,
         } => {
+            // A method on a `!`-rooted receiver cannot type-check (E0599 —
+            // rustc refuses method resolution on `!`), and at runtime the
+            // receiver panics before the arguments evaluate, so the whole
+            // call IS `todo!()` — rendering it as such is exact, not lossy.
+            if is_never_rooted(object) {
+                return quote! { todo!("unknown value") };
+            }
             let obj = generate_expr(object);
             let method_ident = safe_ident(method);
+            // `ToXdr::to_xdr(self, env: &Env)` — the env argument is part of
+            // the trait signature, appended here so the IR stays a plain
+            // niladic method call on the serialized value.
+            if method == "to_xdr" && args.is_empty() {
+                return quote! { #obj.to_xdr(&env) };
+            }
             // BLS12-381 methods take references for most args
             if is_bls_method_chain(object) && is_bls_ref_method(method) {
                 let arg_exprs: Vec<_> = args
@@ -1687,6 +1705,24 @@ fn generate_pattern(pattern: &MatchPattern) -> TokenStream {
     }
 }
 
+/// A `!`-rooted expression: `todo!()`/`panic!()` itself, or a method/field
+/// chain hanging off one. Method resolution on `!` is a hard rustc error
+/// (E0599/E0609), and at runtime the root panics before anything else in the
+/// chain evaluates — so rendering the whole chain as `todo!()` is exact.
+fn is_never_rooted(e: &SorobanExpr) -> bool {
+    match e {
+        SorobanExpr::UnknownVal | SorobanExpr::Panic | SorobanExpr::PanicWithError(_) => true,
+        SorobanExpr::MethodCall { object, .. } | SorobanExpr::FieldAccess { object, .. } => {
+            is_never_rooted(object)
+        }
+        // Renders bare (no syntactic type pin), so a `!` root shows through.
+        // `CastAs` is deliberately NOT here: `todo!() as u128` pins a real
+        // type, and methods on it resolve.
+        SorobanExpr::ValConvert { value, .. } => is_never_rooted(value),
+        _ => false,
+    }
+}
+
 /// Check if a MethodCall's object chain includes `.bls12_381()`.
 fn is_bls_method_chain(object: &SorobanExpr) -> bool {
     match object {
@@ -2589,6 +2625,66 @@ mod generate_expr_tests {
         ]);
         let out = collapse(&s(generate_expr(&l)));
         assert!(out.starts_with("log ! (& env ,"), "got: {out}");
+    }
+
+    // ----- Never-rooted chains & to_xdr (issue #34 t12) -----
+
+    #[test]
+    fn never_rooted_chains_render_as_todo() {
+        // `todo!().contains_key(k)` — rustc refuses method resolution on `!`
+        // (E0599), and the receiver panics before args evaluate, so the
+        // whole chain IS todo!().
+        let call = SorobanExpr::MethodCall {
+            object: boxed(SorobanExpr::UnknownVal),
+            method: "contains_key".into(),
+            args: vec![SorobanExpr::Param("k".into())],
+        };
+        assert_eq!(
+            collapse(&s(generate_expr(&call))),
+            "todo ! (\"unknown value\")"
+        );
+        // Transitive through chains and bare ValConvert wrappers.
+        let chained = SorobanExpr::MethodCall {
+            object: boxed(SorobanExpr::ValConvert {
+                value: boxed(call),
+                target_type: "u32".into(),
+            }),
+            method: "len".into(),
+            args: vec![],
+        };
+        assert_eq!(
+            collapse(&s(generate_expr(&chained))),
+            "todo ! (\"unknown value\")"
+        );
+        let field = SorobanExpr::FieldAccess {
+            object: boxed(SorobanExpr::Panic),
+            field: "admin".into(),
+        };
+        assert_eq!(
+            collapse(&s(generate_expr(&field))),
+            "todo ! (\"unknown value\")"
+        );
+        // A type-pinning cast breaks never-rootedness: `(todo!() as u128)`
+        // has a real type, methods on it resolve.
+        let cast = SorobanExpr::MethodCall {
+            object: boxed(SorobanExpr::CastAs {
+                value: boxed(SorobanExpr::UnknownVal),
+                target_type: "u128".into(),
+            }),
+            method: "checked_add".into(),
+            args: vec![SorobanExpr::U128Literal(1)],
+        };
+        assert!(collapse(&s(generate_expr(&cast))).contains("checked_add"));
+    }
+
+    #[test]
+    fn to_xdr_appends_env_argument() {
+        let e = SorobanExpr::MethodCall {
+            object: boxed(SorobanExpr::Param("token".into())),
+            method: "to_xdr".into(),
+            args: vec![],
+        };
+        assert_eq!(collapse(&s(generate_expr(&e))), "token . to_xdr (& env)");
     }
 
     // ----- Fallbacks -----
