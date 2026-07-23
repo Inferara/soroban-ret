@@ -65,12 +65,12 @@
     {
       "file": "blend-emitter-CCOQM6S7.wasm",
       "entity": "Blend Emitter",
-      "restoration_pct": 97.4,
+      "restoration_pct": 96.2,
       "spec_functions": 9,
       "fn_clean": 6,
       "fn_partial": 3,
       "fn_logic_lost": 0,
-      "artifacts_total": 18,
+      "artifacts_total": 23,
       "wasm_size": 10448,
       "error": null
     },
@@ -178,7 +178,7 @@
       "fn_clean": 18,
       "fn_partial": 5,
       "fn_logic_lost": 0,
-      "artifacts_total": 23,
+      "artifacts_total": 24,
       "wasm_size": 15293,
       "error": null
     },
@@ -221,12 +221,12 @@
     {
       "file": "soroban-domains-CATRNPHY.wasm",
       "entity": "Soroban Domains",
-      "restoration_pct": 91.5,
+      "restoration_pct": 91.4,
       "spec_functions": 15,
       "fn_clean": 4,
       "fn_partial": 11,
       "fn_logic_lost": 0,
-      "artifacts_total": 165,
+      "artifacts_total": 168,
       "wasm_size": 20215,
       "error": null
     },
