@@ -668,6 +668,20 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         }
         log::trace!("Pipeline pass: stage_4m2 fix_misidentified_instance_keys");
 
+        // Stage 4m3: repair struct/union construct fields against the
+        // registry's field specs — AFTER 4m has built enum keys from their
+        // vec forms, so key payloads are visible as construct fields. A
+        // `Hash<32>` crypto digest feeding a `BytesN<32>` slot coerces
+        // faithfully via `.to_bytes()`; a PROVABLY impossible type
+        // (soroban-domains' `SubDomain { node: ContractErrors::InvalidParent,
+        // .. }` — deep lost dataflow) holes to an honest `todo!()`. Only
+        // airtight contradictions fire; anything type-unknown (params,
+        // locals, method results) is left exactly as-is.
+        for func in &mut contract_module.functions {
+            hole_mistyped_construct_fields(&mut func.body, &registry);
+        }
+        log::trace!("Pipeline pass: stage_4m3 hole_mistyped_construct_fields");
+
         // Re-run variable name propagation + self-assignment removal.
         for func in &mut contract_module.functions {
             let param_names: Vec<String> = func.params.iter().map(|p| p.name.clone()).collect();
@@ -2751,6 +2765,8 @@ fn child_exprs(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
             fields.iter().collect()
         }
         SorobanExpr::StructConstruct { fields, .. } => fields.iter().map(|(_, v)| v).collect(),
+        SorobanExpr::EnumConstruct { fields, .. } => fields.iter().collect(),
+        SorobanExpr::MapConstruct(entries) => entries.iter().flat_map(|(k, v)| [k, v]).collect(),
         SorobanExpr::RawHostCall { args, .. } => args.iter().collect(),
         _ => vec![],
     }
@@ -2792,6 +2808,10 @@ fn child_exprs_mut(expr: &mut SorobanExpr) -> Vec<&mut SorobanExpr> {
             fields.iter_mut().collect()
         }
         SorobanExpr::StructConstruct { fields, .. } => fields.iter_mut().map(|(_, v)| v).collect(),
+        SorobanExpr::EnumConstruct { fields, .. } => fields.iter_mut().collect(),
+        SorobanExpr::MapConstruct(entries) => {
+            entries.iter_mut().flat_map(|(k, v)| [k, v]).collect()
+        }
         SorobanExpr::RawHostCall { args, .. } => args.iter_mut().collect(),
         _ => vec![],
     }
@@ -2981,6 +3001,202 @@ fn lower_bytes_new_from_linear_memory(stmts: &mut [SorobanStmt], wasm: &WasmModu
             }
             _ => {}
         }
+    }
+}
+
+/// See the Stage 4b4c comment at the call site: hole construct fields whose
+/// expression type provably contradicts the registry's field spec.
+fn hole_mistyped_construct_fields(stmts: &mut [SorobanStmt], registry: &TypeRegistry) {
+    fn fix_expr(e: &mut SorobanExpr, registry: &TypeRegistry) {
+        for c in child_exprs_mut(e) {
+            fix_expr(c, registry);
+        }
+        match e {
+            SorobanExpr::StructConstruct { type_name, fields } => {
+                let Some(spec) = registry.get_struct(&type_name.clone()) else {
+                    return;
+                };
+                for (fname, fexpr) in fields.iter_mut() {
+                    let Some(fspec) = spec
+                        .fields
+                        .iter()
+                        .find(|f| f.name.to_utf8_string().as_deref() == Ok(fname))
+                    else {
+                        continue;
+                    };
+                    coerce_or_hole_field(fexpr, &fspec.type_, registry);
+                }
+            }
+            SorobanExpr::EnumConstruct {
+                type_name,
+                variant,
+                fields,
+            } => {
+                let Some(spec) = registry.get_union(&type_name.clone()) else {
+                    return;
+                };
+                let Some(case_types) = spec.cases.iter().find_map(|c| match c {
+                    stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t)
+                        if t.name.to_utf8_string().as_deref() == Ok(variant) =>
+                    {
+                        Some(t.type_.to_vec())
+                    }
+                    _ => None,
+                }) else {
+                    return;
+                };
+                for (fexpr, fspec) in fields.iter_mut().zip(case_types.iter()) {
+                    coerce_or_hole_field(fexpr, fspec, registry);
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(expr) | SorobanStmt::Return(Some(expr)) => fix_expr(expr, registry),
+            SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+                fix_expr(value, registry)
+            }
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                fix_expr(condition, registry);
+                hole_mistyped_construct_fields(then_body, registry);
+                hole_mistyped_construct_fields(else_body, registry);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                fix_expr(scrutinee, registry);
+                for arm in arms {
+                    hole_mistyped_construct_fields(&mut arm.body, registry);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => {
+                hole_mistyped_construct_fields(body, registry);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Repair one construct field against its registry spec: a `Hash<32>`-typed
+/// crypto digest feeding a `BytesN<32>` slot coerces faithfully via
+/// `.to_bytes()` (identical bytes, the SDK's own conversion); a provably
+/// impossible type holes to `todo!()`.
+fn coerce_or_hole_field(fexpr: &mut SorobanExpr, fspec: &ScSpecTypeDef, registry: &TypeRegistry) {
+    if matches!(fspec, ScSpecTypeDef::BytesN(_)) && is_crypto_hash_expr(fexpr) {
+        cov_mark::hit!(hash_field_coerced_to_bytes);
+        let inner = std::mem::replace(fexpr, SorobanExpr::UnknownVal);
+        *fexpr = SorobanExpr::MethodCall {
+            object: Box::new(inner),
+            method: "to_bytes".to_string(),
+            args: Vec::new(),
+        };
+        return;
+    }
+    if provably_mistyped(fexpr, fspec, registry) {
+        cov_mark::hit!(mistyped_construct_field_holed);
+        *fexpr = SorobanExpr::UnknownVal;
+    }
+}
+
+/// A `soroban_sdk::crypto::Hash<N>`-typed expression: the direct result of a
+/// digest (the dedicated crypto IR nodes, plus the rendered-method form for
+/// robustness — a user method merely NAMED `sha256` on another receiver does
+/// not qualify).
+fn is_crypto_hash_expr(e: &SorobanExpr) -> bool {
+    match e {
+        SorobanExpr::CryptoSha256(_) | SorobanExpr::CryptoKeccak256(_) => true,
+        SorobanExpr::MethodCall { object, method, .. }
+            if method == "sha256" || method == "keccak256" =>
+        {
+            matches!(
+                object.as_ref(),
+                SorobanExpr::MethodCall { method: m2, .. } if m2 == "crypto"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// True only when `e`'s type is statically KNOWN from its own shape and that
+/// type can never inhabit `spec`. Anything type-ambiguous returns false — the
+/// pass must never hole a value that could be right.
+fn provably_mistyped(e: &SorobanExpr, spec: &ScSpecTypeDef, registry: &TypeRegistry) -> bool {
+    use SorobanExpr as E;
+    // The expression's own statically-evident type family.
+    enum Family {
+        Udt(String),
+        Numeric,
+        Bool,
+        Symbol,
+        Str,
+        VecKind,
+        MapKind,
+        Error,
+    }
+    let fam = match e {
+        E::StructConstruct { type_name, .. } => Family::Udt(type_name.clone()),
+        E::EnumConstruct { type_name, .. } => Family::Udt(type_name.clone()),
+        E::U32Literal(_)
+        | E::I32Literal(_)
+        | E::U64Literal(_)
+        | E::I64Literal(_)
+        | E::U128Literal(_)
+        | E::I128Literal(_) => Family::Numeric,
+        E::BoolLiteral(_) => Family::Bool,
+        E::SymbolLiteral(_) => Family::Symbol,
+        E::StringLiteral(_) => Family::Str,
+        E::CollectionNew(k) if k == "Vec" => Family::VecKind,
+        E::CollectionNew(k) if k == "Map" => Family::MapKind,
+        E::ContractError { .. } | E::ErrorFromCode(_) => Family::Error,
+        _ => return false,
+    };
+    use ScSpecTypeDef as T;
+    match (&fam, spec) {
+        // A UDT value only inhabits its own UDT spec (or an opaque Val).
+        (Family::Udt(a), T::Udt(u)) => u.name.to_utf8_string().as_deref() != Ok(a.as_str()),
+        (Family::Udt(_), T::Val) => false,
+        (Family::Udt(_), _) => true,
+        // Numerics: any numeric spec coerces; a u32-repr contract enum is
+        // ALSO legitimately numeric at the WASM level; Bool is 0/1-encoded.
+        // Only object-typed specs are impossible.
+        (
+            Family::Numeric,
+            T::Address
+            | T::MuxedAddress
+            | T::Bytes
+            | T::BytesN(_)
+            | T::Vec(_)
+            | T::Map(_)
+            | T::String
+            | T::Symbol,
+        ) => true,
+        (Family::Numeric, _) => false,
+        (Family::Bool, T::Bool | T::Val) => false,
+        (Family::Bool, T::Udt(u)) => {
+            // A bool cannot inhabit a struct/union UDT; integer enums are
+            // 0/1-plausible, so leave those.
+            let name = u.name.to_utf8_string().unwrap_or_default();
+            registry.get_struct(&name).is_some() || registry.get_union(&name).is_some()
+        }
+        (Family::Bool, _) => true,
+        (Family::Symbol, T::Symbol | T::Val) => false,
+        (Family::Symbol, _) => true,
+        (Family::Str, T::String | T::Val) => false,
+        (Family::Str, _) => true,
+        (Family::VecKind, T::Vec(_) | T::Val) => false,
+        (Family::VecKind, _) => true,
+        (Family::MapKind, T::Map(_) | T::Val) => false,
+        (Family::MapKind, _) => true,
+        // Error Vals are conversion-failure sentinels, never real payloads
+        // (the dk_result_to_key_expr precedent).
+        (Family::Error, T::Error) => false,
+        (Family::Error, _) => true,
     }
 }
 
@@ -9609,5 +9825,93 @@ mod tests {
             &stmts[1],
             SorobanStmt::Expr(SorobanExpr::UnknownVal)
         ));
+    }
+
+    #[test]
+    fn mistyped_construct_fields_hole_and_coerce() {
+        use stellar_xdr::curr::{
+            ScSpecTypeBytesN, ScSpecUdtStructFieldV0, ScSpecUdtStructV0, StringM, VecM,
+        };
+        let field = |name: &str, ty: ScSpecTypeDef| ScSpecUdtStructFieldV0 {
+            doc: StringM::default(),
+            name: name.try_into().unwrap(),
+            type_: ty,
+        };
+        let spec = ScSpecUdtStructV0 {
+            doc: StringM::default(),
+            lib: StringM::default(),
+            name: "Rec".try_into().unwrap(),
+            fields: VecM::try_from(vec![
+                field("node", ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 32 })),
+                field("price", ScSpecTypeDef::I128),
+                field("owner", ScSpecTypeDef::Address),
+            ])
+            .unwrap(),
+        };
+        let mut registry = TypeRegistry {
+            functions: Default::default(),
+            structs: Default::default(),
+            unions: Default::default(),
+            enums: Default::default(),
+            error_enums: Default::default(),
+            events: Default::default(),
+            meta: Vec::new(),
+            spec_entries: Vec::new(),
+        };
+        registry.structs.insert("Rec".into(), spec);
+
+        let construct = |node: SorobanExpr, price: SorobanExpr, owner: SorobanExpr| {
+            SorobanStmt::Expr(SorobanExpr::StructConstruct {
+                type_name: "Rec".into(),
+                fields: vec![
+                    ("node".into(), node),
+                    ("price".into(), price),
+                    ("owner".into(), owner),
+                ],
+            })
+        };
+        // An error-enum construct in a BytesN field and a bool in an Address
+        // field are provably impossible → holed; a numeric literal in i128
+        // coerces → kept; a crypto digest feeding BytesN coerces via
+        // `.to_bytes()`; an unknown-typed local is left alone.
+        let mut stmts = vec![construct(
+            SorobanExpr::EnumConstruct {
+                type_name: "ContractErrors".into(),
+                variant: "InvalidParent".into(),
+                fields: vec![],
+            },
+            SorobanExpr::I64Literal(1),
+            SorobanExpr::BoolLiteral(true),
+        )];
+        hole_mistyped_construct_fields(&mut stmts, &registry);
+        let SorobanStmt::Expr(SorobanExpr::StructConstruct { fields, .. }) = &stmts[0] else {
+            panic!("construct survives");
+        };
+        assert!(matches!(fields[0].1, SorobanExpr::UnknownVal));
+        assert!(matches!(fields[1].1, SorobanExpr::I64Literal(1)));
+        assert!(matches!(fields[2].1, SorobanExpr::UnknownVal));
+
+        let mut stmts = vec![construct(
+            SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::MethodCall {
+                    object: Box::new(SorobanExpr::Env),
+                    method: "crypto".into(),
+                    args: vec![],
+                }),
+                method: "sha256".into(),
+                args: vec![],
+            },
+            SorobanExpr::NamedLocal("p".into()),
+            SorobanExpr::NamedLocal("who".into()),
+        )];
+        hole_mistyped_construct_fields(&mut stmts, &registry);
+        let SorobanStmt::Expr(SorobanExpr::StructConstruct { fields, .. }) = &stmts[0] else {
+            panic!("construct survives");
+        };
+        assert!(
+            matches!(&fields[0].1, SorobanExpr::MethodCall { method, .. } if method == "to_bytes")
+        );
+        assert!(matches!(fields[1].1, SorobanExpr::NamedLocal(_)));
+        assert!(matches!(fields[2].1, SorobanExpr::NamedLocal(_)));
     }
 }

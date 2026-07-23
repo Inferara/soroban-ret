@@ -253,7 +253,22 @@ use std::process::Command;
 /// (`is_never_rooted`, transitive through method/field chains and bare
 /// `ValConvert` wrappers, deliberately NOT through type-pinning `CastAs`).
 /// aqua-amm 213→129, aqua-rewards 143→113, reflectors −3 todos each.
-const ERROR_CEILING: u32 = 749;
+/// → 734 (issue #34 tranche 13: registry-typed construct-field
+/// admissibility, −15). New pipeline stage 4m3 (AFTER 4m's enum-key
+/// construction so key payloads are visible): a struct/union construct
+/// field whose expression type PROVABLY contradicts the registry's field
+/// spec holes to an honest `todo!()` — soroban-domains'
+/// `SubDomain { node: ContractErrors::InvalidParent, .. }` (an error enum
+/// in a BytesN field), blend-emitter's `LastDistro(symbol_short!(..))`
+/// (a fabricated Symbol where the spec says Address), lightecho's
+/// error-sentinel "price". A `Hash<32>` digest feeding a `BytesN<32>` slot
+/// coerces faithfully via `.to_bytes()` instead (identical bytes). Only
+/// airtight contradictions fire — params/locals/method results are left
+/// untouched; numeric-in-numeric always unifies; integer enums stay
+/// 0/1-plausible for Bool/numeric slots. `child_exprs`/`child_exprs_mut`
+/// walkers gained the missing EnumConstruct/MapConstruct arms (construct
+/// payloads were invisible to every walker-based pass before).
+const ERROR_CEILING: u32 = 734;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
