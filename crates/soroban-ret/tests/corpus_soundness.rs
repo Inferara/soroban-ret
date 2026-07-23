@@ -205,7 +205,22 @@ use std::process::Command;
 /// defaults, zero bare fabrications); keys are each module's own proven
 /// const-keys (verified `EmPauseAdmins`/`StableSwapPoolHash` present in the
 /// aqua-amm wasm). Corpus todos 1208→1162.
-const ERROR_CEILING: u32 = 1094;
+/// → 1051 (issue #34 tranche 10: the frame-descriptor DataKey ctor fold,
+/// −43). The `(i32) -> i64` descriptor-pointer ctor whose row is built at
+/// RUNTIME in the caller's frame (`i32.store` selector, `i64.store` payload
+/// Vals) is folded by executing the ctor's real bytecode under `DkEval`,
+/// seeding the descriptor row from the abstract frame slots — constants
+/// concretely, runtime payloads as move-only `Arg` tokens. Slots are seeded
+/// only when the ordered store log justifies them (the slot's current value
+/// IS its last logged real store, at the store instruction's exact width);
+/// an unjustified or missing slot fails the ctor's load and refuses the
+/// fold. Recovers aqua-rewards' user-keyed protocols
+/// (`vec![Symbol("WorkingBalance"), user]`, `UserRewardsState`; todos
+/// 311→232) and corrects blend-fixed/yieldblox's WRONG bare unit keys into
+/// the true keyed variants (`ResConfig` → `ResConfig(asset)`,
+/// `Positions(user)` — each pool's +4 todos are honest payload holes inside
+/// now-correct variant shapes). Corpus `todo!` lines 1240→1166.
+const ERROR_CEILING: u32 = 1051;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

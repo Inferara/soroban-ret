@@ -572,6 +572,8 @@ static DBG_SLOTJOIN: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_SLOTJOIN").is_ok());
 static DBG_SLOTREAD: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_SLOTREAD").is_ok());
+static DBG_FDK: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_FDK").is_ok());
 
 /// Issue #34 phase 2: classification of a frame slot whose abstract value was
 /// produced by the then arm of a shared-map `IfElse` join, from the
@@ -823,17 +825,22 @@ impl<'a> LiftContext<'a> {
     /// mutates the synthetic `let mut` declared before it) and keep the slot
     /// bound to that variable so later loads read it; otherwise update the
     /// abstract frame-slot map as usual.
-    fn store_frame_slot(&mut self, id: u32, slot: i32, value: StackVal) {
+    fn store_frame_slot(&mut self, id: u32, slot: i32, value: StackVal, width: u32) {
         if !self.promoted_slots.contains_key(&(id, slot)) {
-            // Ordered write log for the IfElse join poison: record what the
-            // slot held before this store so the join can tell a net no-op
-            // rewrite from a genuine then-arm value. Promoted (loop-carried)
-            // slots are excluded: their store renders a real `var_N = ..`
-            // assignment, so the abstract binding is sound on every path.
+            // Ordered write log for the IfElse join poison and the
+            // frame-descriptor key fold: record what the slot held before
+            // this store (join no-op detection) and the real store width
+            // (descriptor seeding). Promoted (loop-carried) slots are
+            // excluded: their store renders a real `var_N = ..` assignment,
+            // so the abstract binding is sound on every path.
             let prev = self.frame_slots.borrow().get(&(id, slot)).cloned();
-            self.slot_write_log
-                .borrow_mut()
-                .push(((id, slot), prev, value.clone()));
+            self.slot_write_log.borrow_mut().push(SlotWrite {
+                key: (id, slot),
+                prev,
+                new: value.clone(),
+                width,
+                depth: self.inline_depth,
+            });
             // After this store the slot holds a value this path produced
             // itself, so any join taint is lifted.
             self.slot_taints.borrow_mut().remove(&(id, slot));
@@ -1083,8 +1090,8 @@ impl<'a> LiftContext<'a> {
             return None;
         }
         let symbol = StackVal::HostCallResult(Box::new(SorobanExpr::SymbolLiteral(name)));
-        self.store_frame_slot(*id, base.base + 8, symbol);
-        self.store_frame_slot(*id, base.base, StackVal::I32(0));
+        self.store_frame_slot(*id, base.base + 8, symbol, 8);
+        self.store_frame_slot(*id, base.base, StackVal::I32(0), 4);
         self.found_host_calls = true;
         Some(true)
     }
@@ -1139,8 +1146,9 @@ impl<'a> LiftContext<'a> {
             id,
             base + layout.val_off,
             StackVal::HostCallResult(Box::new(unwrapped)),
+            8,
         );
-        self.store_frame_slot(id, base + layout.tag_off, StackVal::I32(1));
+        self.store_frame_slot(id, base + layout.tag_off, StackVal::I32(1), 4);
         self.found_host_calls = true;
         cov_mark::hit!(option_decode_first_index_of);
         Some(true)
@@ -1235,6 +1243,168 @@ impl<'a> LiftContext<'a> {
             return false;
         };
         self.stack.push(StackVal::HostCallResult(Box::new(key)));
+        true
+    }
+
+    /// Fold a *frame-descriptor* DataKey constructor call — the `(i32) -> i64`
+    /// descriptor-pointer form of the DataKey dispatcher where the descriptor
+    /// row lives in the CALLER's shadow-stack frame, built just before the
+    /// call (`i32.store` selector at `+0`, `i64.store` runtime payload Vals at
+    /// `+8`, `+16`, …). This is the SDK's keyed-variant lowering
+    /// (`DataKey::UserRewardData(user)`), and the reason the whole
+    /// `has/set/get/extend_ttl` protocol around user-keyed storage lifted with
+    /// `todo!()` keys: the const-pointer paths (`load_struct_const_key`,
+    /// `try_push_descriptor_key`) require static descriptors.
+    ///
+    /// The recovery is by EXECUTION, the same proof the dispatcher fold uses:
+    /// seed the micro-evaluator's memory with the descriptor row exactly as
+    /// the lift context knows it abstractly — constant slots concretely, the
+    /// runtime payload slots as opaque [`DkVal::Arg`] tokens — and run the
+    /// ctor's real bytecode. The evaluator's discipline makes the proof
+    /// airtight: `Arg` participates in nothing but moves (any arithmetic or
+    /// comparison on it bails), unseeded slots fail their loads, and store
+    /// widths must match load widths exactly, so a completed eval proves the
+    /// selector picked its arm and the payload Vals flowed untouched into the
+    /// key vector. `dk_result_to_key_expr` then renders `Arg` payloads
+    /// through the caller's actual `StackVal`s — an unrecovered payload
+    /// stays an honest `todo!()` hole inside the proven key shape.
+    fn try_fold_frame_descriptor_key(&mut self, target_idx: u32, args: &[StackVal]) -> bool {
+        use crate::wasm::ir::WasmType;
+        let [StackVal::FrameSlot(id, off)] = args else {
+            return false;
+        };
+        if off.term.is_some() {
+            return false;
+        }
+        let Some(ft) = self.wasm_module.get_func_type(target_idx) else {
+            return false;
+        };
+        if ft.params.as_slice() != [WasmType::I32] || ft.results.as_slice() != [WasmType::I64] {
+            return false;
+        }
+        if !is_datakey_dispatcher(self.wasm_module, target_idx) {
+            return false;
+        }
+        // A synthetic address for the descriptor row, far above the shadow
+        // stack the ctor grows downward from `StackPtr(0)` — the evaluator's
+        // memory is entry-SP-relative, so the row can never collide with any
+        // interpreted frame.
+        const DESC_BASE: i32 = 1 << 20;
+        // Descriptor rows are one selector plus at most a few payload Vals;
+        // 64 bytes covers every observed layout with slack.
+        const DESC_BYTES: i32 = 64;
+        // PROVENANCE GATE (the audit that killed the naive frame_slots
+        // read): the abstract slot map is ACCUMULATED state — a slot can
+        // hold an unlogged recognizer seed (blend's `I128Limb` in a
+        // descriptor row) whose runtime overwrite the lifter missed, and
+        // embedding one fabricates a key payload. A descriptor slot is
+        // seeded only when its current abstract value IS its last entry in
+        // the ordered store log (t9's `slot_write_log`): the value then
+        // provably comes from a real, modeled `i32/i64.store` that nothing
+        // the lifter saw has shadowed. Unjustified slots stay unseeded — if
+        // the ctor's arm loads one, the eval's load misses and the fold
+        // refuses (an honest `todo!()`, never a stale key). Stale CONSTANT
+        // Vals that pass this gate (a logged scalar the runtime later
+        // overwrote through an unmodeled path) are de-fanged at the render
+        // layer: `dk_result_to_key_expr` embeds False/True only for the
+        // exact 0/1 words and refuses object-tagged constants outright.
+        let mut fresh: HashMap<i32, (StackVal, u32)> = HashMap::new();
+        {
+            let slots = self.frame_slots.borrow();
+            let log = self.slot_write_log.borrow();
+            let mut seen: Vec<i32> = Vec::new();
+            let total = (0..DESC_BYTES / 8)
+                .filter(|k| slots.contains_key(&(*id, off.base + 8 * k)))
+                .count();
+            for w in log.iter().rev() {
+                if seen.len() >= total {
+                    break;
+                }
+                let (sid, soff) = w.key;
+                let k = soff - off.base;
+                if sid != *id || k < 0 || k >= DESC_BYTES || seen.contains(&k) {
+                    continue;
+                }
+                seen.push(k);
+                // Last logged write for this slot: justified only if the
+                // abstract map still holds exactly that value.
+                if slots.get(&w.key) == Some(&w.new) {
+                    fresh.insert(k, (w.new.clone(), w.width));
+                }
+            }
+        }
+        if fresh.is_empty() {
+            return false;
+        }
+        let mut mem = HashMap::new();
+        let mut payloads: Vec<StackVal> = Vec::new();
+        // Offset order, so payload `Arg` indices are deterministic.
+        let mut fresh: Vec<(i32, (StackVal, u32))> = fresh.into_iter().collect();
+        fresh.sort_by_key(|(k, _)| *k);
+        for (k, (v, width)) in &fresh {
+            // The seeded cell's width is the REAL store instruction's width
+            // from the log; a mismatch with what the ctor actually loads
+            // fails the evaluator's exact-width check and refuses the fold —
+            // never a wrong recovery. Sub-word stores never seed (descriptor
+            // fields are i32/i64), and constants stored at the other width
+            // seed as the runtime memory actually holds them.
+            let dv = match (v, width) {
+                (StackVal::I32(c), 4) => DkVal::I32(*c),
+                (StackVal::I64(c), 8) => DkVal::I64(*c),
+                // An `i64.store` of a zero/sign-extended i32: for the
+                // non-negative values descriptors hold, both extensions
+                // agree; a negative value's extension is ambiguous here, so
+                // it stays unseeded.
+                (StackVal::I32(c), 8) if *c >= 0 => DkVal::I64(*c as i64),
+                (StackVal::I32(_), 8) => continue,
+                (StackVal::I64(c), 4) => DkVal::I32(*c as i32),
+                (_, 1 | 2) => continue,
+                (other, _) => {
+                    payloads.push(other.clone());
+                    DkVal::Arg(payloads.len() - 1)
+                }
+            };
+            mem.insert(DESC_BASE + k, (dv, *width));
+        }
+        if *DBG_FDK {
+            eprintln!(
+                "[FDK] ctor={target_idx} frame=({id},{}) mem={mem:?} payloads={payloads:?}",
+                off.base
+            );
+        }
+        let mut ev = DkEval {
+            module: self.wasm_module,
+            mem,
+            sp: DkVal::StackPtr(0),
+            steps: 0,
+            gap_zero: None,
+        };
+        let Some(Some(result)) = ev.eval_call(target_idx, vec![DkVal::StackPtr(DESC_BASE)], 0)
+        else {
+            if *DBG_FDK {
+                eprintln!(
+                    "[FDK] ctor={target_idx} eval bailed (window base {})",
+                    off.base
+                );
+            }
+            return false;
+        };
+        let Some(key) = self.dk_result_to_key_expr(&result, &payloads) else {
+            if *DBG_FDK {
+                eprintln!("[FDK] ctor={target_idx} result not a key: {result:?}");
+            }
+            return false;
+        };
+        if *DBG_FDK {
+            eprintln!("[FDK] ctor={target_idx} FOLDED -> {key:?}");
+        }
+        cov_mark::hit!(frame_descriptor_key_folded);
+        self.stack.push(StackVal::HostCallResult(Box::new(key)));
+        // Deliberately NOT `found_host_calls = true` (unlike the dispatcher
+        // fold): the ctor is a pure key derivation, and claiming a host call
+        // here flips an enclosing pure helper's inline onto the effectful
+        // statement-splice path, breaking its value threading (observed as
+        // blend-emitter losing its `LastDistro` getter recoveries).
         true
     }
 
@@ -1369,9 +1539,15 @@ impl<'a> LiftContext<'a> {
                             // Constant payload Val: only small-value tags are
                             // plausible static key components (False/True and
                             // the 4..=14 small range). Tag 3 is Error — the
-                            // ConversionError sentinel lands here.
+                            // ConversionError sentinel lands here. False/True
+                            // are only genuine when the WHOLE word is 0 or 1:
+                            // a stale scalar whose low byte happens to be zero
+                            // (blend's SCALAR_12 = 0xE8D4A51000) is NOT a
+                            // False Val and must not render as one.
                             let tag = (*v as u64) & 0xff;
-                            if !matches!(tag, 0 | 1 | 4..=14) {
+                            if matches!(tag, 0 | 1) && *v != tag as i64 {
+                                SorobanExpr::UnknownVal
+                            } else if !matches!(tag, 0 | 1 | 4..=14) {
                                 SorobanExpr::UnknownVal
                             } else {
                                 let ex = stack_val_to_expr(
@@ -2303,6 +2479,14 @@ impl<'a> LiftContext<'a> {
                     // rather than an immediate (the `did_key_construct` case above).
                     let did_key_construct = did_key_construct
                         || self.try_push_descriptor_key(*target_idx, first_arg_i32);
+
+                    // *Frame-descriptor* DataKey constructor: the same `(i32) ->
+                    // i64` ctor, but the descriptor row was built at runtime in
+                    // the caller's frame (keyed variants — selector at `+0`,
+                    // payload Vals at `+8`…). Folded by executing the ctor over
+                    // the abstractly-known row.
+                    let did_key_construct =
+                        did_key_construct || self.try_fold_frame_descriptor_key(*target_idx, &args);
 
                     // Immediate-selector DataKey *dispatcher*: `(i64 selector, …)
                     // -> i64` br_table'ing over the selector (neither `(i32) ->
@@ -3427,6 +3611,7 @@ impl<'a> LiftContext<'a> {
                                 self.inline_depth,
                                 Rc::clone(&self.frame_slots),
                                 Rc::clone(&self.next_frame_id),
+                                Rc::clone(&self.slot_write_log),
                             );
                             // Always propagate memory stores from inlined calls — helper
                             // functions may store Val-encoded values to memory without
@@ -4328,7 +4513,7 @@ impl<'a> LiftContext<'a> {
                     && let Some(base) = frame_slot_key(slot_off.base, *offset)
                 {
                     match slot_off.term {
-                        None => self.store_frame_slot(id, base, value),
+                        None => self.store_frame_slot(id, base, value, 8),
                         // Dynamic (loop-indexed) write: record it in the side table
                         // keyed by the symbolic term so a matching indexed load reads
                         // it back, and invalidate any static slot the write could
@@ -4352,7 +4537,7 @@ impl<'a> LiftContext<'a> {
                     && let Some(base) = frame_slot_key(slot_off.base, *offset)
                 {
                     match slot_off.term {
-                        None => self.store_frame_slot(id, base, value),
+                        None => self.store_frame_slot(id, base, value, 4),
                         // Dynamic (loop-indexed) write: record it in the side table
                         // keyed by the symbolic term so a matching indexed load reads
                         // it back, and invalidate any static slot the write could
@@ -4377,11 +4562,16 @@ impl<'a> LiftContext<'a> {
                 // (e.g., I64Load8U) can resolve discriminant bytes written by
                 // struct/enum decoders. Not added to memory_stores (these are
                 // bookkeeping values, not Val-encoded fields).
+                let sub_width = match instr {
+                    WasmInstr::I32Store8(_) | WasmInstr::I64Store8(_) => 1,
+                    WasmInstr::I32Store16(_) | WasmInstr::I64Store16(_) => 2,
+                    _ => 4,
+                };
                 if let StackVal::FrameSlot(id, slot_off) = addr
                     && let Some(base) = frame_slot_key(slot_off.base, *offset)
                 {
                     match slot_off.term {
-                        None => self.store_frame_slot(id, base, value),
+                        None => self.store_frame_slot(id, base, value, sub_width),
                         // Dynamic (loop-indexed) write: record it in the side table
                         // keyed by the symbolic term so a matching indexed load reads
                         // it back, and invalidate any static slot the write could
@@ -5207,11 +5397,16 @@ impl<'a> LiftContext<'a> {
                     // read observing them is sound — and are dropped here.
                     let then_writes: Vec<((u32, i32), StackVal)> = {
                         let log = self.slot_write_log.borrow();
-                        let mut per_key: SlotWriteLog = Vec::new();
-                        for (k, prev, new) in &log[pre_wpos..] {
-                            match per_key.iter_mut().find(|(pk, _, _)| pk == k) {
-                                Some((_, _, last)) => *last = new.clone(),
-                                None => per_key.push((*k, prev.clone(), new.clone())),
+                        let mut per_key: Vec<((u32, i32), Option<StackVal>, StackVal)> = Vec::new();
+                        for w in &log[pre_wpos..] {
+                            // Same-depth entries only: an inlined helper's
+                            // internal stores are not this join's arm writes.
+                            if w.depth != self.inline_depth {
+                                continue;
+                            }
+                            match per_key.iter_mut().find(|(pk, _, _)| *pk == w.key) {
+                                Some((_, _, last)) => *last = w.new.clone(),
+                                None => per_key.push((w.key, w.prev.clone(), w.new.clone())),
                             }
                         }
                         per_key
@@ -8079,6 +8274,7 @@ fn lift_inline_call(
     inline_depth: u32,
     frame_slots: Rc<RefCell<HashMap<(u32, i32), StackVal>>>,
     next_frame_id: Rc<RefCell<u32>>,
+    slot_write_log: Rc<RefCell<SlotWriteLog>>,
 ) -> InlineResult {
     let func = match wasm_module.get_function(target_idx) {
         Some(f) => f,
@@ -8135,6 +8331,10 @@ fn lift_inline_call(
     ctx.inline_depth = inline_depth + 1;
     ctx.frame_slots = frame_slots;
     ctx.next_frame_id = next_frame_id;
+    // Shared like `frame_slots`: the log records GLOBAL simulation order, so
+    // a descriptor built by the caller stays justified when a callee that
+    // received its pointer re-derives the key (the frame-descriptor fold).
+    ctx.slot_write_log = slot_write_log;
 
     // Reclassify safety-net `unreachable` traps before lifting (issue #11) —
     // critical at inline_depth > 0, where trailing safety-net Panics would
@@ -15929,10 +16129,30 @@ type DynamicSlotMap = HashMap<(u32, SymTerm, i32), StackVal>;
 /// `(frame_id, offset)` slot, in program order (see `LiftContext::slot_defs`).
 type SlotDefJournal = HashMap<(u32, i32), Vec<StackVal>>;
 
-/// Type alias for the ordered static-slot write log: `(key, previous_value,
-/// new_value)` per generic store, in simulation order (see
-/// `LiftContext::slot_write_log`).
-type SlotWriteLog = Vec<((u32, i32), Option<StackVal>, StackVal)>;
+/// One entry of the ordered static-slot write log (see
+/// `LiftContext::slot_write_log`), in simulation order.
+#[derive(Clone, Debug)]
+struct SlotWrite {
+    key: (u32, i32),
+    /// What the slot held before this store (the join's net-no-op check).
+    prev: Option<StackVal>,
+    new: StackVal,
+    /// The REAL store instruction's width (`i32.store` = 4, `i64.store` = 8,
+    /// sub-word = 1/2) — the frame-descriptor key fold seeds its evaluator's
+    /// exact-width memory from it.
+    width: u32,
+    /// `inline_depth` of the storing context. The IfElse join poison
+    /// segments arms over SAME-DEPTH entries only, so a caller's join never
+    /// treats an inlined helper's internal stores as its own then-arm writes
+    /// (poisoning them degraded working getter recoveries when the log
+    /// became shared across `lift_inline_call`); the frame-descriptor key
+    /// fold reads all depths (a callee legitimately re-derives its caller's
+    /// descriptor through a passed pointer).
+    depth: u32,
+}
+
+/// Type alias for the ordered static-slot write log.
+type SlotWriteLog = Vec<SlotWrite>;
 
 /// Convert a stack value to a SorobanExpr, decoding packed Soroban Val constants.
 ///
@@ -16712,6 +16932,7 @@ mod tests {
             MAX_INLINE_CALL_DEPTH,
             Rc::new(RefCell::new(HashMap::new())),
             Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
         );
         assert!(result.content.is_none());
         assert!(result.memory_stores.is_empty());
@@ -18707,6 +18928,7 @@ mod tests {
             0,
             Rc::new(RefCell::new(HashMap::new())),
             Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
         );
         let (stmts, return_expr) = result.content.expect("the recovery is effectful");
         let binding_idx = stmts
@@ -18794,6 +19016,7 @@ mod tests {
             0,
             Rc::new(RefCell::new(HashMap::new())),
             Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
         );
         let (stmts, _) = result.content.expect("the recovery is effectful");
         assert!(
@@ -18823,6 +19046,7 @@ mod tests {
             0,
             Rc::new(RefCell::new(HashMap::new())),
             Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
         );
         let (stmts, return_expr) = result.content.expect("the recovery is effectful");
         assert!(
@@ -19088,6 +19312,7 @@ mod tests {
             0,
             Rc::new(RefCell::new(HashMap::new())),
             Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
         );
         let (stmts, return_expr) = result.content.expect("the recovery is effectful");
         assert!(
@@ -20643,6 +20868,7 @@ mod tests {
             0,
             Rc::new(RefCell::new(HashMap::new())),
             Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
         );
         result.stack_result.expect("the tail load leaves a value")
     }
@@ -20676,5 +20902,180 @@ mod tests {
         // Else terminates: fall-through implies the then path ran, so the
         // then value is unconditionally valid downstream.
         assert!(matches!(join_poison_result(4), StackVal::I64(42)));
+    }
+
+    /// Fixture for the frame-descriptor DataKey fold (issue #34 t10): the
+    /// `(i32) -> i64` descriptor-pointer ctor form where the row is built at
+    /// runtime in the caller's frame. Import 0 = `vec_new_from_linear_memory`;
+    /// func 1 = the small-symbol encoder (marker constants + char loop);
+    /// func 2 = the `(ptr, count)` vec builder reaching import 0; func 3 =
+    /// THE CTOR — `br_table` on `descriptor[0]`, selector 0 → keyed arm
+    /// `vec![Symbol("UserData"), descriptor[8]]`, selector 1 → unit arm
+    /// `vec![Symbol("AdminKey")]`. Callers: 4 = genuine keyed build
+    /// (selector + payload stored right before the call); 5 = selector-only
+    /// build (payload slot never stored); 6 = unit-variant build; 7 = build
+    /// whose selector is stored with `i64.store` (wrong width for the
+    /// ctor's `i32.load`).
+    fn frame_descriptor_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "v" "g" (func (param i64 i64) (result i64)))
+                (memory 1)
+                (data (i32.const 2000) "UserDataAdminKey")
+                (global (mut i32) (i32.const 1048576))
+                (func (;1;) (param i32 i32) (result i64)
+                    (local i64 i32)
+                    i32.const 95 drop
+                    i32.const 48 drop
+                    i32.const 65 drop
+                    i32.const 97 drop
+                    loop
+                        local.get 3 local.get 1 i32.lt_u
+                        if
+                            local.get 2 i64.const 6 i64.shl
+                            local.get 0 local.get 3 i32.add i32.load8_u
+                            i64.extend_i32_u i64.const 32 i64.sub i64.or
+                            local.set 2
+                            local.get 3 i32.const 1 i32.add local.set 3
+                            br 1
+                        end
+                    end
+                    local.get 2 i64.const 8 i64.shl i64.const 14 i64.or)
+                (func (;2;) (param i32 i32) (result i64)
+                    local.get 0 i64.extend_i32_u
+                    local.get 1 i64.extend_i32_u
+                    call 0)
+                (func (;3;) (param i32) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 32 i32.sub local.tee 1 drop
+                    block
+                        block
+                            local.get 0 i32.load br_table 0 1 0
+                        end
+                        local.get 1 i32.const 2000 i32.const 8 call 1 i64.store
+                        local.get 1 local.get 0 i64.load offset=8 i64.store offset=8
+                        local.get 1 i32.const 2 call 2
+                        return
+                    end
+                    local.get 1 i32.const 2008 i32.const 8 call 1 i64.store
+                    local.get 1 i32.const 1 call 2)
+                (func (;4;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 1 i32.const 0 i32.store
+                    local.get 1 local.get 0 i64.store offset=8
+                    local.get 1 call 3)
+                (func (;5;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 1 i32.const 0 i32.store
+                    local.get 1 call 3)
+                (func (;6;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 1 i32.const 1 i32.store
+                    local.get 1 call 3)
+                (func (;7;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 1 i64.const 0 i64.store
+                    local.get 1 local.get 0 i64.store offset=8
+                    local.get 1 call 3)
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    /// Lift one `frame_descriptor_module` caller with an optional
+    /// pre-planted frame slot (the stale-state negative), returning the raw
+    /// tail value.
+    fn frame_descriptor_result(
+        idx: u32,
+        plant: Option<((u32, i32), StackVal)>,
+    ) -> Option<StackVal> {
+        let m = frame_descriptor_module();
+        let reg = empty_registry();
+        let slots = Rc::new(RefCell::new(HashMap::new()));
+        if let Some((key, val)) = plant {
+            slots.borrow_mut().insert(key, val);
+        }
+        let result = lift_inline_call(
+            &m,
+            &reg,
+            idx,
+            vec![StackVal::Param("user".to_string())],
+            0,
+            slots,
+            Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
+        );
+        result.stack_result
+    }
+
+    fn as_key_vec(v: &StackVal) -> Option<&Vec<SorobanExpr>> {
+        match v {
+            StackVal::HostCallResult(e) => match e.as_ref() {
+                SorobanExpr::VecConstruct(elems) => Some(elems),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn frame_descriptor_keyed_ctor_folds_at_call_site() {
+        // Keyed variant: the descriptor row {0, user} built right before the
+        // call executes the ctor's real bytecode — the br_table picks arm 0,
+        // the symbol comes from the data section, and the runtime payload
+        // flows through untouched as the second vec element.
+        cov_mark::check!(frame_descriptor_key_folded);
+        let keyed = frame_descriptor_result(4, None).expect("keyed build leaves a value");
+        let elems = as_key_vec(&keyed).expect("keyed build folds to a vec key");
+        assert_eq!(elems.len(), 2);
+        assert_eq!(elems[0], SorobanExpr::SymbolLiteral("UserData".to_string()));
+        assert!(
+            !matches!(elems[1], SorobanExpr::UnknownVal),
+            "the payload embeds the caller's runtime value: {:?}",
+            elems[1]
+        );
+        // Unit variant: selector 1 picks the payload-less arm by execution.
+        let unit = frame_descriptor_result(6, None).expect("unit build leaves a value");
+        let elems = as_key_vec(&unit).expect("unit build folds");
+        assert_eq!(
+            elems.as_slice(),
+            [SorobanExpr::SymbolLiteral("AdminKey".to_string())]
+        );
+    }
+
+    #[test]
+    fn frame_descriptor_fold_refuses_unproven_slots() {
+        cov_mark::check_count!(frame_descriptor_key_folded, 0);
+        // Payload slot never stored: the keyed arm's load misses → refuse.
+        assert!(
+            frame_descriptor_result(5, None)
+                .as_ref()
+                .and_then(as_key_vec)
+                .is_none()
+        );
+        // Stale state: the payload slot value exists in the abstract map but
+        // NOT in the write log (a recognizer-seed-style direct insert whose
+        // runtime overwrite the lifter may have missed) → unjustified →
+        // refuse. This is the gate the blend-fixed-pool `ResData(SCALAR_12)`
+        // fabrication audit forced.
+        assert!(
+            frame_descriptor_result(5, Some(((0, 8), StackVal::I64(1000000000000))))
+                .as_ref()
+                .and_then(as_key_vec)
+                .is_none()
+        );
+        // Selector stored 8-wide but the ctor dispatches on an `i32.load`:
+        // the evaluator's exact-width memory refuses the mismatched read.
+        assert!(
+            frame_descriptor_result(7, None)
+                .as_ref()
+                .and_then(as_key_vec)
+                .is_none()
+        );
     }
 }
