@@ -9314,11 +9314,38 @@ impl DkEval<'_> {
         match addr {
             DkVal::StackPtr(o) => {
                 let a = o.checked_add(offset as i32)?;
-                let (v, w) = self.mem.get(&a)?;
-                if *w != width {
-                    return None;
+                if let Some((v, w)) = self.mem.get(&a)
+                    && *w == width
+                {
+                    return Some(v.clone());
                 }
-                Some(v.clone())
+                // Narrower read fully inside a wider CONSTANT cell: pure
+                // little-endian byte extraction (an `i64.store`d enum
+                // discriminant read back with `i32.load` — blend-backstop's
+                // descriptor shape). Cells never overlap (`store`
+                // invalidates), so at most one covers the range; a covering
+                // SYMBOLIC cell cannot be sliced — the load stays out of
+                // model.
+                for (a0, (v, w0)) in &self.mem {
+                    if *a0 <= a && a + width as i32 <= a0 + *w0 as i32 {
+                        let c: u64 = match v {
+                            DkVal::I32(x) => *x as u32 as u64,
+                            DkVal::I64(x) => *x as u64,
+                            _ => return None,
+                        };
+                        let shifted = c >> (8 * (a - a0) as u32);
+                        let masked = if width == 8 {
+                            shifted
+                        } else {
+                            shifted & ((1u64 << (8 * width)) - 1)
+                        };
+                        return Some(match width {
+                            8 => DkVal::I64(masked as i64),
+                            _ => DkVal::I32(masked as u32 as i32),
+                        });
+                    }
+                }
+                None
             }
             // Static data reads (e.g. variant-name tables); never shadow-stack.
             DkVal::I32(a) if *a > 1024 => {
@@ -9658,6 +9685,18 @@ impl DkEval<'_> {
                 WI::I32Load8U(off) => {
                     let addr = stack.pop()?;
                     stack.push(self.load(&addr, *off, 1)?);
+                }
+                WI::I64Load32U(off) => {
+                    // A 4-byte zero-extending load: constants extend
+                    // concretely; a symbolic payload passes through — its
+                    // 64-bit zero-extension IS the same abstract value, and
+                    // anything not move-shaped downstream still bails.
+                    let addr = stack.pop()?;
+                    stack.push(match self.load(&addr, *off, 4)? {
+                        DkVal::I32(x) => DkVal::I64(x as u32 as i64),
+                        DkVal::Arg(i) => DkVal::Arg(i),
+                        _ => return None,
+                    });
                 }
                 WI::I32Store(off) => {
                     let val = stack.pop()?;
@@ -20933,9 +20972,11 @@ mod tests {
     /// `vec![Symbol("AdminKey")]`. Callers: 4 = genuine keyed build
     /// (selector + payload stored right before the call); 5 = selector-only
     /// build (payload slot never stored); 6 = unit-variant build; 7 = build
-    /// whose selector is stored with `i64.store` (wrong width for the
-    /// ctor's `i32.load`); 8 = build whose payload bytes a later
-    /// `i64.store` at `+4` partially clobbers (the overlap refusal).
+    /// whose selector is stored with `i64.store` (a CONSTANT the ctor's
+    /// `i32.load` slices soundly — little-endian byte extraction);
+    /// 8 = build whose payload bytes a later `i64.store` at `+4` partially
+    /// clobbers (the overlap refusal); 9 = build whose RUNTIME payload is
+    /// stored 4-wide but read 8-wide (symbolic cells cannot be sliced).
     fn frame_descriptor_module() -> WasmModule {
         let wasm = wat::parse_str(
             r#"(module
@@ -21008,6 +21049,12 @@ mod tests {
                     local.get 1 local.get 0 i64.store offset=8
                     local.get 1 i64.const 7 i64.store offset=4
                     local.get 1 call 3)
+                (func (;9;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 1 i32.const 0 i32.store
+                    local.get 1 local.get 0 i32.wrap_i64 i32.store offset=8
+                    local.get 1 call 3)
             )"#,
         )
         .expect("wat parses");
@@ -21051,6 +21098,32 @@ mod tests {
     }
 
     #[test]
+    fn dk_eval_slices_constant_cells_only() {
+        let m = frame_descriptor_module();
+        let mut ev = DkEval {
+            module: &m,
+            mem: HashMap::new(),
+            sp: DkVal::StackPtr(0),
+            steps: 0,
+            gap_zero: None,
+        };
+        ev.store(0, DkVal::I64(0x1122334455667788), 8);
+        ev.store(16, DkVal::Arg(0), 8);
+        let sp = DkVal::StackPtr(0);
+        // Exact-width read returns the cell as-is.
+        assert_eq!(ev.load(&sp, 0, 8), Some(DkVal::I64(0x1122334455667788)));
+        // Narrow reads inside the constant cell extract little-endian bytes.
+        assert_eq!(ev.load(&sp, 0, 4), Some(DkVal::I32(0x55667788)));
+        assert_eq!(ev.load(&sp, 4, 4), Some(DkVal::I32(0x11223344)));
+        assert_eq!(ev.load(&sp, 6, 1), Some(DkVal::I32(0x22)));
+        // A read crossing the cell's end stays out of model.
+        assert_eq!(ev.load(&sp, 4, 8), None);
+        // Symbolic cells cannot be sliced.
+        assert_eq!(ev.load(&sp, 16, 4), None);
+        assert_eq!(ev.load(&sp, 16, 8), Some(DkVal::Arg(0)));
+    }
+
+    #[test]
     fn frame_descriptor_keyed_ctor_folds_at_call_site() {
         // Keyed variant: the descriptor row {0, user} built right before the
         // call executes the ctor's real bytecode — the br_table picks arm 0,
@@ -21073,6 +21146,12 @@ mod tests {
             elems.as_slice(),
             [SorobanExpr::SymbolLiteral("AdminKey".to_string())]
         );
+        // A CONSTANT selector stored 8-wide reads back through the ctor's
+        // `i32.load` by little-endian byte extraction (blend-backstop's
+        // descriptor shape) — the keyed arm still folds.
+        let wide = frame_descriptor_result(7, None).expect("wide-selector build leaves a value");
+        let elems = as_key_vec(&wide).expect("wide-selector build folds");
+        assert_eq!(elems[0], SorobanExpr::SymbolLiteral("UserData".to_string()));
     }
 
     #[test]
@@ -21096,10 +21175,10 @@ mod tests {
                 .and_then(as_key_vec)
                 .is_none()
         );
-        // Selector stored 8-wide but the ctor dispatches on an `i32.load`:
-        // the evaluator's exact-width memory refuses the mismatched read.
+        // A RUNTIME payload stored 4-wide but read 8-wide: symbolic cells
+        // cannot be sliced, so the mismatched read refuses.
         assert!(
-            frame_descriptor_result(7, None)
+            frame_descriptor_result(9, None)
                 .as_ref()
                 .and_then(as_key_vec)
                 .is_none()

@@ -883,7 +883,6 @@ pub(crate) fn is_heterogeneous_val_vec(elems: &[SorobanExpr]) -> bool {
     }
     let mut known: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
     let mut has_unknown = false;
-    let mut has_numeric = false;
     for e in elems {
         if is_never_typed(e) {
             continue;
@@ -891,14 +890,17 @@ pub(crate) fn is_heterogeneous_val_vec(elems: &[SorobanExpr]) -> bool {
         match scalar_class(e) {
             Some(c) => {
                 known.insert(c);
-                if is_numeric_class(c) {
-                    has_numeric = true;
-                }
             }
             None => has_unknown = true,
         }
     }
-    known.len() >= 2 || (has_numeric && has_unknown)
+    // Two distinct known classes can never unify; a known class beside an
+    // unknown-typed element (the keyed-DataKey shape `vec![Symbol, payload]`,
+    // where the payload is an Address/Hash/method result) almost never can —
+    // and `Vec<Val>` is faithful either way (`into_val` yields the identical
+    // per-element ScVal), so the conversion costs nothing when the elements
+    // happened to agree.
+    known.len() >= 2 || (!known.is_empty() && has_unknown)
 }
 
 /// A `!`-typed expression (`todo!()`, `panic!()`, `panic_with_error!()`) — it
@@ -927,10 +929,6 @@ fn scalar_class(e: &SorobanExpr) -> Option<&'static str> {
         E::StringLiteral(_) => Some("string"),
         _ => None,
     }
-}
-
-fn is_numeric_class(c: &str) -> bool {
-    matches!(c, "u32" | "i32" | "u64" | "i64" | "u128" | "i128")
 }
 
 /// Render one heterogeneous-vec element as a `Val` via fully-qualified

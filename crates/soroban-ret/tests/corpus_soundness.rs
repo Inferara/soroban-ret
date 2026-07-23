@@ -220,7 +220,24 @@ use std::process::Command;
 /// the true keyed variants (`ResConfig` → `ResConfig(asset)`,
 /// `Positions(user)` — each pool's +4 todos are honest payload holes inside
 /// now-correct variant shapes). Corpus `todo!` lines 1240→1166.
-const ERROR_CEILING: u32 = 1051;
+/// → 903 (issue #34 tranche 11: DkEval constant-cell narrow reads +
+/// `i64.load32_u`, and the heterogeneous-key-vec fix, −148). The evaluator
+/// now services a narrower load fully inside a wider CONSTANT cell by
+/// little-endian byte extraction (an `i64.store`d discriminant read back
+/// with `i32.load` — blend-backstop's descriptor shape; symbolic cells
+/// still refuse), unlocking keyed folds there (bare WRONG
+/// `BackstopDataKey::UserBalance` unit keys → true `PoolBalance(pool)`)
+/// and aqua-amm's hash-keyed `vec![Symbol("TokensSetPools"), sha256(..)]`.
+/// `is_heterogeneous_val_vec` then broadened to "any known class beside an
+/// unknown-typed element" (was: two known classes, or numeric+unknown), so
+/// keyed vecs `[Symbol, payload]` render as `Vec<Val>` via per-element
+/// `IntoVal` — faithful (identical per-element ScVal) and the only type a
+/// heterogeneous key vec can have. Fixed 87 hash-key + dozens of
+/// pre-existing Symbol/Address-mix E0308s: aqua-rewards 228→143,
+/// aqua-amm 272→213, comet 55→50; blend-backstop 26→29 is the faithful
+/// unmask of its REMAINING bare fn-pointer `UserBalance` keys (E0277)
+/// surfacing once neighboring sites compile.
+const ERROR_CEILING: u32 = 903;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

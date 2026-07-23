@@ -5,12 +5,12 @@
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
       "entity": "Aqua AMM",
-      "restoration_pct": 94.4,
+      "restoration_pct": 94.6,
       "spec_functions": 75,
       "fn_clean": 21,
       "fn_partial": 54,
       "fn_logic_lost": 0,
-      "artifacts_total": 392,
+      "artifacts_total": 394,
       "wasm_size": 44514,
       "error": null
     },
@@ -53,7 +53,7 @@
     {
       "file": "blend-backstop-CAQQR5SW.wasm",
       "entity": "Blend Backstop",
-      "restoration_pct": 91.0,
+      "restoration_pct": 92.0,
       "spec_functions": 17,
       "fn_clean": 10,
       "fn_partial": 7,
@@ -113,12 +113,12 @@
     {
       "file": "comet-blnd-usdc-amm-CAS3FL6T.wasm",
       "entity": "Comet BLND-USDC AMM",
-      "restoration_pct": 96.8,
+      "restoration_pct": 97.6,
       "spec_functions": 30,
-      "fn_clean": 16,
-      "fn_partial": 14,
+      "fn_clean": 17,
+      "fn_partial": 13,
       "fn_logic_lost": 0,
-      "artifacts_total": 23,
+      "artifacts_total": 20,
       "wasm_size": 29046,
       "error": null
     },
@@ -161,12 +161,12 @@
     {
       "file": "fxdao-vault-CCUN4RXU.wasm",
       "entity": "FxDAO Vault",
-      "restoration_pct": 91.4,
+      "restoration_pct": 90.6,
       "spec_functions": 2,
       "fn_clean": 1,
       "fn_partial": 1,
       "fn_logic_lost": 0,
-      "artifacts_total": 10,
+      "artifacts_total": 9,
       "wasm_size": 10930,
       "error": null
     },
