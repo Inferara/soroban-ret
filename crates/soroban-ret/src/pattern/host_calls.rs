@@ -768,11 +768,15 @@ fn lift_vec_call(name: &str, mut args: Vec<SorobanExpr>) -> SorobanExpr {
 fn lift_buf_call(name: &str, mut args: Vec<SorobanExpr>) -> SorobanExpr {
     match name {
         "serialize_to_bytes" => {
+            // The SDK form is `val.to_xdr(&env)` (`soroban_sdk::xdr::ToXdr`,
+            // `fn to_xdr(self, env: &Env)`) — `Env` has no `to_xdr` method,
+            // so the old `env.to_xdr(val)` shape was an E0599 on every site.
+            // The codegen appends the `&env` argument for this method name.
             let val = args.pop().unwrap_or(SorobanExpr::Void);
             SorobanExpr::MethodCall {
-                object: Box::new(SorobanExpr::Env),
+                object: Box::new(val),
                 method: "to_xdr".to_string(),
-                args: vec![val],
+                args: Vec::new(),
             }
         }
         "deserialize_from_bytes" => {

@@ -237,7 +237,23 @@ use std::process::Command;
 /// aqua-amm 272→213, comet 55→50; blend-backstop 26→29 is the faithful
 /// unmask of its REMAINING bare fn-pointer `UserBalance` keys (E0277)
 /// surfacing once neighboring sites compile.
-const ERROR_CEILING: u32 = 903;
+/// → 749 (issue #34 tranche 12: codegen soundness sweep, −154). Three
+/// levers, each replacing a guaranteed-non-compiling render with either the
+/// faithful construct or an honest hole: (1) surviving raw
+/// `bytes_new_from_linear_memory` lowers late (stage 4b4b, AFTER the BLS
+/// field-argument recovery that claims some of the same sites) to real
+/// static bytes `Bytes::from_slice(&env, &[..])` under a strict in-segment
+/// read, else `todo!()` — never the fabricated `env.buf()` API; (2)
+/// `serialize_to_bytes` lifts to the SDK's real `val.to_xdr(&env)`
+/// (`soroban_sdk::xdr::ToXdr` imported on use) instead of the non-existent
+/// `env.to_xdr(val)`; (3) a method call or field access on a `!`-rooted
+/// receiver (`todo!().contains_key(..)`, E0599/E0609 — rustc refuses method
+/// resolution on `!`) renders as `todo!()` outright, which is EXACT: the
+/// receiver panics before the arguments evaluate either way
+/// (`is_never_rooted`, transitive through method/field chains and bare
+/// `ValConvert` wrappers, deliberately NOT through type-pinning `CastAs`).
+/// aqua-amm 213→129, aqua-rewards 143→113, reflectors −3 todos each.
+const ERROR_CEILING: u32 = 749;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

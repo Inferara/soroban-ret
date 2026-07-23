@@ -574,6 +574,8 @@ static DBG_SLOTREAD: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_SLOTREAD").is_ok());
 static DBG_FDK: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_FDK").is_ok());
+static DBG_DKTRACE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_DKTRACE").is_ok());
 
 /// Issue #34 phase 2: classification of a frame slot whose abstract value was
 /// produced by the then arm of a shared-map `IfElse` join, from the
@@ -9572,6 +9574,9 @@ impl DkEval<'_> {
             let Some(ins) = func.body.get(ip) else {
                 break; // fell off the end = function return
             };
+            if *DBG_DKTRACE {
+                eprintln!("[DKTRACE] f={func_idx} ip={ip} {ins:?} stack={stack:?}");
+            }
             match ins {
                 WI::I32Const(v) => stack.push(DkVal::I32(*v)),
                 WI::I64Const(v) => stack.push(DkVal::I64(*v)),
@@ -16646,7 +16651,7 @@ fn extract_frame_slot_from_stack_val(val: &StackVal) -> Option<(u32, i32)> {
 /// Extract a U32 value from a SorobanExpr.
 /// Handles U32Literal directly, and I64Literal via Val decoding (tag 0x04 = U32).
 /// U32Val layout: bits 63-32 = value (major), bits 31-8 = 0 (minor), bits 7-0 = tag (0x04).
-fn extract_u32_from_expr(expr: &SorobanExpr) -> Option<u32> {
+pub(crate) fn extract_u32_from_expr(expr: &SorobanExpr) -> Option<u32> {
     match expr {
         SorobanExpr::U32Literal(v) => Some(*v),
         SorobanExpr::I32Literal(v) => Some(*v as u32),

@@ -168,9 +168,15 @@ pub fn compute_imports(module: &ContractModule, registry: &TypeRegistry) -> Toke
         }
     });
 
-    quote! {
+    let mut out = quote! {
         use soroban_sdk::{#(#items),*};
+    };
+    // `ToXdr` lives in the `xdr` submodule and is not re-exported from the
+    // crate root; `val.to_xdr(&env)` needs the trait in scope.
+    if needs.to_xdr {
+        out.extend(quote! { use soroban_sdk::xdr::ToXdr; });
     }
+    out
 }
 
 #[derive(Default)]
@@ -196,6 +202,7 @@ struct ImportNeeds {
     u256: bool,
     i256: bool,
     into_val: bool,
+    to_xdr: bool,
     val: bool,
 }
 
@@ -431,7 +438,14 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
         SorobanExpr::FieldAccess { object, .. } => {
             scan_expr(object, needs);
         }
-        SorobanExpr::MethodCall { object, args, .. } => {
+        SorobanExpr::MethodCall {
+            object,
+            method,
+            args,
+        } => {
+            if method == "to_xdr" {
+                needs.to_xdr = true;
+            }
             scan_expr(object, needs);
             for a in args {
                 scan_expr(a, needs);

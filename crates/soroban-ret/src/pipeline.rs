@@ -458,6 +458,21 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         }
         log::trace!("Pipeline pass: stage_4b4 recover_crypto_field_args");
 
+        // Stage 4b4b: lower surviving raw `bytes_new_from_linear_memory` calls.
+        // Runs AFTER 4b4 so the BLS field-argument recovery has already claimed
+        // its sites — an earlier (lifter-level) version of this lowering
+        // preempted that pass and regressed `map_fp2_to_g2(&proof.fp2)` to a
+        // modulus byte literal. A surviving raw call renders as the fabricated
+        // `env.buf()` API (E0599 on every site), so: constant pointer + length
+        // inside REAL initialized static data → the actual bytes as
+        // `Bytes::from_slice(&env, &[..])` (strict `read_bytes` — data-segment
+        // gaps stay out of model, they can hold runtime-written statics per
+        // the PR #44 audit); anything else → an honest `todo!()`.
+        for func in &mut contract_module.functions {
+            lower_bytes_new_from_linear_memory(&mut func.body, &wasm_module);
+        }
+        log::trace!("Pipeline pass: stage_4b4b lower_bytes_new_from_linear_memory");
+
         // Stage 4b5: bind data-carrying match-arm payloads (Fix D1, issue #14, udt). A
         // Soroban enum with data is a 2-element Vec `[discriminant, payload]`, so an arm
         // reads the variant's data via `<scrutinee>.get(1)`. The lifter leaves such arms
@@ -2896,6 +2911,73 @@ fn rewrite_crypto_args_stmts(
             }
             SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
                 rewrite_crypto_args_stmts(body, param, unconsumed)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// See the Stage 4b4b comment at the call site: lower every surviving raw
+/// `bytes_new_from_linear_memory` to real bytes or an honest hole — the raw
+/// form renders as the fabricated `env.buf()` API, which compiles nowhere.
+fn lower_bytes_new_from_linear_memory(stmts: &mut [SorobanStmt], wasm: &WasmModule) {
+    fn lower_expr(e: &mut SorobanExpr, wasm: &WasmModule) {
+        for c in child_exprs_mut(e) {
+            lower_expr(c, wasm);
+        }
+        if let SorobanExpr::RawHostCall {
+            module,
+            function,
+            args,
+        } = e
+            && module == "Buf"
+            && function == "bytes_new_from_linear_memory"
+        {
+            let bytes = (|| {
+                let ptr = crate::pattern::lifter::extract_u32_from_expr(args.first()?)?;
+                let len = crate::pattern::lifter::extract_u32_from_expr(args.get(1)?)?;
+                if len == 0 || len > 4096 {
+                    return None;
+                }
+                wasm.data_sections.read_bytes(ptr, len).map(|b| b.to_vec())
+            })();
+            *e = match bytes {
+                Some(b) => {
+                    cov_mark::hit!(static_bytes_new_lowered);
+                    SorobanExpr::BytesLiteral(b)
+                }
+                None => {
+                    cov_mark::hit!(bytes_new_holed);
+                    SorobanExpr::UnknownVal
+                }
+            };
+        }
+    }
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Expr(expr) | SorobanStmt::Return(Some(expr)) => lower_expr(expr, wasm),
+            SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+                lower_expr(value, wasm)
+            }
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                lower_expr(condition, wasm);
+                lower_bytes_new_from_linear_memory(then_body, wasm);
+                lower_bytes_new_from_linear_memory(else_body, wasm);
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                lower_expr(scrutinee, wasm);
+                for arm in arms {
+                    lower_bytes_new_from_linear_memory(&mut arm.body, wasm);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => {
+                lower_bytes_new_from_linear_memory(body, wasm);
             }
             _ => {}
         }
@@ -9477,5 +9559,55 @@ mod tests {
             )],
         }];
         assert!(!is_enum_identity_roundtrip(&wrong_scrutinee, "v"));
+    }
+
+    #[test]
+    fn bytes_new_lowering_reads_static_and_holes_lost() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (data (i32.const 2000) "\01\02\03\04"))"#,
+        )
+        .expect("wat parses");
+        let module = WasmModule::parse(&wasm).expect("module parses");
+        let raw = |args: Vec<SorobanExpr>| SorobanExpr::RawHostCall {
+            module: "Buf".into(),
+            function: "bytes_new_from_linear_memory".into(),
+            args,
+        };
+        // Constant pointer inside real static data → the actual bytes.
+        cov_mark::check!(static_bytes_new_lowered);
+        let mut stmts = vec![SorobanStmt::Expr(raw(vec![
+            SorobanExpr::U32Literal(2000),
+            SorobanExpr::U32Literal(4),
+        ]))];
+        lower_bytes_new_from_linear_memory(&mut stmts, &module);
+        assert!(matches!(
+            &stmts[0],
+            SorobanStmt::Expr(SorobanExpr::BytesLiteral(b)) if b == &vec![1, 2, 3, 4]
+        ));
+        // A lost pointer, and a constant pointing OUTSIDE initialized data
+        // (a gap can hold runtime-written statics — strict read refuses):
+        // both hole honestly instead of rendering the fabricated `env.buf()`.
+        cov_mark::check_count!(static_bytes_new_lowered, 0);
+        let mut stmts = vec![
+            SorobanStmt::Expr(raw(vec![
+                SorobanExpr::UnknownVal,
+                SorobanExpr::U32Literal(4),
+            ])),
+            SorobanStmt::Expr(raw(vec![
+                SorobanExpr::U32Literal(60000),
+                SorobanExpr::U32Literal(4),
+            ])),
+        ];
+        lower_bytes_new_from_linear_memory(&mut stmts, &module);
+        assert!(matches!(
+            &stmts[0],
+            SorobanStmt::Expr(SorobanExpr::UnknownVal)
+        ));
+        assert!(matches!(
+            &stmts[1],
+            SorobanStmt::Expr(SorobanExpr::UnknownVal)
+        ));
     }
 }
