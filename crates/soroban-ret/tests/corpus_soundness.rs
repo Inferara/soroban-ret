@@ -328,7 +328,29 @@ use std::process::Command;
 /// residue includes ~9 error-shape migrations at the buf-hole sites (fake
 /// `env.buf()` E0599s became inference fallout on the now-honest todo
 /// bindings — same already-broken functions, strictly more honest output).
-const ERROR_CEILING: u32 = 404;
+/// → 332 (issue #34 tranche 16: adopted defaults + construct arity, −72,
+/// zero per-contract regressions). Three levers: (1) enum-construct ARITY
+/// padding (stage 4m3 extension) — a TUPLE variant constructed with fewer
+/// fields than its spec declares renders as a bare fn item
+/// (`PoolDataKey::ResConfig` — E0277 `TryFromVal<Env, fn(..)>` the moment
+/// it flows into a Val conversion); the payload was LOST, not absent → pad
+/// with `todo!()` holes (`ResConfig(todo!())`). blend fixed/yieldblox −17
+/// each, blend-backstop's UserBalance keys likewise. (2) storage-KEY-adopted
+/// default repair (stage 4m6) — `let mut vp = DataKey::AllRecordData;` as
+/// the lost default arm of `if has(k) { vp = get(k).unwrap() }` is the
+/// lifter adopting a stale stack value (the KEY) as the VALUE — provably
+/// wrong (the reassignment types the local as the stored value; a key enum
+/// has no `contains_key`) and silently so. Airtight gate: the init
+/// EnumConstruct must be byte-equal to the key of a later get assigned to
+/// the same local → honest `todo!()` init. comet −17 (15 sites). (3) bool-
+/// local literal unification (stage 4m7) — a local with one provably-bool
+/// assignment (comparison/`contains_key`/`is_none`…) and otherwise only 0/1
+/// integer literals is the original `bool` in wasm encoding → literals
+/// become `false`/`true`. A `!`-rooted assignment is TYPE-NEUTRAL (renders
+/// as a coercing todo!()) and counts as disqualifying evidence — a never-
+/// rooted comparison init mis-unified reflector's `version() -> u32` local
+/// before that guard. soroban-domains −17, lightecho/soroswap tail.
+const ERROR_CEILING: u32 = 332;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

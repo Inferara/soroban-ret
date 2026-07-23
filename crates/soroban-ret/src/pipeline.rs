@@ -7,7 +7,7 @@
 /// 3. Pattern Matcher -> Soroban-Aware IR
 /// 4. IR Optimizer -> High-Level IR
 /// 5. Rust Emitter -> Formatted source code
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::codegen::module::{assemble_generic_module, assemble_module, format_source};
 use crate::ir::correctness::{
@@ -710,6 +710,23 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
             hole_pure_raw_host_reads(&mut func.body);
         }
         log::trace!("Pipeline pass: stage_4m5 hole_pure_raw_host_reads");
+
+        // Stage 4m6: a mutable local initialized with the storage KEY of the
+        // get that fills its other branch is the lifter mis-adopting a stale
+        // stack value as the lost default arm — provably wrong (the
+        // reassignment types the local as the stored value) → honest todo!().
+        for func in &mut contract_module.functions {
+            repair_key_adopted_defaults(&mut func.body);
+        }
+        log::trace!("Pipeline pass: stage_4m6 repair_key_adopted_defaults");
+
+        // Stage 4m7: a local with one provably-bool assignment and otherwise
+        // only 0/1 integer literals is the original `bool` in wasm encoding —
+        // rewrite the literals to `false`/`true`.
+        for func in &mut contract_module.functions {
+            unify_bool_locals(&mut func.body);
+        }
+        log::trace!("Pipeline pass: stage_4m7 unify_bool_locals");
 
         // Re-run variable name propagation + self-assignment removal.
         for func in &mut contract_module.functions {
@@ -3201,6 +3218,16 @@ fn hole_mistyped_construct_fields(stmts: &mut [SorobanStmt], registry: &TypeRegi
                 }) else {
                     return;
                 };
+                // Arity padding: a TUPLE variant constructed with fewer fields
+                // than its spec declares renders as a bare fn item
+                // (`PoolDataKey::ResConfig` without arguments — E0277 the
+                // moment it flows into a `Val` conversion). The payload was
+                // lost, not absent: pad with honest `todo!()` holes so the
+                // variant is at least the right shape.
+                while fields.len() < case_types.len() {
+                    cov_mark::hit!(enum_construct_arity_padded);
+                    fields.push(SorobanExpr::UnknownVal);
+                }
                 for (fexpr, fspec) in fields.iter_mut().zip(case_types.iter()) {
                     coerce_or_hole_field(fexpr, fspec, registry);
                 }
@@ -3399,6 +3426,236 @@ fn fold_option_void_compares_in(stmts: &mut [SorobanStmt], use_counts: &HashMap<
             _ => {}
         }
     }
+}
+
+/// Stage 4m6: repair storage-KEY-adopted default values.
+///
+/// The `if has(key) { v = get(key).unwrap() } else { v = <default> }` idiom
+/// loses its default arm at an unmodeled phi, and the lifter adopts a stale
+/// stack value — the storage KEY itself — as the initializer:
+///
+/// ```text
+/// let mut vp = DataKey::AllRecordData;               // ← the KEY, as a value
+/// if has(&DataKey::AllRecordData) { vp = get(&DataKey::AllRecordData).unwrap(); }
+/// vp.contains_key(t)                                  // E0599 on the enum
+/// ```
+///
+/// The init is provably wrong — the reassignment types the local as the
+/// STORED value, and a key enum has no collection methods — and silently so
+/// (`DataKey::X` as a value compiles in some positions). The airtight
+/// signature is the pass's gate: a mutable local initialized with an
+/// `EnumConstruct` that is byte-equal to the KEY of a later `StorageGet`
+/// assigned to the SAME local. The default arm's real value is lost →
+/// honest `todo!()` init. Locals with more than one `let` of the same name
+/// (shadowing) are skipped.
+fn repair_key_adopted_defaults(stmts: &mut [SorobanStmt]) {
+    // Collect per-name: how many Lets, the EnumConstruct inits, and the keys
+    // of gets assigned to the name.
+    fn collect(
+        stmts: &[SorobanStmt],
+        let_counts: &mut HashMap<String, u32>,
+        get_keys: &mut HashMap<String, Vec<SorobanExpr>>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Let { name, .. } => {
+                    *let_counts.entry(name.clone()).or_insert(0) += 1;
+                }
+                SorobanStmt::Assign {
+                    target,
+                    value: SorobanExpr::StorageGet { key, .. },
+                } => {
+                    get_keys
+                        .entry(target.clone())
+                        .or_default()
+                        .push((**key).clone());
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect(then_body, let_counts, get_keys);
+                    collect(else_body, let_counts, get_keys);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        collect(&arm.body, let_counts, get_keys);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => collect(body, let_counts, get_keys),
+                _ => {}
+            }
+        }
+    }
+    fn rewrite(
+        stmts: &mut [SorobanStmt],
+        let_counts: &HashMap<String, u32>,
+        get_keys: &HashMap<String, Vec<SorobanExpr>>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Let {
+                    name,
+                    mutable: true,
+                    value,
+                } => {
+                    if matches!(value, SorobanExpr::EnumConstruct { .. })
+                        && let_counts.get(name).copied().unwrap_or(0) == 1
+                        && get_keys
+                            .get(name)
+                            .is_some_and(|keys| keys.iter().any(|k| k == value))
+                    {
+                        cov_mark::hit!(key_adopted_default_holed);
+                        *value = SorobanExpr::UnknownVal;
+                    }
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    rewrite(then_body, let_counts, get_keys);
+                    rewrite(else_body, let_counts, get_keys);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        rewrite(&mut arm.body, let_counts, get_keys);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => rewrite(body, let_counts, get_keys),
+                _ => {}
+            }
+        }
+    }
+    let mut let_counts = HashMap::new();
+    let mut get_keys = HashMap::new();
+    collect(stmts, &mut let_counts, &mut get_keys);
+    if get_keys.is_empty() {
+        return;
+    }
+    rewrite(stmts, &let_counts, &get_keys);
+}
+
+/// Stage 4m7: unify bool-typed locals whose other assignments are the wasm
+/// `0`/`1` integer encoding of `false`/`true`.
+///
+/// `let mut var_2 = 1; if c { var_2 = hash.len() != N; } if var_2 { … }` —
+/// the local is PROVABLY `bool` (one assignment is a comparison; rustc
+/// unifies all assignments), and wasm has no bool type, so the `1` is the
+/// original `true`. Rewriting the 0/1 literals to `false`/`true` recovers
+/// the E0308 pair ("expected integer, found bool" at the assign + "expected
+/// bool, found integer" at the consumer). Fires only when at least one
+/// assignment is bool-typed and EVERY other assignment is a bare 0/1
+/// integer literal — anything else leaves the local untouched.
+fn unify_bool_locals(stmts: &mut [SorobanStmt]) {
+    fn is_zero_one(e: &SorobanExpr) -> Option<bool> {
+        match e {
+            SorobanExpr::I32Literal(v @ (0 | 1)) => Some(*v == 1),
+            SorobanExpr::I64Literal(v @ (0 | 1)) => Some(*v == 1),
+            SorobanExpr::U32Literal(v @ (0 | 1)) => Some(*v == 1),
+            SorobanExpr::U64Literal(v @ (0 | 1)) => Some(*v == 1),
+            _ => None,
+        }
+    }
+    fn collect(
+        stmts: &[SorobanStmt],
+        assigns: &mut HashMap<String, (u32, u32, u32)>, // (bool_typed, zero_one, other)
+    ) {
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Let { name, value, .. }
+                | SorobanStmt::Assign {
+                    target: name,
+                    value,
+                } => {
+                    let entry = assigns.entry(name.clone()).or_insert((0, 0, 0));
+                    // A `!`-rooted value is TYPE-NEUTRAL, not bool evidence:
+                    // it renders as a coercing `todo!()`, and a never-rooted
+                    // comparison (`todo!() == x`) says nothing about the
+                    // local's real type (reflector's `version() -> u32` local
+                    // was mis-unified to `false` by exactly this). Count it
+                    // as "other" so the gate refuses the local.
+                    if value.is_never_rooted() {
+                        entry.2 += 1;
+                    } else if crate::ir::optimizer::is_bool_typed(value) {
+                        entry.0 += 1;
+                    } else if is_zero_one(value).is_some() {
+                        entry.1 += 1;
+                    } else {
+                        entry.2 += 1;
+                    }
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect(then_body, assigns);
+                    collect(else_body, assigns);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        collect(&arm.body, assigns);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => collect(body, assigns),
+                _ => {}
+            }
+        }
+    }
+    fn rewrite(stmts: &mut [SorobanStmt], bool_locals: &HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Let { name, value, .. }
+                | SorobanStmt::Assign {
+                    target: name,
+                    value,
+                } => {
+                    if bool_locals.contains(name)
+                        && let Some(b) = is_zero_one(value)
+                    {
+                        cov_mark::hit!(bool_local_literal_unified);
+                        *value = SorobanExpr::BoolLiteral(b);
+                    }
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    rewrite(then_body, bool_locals);
+                    rewrite(else_body, bool_locals);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        rewrite(&mut arm.body, bool_locals);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => rewrite(body, bool_locals),
+                _ => {}
+            }
+        }
+    }
+    let mut assigns = HashMap::new();
+    collect(stmts, &mut assigns);
+    let bool_locals: HashSet<String> = assigns
+        .into_iter()
+        .filter(|(_, (bools, zero_ones, others))| *bools >= 1 && *zero_ones >= 1 && *others == 0)
+        .map(|(name, _)| name)
+        .collect();
+    if bool_locals.is_empty() {
+        return;
+    }
+    rewrite(stmts, &bool_locals);
 }
 
 /// Stage 4m5: hole surviving PURE-READ raw host-call renders to `UnknownVal`.
@@ -10352,6 +10609,191 @@ mod tests {
         assert!(matches!(
             &stmts[2],
             SorobanStmt::Expr(SorobanExpr::RawHostCall { .. })
+        ));
+    }
+
+    #[test]
+    fn enum_construct_arity_pads_with_holes() {
+        use stellar_xdr::curr::{
+            ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0,
+            ScSpecUdtUnionV0, StringM, VecM,
+        };
+        let spec = ScSpecUdtUnionV0 {
+            doc: StringM::default(),
+            lib: StringM::default(),
+            name: "PoolDataKey".try_into().unwrap(),
+            cases: VecM::try_from(vec![
+                ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
+                    doc: StringM::default(),
+                    name: "ResConfig".try_into().unwrap(),
+                    type_: VecM::try_from(vec![ScSpecTypeDef::Address]).unwrap(),
+                }),
+                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                    doc: StringM::default(),
+                    name: "Admin".try_into().unwrap(),
+                }),
+            ])
+            .unwrap(),
+        };
+        let mut registry = TypeRegistry {
+            functions: Default::default(),
+            structs: Default::default(),
+            unions: Default::default(),
+            enums: Default::default(),
+            error_enums: Default::default(),
+            events: Default::default(),
+            meta: Vec::new(),
+            spec_entries: Vec::new(),
+        };
+        registry.unions.insert("PoolDataKey".into(), spec);
+
+        let construct = |variant: &str| SorobanExpr::EnumConstruct {
+            type_name: "PoolDataKey".into(),
+            variant: variant.into(),
+            fields: vec![],
+        };
+        let mut stmts = vec![
+            // Tuple variant built with 0 of its 1 declared fields: padded.
+            SorobanStmt::Expr(construct("ResConfig")),
+            // Unit (Void) variant: correctly bare, untouched.
+            SorobanStmt::Expr(construct("Admin")),
+        ];
+        hole_mistyped_construct_fields(&mut stmts, &registry);
+        let SorobanStmt::Expr(SorobanExpr::EnumConstruct { fields, .. }) = &stmts[0] else {
+            panic!("enum construct expected");
+        };
+        assert_eq!(fields.len(), 1, "lost payload should be padded");
+        assert!(matches!(fields[0], SorobanExpr::UnknownVal));
+        let SorobanStmt::Expr(SorobanExpr::EnumConstruct { fields, .. }) = &stmts[1] else {
+            panic!("enum construct expected");
+        };
+        assert!(fields.is_empty(), "unit variant stays bare");
+    }
+
+    #[test]
+    fn key_adopted_default_init_holes() {
+        let key = || SorobanExpr::EnumConstruct {
+            type_name: "DataKey".into(),
+            variant: "AllRecordData".into(),
+            fields: vec![],
+        };
+        let get = SorobanExpr::StorageGet {
+            storage_type: crate::ir::soroban_ir::StorageType::Persistent,
+            key: Box::new(key()),
+            unwrap: true,
+            on_missing: None,
+        };
+        let mut stmts = vec![
+            SorobanStmt::Let {
+                name: "vp".into(),
+                mutable: true,
+                value: key(),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::StorageHas {
+                    storage_type: crate::ir::soroban_ir::StorageType::Persistent,
+                    key: Box::new(key()),
+                },
+                then_body: vec![SorobanStmt::Assign {
+                    target: "vp".into(),
+                    value: get,
+                }],
+                else_body: vec![],
+            },
+            // A DIFFERENT enum init with no matching get: untouched.
+            SorobanStmt::Let {
+                name: "other".into(),
+                mutable: true,
+                value: SorobanExpr::EnumConstruct {
+                    type_name: "DataKey".into(),
+                    variant: "Admin".into(),
+                    fields: vec![],
+                },
+            },
+        ];
+        repair_key_adopted_defaults(&mut stmts);
+        assert!(matches!(
+            &stmts[0],
+            SorobanStmt::Let {
+                value: SorobanExpr::UnknownVal,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &stmts[2],
+            SorobanStmt::Let {
+                value: SorobanExpr::EnumConstruct { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bool_locals_unify_zero_one_literals() {
+        let cmp = SorobanExpr::Ne(
+            Box::new(SorobanExpr::Param("n".into())),
+            Box::new(SorobanExpr::U32Literal(32)),
+        );
+        let mut stmts = vec![
+            SorobanStmt::Let {
+                name: "flag".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(1),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::Param("c".into()),
+                then_body: vec![SorobanStmt::Assign {
+                    target: "flag".into(),
+                    value: cmp,
+                }],
+                else_body: vec![],
+            },
+            // A local with a non-0/1, non-bool assignment: untouched.
+            SorobanStmt::Let {
+                name: "n2".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(1),
+            },
+            SorobanStmt::Assign {
+                target: "n2".into(),
+                value: SorobanExpr::I32Literal(7),
+            },
+            // A never-rooted comparison is TYPE-NEUTRAL (renders as a
+            // coercing todo!()) — no bool evidence, local untouched.
+            SorobanStmt::Let {
+                name: "n3".into(),
+                mutable: true,
+                value: SorobanExpr::Eq(
+                    Box::new(SorobanExpr::UnknownVal),
+                    Box::new(SorobanExpr::U32Literal(1)),
+                ),
+            },
+            SorobanStmt::Assign {
+                target: "n3".into(),
+                value: SorobanExpr::I32Literal(0),
+            },
+        ];
+        unify_bool_locals(&mut stmts);
+        assert!(matches!(
+            &stmts[0],
+            SorobanStmt::Let {
+                value: SorobanExpr::BoolLiteral(true),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &stmts[2],
+            SorobanStmt::Let {
+                value: SorobanExpr::I32Literal(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &stmts[5],
+            SorobanStmt::Assign {
+                value: SorobanExpr::I32Literal(0),
+                ..
+            }
         ));
     }
 
