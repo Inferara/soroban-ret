@@ -268,7 +268,7 @@ use std::process::Command;
 /// 0/1-plausible for Bool/numeric slots. `child_exprs`/`child_exprs_mut`
 /// walkers gained the missing EnumConstruct/MapConstruct arms (construct
 /// payloads were invisible to every walker-based pass before).
-/// → 479 (issue #34 tranche 14: never-value rendering discipline, −255;
+/// → 478 (issue #34 tranche 14: never-value rendering discipline, −256;
 /// digicus becomes the THIRD clean-compiling contract, zero per-contract
 /// regressions). One principle, five renders: a `!`-rooted ("never") value —
 /// an already-lost `todo!()` and anything provably downstream of one — must
@@ -293,9 +293,12 @@ use std::process::Command;
 /// untouched (its `let` unifies to the real type). `child_exprs(_mut)`
 /// completed the remaining child-bearing variants (crypto/invoke/event/
 /// prng/ttl/Try/Some/Log — uses inside them were invisible to every walker).
-/// aqua-amm 129→65, aqua-rewards 99→49, blend-backstop 32→9, blend pools
+/// The invoke-arg bare-todo exception broadened from literal `UnknownVal` to
+/// any `!`-rooted arg (a never chain renders as bare `todo!()` via the chain
+/// husk, so appending `.into_val` rebuilt the E0277 it exists to avoid).
+/// aqua-amm 129→64, aqua-rewards 99→49, blend-backstop 32→9, blend pools
 /// 67→43 ×2, reflectors 18→9 ×2, soroswap 14→4/36→29, digicus 1→0 CLEAN.
-const ERROR_CEILING: u32 = 479;
+const ERROR_CEILING: u32 = 478;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

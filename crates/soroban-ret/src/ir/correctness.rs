@@ -1635,6 +1635,17 @@ fn literal_scalar_class(e: &SorobanExpr) -> Option<&'static str> {
 // introduces (rustc would reject it — there is no working code to disturb) and
 // shape 2 requires every assignment to be `!`-rooted, so the pass is a strict
 // no-op on compiling bodies.
+//
+// Shadowing note (deliberate conservatism): pass 2 groups bindings by NAME
+// across the whole function, not by lexical binding. Under shadowing this can
+// only ever *withhold* a husk, never mis-apply one: a name husks only when
+// EVERY binding of it is `!`-rooted, which is exact regardless of which
+// binding dominates a given use (each one panics at its own execution) — while
+// a single real binding anywhere disqualifies the name, leaving a genuinely
+// `!`-typed shadowed sibling un-husked. That miss keeps today's render (the
+// error stays visible in the soundness ratchet, nothing silently wrong), and
+// the corpus has zero such sites — scope-identity tracking can be added if one
+// ever appears.
 
 pub fn husk_unbound_local_uses(
     mut stmts: Vec<SorobanStmt>,
@@ -2094,6 +2105,45 @@ mod tests {
         };
         assert!(matches!(**a, SorobanExpr::NamedLocal(_)));
         assert!(matches!(**b, SorobanExpr::NamedLocal(_)));
+        let SorobanStmt::Return(Some(e)) = &out[2] else {
+            panic!("return expected");
+        };
+        assert!(matches!(e, SorobanExpr::NamedLocal(_)));
+    }
+
+    #[test]
+    fn shadowed_mixed_bindings_conservatively_untouched() {
+        // Outer `let x = 5;` + inner shadowing `let x = todo!();` share the
+        // name, so the real outer RHS disqualifies `x` from the never set —
+        // the inner use stays as-is (a withheld husk, never a wrong one).
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "x".into(),
+                mutable: false,
+                value: SorobanExpr::U32Literal(5),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::Param("c".into()),
+                then_body: vec![
+                    SorobanStmt::Let {
+                        name: "x".into(),
+                        mutable: false,
+                        value: SorobanExpr::UnknownVal,
+                    },
+                    SorobanStmt::Expr(SorobanExpr::CryptoSha256(Box::new(named("x")))),
+                ],
+                else_body: vec![],
+            },
+            SorobanStmt::Return(Some(named("x"))),
+        ];
+        let out = husk_unbound_local_uses(stmts, &[]);
+        let SorobanStmt::If { then_body, .. } = &out[1] else {
+            panic!("if expected");
+        };
+        let SorobanStmt::Expr(SorobanExpr::CryptoSha256(arg)) = &then_body[1] else {
+            panic!("sha256 expected");
+        };
+        assert!(matches!(**arg, SorobanExpr::NamedLocal(_)));
         let SorobanStmt::Return(Some(e)) = &out[2] else {
             panic!("return expected");
         };

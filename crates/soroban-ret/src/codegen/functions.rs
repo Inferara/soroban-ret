@@ -478,8 +478,11 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                     let e = generate_expr(a);
                     // A lost arg renders as a bare `todo!()` (`!`), which already
                     // coerces to the element type; `.into_val()` on `!` does not
-                    // type-check (`Val: TryFromVal<Env, !>`, E0277). Keep it bare.
-                    if matches!(a, SorobanExpr::UnknownVal) {
+                    // type-check (`Val: TryFromVal<Env, !>`, E0277). Keep it bare
+                    // — for ANY `!`-rooted arg (a never chain also renders as a
+                    // bare `todo!()` via the chain husk, so appending `.into_val`
+                    // to its tokens would rebuild the same E0277).
+                    if is_never_rooted(a) {
                         e
                     } else {
                         quote! { #e.into_val(&env) }
@@ -504,8 +507,11 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                     let e = generate_expr(a);
                     // A lost arg renders as a bare `todo!()` (`!`), which already
                     // coerces to the element type; `.into_val()` on `!` does not
-                    // type-check (`Val: TryFromVal<Env, !>`, E0277). Keep it bare.
-                    if matches!(a, SorobanExpr::UnknownVal) {
+                    // type-check (`Val: TryFromVal<Env, !>`, E0277). Keep it bare
+                    // — for ANY `!`-rooted arg (a never chain also renders as a
+                    // bare `todo!()` via the chain husk, so appending `.into_val`
+                    // to its tokens would rebuild the same E0277).
+                    if is_never_rooted(a) {
                         e
                     } else {
                         quote! { #e.into_val(&env) }
@@ -2389,6 +2395,30 @@ mod generate_expr_tests {
             out.contains("todo !"),
             "lost arg should stay a bare todo!(): {out}"
         );
+    }
+
+    #[test]
+    fn invoke_contract_never_chain_arg_stays_bare_todo() {
+        // A `!`-rooted CHAIN arg (not a literal UnknownVal) renders as a bare
+        // `todo!()` via the chain husk — appending `.into_val(&env)` to those
+        // tokens would rebuild the E0277 the husk exists to avoid.
+        let e = SorobanExpr::InvokeContract {
+            address: boxed(SorobanExpr::Param("addr".into())),
+            function: boxed(SorobanExpr::SymbolLiteral("f".into())),
+            args: vec![SorobanExpr::MethodCall {
+                object: boxed(SorobanExpr::UnknownVal),
+                method: "clone".into(),
+                args: vec![],
+            }],
+            return_type: None,
+        };
+        let out = collapse(&s(generate_expr(&e)));
+        assert_eq!(
+            out.matches("into_val").count(),
+            0,
+            "never-chain arg must stay bare: {out}"
+        );
+        assert!(out.contains("todo !"), "got: {out}");
     }
 
     #[test]
