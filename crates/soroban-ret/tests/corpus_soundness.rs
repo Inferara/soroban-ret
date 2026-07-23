@@ -298,7 +298,37 @@ use std::process::Command;
 /// husk, so appending `.into_val` rebuilt the E0277 it exists to avoid).
 /// aqua-amm 129→64, aqua-rewards 99→49, blend-backstop 32→9, blend pools
 /// 67→43 ×2, reflectors 18→9 ×2, soroswap 14→4/36→29, digicus 1→0 CLEAN.
-const ERROR_CEILING: u32 = 478;
+/// → 404 (issue #34 tranche 15: semantic recoveries, −74, zero per-contract
+/// regressions). Three levers: (1) Option-Void compare recovery — the SDK's
+/// `Vec::first_index_of`/`last_index_of` return `Option<u32>`; at the Val
+/// level `None` is the Void word (raw == 2) and `Some(i)` is `(i<<32)|4`
+/// (never 2), so a bare index-of compared to literal 2 is EXACTLY the `None`
+/// check: `== 2` → `.is_none()`, `!= 2` → `.is_some()` (30 corpus sites).
+/// Since `first_index_of(item: impl Borrow<T>)` consumes its argument, a
+/// multi-use identifier arg gets a `.clone()` (host-handle refcount bump =
+/// same value; borrowck rejected the move the moment the comparison
+/// type-checked — 34 E0382s in aqua-rewards alone, previously masked by the
+/// comparison's own type error); an UNKNOWN item (todo-containing arg) makes
+/// the whole comparison an honest `todo!()` instead (index-of-unknown is
+/// unknown; a `!`/lost arg can't satisfy `Borrow<T>` anyway). (2) Bytes
+/// append-chain block render — the lifter models the `bytes_append` HOST fn
+/// functionally (`Bytes::new(&env).append(a).append(b)`), but the SDK's
+/// `append(&mut self, &Bytes)` returns `()`, so every chain is E0599 on the
+/// second link; re-render as a mutable-accumulator block (the SDK wrapper's
+/// own shape, identical semantics), with `Hash<32>` digest args coerced via
+/// the SDK's own `Bytes::from(h.to_bytes())`. Gated to chains based at a
+/// fresh `Bytes::new` — receiver-typed appends on locals stay. (3) Pure-read
+/// raw host-call holes — `map_key_by_pos`/`map_val_by_pos`/`bytes_front`/
+/// `bytes_copy_from_linear_memory` have no SDK lowering and rendered as
+/// `env.map().…` (E0599 "Env is not an iterator"); all are functional reads
+/// with no chain-state effect → honest `UnknownVal` at the IR level, so the
+/// t14 unbound-local machinery composes (discarded reads drop, bindings husk).
+/// soroban-domains 92→70, aqua-rewards 49→24, soroswap 29→17, aqua-amm
+/// 64→55, blend fixed/yieldblox 43→41 ×2, lightecho 22→21. aqua-rewards'
+/// residue includes ~9 error-shape migrations at the buf-hole sites (fake
+/// `env.buf()` E0599s became inference fallout on the now-honest todo
+/// bindings — same already-broken functions, strictly more honest output).
+const ERROR_CEILING: u32 = 404;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
