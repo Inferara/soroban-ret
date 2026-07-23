@@ -1608,6 +1608,320 @@ fn literal_scalar_class(e: &SorobanExpr) -> Option<&'static str> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Detector 4: uses of unbound or `!`-bound locals (rustc E0425 / E0308 `&!`).
+// ---------------------------------------------------------------------------
+//
+// Lost loop/phi dataflow leaves two shapes a correctly-lifted body can never
+// contain:
+//
+//   1. An expression referencing a local with **no visible binding** — most
+//      often a self-referential residue of a lost accumulation loop
+//      (`let var_2 = var_2.append(t.to_xdr(&env));` from a lost
+//      `for t in tokens { salt.append(&t.to_xdr(&env)) }`), or a use after the
+//      join of a binding that only exists inside one branch. E0425 — and the
+//      value at the use site is genuinely unknown (its defining flow was not
+//      threaded), so `todo!("unknown value")` is the honest render.
+//
+//   2. A use of a local **every** binding of which is `!`-rooted
+//      (`let var_5 = todo!("unknown value"); f(&var_5);`). The binding panics
+//      before any use executes, so replacing the uses with `UnknownVal` is
+//      exact — and necessary, because a `!`-typed *variable* breaks in ways a
+//      bare `todo!()` does not (`&var_5` is `&!`, E0308; operator traits fall
+//      back to `()`, E0277). A local with at least one real binding is left
+//      alone: its `let` unifies to the real type and a `todo!()` init coerces.
+//
+// Conservative by construction: shape 1 requires a name no visible binding
+// introduces (rustc would reject it — there is no working code to disturb) and
+// shape 2 requires every assignment to be `!`-rooted, so the pass is a strict
+// no-op on compiling bodies.
+
+pub fn husk_unbound_local_uses(
+    mut stmts: Vec<SorobanStmt>,
+    params: &[FnParam],
+) -> Vec<SorobanStmt> {
+    // Pass 1: scope-accurate walk replacing uses of names with no visible
+    // binding at the use site.
+    let mut scope: Vec<HashSet<String>> = vec![params.iter().map(|p| p.name.clone()).collect()];
+    subst_undeclared_uses(&mut stmts, &mut scope);
+
+    // Pass 2: find locals whose every binding is `!`-rooted. Monotone fixpoint:
+    // a binding like `let b = a.method();` only shows as `!`-rooted once `a` is
+    // known never-bound, so grow the set until stable.
+    let mut bindings: HashMap<String, Vec<SorobanExpr>> = HashMap::new();
+    let mut real_bound: HashSet<String> = HashSet::new();
+    collect_bindings(&stmts, &mut bindings, &mut real_bound);
+    let mut never: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (name, rhss) in &bindings {
+            if never.contains(name) || real_bound.contains(name) {
+                continue;
+            }
+            if rhss.iter().all(|e| never_rooted_with(e, &never)) {
+                never.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Pass 3: replace every use of a never-bound local with `UnknownVal`. The
+    // binding itself stays (its `!`-rooted initializer already renders as
+    // `todo!()` via the codegen chain husk).
+    if !never.is_empty() {
+        for stmt in &mut stmts {
+            subst_never_uses_stmt(stmt, &never);
+        }
+    }
+    stmts
+}
+
+/// Canonical codegen name of a variable-reference expression.
+/// (`Local(3)` renders as `var_3`; `NamedLocal` renders its string.)
+fn local_use_name(e: &SorobanExpr) -> Option<String> {
+    match e {
+        SorobanExpr::Local(i) => Some(format!("var_{i}")),
+        SorobanExpr::NamedLocal(n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+fn declare(scope: &mut [HashSet<String>], name: &str) {
+    if let Some(top) = scope.last_mut() {
+        top.insert(name.to_string());
+    }
+}
+
+fn is_visible(scope: &[HashSet<String>], name: &str) -> bool {
+    scope.iter().any(|frame| frame.contains(name))
+}
+
+fn subst_undeclared_expr(e: &mut SorobanExpr, scope: &[HashSet<String>]) {
+    if let Some(name) = local_use_name(e) {
+        if !is_visible(scope, &name) {
+            *e = SorobanExpr::UnknownVal;
+        }
+        return;
+    }
+    for c in crate::pipeline::child_exprs_mut(e) {
+        subst_undeclared_expr(c, scope);
+    }
+}
+
+fn subst_undeclared_uses(stmts: &mut [SorobanStmt], scope: &mut Vec<HashSet<String>>) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Let { name, value, .. } => {
+                // The initializer is evaluated before the binding exists, so a
+                // self-reference inside it is an undeclared use.
+                subst_undeclared_expr(value, scope);
+                declare(scope, name);
+            }
+            SorobanStmt::Assign { target, value } => {
+                subst_undeclared_expr(value, scope);
+                // An assign to an undeclared target is Detector 3's problem
+                // (`declare_undeclared_assignments`); uses are ours.
+                let _ = target;
+            }
+            SorobanStmt::Expr(e) => subst_undeclared_expr(e, scope),
+            SorobanStmt::Return(Some(e)) => subst_undeclared_expr(e, scope),
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                subst_undeclared_expr(condition, scope);
+                scope.push(HashSet::new());
+                subst_undeclared_uses(then_body, scope);
+                scope.pop();
+                scope.push(HashSet::new());
+                subst_undeclared_uses(else_body, scope);
+                scope.pop();
+            }
+            SorobanStmt::Match { scrutinee, arms } => {
+                subst_undeclared_expr(scrutinee, scope);
+                for arm in arms {
+                    scope.push(HashSet::new());
+                    if let super::soroban_ir::MatchPattern::EnumVariant { bindings, .. } =
+                        &arm.pattern
+                    {
+                        for b in bindings {
+                            declare(scope, b);
+                        }
+                    }
+                    subst_undeclared_uses(&mut arm.body, scope);
+                    scope.pop();
+                }
+            }
+            SorobanStmt::Loop { body } => {
+                scope.push(HashSet::new());
+                subst_undeclared_uses(body, scope);
+                scope.pop();
+            }
+            SorobanStmt::For {
+                var,
+                start,
+                end,
+                body,
+                ..
+            } => {
+                subst_undeclared_expr(start, scope);
+                subst_undeclared_expr(end, scope);
+                scope.push(HashSet::new());
+                declare(scope, var);
+                subst_undeclared_uses(body, scope);
+                scope.pop();
+            }
+            SorobanStmt::Block(body) => {
+                scope.push(HashSet::new());
+                subst_undeclared_uses(body, scope);
+                scope.pop();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect every RHS written to each name (`let` inits and assignments), and
+/// the names bound by non-expression constructs (`for` variables, match-arm
+/// destructurings) — those are always real values, never `!`.
+fn collect_bindings(
+    stmts: &[SorobanStmt],
+    bindings: &mut HashMap<String, Vec<SorobanExpr>>,
+    real_bound: &mut HashSet<String>,
+) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Let { name, value, .. } => {
+                bindings
+                    .entry(name.clone())
+                    .or_default()
+                    .push(value.clone());
+            }
+            SorobanStmt::Assign { target, value } => {
+                bindings
+                    .entry(target.clone())
+                    .or_default()
+                    .push(value.clone());
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_bindings(then_body, bindings, real_bound);
+                collect_bindings(else_body, bindings, real_bound);
+            }
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms {
+                    if let super::soroban_ir::MatchPattern::EnumVariant { bindings: bs, .. } =
+                        &arm.pattern
+                    {
+                        real_bound.extend(bs.iter().cloned());
+                    }
+                    collect_bindings(&arm.body, bindings, real_bound);
+                }
+            }
+            SorobanStmt::For { var, body, .. } => {
+                real_bound.insert(var.clone());
+                collect_bindings(body, bindings, real_bound);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                collect_bindings(body, bindings, real_bound);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// [`SorobanExpr::is_never_rooted`] extended with "a reference to a local in
+/// `never` is `!`-rooted" — needed because never-ness flows through bindings
+/// (`let b = a.method();` is `!`-rooted once `a` is known never-bound).
+fn never_rooted_with(e: &SorobanExpr, never: &HashSet<String>) -> bool {
+    if let Some(name) = local_use_name(e) {
+        return never.contains(&name);
+    }
+    match e {
+        SorobanExpr::MethodCall { object, .. } | SorobanExpr::FieldAccess { object, .. } => {
+            never_rooted_with(object, never)
+        }
+        SorobanExpr::ValConvert { value, .. } => never_rooted_with(value, never),
+        SorobanExpr::Add(a, b)
+        | SorobanExpr::Sub(a, b)
+        | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Div(a, b)
+        | SorobanExpr::Rem(a, b)
+        | SorobanExpr::Eq(a, b)
+        | SorobanExpr::Ne(a, b)
+        | SorobanExpr::Lt(a, b)
+        | SorobanExpr::Le(a, b)
+        | SorobanExpr::Gt(a, b)
+        | SorobanExpr::Ge(a, b) => {
+            never_rooted_with(a, never) || (never_rooted_with(b, never) && a.is_effect_free())
+        }
+        SorobanExpr::Not(a) => never_rooted_with(a, never),
+        _ => e.is_never_rooted(),
+    }
+}
+
+fn subst_never_expr(e: &mut SorobanExpr, never: &HashSet<String>) {
+    if let Some(name) = local_use_name(e) {
+        if never.contains(&name) {
+            *e = SorobanExpr::UnknownVal;
+        }
+        return;
+    }
+    for c in crate::pipeline::child_exprs_mut(e) {
+        subst_never_expr(c, never);
+    }
+}
+
+fn subst_never_uses_stmt(stmt: &mut SorobanStmt, never: &HashSet<String>) {
+    match stmt {
+        SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+            subst_never_expr(value, never)
+        }
+        SorobanStmt::Expr(e) => subst_never_expr(e, never),
+        SorobanStmt::Return(Some(e)) => subst_never_expr(e, never),
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            subst_never_expr(condition, never);
+            for s in then_body.iter_mut().chain(else_body.iter_mut()) {
+                subst_never_uses_stmt(s, never);
+            }
+        }
+        SorobanStmt::Match { scrutinee, arms } => {
+            subst_never_expr(scrutinee, never);
+            for arm in arms {
+                for s in &mut arm.body {
+                    subst_never_uses_stmt(s, never);
+                }
+            }
+        }
+        SorobanStmt::For {
+            start, end, body, ..
+        } => {
+            subst_never_expr(start, never);
+            subst_never_expr(end, never);
+            for s in body {
+                subst_never_uses_stmt(s, never);
+            }
+        }
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+            for s in body {
+                subst_never_uses_stmt(s, never);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,6 +1932,191 @@ mod tests {
             storage_type: StorageType::Persistent,
             key: Box::new(SorobanExpr::Param(key.into())),
         })
+    }
+
+    // ----- Detector 4: unbound / `!`-bound local uses -----
+
+    fn named(n: &str) -> SorobanExpr {
+        SorobanExpr::NamedLocal(n.into())
+    }
+
+    #[test]
+    fn self_referential_let_and_downstream_uses_husk() {
+        // `let var_2 = var_2.append(x);` — the init's self-reference is an
+        // undeclared use → UnknownVal; the binding becomes `!`-rooted, so the
+        // later `sha256(&var_2)` use husks too.
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_2".into(),
+                mutable: false,
+                value: SorobanExpr::MethodCall {
+                    object: Box::new(named("var_2")),
+                    method: "append".into(),
+                    args: vec![SorobanExpr::Param("x".into())],
+                },
+            },
+            SorobanStmt::Expr(SorobanExpr::CryptoSha256(Box::new(named("var_2")))),
+        ];
+        let out = husk_unbound_local_uses(stmts, &[]);
+        let SorobanStmt::Let { value, .. } = &out[0] else {
+            panic!("let expected");
+        };
+        let SorobanExpr::MethodCall { object, .. } = value else {
+            panic!("method call expected");
+        };
+        assert!(matches!(**object, SorobanExpr::UnknownVal));
+        let SorobanStmt::Expr(SorobanExpr::CryptoSha256(arg)) = &out[1] else {
+            panic!("sha256 expected");
+        };
+        assert!(matches!(**arg, SorobanExpr::UnknownVal));
+    }
+
+    #[test]
+    fn never_bound_local_uses_husk_but_mixed_bindings_stay() {
+        // All-`!` bindings → uses husk.
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "a".into(),
+                mutable: false,
+                value: SorobanExpr::UnknownVal,
+            },
+            SorobanStmt::Expr(SorobanExpr::CryptoSha256(Box::new(named("a")))),
+        ];
+        let out = husk_unbound_local_uses(stmts, &[]);
+        let SorobanStmt::Expr(SorobanExpr::CryptoSha256(arg)) = &out[1] else {
+            panic!("sha256 expected");
+        };
+        assert!(matches!(**arg, SorobanExpr::UnknownVal));
+
+        // A later REAL assignment: the `let` unifies to the real type (the
+        // `todo!()` init coerces), so uses must stay untouched.
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "a".into(),
+                mutable: true,
+                value: SorobanExpr::UnknownVal,
+            },
+            SorobanStmt::Assign {
+                target: "a".into(),
+                value: SorobanExpr::U32Literal(5),
+            },
+            SorobanStmt::Expr(SorobanExpr::CryptoSha256(Box::new(named("a")))),
+        ];
+        let out = husk_unbound_local_uses(stmts, &[]);
+        let SorobanStmt::Expr(SorobanExpr::CryptoSha256(arg)) = &out[2] else {
+            panic!("sha256 expected");
+        };
+        assert!(matches!(**arg, SorobanExpr::NamedLocal(_)));
+    }
+
+    #[test]
+    fn never_ness_flows_through_bindings() {
+        // `let a = todo!(); let b = a.len(); use(b)` — b is `!`-rooted only
+        // once `a` is known never-bound (the fixpoint), so use(b) husks.
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "a".into(),
+                mutable: false,
+                value: SorobanExpr::UnknownVal,
+            },
+            SorobanStmt::Let {
+                name: "b".into(),
+                mutable: false,
+                value: SorobanExpr::MethodCall {
+                    object: Box::new(named("a")),
+                    method: "len".into(),
+                    args: vec![],
+                },
+            },
+            SorobanStmt::Return(Some(named("b"))),
+        ];
+        let out = husk_unbound_local_uses(stmts, &[]);
+        let SorobanStmt::Return(Some(e)) = &out[2] else {
+            panic!("return expected");
+        };
+        assert!(matches!(e, SorobanExpr::UnknownVal));
+    }
+
+    #[test]
+    fn branch_scoped_binding_use_after_join_husks() {
+        // `if c { let x = 5; } use(x)` — x is not visible after the join; the
+        // use is E0425 and the value at that point is genuinely unknown.
+        let stmts = vec![
+            SorobanStmt::If {
+                condition: SorobanExpr::Param("c".into()),
+                then_body: vec![SorobanStmt::Let {
+                    name: "x".into(),
+                    mutable: false,
+                    value: SorobanExpr::U32Literal(5),
+                }],
+                else_body: vec![],
+            },
+            SorobanStmt::Return(Some(named("x"))),
+        ];
+        let out = husk_unbound_local_uses(stmts, &[]);
+        let SorobanStmt::Return(Some(e)) = &out[1] else {
+            panic!("return expected");
+        };
+        assert!(matches!(e, SorobanExpr::UnknownVal));
+    }
+
+    #[test]
+    fn declared_locals_params_and_loop_vars_untouched() {
+        let params = vec![FnParam {
+            name: "p".into(),
+            type_def: ScSpecTypeDef::U32,
+        }];
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "x".into(),
+                mutable: false,
+                value: SorobanExpr::Param("p".into()),
+            },
+            SorobanStmt::For {
+                var: "i".into(),
+                start: SorobanExpr::U32Literal(0),
+                end: SorobanExpr::U32Literal(3),
+                step: 1,
+                body: vec![SorobanStmt::Expr(SorobanExpr::Add(
+                    Box::new(named("x")),
+                    Box::new(named("i")),
+                ))],
+            },
+            SorobanStmt::Return(Some(named("x"))),
+        ];
+        let out = husk_unbound_local_uses(stmts.clone(), &params);
+        // Nothing husked: x is let-bound to a real value, i is a for-var.
+        let SorobanStmt::For { body, .. } = &out[1] else {
+            panic!("for expected");
+        };
+        let SorobanStmt::Expr(SorobanExpr::Add(a, b)) = &body[0] else {
+            panic!("add expected");
+        };
+        assert!(matches!(**a, SorobanExpr::NamedLocal(_)));
+        assert!(matches!(**b, SorobanExpr::NamedLocal(_)));
+        let SorobanStmt::Return(Some(e)) = &out[2] else {
+            panic!("return expected");
+        };
+        assert!(matches!(e, SorobanExpr::NamedLocal(_)));
+    }
+
+    #[test]
+    fn local_index_form_matches_let_name() {
+        // `Local(2)` renders as `var_2` — it must count as a use of the
+        // let-bound name `var_2`, in both directions.
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_2".into(),
+                mutable: false,
+                value: SorobanExpr::UnknownVal,
+            },
+            SorobanStmt::Return(Some(SorobanExpr::Local(2))),
+        ];
+        let out = husk_unbound_local_uses(stmts, &[]);
+        let SorobanStmt::Return(Some(e)) = &out[1] else {
+            panic!("return expected");
+        };
+        assert!(matches!(e, SorobanExpr::UnknownVal));
     }
 
     #[test]

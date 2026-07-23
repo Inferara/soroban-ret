@@ -1440,11 +1440,16 @@ fn aquarius_recovers_invoke_return_types_and_drops_tag_assert_husks() {
         !body.contains("!= 69 {") && !body.contains("!= 75 {"),
         "SDK Val->T type-assertion husks should be dropped, got:\n{body}"
     );
-    // ...but the ambiguous `== 1` guard (Tag::True, not a type assertion) stays:
-    // dropping it would be a wrong recovery, not noise removal.
+    // ...but the ambiguous `== 1` guard (Tag::True, not a type assertion) stays
+    // as an `if` with its `panic!()` body: dropping it would be a wrong
+    // recovery, not noise removal. Since t14 the condition itself renders as
+    // `todo!()` (comparing an unknown value against 1 is unknown, and
+    // `todo!() == 1` is a guaranteed E0277 — `!` falls back to `()` in operator
+    // traits), so the preserved guard reads `if todo!("unknown value") { panic!(); }`.
     assert!(
-        body.contains("== 1 {"),
-        "ambiguous non-type-tag guards must be preserved, got:\n{body}"
+        body.contains("if todo!(\"unknown value\") {\n            panic!();"),
+        "ambiguous non-type-tag guards must be preserved (as an if-with-panic \
+         whose condition is an honest hole), got:\n{body}"
     );
 }
 

@@ -140,6 +140,15 @@ fn generate_expr_prec(expr: &SorobanExpr, parent_prec: u8, is_right: bool) -> To
         return generate_expr_base(expr);
     };
 
+    // An operator with a `!` operand cannot type-check: operator traits on `!`
+    // fall back to `()` (E0277 "can't compare `()` with `i32`", "cannot add
+    // `()` to `()`", …). The `!` root panics before the operator applies, so
+    // the whole expression IS `todo!()` — exact, not lossy. `&&`/`||` are not
+    // never-rooted (see `SorobanExpr::is_never_rooted`) and keep their render.
+    if is_never_rooted(expr) {
+        return quote! { todo!("unknown value") };
+    }
+
     // Not is unary prefix — handle separately (no wrapping logic for Not itself)
     if let SorobanExpr::Not(a) = expr {
         let inner = generate_expr_prec(a, PREC_NOT, false);
@@ -314,7 +323,15 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             unwrap,
             on_missing,
         } => {
-            let key = generate_expr(key);
+            // A `!`-rooted key renders bare with `K` pinned to `Val` (same
+            // rule as `StorageSet` below — `&todo!()` is `&!`, and a bare `!`
+            // leaves `K` uninferable).
+            let turbo = if is_never_rooted(key) {
+                quote! { ::<soroban_sdk::Val, _> }
+            } else {
+                quote! {}
+            };
+            let key = ref_arg(key);
             let storage = storage_method(*storage_type);
             if let Some(miss) = on_missing {
                 let miss_expr = generate_expr(miss);
@@ -324,18 +341,18 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                     // error. Must be LAZY (`unwrap_or_else`) — `ok_or`/
                     // `unwrap_or` would evaluate the diverging panic
                     // eagerly and change behavior on the present-key path.
-                    quote! { env.storage().#storage().get(&#key).unwrap_or_else(|| #miss_expr) }
+                    quote! { env.storage().#storage().get #turbo (#key).unwrap_or_else(|| #miss_expr) }
                 } else if is_contract_error_expr(miss) {
-                    quote! { env.storage().#storage().get(&#key).ok_or(#miss_expr) }
+                    quote! { env.storage().#storage().get #turbo (#key).ok_or(#miss_expr) }
                 } else {
                     // A recovered defaulting getter: the missing-key path
                     // yields a plain default value, not an error.
-                    quote! { env.storage().#storage().get(&#key).unwrap_or(#miss_expr) }
+                    quote! { env.storage().#storage().get #turbo (#key).unwrap_or(#miss_expr) }
                 }
             } else if *unwrap {
-                quote! { env.storage().#storage().get(&#key).unwrap() }
+                quote! { env.storage().#storage().get #turbo (#key).unwrap() }
             } else {
-                quote! { env.storage().#storage().get(&#key) }
+                quote! { env.storage().#storage().get #turbo (#key) }
             }
         }
         SorobanExpr::StorageSet {
@@ -343,20 +360,42 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             key,
             value,
         } => {
-            let key = generate_expr(key);
-            let value = generate_expr(value);
             let storage = storage_method(*storage_type);
-            quote! { env.storage().#storage().set(&#key, &#value) }
+            // `set<K, V>` infers both generics from its arguments, so a lost
+            // (`!`-rooted) key or value breaks it twice over: `&todo!()` is
+            // `&!` (no coercion, E0308), and even bare it leaves the generic
+            // unconstrained (surfacing as E0277 `Val: TryFromVal<Env, !>`).
+            // Render the `!` side bare AND pin its generic to `Val` — the one
+            // type every stored value has. A set with both sides intact keeps
+            // the exact current tokens.
+            let k_never = is_never_rooted(key);
+            let v_never = is_never_rooted(value);
+            let key = ref_arg(key);
+            let value = ref_arg(value);
+            match (k_never, v_never) {
+                (false, false) => quote! { env.storage().#storage().set(#key, #value) },
+                (false, true) => {
+                    quote! { env.storage().#storage().set::<_, soroban_sdk::Val>(#key, #value) }
+                }
+                (true, false) => {
+                    quote! { env.storage().#storage().set::<soroban_sdk::Val, _>(#key, #value) }
+                }
+                (true, true) => quote! {
+                    env.storage().#storage().set::<soroban_sdk::Val, soroban_sdk::Val>(#key, #value)
+                },
+            }
         }
         SorobanExpr::StorageHas { storage_type, key } => {
-            let key = generate_expr(key);
+            let turbo = never_key_turbofish(key);
+            let key = ref_arg(key);
             let storage = storage_method(*storage_type);
-            quote! { env.storage().#storage().has(&#key) }
+            quote! { env.storage().#storage().has #turbo (#key) }
         }
         SorobanExpr::StorageRemove { storage_type, key } => {
-            let key = generate_expr(key);
+            let turbo = never_key_turbofish(key);
+            let key = ref_arg(key);
             let storage = storage_method(*storage_type);
-            quote! { env.storage().#storage().remove(&#key) }
+            quote! { env.storage().#storage().remove #turbo (#key) }
         }
         SorobanExpr::StorageExtendTtl {
             storage_type,
@@ -364,11 +403,12 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             threshold,
             extend_to,
         } => {
-            let key = generate_expr(key);
+            let turbo = never_key_turbofish(key);
+            let key = ref_arg(key);
             let threshold = generate_expr(threshold);
             let extend_to = generate_expr(extend_to);
             let storage = storage_method(*storage_type);
-            quote! { env.storage().#storage().extend_ttl(&#key, #threshold, #extend_to) }
+            quote! { env.storage().#storage().extend_ttl #turbo (#key, #threshold, #extend_to) }
         }
         SorobanExpr::ExtendInstanceAndCodeTtl {
             threshold,
@@ -428,8 +468,10 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             args,
             return_type,
         } => {
-            let addr = generate_expr(address);
-            let func = generate_expr(function);
+            // A `!`-rooted address/function renders bare (`&todo!()` is `&!`,
+            // which does not coerce to `&Address`/`&Symbol` — E0308).
+            let addr = ref_arg(address);
+            let func = ref_arg(function);
             let arg_exprs: Vec<_> = args
                 .iter()
                 .map(|a| {
@@ -445,7 +487,7 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 })
                 .collect();
             let type_param = invoke_type_param(return_type);
-            quote! { env.invoke_contract::<#type_param>(&#addr, &#func, vec![&env, #(#arg_exprs),*]) }
+            quote! { env.invoke_contract::<#type_param>(#addr, #func, vec![&env, #(#arg_exprs),*]) }
         }
         SorobanExpr::TryInvokeContract {
             address,
@@ -453,8 +495,9 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             args,
             return_type,
         } => {
-            let addr = generate_expr(address);
-            let func = generate_expr(function);
+            // Same `&!` rule as `InvokeContract` above.
+            let addr = ref_arg(address);
+            let func = ref_arg(function);
             let arg_exprs: Vec<_> = args
                 .iter()
                 .map(|a| {
@@ -475,7 +518,7 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             // function's declared `Result<T, E>`. `E` is left to inference so it matches
             // whatever error type the signature declares (contract enum or `soroban_sdk::Error`).
             quote! {
-                env.try_invoke_contract::<#type_param, _>(&#addr, &#func, vec![&env, #(#arg_exprs),*])
+                env.try_invoke_contract::<#type_param, _>(#addr, #func, vec![&env, #(#arg_exprs),*])
                     .map(|r| r.unwrap())
                     .map_err(|e| e.unwrap())
             }
@@ -644,34 +687,35 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             quote! { panic!() }
         }
 
-        // Crypto
+        // Crypto — all by-ref args go through `ref_arg` (a `!`-rooted arg must
+        // render bare; the parameter types here are concrete, so it coerces).
         SorobanExpr::CryptoSha256(data) => {
-            let data = generate_expr(data);
-            quote! { env.crypto().sha256(&#data) }
+            let data = ref_arg(data);
+            quote! { env.crypto().sha256(#data) }
         }
         SorobanExpr::CryptoKeccak256(data) => {
-            let data = generate_expr(data);
-            quote! { env.crypto().keccak256(&#data) }
+            let data = ref_arg(data);
+            quote! { env.crypto().keccak256(#data) }
         }
         SorobanExpr::CryptoEd25519Verify {
             public_key,
             message,
             signature,
         } => {
-            let pk = generate_expr(public_key);
-            let msg = generate_expr(message);
-            let sig = generate_expr(signature);
-            quote! { env.crypto().ed25519_verify(&#pk, &#msg, &#sig) }
+            let pk = ref_arg(public_key);
+            let msg = ref_arg(message);
+            let sig = ref_arg(signature);
+            quote! { env.crypto().ed25519_verify(#pk, #msg, #sig) }
         }
         SorobanExpr::CryptoSecp256k1Recover {
             msg_digest,
             signature,
             recovery_id,
         } => {
-            let md = generate_expr(msg_digest);
-            let sig = generate_expr(signature);
+            let md = ref_arg(msg_digest);
+            let sig = ref_arg(signature);
             let rid = generate_expr(recovery_id);
-            quote! { env.crypto().secp256k1_recover(&#md, &#sig, #rid) }
+            quote! { env.crypto().secp256k1_recover(#md, #sig, #rid) }
         }
 
         // Ledger info
@@ -683,8 +727,8 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
 
         // PRNG
         SorobanExpr::PrngReseed(seed) => {
-            let seed = generate_expr(seed);
-            quote! { env.prng().reseed(&#seed) }
+            let seed = ref_arg(seed);
+            quote! { env.prng().reseed(#seed) }
         }
         SorobanExpr::PrngBytesNew(len) => {
             let len = generate_expr(len);
@@ -702,8 +746,8 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
 
         // Address operations
         SorobanExpr::StrkeyToAddress(strkey) => {
-            let sk = generate_expr(strkey);
-            quote! { Address::from_string(&#sk) }
+            let sk = ref_arg(strkey);
+            quote! { Address::from_string(#sk) }
         }
         SorobanExpr::AddressToStrkey(addr) => {
             let a = generate_expr(addr);
@@ -788,7 +832,13 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 on_missing,
             } = value.as_ref()
             {
-                let key = generate_expr(key);
+                // Same `!`-rooted-key rule as the plain `StorageGet` arm.
+                let kt = if is_never_rooted(key) {
+                    quote! { soroban_sdk::Val }
+                } else {
+                    quote! { _ }
+                };
+                let key = ref_arg(key);
                 let storage = storage_method(*storage_type);
                 let ty: syn::Type = syn::parse_str(target_type).expect("checked by guard");
                 if let Some(miss) = on_missing {
@@ -798,16 +848,16 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                     if matches!(miss.as_ref(), SorobanExpr::PanicWithError(_)) {
                         // Lazy: the diverging panic must only run on the
                         // missing-key path (see the plain-render arm).
-                        quote! { env.storage().#storage().get::<_, #ty>(&#key).unwrap_or_else(|| #miss_expr) }
+                        quote! { env.storage().#storage().get::<#kt, #ty>(#key).unwrap_or_else(|| #miss_expr) }
                     } else if is_contract_error_expr(miss) {
-                        quote! { env.storage().#storage().get::<_, #ty>(&#key).ok_or(#miss_expr) }
+                        quote! { env.storage().#storage().get::<#kt, #ty>(#key).ok_or(#miss_expr) }
                     } else {
-                        quote! { env.storage().#storage().get::<_, #ty>(&#key).unwrap_or(#miss_expr) }
+                        quote! { env.storage().#storage().get::<#kt, #ty>(#key).unwrap_or(#miss_expr) }
                     }
                 } else if *unwrap {
-                    quote! { env.storage().#storage().get::<_, #ty>(&#key).unwrap() }
+                    quote! { env.storage().#storage().get::<#kt, #ty>(#key).unwrap() }
                 } else {
-                    quote! { env.storage().#storage().get::<_, #ty>(&#key) }
+                    quote! { env.storage().#storage().get::<#kt, #ty>(#key) }
                 }
             } else {
                 unreachable!("guarded by matches! on StorageGet")
@@ -1705,21 +1755,35 @@ fn generate_pattern(pattern: &MatchPattern) -> TokenStream {
     }
 }
 
-/// A `!`-rooted expression: `todo!()`/`panic!()` itself, or a method/field
-/// chain hanging off one. Method resolution on `!` is a hard rustc error
-/// (E0599/E0609), and at runtime the root panics before anything else in the
-/// chain evaluates — so rendering the whole chain as `todo!()` is exact.
+/// A `!`-rooted expression — see [`SorobanExpr::is_never_rooted`] (shared with
+/// the IR-level unbound-local pass, which needs the identical judgement).
 fn is_never_rooted(e: &SorobanExpr) -> bool {
-    match e {
-        SorobanExpr::UnknownVal | SorobanExpr::Panic | SorobanExpr::PanicWithError(_) => true,
-        SorobanExpr::MethodCall { object, .. } | SorobanExpr::FieldAccess { object, .. } => {
-            is_never_rooted(object)
-        }
-        // Renders bare (no syntactic type pin), so a `!` root shows through.
-        // `CastAs` is deliberately NOT here: `todo!() as u128` pins a real
-        // type, and methods on it resolve.
-        SorobanExpr::ValConvert { value, .. } => is_never_rooted(value),
-        _ => false,
+    e.is_never_rooted()
+}
+
+/// Render an argument the call site passes by reference. A `!`-rooted value
+/// must render *bare*: `&todo!()` has type `&!`, which does not coerce to the
+/// expected `&T` (E0308 "expected `&Address`, found `&!`"), while a bare
+/// `todo!()` coerces to any expected type, `&T` included. Only used at sites
+/// whose parameter type is concrete (an unconstrained generic would be left
+/// uninferable by a bare `!`).
+fn ref_arg(e: &SorobanExpr) -> TokenStream {
+    let toks = generate_expr(e);
+    if is_never_rooted(e) {
+        toks
+    } else {
+        quote! { &#toks }
+    }
+}
+
+/// Turbofish pinning a single-generic storage op's key type to `Val` when the
+/// key is `!`-rooted (bare `todo!()` leaves `K` uninferable — E0282/E0277).
+/// Empty for an intact key, so the render is token-identical to the legacy one.
+fn never_key_turbofish(key: &SorobanExpr) -> TokenStream {
+    if is_never_rooted(key) {
+        quote! { ::<soroban_sdk::Val> }
+    } else {
+        quote! {}
     }
 }
 
@@ -2675,6 +2739,173 @@ mod generate_expr_tests {
             args: vec![SorobanExpr::U128Literal(1)],
         };
         assert!(collapse(&s(generate_expr(&cast))).contains("checked_add"));
+    }
+
+    #[test]
+    fn never_operand_operators_render_as_todo() {
+        // Operator traits on `!` fall back to `()` (E0277 "can't compare `()`
+        // with `i32`"), so an operator with a `!` operand IS todo!().
+        let eq = SorobanExpr::Eq(
+            boxed(SorobanExpr::UnknownVal),
+            boxed(SorobanExpr::I32Literal(0)),
+        );
+        assert_eq!(
+            collapse(&s(generate_expr(&eq))),
+            "todo ! (\"unknown value\")"
+        );
+        // Nested: `(todo!() + 4) < (todo!() + todo!())`.
+        let lt = SorobanExpr::Lt(
+            boxed(SorobanExpr::Add(
+                boxed(SorobanExpr::UnknownVal),
+                boxed(SorobanExpr::I32Literal(4)),
+            )),
+            boxed(SorobanExpr::Add(
+                boxed(SorobanExpr::UnknownVal),
+                boxed(SorobanExpr::UnknownVal),
+            )),
+        );
+        assert_eq!(
+            collapse(&s(generate_expr(&lt))),
+            "todo ! (\"unknown value\")"
+        );
+        // Right-operand `!` with an effect-free left operand: still todo!().
+        let sub = SorobanExpr::Sub(
+            boxed(SorobanExpr::Param("a".into())),
+            boxed(SorobanExpr::UnknownVal),
+        );
+        assert_eq!(
+            collapse(&s(generate_expr(&sub))),
+            "todo ! (\"unknown value\")"
+        );
+        // Right-operand `!` with an EFFECTFUL left operand: the left side's
+        // side effect must not be skipped, so the render is left as-is.
+        let effectful = SorobanExpr::Sub(
+            boxed(SorobanExpr::StorageGet {
+                storage_type: StorageType::Instance,
+                key: boxed(SorobanExpr::SymbolLiteral("K".into())),
+                unwrap: true,
+                on_missing: None,
+            }),
+            boxed(SorobanExpr::UnknownVal),
+        );
+        assert!(collapse(&s(generate_expr(&effectful))).contains("get"));
+        // `&&`/`||` type-check with a `!` operand (plain bool coercion, no
+        // operator trait) — their render stands.
+        let and = SorobanExpr::And(
+            boxed(SorobanExpr::UnknownVal),
+            boxed(SorobanExpr::Param("b".into())),
+        );
+        assert!(collapse(&s(generate_expr(&and))).contains("&&"));
+        // Unary Not on `!` (E0600 after unit fallback) husks too.
+        let not = SorobanExpr::Not(boxed(SorobanExpr::UnknownVal));
+        assert_eq!(
+            collapse(&s(generate_expr(&not))),
+            "todo ! (\"unknown value\")"
+        );
+    }
+
+    #[test]
+    fn never_by_ref_args_render_bare() {
+        // `&todo!()` is `&!` — no coercion under a reference (E0308); the bare
+        // `todo!()` coerces to any expected `&T`.
+        let invoke = SorobanExpr::InvokeContract {
+            address: boxed(SorobanExpr::UnknownVal),
+            function: boxed(SorobanExpr::SymbolLiteral("deposit".into())),
+            args: vec![],
+            return_type: None,
+        };
+        let out = collapse(&s(generate_expr(&invoke)));
+        assert!(out.contains("(todo ! (\"unknown value\") , & symbol_short ! (\"deposit\")"));
+        let sha = SorobanExpr::CryptoSha256(boxed(SorobanExpr::UnknownVal));
+        assert_eq!(
+            collapse(&s(generate_expr(&sha))),
+            "env . crypto () . sha256 (todo ! (\"unknown value\"))"
+        );
+        // Non-`!` args keep their reference.
+        let sha_ok = SorobanExpr::CryptoSha256(boxed(SorobanExpr::Param("data".into())));
+        assert_eq!(
+            collapse(&s(generate_expr(&sha_ok))),
+            "env . crypto () . sha256 (& data)"
+        );
+    }
+
+    #[test]
+    fn storage_set_never_value_pins_val_and_renders_bare() {
+        // `set<K, V>` infers V from its argument; a `!` value renders bare and
+        // pins `V = Val` (E0277 `Val: TryFromVal<Env, !>` otherwise).
+        let set = SorobanExpr::StorageSet {
+            storage_type: StorageType::Instance,
+            key: boxed(SorobanExpr::EnumConstruct {
+                type_name: "DataKey".into(),
+                variant: "Admin".into(),
+                fields: vec![],
+            }),
+            value: boxed(SorobanExpr::UnknownVal),
+        };
+        let out = collapse(&s(generate_expr(&set)));
+        assert!(
+            out.contains("set :: < _ , soroban_sdk :: Val > (& DataKey :: Admin , todo ! (\"unknown value\"))"),
+            "got: {out}"
+        );
+        // Both sides intact → exact legacy tokens (snapshot-stable).
+        let clean = SorobanExpr::StorageSet {
+            storage_type: StorageType::Instance,
+            key: boxed(SorobanExpr::SymbolLiteral("K".into())),
+            value: boxed(SorobanExpr::Param("v".into())),
+        };
+        let out = collapse(&s(generate_expr(&clean)));
+        assert!(
+            out.contains("set (& symbol_short ! (\"K\") , & v)"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn storage_never_keys_render_bare_with_val_pin() {
+        let get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Temporary,
+            key: boxed(SorobanExpr::UnknownVal),
+            unwrap: false,
+            on_missing: None,
+        };
+        let out = collapse(&s(generate_expr(&get)));
+        assert!(
+            out.contains("get :: < soroban_sdk :: Val , _ > (todo ! (\"unknown value\"))"),
+            "got: {out}"
+        );
+        let has = SorobanExpr::StorageHas {
+            storage_type: StorageType::Persistent,
+            key: boxed(SorobanExpr::UnknownVal),
+        };
+        let out = collapse(&s(generate_expr(&has)));
+        assert!(
+            out.contains("has :: < soroban_sdk :: Val > (todo ! (\"unknown value\"))"),
+            "got: {out}"
+        );
+        // The typed-get turbofish vehicle keeps its value type and pins K.
+        let cast = SorobanExpr::CastAs {
+            value: boxed(SorobanExpr::StorageGet {
+                storage_type: StorageType::Temporary,
+                key: boxed(SorobanExpr::UnknownVal),
+                unwrap: false,
+                on_missing: None,
+            }),
+            target_type: "Val".into(),
+        };
+        let out = collapse(&s(generate_expr(&cast)));
+        assert!(
+            out.contains("get :: < soroban_sdk :: Val , Val > (todo ! (\"unknown value\"))"),
+            "got: {out}"
+        );
+        // Intact keys keep the legacy tokens.
+        let clean = SorobanExpr::StorageHas {
+            storage_type: StorageType::Persistent,
+            key: boxed(SorobanExpr::Param("k".into())),
+        };
+        assert_eq!(
+            collapse(&s(generate_expr(&clean))),
+            "env . storage () . persistent () . has (& k)"
+        );
     }
 
     #[test]
