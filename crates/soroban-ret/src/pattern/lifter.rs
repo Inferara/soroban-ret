@@ -5374,8 +5374,13 @@ impl<'a> LiftContext<'a> {
                     //   for offset in (0, STEP, ..., LIMIT-STEP):
                     //     frame[dest+offset] = frame[src+offset]
                     // The lifter simulated iteration 0; extend with 1..N.
-                    let copy_info = detect_memory_copy_loop(body);
-                    if let Some(copy_info) = &copy_info {
+                    // The taint exemption below requires the copy model to have
+                    // ACTUALLY extended the state — a detected-but-unresolved
+                    // copy loop (no frame_slot entry at dest_base) fills
+                    // nothing, and its body-written slots are one-iteration
+                    // artifacts like any other loop's.
+                    let mut copy_extended = false;
+                    if let Some(copy_info) = detect_memory_copy_loop(body) {
                         // Resolve frame_id: find any frame_slot entry at dest_base
                         // offset that was created by iteration 0's I64Store.
                         let frame_slots = self.frame_slots.borrow();
@@ -5406,10 +5411,13 @@ impl<'a> LiftContext<'a> {
                             for (key, val) in new_entries {
                                 frame_slots.insert(key, val);
                             }
+                            copy_extended = true;
                         }
-                    } else {
-                        // Not a proven-exact loop model: the map's body-written
-                        // slots are one-iteration artifacts — stamp them.
+                    }
+                    if !copy_extended {
+                        // Not a proven-and-applied exact loop model: the map's
+                        // body-written slots are one-iteration artifacts —
+                        // stamp them.
                         self.taint_loop_variant_slots(loop_pre_wpos);
                     }
 
