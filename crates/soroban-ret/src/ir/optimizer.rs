@@ -4547,7 +4547,7 @@ fn is_identity_val_convert(inner: &SorobanExpr, target_type: &str) -> bool {
 
 /// Returns true for expressions known to produce a boolean value at the SDK level,
 /// even though WASM represents them as integers.
-fn is_bool_typed(e: &SorobanExpr) -> bool {
+pub(crate) fn is_bool_typed(e: &SorobanExpr) -> bool {
     if matches!(
         e,
         SorobanExpr::StorageHas { .. }
@@ -4579,6 +4579,8 @@ fn is_bool_typed(e: &SorobanExpr) -> bool {
                 | "pairing_check"
                 | "g1_is_in_subgroup"
                 | "g2_is_in_subgroup"
+                | "is_none"
+                | "is_some"
         );
     }
     false

@@ -315,14 +315,19 @@ fn test_decompile_blend_backstop_user_balance_body() {
     let source = decompile(wasm).expect("decompilation failed");
 
     // The real persistent-storage protocol is recovered, NOT a bare `panic!()`.
+    // Since t16, the keyed `UserBalance` variant carries its (lost) payload as
+    // an honest `todo!()` hole — the registry declares it a tuple variant, so
+    // the earlier bare `BackstopDataKey::UserBalance` was an uncompilable fn
+    // item, not a value.
     assert_in_fn(
         &source,
         "pub fn user_balance",
         &[
             ".persistent()",
-            ".has(&BackstopDataKey::UserBalance)",
-            ".get::<_, Val>(&BackstopDataKey::UserBalance)",
-            ".extend_ttl(&BackstopDataKey::UserBalance",
+            ".has(&BackstopDataKey::UserBalance(",
+            ".get::<_, Val>(&BackstopDataKey::UserBalance(",
+            ".extend_ttl(",
+            "&BackstopDataKey::UserBalance(todo!(",
         ],
     );
 
