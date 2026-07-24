@@ -572,6 +572,12 @@ static DBG_SLOTJOIN: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_SLOTJOIN").is_ok());
 static DBG_SLOTREAD: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_SLOTREAD").is_ok());
+/// Issue #38 census probe: report loop-body generic slot reads that a LATER
+/// store in the same body overwrites — the back-edge use-before-def class
+/// (iteration 2+ observes iteration 1's value; the linear sim shows the
+/// pre-loop value). Measurement-only; no behavior change.
+static DBG_LOOPRBW: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_LOOPRBW").is_ok());
 static DBG_FDK: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_FDK").is_ok());
 static DBG_DKTRACE: std::sync::LazyLock<bool> =
@@ -602,6 +608,15 @@ enum SlotTaintKind {
     /// surviving then-write observes a value from a path that provably did
     /// not fall through.
     DeadThen,
+    /// Set after a loop body lifts against the shared slot map: the map holds
+    /// ONE-ITERATION values for every slot the body wrote — wrong for a loop
+    /// that runs zero times (the slot holds its pre-loop value at runtime)
+    /// and for 2+ iterations (later iterations overwrite). A post-loop read
+    /// observing the exact one-iteration value is unsound; proven-exact loop
+    /// models (the memory-copy extension) are excluded at the stamp site.
+    /// (Issue #38 substrate: in-body back-edge reads — iteration 2+ observing
+    /// iteration 1 state — are the remaining unmeasured half.)
+    LoopVariant,
 }
 
 /// A tainted slot: the classification plus the exact value the then arm
@@ -717,7 +732,17 @@ struct LiftContext<'a> {
     /// under `DBG_SLOTREAD`); any store clears the taint. Shared/detached
     /// like `slot_write_log`.
     slot_taints: Rc<RefCell<HashMap<(u32, i32), SlotTaint>>>,
+    /// Issue #38 census probe (`DBG_LOOPRBW` only): generic slot reads as
+    /// `(key, write-log length at read time)`, so a loop site can report
+    /// body reads that a LATER body store overwrites (the back-edge
+    /// use-before-def class — iteration 2+ observes iteration 1's value,
+    /// the linear sim shows the pre-loop value). Empty unless the flag is
+    /// set; measurement-only, never changes lifting behavior.
+    slot_read_log: Rc<RefCell<SlotReadLog>>,
 }
+
+/// `(slot key, write-log length at read time)` — see `slot_read_log`.
+type SlotReadLog = Vec<((u32, i32), usize)>;
 
 impl<'a> LiftContext<'a> {
     fn new(
@@ -756,6 +781,7 @@ impl<'a> LiftContext<'a> {
             loop_depth: 0,
             slot_write_log: Rc::new(RefCell::new(Vec::new())),
             slot_taints: Rc::new(RefCell::new(HashMap::new())),
+            slot_read_log: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -790,6 +816,7 @@ impl<'a> LiftContext<'a> {
             loop_depth: self.loop_depth,
             slot_write_log: Rc::clone(&self.slot_write_log),
             slot_taints: Rc::clone(&self.slot_taints),
+            slot_read_log: Rc::clone(&self.slot_read_log),
         }
     }
 
@@ -866,6 +893,73 @@ impl<'a> LiftContext<'a> {
                 .insert((id, slot), StackVal::LetBinding(var_idx));
         } else {
             self.frame_slots.borrow_mut().insert((id, slot), value);
+        }
+    }
+
+    /// Issue #38 substrate — loop-variant slot taints. After a loop body
+    /// lifts against the shared slot map, every slot the body wrote (at this
+    /// inline depth) holds a ONE-ITERATION value: wrong when the loop runs
+    /// zero times (at runtime the slot keeps its pre-loop value) and when it
+    /// runs 2+ times (later iterations overwrite). Stamp the survivors so a
+    /// generic post-loop load observing the exact one-iteration value
+    /// degrades to `Unknown` — the same read-time discipline as the t9 join
+    /// poison: the map itself is NEVER poisoned, a later writer clears the
+    /// taint in `store_frame_slot`, and the value-equality check at the load
+    /// shields recognizer-adopted values. Net no-op rewrites (final value ==
+    /// pre-loop value, e.g. save/restore) are dropped as sound.
+    fn taint_loop_variant_slots(&self, pre_wpos: usize) {
+        // Census probe: report body reads that a LATER body store overwrites
+        // (back-edge use-before-def — the sim gave iteration-1 code the
+        // pre-loop value, but iteration 2+ observes iteration 1's write).
+        if *DBG_LOOPRBW {
+            let reads = self.slot_read_log.borrow();
+            let log = self.slot_write_log.borrow();
+            for (rk, wpos) in reads.iter() {
+                // Only reads issued during THIS body (write-log position at
+                // read time within the body segment), overwritten afterwards.
+                if *wpos >= pre_wpos
+                    && log[*wpos..]
+                        .iter()
+                        .any(|w| w.key == *rk && w.depth == self.inline_depth)
+                {
+                    eprintln!(
+                        "[LOOPRBW] frame=({},{}) loop={} inline={}",
+                        rk.0, rk.1, self.loop_depth, self.inline_depth
+                    );
+                }
+            }
+        }
+        let per_key: Vec<((u32, i32), Option<StackVal>, StackVal)> = {
+            let log = self.slot_write_log.borrow();
+            let mut per_key: Vec<((u32, i32), Option<StackVal>, StackVal)> = Vec::new();
+            for w in &log[pre_wpos..] {
+                // Same-depth entries only (t10 lesson): an inlined helper's
+                // internal stores are its own scratch, not this loop's state.
+                if w.depth != self.inline_depth {
+                    continue;
+                }
+                match per_key.iter_mut().find(|(pk, _, _)| *pk == w.key) {
+                    Some((_, _, last)) => *last = w.new.clone(),
+                    None => per_key.push((w.key, w.prev.clone(), w.new.clone())),
+                }
+            }
+            per_key
+        };
+        if per_key.is_empty() {
+            return;
+        }
+        let mut taints = self.slot_taints.borrow_mut();
+        for (k, first_prev, last_new) in per_key {
+            if first_prev.as_ref() == Some(&last_new) {
+                continue;
+            }
+            taints.insert(
+                k,
+                SlotTaint {
+                    kind: SlotTaintKind::LoopVariant,
+                    val: last_new,
+                },
+            );
         }
     }
 
@@ -2045,6 +2139,7 @@ impl<'a> LiftContext<'a> {
         // Same for the read-journal measurement state (issue #34 phase 2).
         sim.slot_write_log = Rc::new(RefCell::new(self.slot_write_log.borrow().clone()));
         sim.slot_taints = Rc::new(RefCell::new(self.slot_taints.borrow().clone()));
+        sim.slot_read_log = Rc::new(RefCell::new(Vec::new()));
         sim.loop_depth += 1;
         for &l in &written {
             if let Some(slot) = sim.locals.get_mut(l as usize) {
@@ -2098,6 +2193,7 @@ impl<'a> LiftContext<'a> {
         sim.slot_defs = Rc::new(RefCell::new(self.slot_defs.borrow().clone()));
         sim.slot_write_log = Rc::new(RefCell::new(self.slot_write_log.borrow().clone()));
         sim.slot_taints = Rc::new(RefCell::new(self.slot_taints.borrow().clone()));
+        sim.slot_read_log = Rc::new(RefCell::new(Vec::new()));
         sim.loop_depth += 1;
         // Also seed body-written locals with LoopPhi so an accumulator that adds
         // the counter (`acc += i`) stays symbolic — otherwise the counter's
@@ -4409,6 +4505,10 @@ impl<'a> LiftContext<'a> {
                             // deliberately NOT poisoned: those resolutions
                             // happen under recognizer control, where adopted
                             // then-arm values are part of audited shapes.
+                            if *DBG_LOOPRBW {
+                                let wpos = self.slot_write_log.borrow().len();
+                                self.slot_read_log.borrow_mut().push(((id, slot), wpos));
+                            }
                             if !matches!(v, StackVal::Unknown)
                                 && let Some(t) = self.slot_taints.borrow().get(&(id, slot))
                                 && t.val == v
@@ -4419,6 +4519,7 @@ impl<'a> LiftContext<'a> {
                                         SlotTaintKind::CrossArm => "else-rbw",
                                         SlotTaintKind::Conditional => "cond-read",
                                         SlotTaintKind::DeadThen => "dead-then-read",
+                                        SlotTaintKind::LoopVariant => "loop-variant-read",
                                     };
                                     let mut vdbg = format!("{v:?}");
                                     vdbg.truncate(160);
@@ -5185,6 +5286,11 @@ impl<'a> LiftContext<'a> {
                         cov_mark::hit!(loop_carried_recovered);
                     }
 
+                    // Write-log position before the body: everything the log
+                    // gains during the body lift is a loop-body store whose
+                    // post-loop map value is a ONE-ITERATION artifact (issue
+                    // #38 substrate — see `taint_loop_variant_slots`).
+                    let loop_pre_wpos = self.slot_write_log.borrow().len();
                     let mut loop_ctx = self.child_context();
                     loop_ctx.loop_carried_locals = carried;
                     loop_ctx.loop_depth += 1;
@@ -5268,7 +5374,8 @@ impl<'a> LiftContext<'a> {
                     //   for offset in (0, STEP, ..., LIMIT-STEP):
                     //     frame[dest+offset] = frame[src+offset]
                     // The lifter simulated iteration 0; extend with 1..N.
-                    if let Some(copy_info) = detect_memory_copy_loop(body) {
+                    let copy_info = detect_memory_copy_loop(body);
+                    if let Some(copy_info) = &copy_info {
                         // Resolve frame_id: find any frame_slot entry at dest_base
                         // offset that was created by iteration 0's I64Store.
                         let frame_slots = self.frame_slots.borrow();
@@ -5300,6 +5407,10 @@ impl<'a> LiftContext<'a> {
                                 frame_slots.insert(key, val);
                             }
                         }
+                    } else {
+                        // Not a proven-exact loop model: the map's body-written
+                        // slots are one-iteration artifacts — stamp them.
+                        self.taint_loop_variant_slots(loop_pre_wpos);
                     }
 
                     if !loop_stmts.is_empty() {
@@ -6980,12 +7091,16 @@ impl<'a> LiftContext<'a> {
                     }
                 }
                 StructuredBlock::Loop { body, .. } => {
-                    // Nested loop
+                    // Nested loop — same one-iteration-artifact discipline as
+                    // the top-level loop site (no copy-loop model runs here,
+                    // so body-written slots always stamp).
+                    let loop_pre_wpos = self.slot_write_log.borrow().len();
                     let mut inner_ctx = self.child_context();
                     inner_ctx.loop_depth += 1;
                     inner_ctx.lift_structured_loop(body);
                     let inner_stmts = inner_ctx.stmts;
                     self.found_host_calls |= inner_ctx.found_host_calls;
+                    self.taint_loop_variant_slots(loop_pre_wpos);
                     if !inner_stmts.is_empty() {
                         self.stmts.push(SorobanStmt::Loop { body: inner_stmts });
                     }
@@ -20939,6 +21054,77 @@ mod tests {
             Rc::new(RefCell::new(Vec::new())),
         );
         result.stack_result.expect("the tail load leaves a value")
+    }
+
+    /// Fixture for the loop-variant slot poison (issue #38 substrate).
+    /// Functions: 0 = a loop body writes slot +8 (one-iteration artifact —
+    /// the post-loop read must degrade); 1 = the body re-stores the exact
+    /// pre-loop value (net no-op — the post-loop read stays sound).
+    fn loop_poison_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (global (mut i32) (i32.const 1048576))
+                (memory 1)
+                (func (;0;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    loop
+                        local.get 1 i64.const 42 i64.store offset=8
+                        local.get 0 i32.wrap_i64
+                        br_if 0
+                    end
+                    local.get 1 i64.load offset=8)
+                (func (;1;) (param i64) (result i64)
+                    (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 drop
+                    local.get 1 i64.const 7 i64.store offset=8
+                    loop
+                        local.get 1 i64.const 7 i64.store offset=8
+                        local.get 0 i32.wrap_i64
+                        br_if 0
+                    end
+                    local.get 1 i64.load offset=8)
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    fn loop_poison_result(idx: u32) -> StackVal {
+        let m = loop_poison_module();
+        let reg = empty_registry();
+        let result = lift_inline_call(
+            &m,
+            &reg,
+            idx,
+            vec![StackVal::Unknown],
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
+        );
+        result.stack_result.expect("the tail load leaves a value")
+    }
+
+    #[test]
+    fn loop_written_slot_post_loop_read_poisoned() {
+        // `loop { slot = 42; br_if } ; read slot` — the map holds the
+        // one-iteration value, but at runtime the loop may have written it
+        // any number of times (or the surrounding control flow zero times).
+        // The post-loop read must degrade to Unknown, not adopt 42.
+        cov_mark::check!(join_tainted_read_poisoned);
+        assert!(matches!(loop_poison_result(0), StackVal::Unknown));
+    }
+
+    #[test]
+    fn loop_net_noop_slot_read_stays_sound() {
+        // The body re-stores the exact pre-loop value: every iteration count
+        // (including the abstract one) leaves the same state — no poison.
+        let v = loop_poison_result(1);
+        assert!(
+            matches!(v, StackVal::I64(7)),
+            "save/restore slot must keep its value, got {v:?}"
+        );
     }
 
     #[test]
