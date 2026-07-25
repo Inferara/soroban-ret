@@ -14687,10 +14687,17 @@ fn detect_counted_loop(
         // evaluator, not to promotion — certifying those surfaced
         // fxdao-oracle's fabricated `SymbolSmall` keys as raw holes and
         // regressed its clean-compile status (+16 corpus errors).
+        // The eqz must FEED A BRANCH (`local.get C; eqz; br_if`) — an
+        // incidental eqz on the counter (feeding arithmetic or a select)
+        // is not an exit test (greptile P1 hardening; note the promotion
+        // machinery is exit-shape-independent for soundness — the emitted
+        // statements mirror the body either way — this gate only scopes
+        // WHICH loops opt in).
         if has_builder_call {
-            for w in all_instrs.windows(2) {
+            for w in all_instrs.windows(3) {
                 if matches!(w[0], WasmInstr::LocalGet(c) if *c == counter_local)
                     && matches!(w[1], WasmInstr::I32Eqz | WasmInstr::I64Eqz)
+                    && matches!(w[2], WasmInstr::BrIf(_))
                 {
                     return Some(Some(0));
                 }
