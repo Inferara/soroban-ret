@@ -1672,17 +1672,41 @@ fn snapshot_contract_with_constructor() {
     insta::assert_snapshot!("contract_with_constructor", source);
 }
 
+/// Issue #38 t22 (#61): fully-static symbol-builder loops are EVALUATED at
+/// lift time — fxdao-oracle's storage keys recover as the real
+/// `Symbol::new(&env, "AssetRecord")` instead of the fabricated tag-only
+/// `vec![&env, 14]` (an empty `SymbolSmall` — the one-iteration artifact
+/// that silently compiled inside a "clean" contract).
+#[test]
+fn fxdao_oracle_recovers_real_symbol_keys() {
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/fxdao-oracle-CB5OTV4G.wasm");
+    let source = decompile(wasm).expect("decompile fxdao-oracle");
+    assert!(
+        source.contains("Symbol::new(&env, \"AssetRecord\")"),
+        "const-loop evaluation must recover the real AssetRecord key:\n{}",
+        &source[..source.len().min(4000)]
+    );
+    assert!(
+        !source.contains("vec![&env, 14]"),
+        "the fabricated tag-only SymbolSmall key must be gone"
+    );
+}
+
 /// Regression for issue #6 (iterative/fixpoint dataflow over loops). A bounded
 /// loop with a loop-carried accumulator must recover the accumulation as a
 /// mutable variable the loop updates, instead of dropping the loop body and
 /// emitting `todo!()`. The fixture computes `sum(0..5)`.
 #[test]
 fn loop_carried_accumulator_is_recovered() {
+    // The accumulator seeds from a PARAM so the const-loop evaluator (issue
+    // #38 t22) cannot fold the whole loop — this test pins the carried
+    // PROMOTION rendering; `fully_static_loop_folds_to_constant` pins the
+    // fold.
     let wat = r#"(module
-      (func (export "accumulate") (result i64)
+      (func (export "accumulate") (param $base i64) (result i64)
         (local $i i64) (local $acc i64)
         (local.set $i (i64.const 0))
-        (local.set $acc (i64.const 0))
+        (local.set $acc (local.get $base))
         (block $exit
           (loop $top
             (br_if $exit (i64.eq (local.get $i) (i64.const 5)))
@@ -1700,28 +1724,28 @@ fn loop_carried_accumulator_is_recovered() {
     );
     // The accumulator (var_1) becomes a `let mut` declared before the loop.
     assert!(
-        source.contains("let mut var_1 = 0"),
-        "accumulator not recovered as `let mut`:\n{source}"
+        source.contains("let mut var_2 = arg0"),
+        "accumulator not recovered as a param-seeded `let mut`:\n{source}"
     );
     // The counter is dead after the loop, so the counted loop renders as a
     // `for` over the recovered range (DoD #2) rather than a `while`.
     assert!(
-        source.contains("for var_0 in 0..5"),
+        source.contains("for var_1 in 0..5"),
         "counted loop not rendered as a `for` range:\n{source}"
     );
     // The accumulation `acc = acc + i` runs in the loop body, and the explicit
     // counter step is gone (the range steps it).
     assert!(
-        source.contains("var_1 = (var_1 + var_0)"),
+        source.contains("var_2 = (var_2 + var_1)"),
         "accumulation not recovered:\n{source}"
     );
     assert!(
-        !source.contains("var_0 = (var_0 + 1)"),
+        !source.contains("var_1 = (var_1 + 1)"),
         "counter step should be subsumed by the `for` range:\n{source}"
     );
     // The function returns the accumulated value.
     assert!(
-        source.contains("var_1\n") || source.contains("var_1 }"),
+        source.contains("var_2\n") || source.contains("var_2 }"),
         "missing tail return of accumulator:\n{source}"
     );
 }
@@ -1784,11 +1808,12 @@ fn loop_recovery_loop_variants() {
         decompile(&wasm).expect("decompile must not error")
     };
 
-    // Non-unit step renders a `.step_by` range. (sum of 0,2,4)
+    // Non-unit step renders a `.step_by` range (param-seeded accumulator so
+    // the const-loop evaluator cannot fold the loop away).
     let step2 = decomp(
-        r#"(module (func (export "f") (result i64)
+        r#"(module (func (export "f") (param $b i64) (result i64)
             (local $i i64) (local $acc i64)
-            (local.set $i (i64.const 0)) (local.set $acc (i64.const 0))
+            (local.set $i (i64.const 0)) (local.set $acc (local.get $b))
             (block $e (loop $t
               (br_if $e (i64.eq (local.get $i) (i64.const 6)))
               (local.set $acc (i64.add (local.get $acc) (local.get $i)))
@@ -1796,7 +1821,7 @@ fn loop_recovery_loop_variants() {
             (local.get $acc)))"#,
     );
     assert!(
-        step2.contains("for var_0 in (0..6).step_by(2)"),
+        step2.contains("for var_1 in (0..6).step_by(2)"),
         "non-unit step not rendered as step_by range:\n{step2}"
     );
     assert!(
@@ -1807,9 +1832,9 @@ fn loop_recovery_loop_variants() {
     // A descending counter is recovered but stays a `while` (a `for` range can't
     // count down), not dropped to `todo!`.
     let down = decomp(
-        r#"(module (func (export "f") (result i64)
+        r#"(module (func (export "f") (param $b i64) (result i64)
             (local $i i64) (local $acc i64)
-            (local.set $i (i64.const 5)) (local.set $acc (i64.const 0))
+            (local.set $i (i64.const 5)) (local.set $acc (local.get $b))
             (block $e (loop $t
               (br_if $e (i64.eq (local.get $i) (i64.const 0)))
               (local.set $acc (i64.add (local.get $acc) (local.get $i)))
@@ -1817,7 +1842,7 @@ fn loop_recovery_loop_variants() {
             (local.get $acc)))"#,
     );
     assert!(
-        down.contains("while var_0 != 0") && !down.contains("for var_0"),
+        down.contains("while var_1 != 0") && !down.contains("for var_1"),
         "descending counter should stay a while, not a for:\n{down}"
     );
     assert!(
@@ -1828,9 +1853,9 @@ fn loop_recovery_loop_variants() {
     // A counter read after the loop is live-out: `for` would scope it away, so
     // the loop must stay a `while`.
     let live = decomp(
-        r#"(module (func (export "f") (result i64)
+        r#"(module (func (export "f") (param $b i64) (result i64)
             (local $i i64) (local $acc i64)
-            (local.set $i (i64.const 0)) (local.set $acc (i64.const 0))
+            (local.set $i (i64.const 0)) (local.set $acc (local.get $b))
             (block $e (loop $t
               (br_if $e (i64.eq (local.get $i) (i64.const 5)))
               (local.set $acc (i64.add (local.get $acc) (local.get $i)))
@@ -1838,7 +1863,7 @@ fn loop_recovery_loop_variants() {
             (i64.add (local.get $i) (local.get $acc))))"#,
     );
     assert!(
-        live.contains("while var_0 != 5") && !live.contains("for var_0"),
+        live.contains("while var_1 != 5") && !live.contains("for var_1"),
         "live-out counter must keep the loop a while:\n{live}"
     );
 
@@ -1863,9 +1888,9 @@ fn loop_recovery_loop_variants() {
     // A step that does not evenly reach the `== end` bound must NOT become a
     // `for` range (it would change the iteration count); it stays a `while`.
     let nondiv = decomp(
-        r#"(module (func (export "f") (result i64)
+        r#"(module (func (export "f") (param $b i64) (result i64)
             (local $i i64) (local $acc i64)
-            (local.set $i (i64.const 0)) (local.set $acc (i64.const 0))
+            (local.set $i (i64.const 0)) (local.set $acc (local.get $b))
             (block $e (loop $t
               (br_if $e (i64.eq (local.get $i) (i64.const 5)))
               (local.set $acc (i64.add (local.get $acc) (local.get $i)))
@@ -1873,7 +1898,7 @@ fn loop_recovery_loop_variants() {
             (local.get $acc)))"#,
     );
     assert!(
-        !nondiv.contains("for var_0"),
+        !nondiv.contains("for var_1"),
         "non-dividing step must not become a for range:\n{nondiv}"
     );
 

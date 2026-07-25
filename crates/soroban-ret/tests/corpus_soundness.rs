@@ -360,7 +360,18 @@ use std::process::Command;
 /// registered) both closes the hole AND unifies MORE than the name-merged
 /// version did (each sibling binding now qualifies on its own evidence:
 /// soroban-domains −2 further).
-const ERROR_CEILING: u32 = 330;
+/// → 326 (issue #38 t22, #61): DkEval const-loop evaluator — fully-static
+/// loops (pure register arithmetic + static-data loads, all touched
+/// locals concrete or provably unread) are EVALUATED at lift time; the
+/// final local values adopt and no loop is emitted. Recovers what was
+/// previously fabricated or holed: fxdao-oracle's storage keys fold to
+/// the real `Symbol::new(&env, "AssetRecord")` (the "clean" output had
+/// carried tag-only `vec![&env, 14]` SymbolSmall fabrications — issue
+/// #61), xycloans' invoke symbols fold to `symbol_short!("transfer")` /
+/// `symbol_short!("exec_op")` (−3), and lightecho's `vec![&env, 14, ..]`
+/// enum encodings re-fire the variant recognizer as
+/// `Asset::Stellar(..)` (−1). Zero regressions.
+const ERROR_CEILING: u32 = 326;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
