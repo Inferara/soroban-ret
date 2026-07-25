@@ -1083,23 +1083,26 @@ impl<'a> LiftContext<'a> {
                 _ => dk_locals[n as usize] = DkVal::Arg(n as usize),
             }
         }
-        // Fragment: the loop with structure restored, inside 4 synthetic
-        // void blocks — exit branches to enclosing labels land on a wrapper
-        // and fall off the fragment end.
+        // Fragment: the loop with structure restored, inside exactly ONE
+        // synthetic void block — the canonical `block { loop { br_if exit } }`
+        // exit lands on the wrapper and falls off the fragment end. A branch
+        // escaping DEEPER than one level fails the evaluation (dk_branch
+        // frame underflow → None): with multiple wrappers, a `br` that at
+        // runtime re-enters an ENCLOSING loop would read as a forward exit
+        // and the adoption would fabricate partial-execution finals
+        // (greptile P1). The call site additionally requires
+        // `loop_depth == 0`, so every enclosing label IS a block and the
+        // single-wrapper exit model is exact.
         let mut frag: Vec<WI> = Vec::new();
-        for _ in 0..4 {
-            frag.push(WI::Block {
-                block_type: BlockType::Empty,
-            });
-        }
+        frag.push(WI::Block {
+            block_type: BlockType::Empty,
+        });
         frag.push(WI::Loop {
             block_type: BlockType::Empty,
         });
         flatten_structured(body, &mut frag);
         frag.push(WI::End);
-        for _ in 0..4 {
-            frag.push(WI::End);
-        }
+        frag.push(WI::End);
         let mut dk = DkEval {
             module: self.wasm_module,
             mem: HashMap::new(),
@@ -5435,7 +5438,9 @@ impl<'a> LiftContext<'a> {
                     // evaluation recovers the REAL encoded value. The body
                     // has no stores/calls (gated), so locals are the loop's
                     // only effect.
-                    if let Some(finals) = self.try_eval_const_loop(body) {
+                    if self.loop_depth == 0
+                        && let Some(finals) = self.try_eval_const_loop(body)
+                    {
                         cov_mark::hit!(const_loop_evaluated);
                         for (l, v) in finals {
                             if let Some(slot) = self.locals.get_mut(l as usize) {

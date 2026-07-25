@@ -370,7 +370,15 @@ use std::process::Command;
 /// #61), xycloans' invoke symbols fold to `symbol_short!("transfer")` /
 /// `symbol_short!("exec_op")` (−3), and lightecho's `vec![&env, 14, ..]`
 /// enum encodings re-fire the variant recognizer as
-/// `Asset::Stellar(..)` (−1). Zero regressions.
+/// `Asset::Stellar(..)` (−1). Zero regressions. The greptile-P1 hardening
+/// (single-wrapper escape model + `loop_depth == 0` scope) also REFUSED a
+/// live fabrication the first cut produced: xycloans' 13-char symbol loop
+/// had folded to a TRUNCATED `symbol_short!("transfer_")` through a
+/// mis-modeled inner escape — it now stays an honest holed loop. NOTE:
+/// this count is pinned on rustc 1.95.0 (the gate's calibration
+/// toolchain, see CI) — measure with `RUSTUP_TOOLCHAIN=1.95.0` locally
+/// before touching this ceiling; newer rustc dedups some E0283/E0284
+/// pairs and reports fewer.
 const ERROR_CEILING: u32 = 326;
 
 #[test]
