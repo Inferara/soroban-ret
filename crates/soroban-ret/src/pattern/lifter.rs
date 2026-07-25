@@ -2581,12 +2581,15 @@ impl<'a> LiftContext<'a> {
         }
 
         // Store discipline: every store in the body is either the recognized
-        // element store (offset 0) or the RawVec len update (`pair.len`,
-        // `cap_off + 8` from the frame base). Any other store could alias the
-        // buffer with a non-counter value.
+        // element store (offset 0, EXACTLY ONE — a second zero-offset store
+        // could overwrite a populated element with a non-counter value while
+        // the relay still substitutes the ordinal) or the RawVec len update
+        // (`pair.len`, `cap_off + 8` from the frame base). Any other store
+        // could alias the buffer.
+        let mut zero_offset_stores = 0usize;
         for i in &instrs {
             match i {
-                WI::I32Store(0) => {}
+                WI::I32Store(0) => zero_offset_stores += 1,
                 WI::I32Store(o) if *o as i32 == cap_off + 8 => {}
                 WI::I32Store(_)
                 | WI::I64Store(_)
@@ -2597,6 +2600,9 @@ impl<'a> LiftContext<'a> {
                 | WI::I64Store32(_) => return None,
                 _ => {}
             }
+        }
+        if zero_offset_stores != 1 {
+            return None;
         }
         // Call discipline: the grow helper is the body's only call.
         if instrs.iter().any(|i| match i {
@@ -15447,7 +15453,17 @@ fn is_rawvec_grow_helper(wasm_module: &WasmModule, g: u32, stride: i32) -> bool 
                     WI::I32Const(sh),
                     WI::I32Shl,
                     WI::Call(m),
-                ) if *dst == np && *src == s && (1i32 << *sh) == stride => Some(*m),
+                ) if *dst == np
+                    && *src == s
+                    // Checked: a hostile/degenerate shift count must refuse,
+                    // not panic the recognizer.
+                    && u32::try_from(*sh)
+                        .ok()
+                        .and_then(|s| 1i32.checked_shl(s))
+                        == Some(stride) =>
+                {
+                    Some(*m)
+                }
                 _ => None,
             });
     let Some(m) = copy_callee else {
@@ -15485,6 +15501,18 @@ fn refuse_relay(reason: &str) -> bool {
 /// no global writes, no indirect calls, and either call-free or a thin
 /// wrapper around exactly one such function (`hops` bounds the unwrap —
 /// rustc emits `memcpy` as a wrapper over the aligned-copy worker).
+///
+/// The call-free leaf must additionally show COPY dataflow: at least one
+/// store whose value operand is the immediately-preceding memory load
+/// (WASM's stack discipline makes load→store adjacency the transfer of a
+/// loaded value; every rustc memcpy emission has it in its byte head/tail
+/// loops). A fill/memset-shaped `(dst, val, n)` function stores constants or
+/// locals and performs no loads at all, so it can never satisfy this — it
+/// would zero the relay buffer while the relay still substitutes ordinals.
+/// Full copy verification (offsets line up, all bytes transferred) stays out
+/// of scope: the caller-side idiom (the grow's argument provenance — dst is
+/// the pointer written back to the pair, src the old buffer pointer, length
+/// the old capacity in bytes) carries the rest of the proof.
 fn is_pure_copy_fn(wasm_module: &WasmModule, m: u32, hops: u32) -> bool {
     use crate::wasm::ir::WasmInstr as WI;
     if m < wasm_module.num_imported_functions {
@@ -15514,8 +15542,42 @@ fn is_pure_copy_fn(wasm_module: &WasmModule, m: u32, hops: u32) -> bool {
             _ => None,
         })
         .collect();
+    let is_mem_load = |i: &WI| {
+        matches!(
+            i,
+            WI::I32Load(_)
+                | WI::I64Load(_)
+                | WI::I32Load8S(_)
+                | WI::I32Load8U(_)
+                | WI::I32Load16S(_)
+                | WI::I32Load16U(_)
+                | WI::I64Load8S(_)
+                | WI::I64Load8U(_)
+                | WI::I64Load16S(_)
+                | WI::I64Load16U(_)
+                | WI::I64Load32S(_)
+                | WI::I64Load32U(_)
+        )
+    };
+    let is_mem_store = |i: &WI| {
+        matches!(
+            i,
+            WI::I32Store(_)
+                | WI::I64Store(_)
+                | WI::I32Store8(_)
+                | WI::I32Store16(_)
+                | WI::I64Store8(_)
+                | WI::I64Store16(_)
+                | WI::I64Store32(_)
+        )
+    };
+    let has_copy_dataflow = || {
+        func.body
+            .windows(2)
+            .any(|w| is_mem_load(&w[0]) && is_mem_store(&w[1]))
+    };
     match callees.as_slice() {
-        [] => true,
+        [] => has_copy_dataflow(),
         [inner] => hops > 0 && is_pure_copy_fn(wasm_module, *inner, hops - 1),
         _ => false,
     }
