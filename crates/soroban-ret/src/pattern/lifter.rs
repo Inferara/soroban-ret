@@ -16431,10 +16431,8 @@ fn stmts_contain_promoted_loop(stmts: &[SorobanStmt]) -> bool {
                         return true;
                     }
                 }
-                SorobanStmt::Block(body) => {
-                    if scan(body, muts) {
-                        return true;
-                    }
+                SorobanStmt::Block(body) if scan(body, muts) => {
+                    return true;
                 }
                 _ => {}
             }
