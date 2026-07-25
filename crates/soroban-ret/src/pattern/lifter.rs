@@ -2471,7 +2471,10 @@ impl<'a> LiftContext<'a> {
             return None;
         }
         let seed = self.local_arith_expr(c);
-        if !matches!(seed, SorobanExpr::I32Literal(0) | SorobanExpr::U32Literal(0)) {
+        if !matches!(
+            seed,
+            SorobanExpr::I32Literal(0) | SorobanExpr::U32Literal(0)
+        ) {
             return None;
         }
         // No nested loops: an inner loop could re-write the buffer.
@@ -2482,15 +2485,21 @@ impl<'a> LiftContext<'a> {
         }
 
         // Exit: `while trip != i` (either operand order), a variable bound.
-        let bound_local = instrs.windows(4).find_map(|w| match (w[0], w[1], w[2], w[3]) {
-            (WI::LocalGet(b), WI::LocalGet(cc), WI::I32Eq, WI::BrIf(_)) if *cc == c && *b != c => {
-                Some(*b)
-            }
-            (WI::LocalGet(cc), WI::LocalGet(b), WI::I32Eq, WI::BrIf(_)) if *cc == c && *b != c => {
-                Some(*b)
-            }
-            _ => None,
-        })?;
+        let bound_local = instrs
+            .windows(4)
+            .find_map(|w| match (w[0], w[1], w[2], w[3]) {
+                (WI::LocalGet(b), WI::LocalGet(cc), WI::I32Eq, WI::BrIf(_))
+                    if *cc == c && *b != c =>
+                {
+                    Some(*b)
+                }
+                (WI::LocalGet(cc), WI::LocalGet(b), WI::I32Eq, WI::BrIf(_))
+                    if *cc == c && *b != c =>
+                {
+                    Some(*b)
+                }
+                _ => None,
+            })?;
         let trip = self.local_arith_expr(bound_local);
         if !matches!(
             trip,
@@ -2500,25 +2509,30 @@ impl<'a> LiftContext<'a> {
         }
 
         // Cap guard: `if i == pair.cap { grow(&pair) }`.
-        let (f, cap_off) = instrs.windows(5).find_map(|w| {
-            match (w[0], w[1], w[2], w[3], w[4]) {
-                (WI::LocalGet(cc), WI::LocalGet(f), WI::I32Load(off), WI::I32Ne, WI::BrIf(_))
-                    if *cc == c =>
+        let (f, cap_off) =
+            instrs
+                .windows(5)
+                .find_map(|w| match (w[0], w[1], w[2], w[3], w[4]) {
+                    (
+                        WI::LocalGet(cc),
+                        WI::LocalGet(f),
+                        WI::I32Load(off),
+                        WI::I32Ne,
+                        WI::BrIf(_),
+                    ) if *cc == c => Some((*f, *off as i32)),
+                    _ => None,
+                })?;
+        // Grow call: `call g(&pair)`.
+        let g = instrs
+            .windows(4)
+            .find_map(|w| match (w[0], w[1], w[2], w[3]) {
+                (WI::LocalGet(ff), WI::I32Const(k), WI::I32Add, WI::Call(g))
+                    if *ff == f && *k == cap_off =>
                 {
-                    Some((*f, *off as i32))
+                    Some(*g)
                 }
                 _ => None,
-            }
-        })?;
-        // Grow call: `call g(&pair)`.
-        let g = instrs.windows(4).find_map(|w| match (w[0], w[1], w[2], w[3]) {
-            (WI::LocalGet(ff), WI::I32Const(k), WI::I32Add, WI::Call(g))
-                if *ff == f && *k == cap_off =>
-            {
-                Some(*g)
-            }
-            _ => None,
-        })?;
+            })?;
         // Pointer reload after grow: `p = pair.ptr`.
         let ptr_off = cap_off + 4;
         let p = instrs.windows(3).find_map(|w| match (w[0], w[1], w[2]) {
@@ -2530,23 +2544,29 @@ impl<'a> LiftContext<'a> {
             _ => None,
         })?;
         // The element store: `mem[p + off] = i`.
-        let off_local = instrs.windows(5).find_map(|w| match (w[0], w[1], w[2], w[3], w[4]) {
-            (WI::LocalGet(pp), WI::LocalGet(o), WI::I32Add, WI::LocalGet(cc), WI::I32Store(0))
-                if *pp == p && *cc == c && *o != c =>
-            {
-                Some(*o)
-            }
-            _ => None,
-        })?;
+        let off_local = instrs
+            .windows(5)
+            .find_map(|w| match (w[0], w[1], w[2], w[3], w[4]) {
+                (
+                    WI::LocalGet(pp),
+                    WI::LocalGet(o),
+                    WI::I32Add,
+                    WI::LocalGet(cc),
+                    WI::I32Store(0),
+                ) if *pp == p && *cc == c && *o != c => Some(*o),
+                _ => None,
+            })?;
         // The walking offset: 0-seeded, stride-stepped.
-        let stride = instrs.windows(4).find_map(|w| match (w[0], w[1], w[2], w[3]) {
-            (WI::LocalGet(oo), WI::I32Const(s), WI::I32Add, WI::LocalSet(o2))
-                if *oo == off_local && *o2 == off_local =>
-            {
-                Some(*s)
-            }
-            _ => None,
-        })?;
+        let stride = instrs
+            .windows(4)
+            .find_map(|w| match (w[0], w[1], w[2], w[3]) {
+                (WI::LocalGet(oo), WI::I32Const(s), WI::I32Add, WI::LocalSet(o2))
+                    if *oo == off_local && *o2 == off_local =>
+                {
+                    Some(*s)
+                }
+                _ => None,
+            })?;
         // Only the u32-element stride is consumed (the load side accepts
         // 4-byte loads only); other widths refuse rather than half-match.
         if stride != 4 {
@@ -2679,14 +2699,16 @@ impl<'a> LiftContext<'a> {
         }
         // The walking pointer: seeded from the relay buffer (provenance via
         // RelayBufPtr), stepped by exactly the relay stride.
-        let walk = instrs.windows(4).find_map(|w| match (w[0], w[1], w[2], w[3]) {
-            (WI::LocalGet(q), WI::I32Const(s), WI::I32Add, WI::LocalSet(q2))
-                if *q == *q2 && *s == relay.stride =>
-            {
-                Some(*q)
-            }
-            _ => None,
-        });
+        let walk = instrs
+            .windows(4)
+            .find_map(|w| match (w[0], w[1], w[2], w[3]) {
+                (WI::LocalGet(q), WI::I32Const(s), WI::I32Add, WI::LocalSet(q2))
+                    if *q == *q2 && *s == relay.stride =>
+                {
+                    Some(*q)
+                }
+                _ => None,
+            });
         let Some(q) = walk else {
             return refuse_relay("no pointer walk");
         };
@@ -2757,13 +2779,14 @@ impl<'a> LiftContext<'a> {
             let relay = self.relay.borrow();
             let Some(r) = relay.as_ref() else { return };
             match addr {
-                StackVal::FrameSlot(id, so) => match (so.term, frame_slot_key(so.base, store_off))
-                {
-                    (None, Some(key)) => {
-                        *id == r.frame_id && (key == r.cap_off || key == r.ptr_off)
+                StackVal::FrameSlot(id, so) => {
+                    match (so.term, frame_slot_key(so.base, store_off)) {
+                        (None, Some(key)) => {
+                            *id == r.frame_id && (key == r.cap_off || key == r.ptr_off)
+                        }
+                        _ => true,
                     }
-                    _ => true,
-                },
+                }
                 _ => true,
             }
         };
@@ -5915,9 +5938,10 @@ impl<'a> LiftContext<'a> {
                     // failed check keeps today's honest `todo!()`.
                     let relay_index: Option<u32> = if self.loop_depth == 0
                         && !self.in_analysis_sim
-                        && pending_relay.as_ref().is_some_and(|r| {
-                            self.relay_consume_ok(body, r, counted_info.as_ref())
-                        }) {
+                        && pending_relay
+                            .as_ref()
+                            .is_some_and(|r| self.relay_consume_ok(body, r, counted_info.as_ref()))
+                    {
                         let idx = self.locals.len() as u32;
                         self.locals.push(StackVal::LetBinding(idx));
                         Some(idx)
@@ -15413,19 +15437,19 @@ fn is_rawvec_grow_helper(wasm_module: &WasmModule, g: u32, stride: i32) -> bool 
         return false;
     }
     // (c) the copy: `memcpy(new_ptr, old_ptr, old_cap << log2(stride))`.
-    let copy_callee = body.windows(6).find_map(|w| {
-        match (&w[0], &w[1], &w[2], &w[3], &w[4], &w[5]) {
-            (
-                WI::LocalGet(dst),
-                WI::LocalGet(src),
-                WI::LocalGet(_),
-                WI::I32Const(sh),
-                WI::I32Shl,
-                WI::Call(m),
-            ) if *dst == np && *src == s && (1i32 << *sh) == stride => Some(*m),
-            _ => None,
-        }
-    });
+    let copy_callee =
+        body.windows(6)
+            .find_map(|w| match (&w[0], &w[1], &w[2], &w[3], &w[4], &w[5]) {
+                (
+                    WI::LocalGet(dst),
+                    WI::LocalGet(src),
+                    WI::LocalGet(_),
+                    WI::I32Const(sh),
+                    WI::I32Shl,
+                    WI::Call(m),
+                ) if *dst == np && *src == s && (1i32 << *sh) == stride => Some(*m),
+                _ => None,
+            });
     let Some(m) = copy_callee else {
         return false;
     };
@@ -17449,12 +17473,9 @@ fn stmt_references_local_idx(s: &SorobanStmt, idx: u32) -> bool {
             condition,
             then_body,
             else_body,
-        } => {
-            expr_references_local_idx(condition, idx) || in_body(then_body) || in_body(else_body)
-        }
+        } => expr_references_local_idx(condition, idx) || in_body(then_body) || in_body(else_body),
         SorobanStmt::Match { scrutinee, arms } => {
-            expr_references_local_idx(scrutinee, idx)
-                || arms.iter().any(|a| in_body(&a.body))
+            expr_references_local_idx(scrutinee, idx) || arms.iter().any(|a| in_body(&a.body))
         }
         SorobanStmt::Loop { body } | SorobanStmt::Block(body) => in_body(body),
         SorobanStmt::For {
