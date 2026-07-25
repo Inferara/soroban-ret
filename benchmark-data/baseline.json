@@ -173,7 +173,7 @@
     {
       "file": "lightecho-CDOR3QD2.wasm",
       "entity": "Lightecho",
-      "restoration_pct": 94.9,
+      "restoration_pct": 94.8,
       "spec_functions": 23,
       "fn_clean": 18,
       "fn_partial": 5,
@@ -269,12 +269,12 @@
     {
       "file": "xycloans-CBV4OSTR.wasm",
       "entity": "XycLoans",
-      "restoration_pct": 98.3,
+      "restoration_pct": 98.2,
       "spec_functions": 9,
       "fn_clean": 7,
       "fn_partial": 2,
       "fn_logic_lost": 0,
-      "artifacts_total": 24,
+      "artifacts_total": 13,
       "wasm_size": 11188,
       "error": null
     },

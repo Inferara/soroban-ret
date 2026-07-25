@@ -999,6 +999,137 @@ impl<'a> LiftContext<'a> {
         }
     }
 
+    /// Issue #38 t22 (#61): concretely evaluate a fully-static loop. The
+    /// loop must be pure register arithmetic over locals plus static-data
+    /// loads — no calls, no stores, no globals, no `return` (a `return`
+    /// would exit the FUNCTION; modeling it as a loop exit would be wrong).
+    /// Every touched local's pre-loop value must be a concrete `I32`/`I64`.
+    /// The body (with its structure restored) is wrapped in synthetic void
+    /// blocks so multi-level exit branches land cleanly, and interpreted by
+    /// DkEval — the per-instruction step budget bounds total iteration work,
+    /// so a runaway loop simply fails the evaluation. On success, returns
+    /// the final concrete values of every body-written local: the loop ran
+    /// to completion at lift time (the fxdao-oracle symbol-builder class,
+    /// whose one-iteration artifact previously fabricated tag-only
+    /// `SymbolSmall` keys). Any unsupported construct makes DkEval return
+    /// `None` and the loop falls through to the ordinary paths.
+    fn try_eval_const_loop(
+        &self,
+        body: &[super::structurize::StructuredBlock],
+    ) -> Option<Vec<(u32, StackVal)>> {
+        use crate::wasm::ir::{BlockType, WasmInstr as WI};
+        let mut instrs = Vec::new();
+        collect_instrs(body, &mut instrs);
+        if instrs.is_empty() {
+            return None;
+        }
+        if instrs.iter().any(|i| {
+            matches!(
+                i,
+                WI::Call(_)
+                    | WI::CallIndirect(_)
+                    | WI::GlobalGet(_)
+                    | WI::GlobalSet(_)
+                    | WI::Return
+                    | WI::I32Store(_)
+                    | WI::I64Store(_)
+                    | WI::I32Store8(_)
+                    | WI::I32Store16(_)
+                    | WI::I64Store8(_)
+                    | WI::I64Store16(_)
+                    | WI::I64Store32(_)
+            )
+        }) {
+            if *DBG_LOOPGATE {
+                eprintln!("[CONSTLOOP] bail: impure instrs");
+            }
+            return None;
+        }
+        let mut touched: Vec<u32> = Vec::new();
+        let mut written: Vec<u32> = Vec::new();
+        for i in &instrs {
+            match i {
+                WI::LocalGet(n) => {
+                    if !touched.contains(n) {
+                        touched.push(*n);
+                    }
+                }
+                WI::LocalSet(n) | WI::LocalTee(n) => {
+                    if !touched.contains(n) {
+                        touched.push(*n);
+                    }
+                    if !written.contains(n) {
+                        written.push(*n);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if written.is_empty() {
+            return None;
+        }
+        let max_local = *touched.iter().max()? as usize;
+        let mut dk_locals: Vec<DkVal> = vec![DkVal::I32(0); max_local + 1];
+        for &n in &touched {
+            match self.locals.get(n as usize) {
+                Some(StackVal::I32(v)) => dk_locals[n as usize] = DkVal::I32(*v),
+                Some(StackVal::I64(v)) => dk_locals[n as usize] = DkVal::I64(*v),
+                // Not concrete: seed OPAQUE (`DkVal::Arg`). A body path that
+                // actually READS it into arithmetic fails the evaluation
+                // (`dk_i32`/`dk_i64` reject it) — exact under any control
+                // flow; a write-before-read path just overwrites it. If it
+                // survives to a written local's final value, the adoption
+                // match below refuses it.
+                _ => dk_locals[n as usize] = DkVal::Arg(n as usize),
+            }
+        }
+        // Fragment: the loop with structure restored, inside exactly ONE
+        // synthetic void block — the canonical `block { loop { br_if exit } }`
+        // exit lands on the wrapper and falls off the fragment end. A branch
+        // escaping DEEPER than one level fails the evaluation (dk_branch
+        // frame underflow → None): with multiple wrappers, a `br` that at
+        // runtime re-enters an ENCLOSING loop would read as a forward exit
+        // and the adoption would fabricate partial-execution finals
+        // (greptile P1). The call site additionally requires
+        // `loop_depth == 0`, so every enclosing label IS a block and the
+        // single-wrapper exit model is exact.
+        let mut frag: Vec<WI> = Vec::new();
+        frag.push(WI::Block {
+            block_type: BlockType::Empty,
+        });
+        frag.push(WI::Loop {
+            block_type: BlockType::Empty,
+        });
+        flatten_structured(body, &mut frag);
+        frag.push(WI::End);
+        frag.push(WI::End);
+        let mut dk = DkEval {
+            module: self.wasm_module,
+            mem: HashMap::new(),
+            sp: DkVal::StackPtr(0),
+            steps: 0,
+            gap_zero: None,
+        };
+        if dk.run_instrs(&frag, &mut dk_locals, 0, 0).is_none() {
+            if *DBG_LOOPGATE {
+                eprintln!("[CONSTLOOP] bail: eval failed (frag {} instrs)", frag.len());
+            }
+            return None;
+        }
+        let mut out = Vec::new();
+        for &n in &written {
+            out.push((
+                n,
+                match &dk_locals[n as usize] {
+                    DkVal::I32(v) => StackVal::I32(*v),
+                    DkVal::I64(v) => StackVal::I64(*v),
+                    _ => return None,
+                },
+            ));
+        }
+        Some(out)
+    }
+
     /// Issue #38 census probe (`DBG_LOOPGATE` only): for one structured loop,
     /// report every gate the carried-state recovery consults — the counted
     /// shape, the body-effect class (calls / stores), the carried local & slot
@@ -5297,6 +5428,30 @@ impl<'a> LiftContext<'a> {
                 }
                 StructuredBlock::Loop { body, .. } => {
                     self.report_loop_gates(body, false);
+                    // Issue #38 t22 (#61): a fully-static loop (pure register
+                    // arithmetic + static-data loads, all touched locals
+                    // concrete) is EVALUATED at lift time — the final local
+                    // values adopt directly and no loop is emitted. This is
+                    // the fxdao-oracle symbol-builder class, whose
+                    // one-iteration artifact previously fabricated tag-only
+                    // `SymbolSmall` keys (`vec![&env, 14]`); concrete
+                    // evaluation recovers the REAL encoded value. The body
+                    // has no stores/calls (gated), so locals are the loop's
+                    // only effect.
+                    if self.loop_depth == 0
+                        && let Some(finals) = self.try_eval_const_loop(body)
+                    {
+                        cov_mark::hit!(const_loop_evaluated);
+                        for (l, v) in finals {
+                            if let Some(slot) = self.locals.get_mut(l as usize) {
+                                *slot = v;
+                            }
+                        }
+                        // `lift_structured` iterates with a manual index —
+                        // advance it before skipping the rest of the arm.
+                        i += 1;
+                        continue;
+                    }
                     // Detect register-rotation copy loops BEFORE lifting.
                     // Pattern: 2-iteration loop that copies local[SOURCE] to
                     // local[TARGET] via a temporary. The lifter simulates one
@@ -9583,6 +9738,11 @@ struct DkFrame {
     arity: usize,
     /// Value-stack height at block entry.
     height: usize,
+    /// `Some(ip of the Loop instr)` for loop frames (issue #38 t22): a
+    /// branch targeting this frame is a BACK EDGE — it re-enters the body
+    /// at `loop_start + 1` and the frame survives. `None` for block/if
+    /// frames (branch = forward exit past `end`).
+    loop_start: Option<usize>,
 }
 
 /// Forward small-symbol codec — the exact inverse of
@@ -9694,12 +9854,23 @@ fn dk_exit_block(stack: &mut Vec<DkVal>, fr: &DkFrame) -> Option<()> {
     Some(())
 }
 
-/// Take a branch to label `depth`: unwind to that frame carrying its results,
-/// and resume after its `End`. (Loop frames cannot occur — bodies containing
-/// `Loop` are rejected before interpretation.)
+/// Take a branch to label `depth`. For a BLOCK/IF frame: unwind to it
+/// carrying its results and resume after its `End`. For a LOOP frame (issue
+/// #38 t22): the branch is the back edge — truncate the value stack to the
+/// frame's entry height (loop labels carry no values in the MVP shapes this
+/// evaluator accepts), KEEP the frame and every frame above it popped, and
+/// resume at the body start.
 fn dk_branch(frames: &mut Vec<DkFrame>, stack: &mut Vec<DkVal>, depth: u32) -> Option<usize> {
     let idx = frames.len().checked_sub(1 + depth as usize)?;
     let fr = frames[idx].clone();
+    if let Some(start) = fr.loop_start {
+        if stack.len() < fr.height {
+            return None;
+        }
+        stack.truncate(fr.height);
+        frames.truncate(idx + 1);
+        return Some(start + 1);
+    }
     if stack.len() < fr.arity || stack.len() - fr.arity < fr.height {
         return None;
     }
@@ -9957,7 +10128,24 @@ impl DkEval<'_> {
             });
         }
 
-        let ends = dk_scan_blocks(&func.body)?;
+        self.run_instrs(&func.body, &mut locals, result_arity, depth)
+    }
+
+    /// The interpreter core over a flat instruction sequence — factored out
+    /// of [`Self::eval_call`] so the const-loop evaluator (issue #38 t22,
+    /// #61) can run a re-flattened loop fragment against caller-provided
+    /// locals. Behavior-identical for `eval_call`.
+    fn run_instrs(
+        &mut self,
+        body: &[crate::wasm::ir::WasmInstr],
+        locals: &mut [DkVal],
+        result_arity: usize,
+        depth: u32,
+    ) -> Option<Option<DkVal>> {
+        use crate::wasm::ir::{WasmInstr as WI, WasmType};
+        let _ = WasmType::I32; // keep the import shape identical to eval_call's
+
+        let ends = dk_scan_blocks(body)?;
         let mut stack: Vec<DkVal> = Vec::new();
         let mut frames: Vec<DkFrame> = Vec::new();
         let mut ip = 0usize;
@@ -9996,11 +10184,11 @@ impl DkEval<'_> {
             if self.steps > DK_MAX_STEPS {
                 return None;
             }
-            let Some(ins) = func.body.get(ip) else {
+            let Some(ins) = body.get(ip) else {
                 break; // fell off the end = function return
             };
             if *DBG_DKTRACE {
-                eprintln!("[DKTRACE] f={func_idx} ip={ip} {ins:?} stack={stack:?}");
+                eprintln!("[DKTRACE] ip={ip} {ins:?} stack={stack:?}");
             }
             match ins {
                 WI::I32Const(v) => stack.push(DkVal::I32(*v)),
@@ -10116,6 +10304,25 @@ impl DkEval<'_> {
                     let addr = stack.pop()?;
                     stack.push(self.load(&addr, *off, 1)?);
                 }
+                // 1/2-byte zero-extending i64 loads (issue #38 t22): same
+                // concrete-only discipline as `I64Load32U` below — constants
+                // extend, symbolic cells refuse.
+                WI::I64Load8U(off) => {
+                    let addr = stack.pop()?;
+                    stack.push(match self.load(&addr, *off, 1)? {
+                        DkVal::I32(x) => DkVal::I64(x as u32 as i64),
+                        DkVal::I64(x) => DkVal::I64(x as u64 as i64 & 0xFF),
+                        _ => return None,
+                    });
+                }
+                WI::I64Load16U(off) => {
+                    let addr = stack.pop()?;
+                    stack.push(match self.load(&addr, *off, 2)? {
+                        DkVal::I32(x) => DkVal::I64(x as u32 as i64),
+                        DkVal::I64(x) => DkVal::I64(x as u64 as i64 & 0xFFFF),
+                        _ => return None,
+                    });
+                }
                 WI::I64Load32U(off) => {
                     // A 4-byte zero-extending load: constants extend
                     // concretely. A symbolic cell REFUSES: the 4-wide store
@@ -10154,6 +10361,19 @@ impl DkEval<'_> {
                         end,
                         arity: dk_block_arity(block_type)?,
                         height: stack.len(),
+                        loop_start: None,
+                    });
+                }
+                // Loop frames (issue #38 t22): entered like a block; a branch
+                // targeting the frame is the back edge (see `dk_branch`). The
+                // per-instruction step budget bounds total iteration work.
+                WI::Loop { block_type } => {
+                    let (end, _) = *ends.get(&ip)?;
+                    frames.push(DkFrame {
+                        end,
+                        arity: dk_block_arity(block_type)?,
+                        height: stack.len(),
+                        loop_start: Some(ip),
                     });
                 }
                 WI::If { block_type } => {
@@ -10163,6 +10383,7 @@ impl DkEval<'_> {
                         end,
                         arity: dk_block_arity(block_type)?,
                         height: stack.len(),
+                        loop_start: None,
                     };
                     if cond != 0 {
                         frames.push(fr);
@@ -14363,6 +14584,54 @@ fn detect_register_rotation(body: &[super::structurize::StructuredBlock]) -> Opt
 /// instructions it contains, in execution order. Shared by the loop
 /// recognizers (`detect_memory_copy_loop`, `detect_counted_loop`) and the
 /// loop-carried dataflow analysis.
+/// Re-flatten a structured subtree to flat wasm with the structure markers
+/// restored (`Block`/`Loop`/`If`/`Else`/`End`) — the inverse of `structurize`
+/// for one subtree, feeding the DkEval const-loop evaluator (issue #38 t22).
+/// `SafetyNetUnreachable` re-emits `Unreachable`: proven dead by CFG
+/// analysis, and DkEval bails if evaluation ever actually reaches one.
+fn flatten_structured(
+    blocks: &[super::structurize::StructuredBlock],
+    out: &mut Vec<crate::wasm::ir::WasmInstr>,
+) {
+    use super::structurize::StructuredBlock as SB;
+    use crate::wasm::ir::WasmInstr as WI;
+    for b in blocks {
+        match b {
+            SB::Instruction(i) => out.push(i.clone()),
+            SB::Block { block_type, body } => {
+                out.push(WI::Block {
+                    block_type: block_type.clone(),
+                });
+                flatten_structured(body, out);
+                out.push(WI::End);
+            }
+            SB::Loop { block_type, body } => {
+                out.push(WI::Loop {
+                    block_type: block_type.clone(),
+                });
+                flatten_structured(body, out);
+                out.push(WI::End);
+            }
+            SB::IfElse {
+                block_type,
+                then_body,
+                else_body,
+            } => {
+                out.push(WI::If {
+                    block_type: block_type.clone(),
+                });
+                flatten_structured(then_body, out);
+                if !else_body.is_empty() {
+                    out.push(WI::Else);
+                    flatten_structured(else_body, out);
+                }
+                out.push(WI::End);
+            }
+            SB::SafetyNetUnreachable => out.push(WI::Unreachable),
+        }
+    }
+}
+
 fn collect_instrs<'a>(
     blocks: &'a [super::structurize::StructuredBlock],
     out: &mut Vec<&'a crate::wasm::ir::WasmInstr>,
@@ -21763,6 +22032,54 @@ mod tests {
             Rc::new(RefCell::new(Vec::new())),
         );
         result.stack_result.expect("the tail load leaves a value")
+    }
+
+    #[test]
+    fn const_loop_evaluates_static_fold() {
+        // A fully-static loop (constant seeds, static-data loads, pure
+        // arithmetic) is evaluated at lift time (issue #38 t22, #61): the
+        // exported function folds bytes 1048576..+4 ("ABCD") into an
+        // accumulator and returns it — the lift must produce the CONCRETE
+        // fold result, no loop, no todo. This is the fxdao-oracle
+        // symbol-builder class whose one-iteration artifact previously
+        // fabricated tag-only SymbolSmall keys.
+        cov_mark::check!(const_loop_evaluated);
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (data (i32.const 1048576) "ABCD")
+                (func (export "f") (result i64)
+                    (local $i i32) (local $acc i64)
+                    (local.set $i (i32.const 0)) (local.set $acc (i64.const 0))
+                    (block $e (loop $t
+                      (br_if $e (i32.eq (local.get $i) (i32.const 4)))
+                      (local.set $acc (i64.or
+                        (i64.shl (local.get $acc) (i64.const 8))
+                        (i64.load8_u (i32.add (i32.const 1048576) (local.get $i)))))
+                      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                      (br $t)))
+                    (local.get $acc)))"#,
+        )
+        .expect("wat parses");
+        let module = WasmModule::parse(&wasm).expect("module parses");
+        let reg = empty_registry();
+        let result = lift_inline_call(
+            &module,
+            &reg,
+            0,
+            vec![],
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
+        );
+        // 'A'=0x41 'B'=0x42 'C'=0x43 'D'=0x44 folded MSB-first.
+        let expect = (0x41i64 << 24) | (0x42 << 16) | (0x43 << 8) | 0x44;
+        assert!(
+            matches!(result.stack_result, Some(StackVal::I64(v)) if v == expect),
+            "static fold must evaluate concretely, got {:?}",
+            result.stack_result
+        );
     }
 
     #[test]
