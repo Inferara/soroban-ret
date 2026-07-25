@@ -16210,10 +16210,15 @@ fn is_int_literal_expr(expr: &SorobanExpr) -> bool {
 /// inlining them into an initializer would re-evaluate the call. The
 /// original gate's rationale — variable-name propagation folding the
 /// `let mut` onto its named source, leaving a mutation of an immutable
-/// binding — no longer applies: name propagation reserves parameter names
-/// (a param-seeded `let mut` gets a suffixed fresh name), and
-/// `remove_self_assignments` keeps every mutable self-`let` that is not a
-/// bare param copy (`let mut x = x` is a valid mutable shadow).
+/// binding — is closed by the guard in `propagate_variable_names`, not by
+/// name reservation: for spec-less functions the synthesized `argN` param
+/// names are NOT in `reserved_names`/`used_names`, so the rename to
+/// `let mut arg0 = arg0` (which `remove_self_assignments` then DROPS for
+/// param seeds, leaving the body assigning an immutable param) was still
+/// reachable. The guard keeps the `var_N` name on any MUTATED mutable let
+/// whose value is its own bare `Param`/`NamedLocal` seed — see
+/// `collect_assign_targets` and the `mutable_let_never_renamed_onto_its_
+/// param_seed` test.
 fn is_admissible_seed_expr(expr: &SorobanExpr) -> bool {
     is_int_literal_expr(expr) || expr.is_never_rooted() || expr.is_effect_free()
 }
