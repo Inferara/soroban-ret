@@ -841,6 +841,14 @@ fn test_decompile_alloc() {
         !source.contains("Vec::new(&env)\n    }"),
         "num_list must not fabricate an empty-vec return:\n{source}"
     );
+    // Issue #38 t21: the vec ACCUMULATOR recovers end-to-end — seeded from
+    // the empty constructor, mutated through the SDK's `push_back`, and
+    // returned. (The pushed value stays holed until the populate-loop value
+    // link lands.)
+    assert!(
+        source.contains("vec.push_back(") && source.contains("= Vec::new(&env)"),
+        "num_list's vec accumulator must recover as a push_back loop:\n{source}"
+    );
 }
 
 #[test]

@@ -45,20 +45,22 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 ///     `version` — recompiled bodies still hole values the lifter has not
 ///     recovered (the long-standing set previously misattributed here to
 ///     `test_alloc`).
-///   - `test_alloc` (5, issue #38 t19 unmask): `num_list` now COMPILES in
-///     this harness — the t19 carried-loop recovery replaced the
-///     `Vec::new(&env).push_back(todo!())` husk (whose unit-never-type
-///     fallback was a compile error here, hiding the function entirely)
-///     with a clean counted `while` + honest `todo!()` tail. The 5 cases
-///     that now execute diverge because the vec-population loop's VALUE is
-///     still unrecovered — the issue #38 buffer-iteration target. Driving
-///     this back down is the next tranche's job (vec-accumulator model).
+///   - `test_alloc` (4, issue #38 t21): `num_list`'s vec accumulator now
+///     recovers end-to-end (`let mut vec = Vec::new(&env); while … {
+///     vec.push_back(todo!()) } vec`), so the `count = 0` case RETURNS THE
+///     EMPTY VEC and matches. The remaining 4 cases (`count > 0`) diverge
+///     as honest todo-panics because the pushed VALUE still reads an
+///     unmodeled heap buffer (the std-alloc grow protocol) — closing them
+///     needs the populate-loop → push-loop value link.
 ///
-/// Previously 4 (digicus); 60 → 4 came from the fallible-storage-get
-/// recovery (`detect_fallible_storage_get_helper`) eliminating
-/// `unknown-oracle`'s 56 empty-storage divergences; 75 → 60 from the
-/// `checked_add`/`checked_sub` recovery (`recover_checked_arith_from_body`).
-const DIVERGENCE_CEILING: usize = 9;
+/// Previously 9 (t19 unmask: `num_list` first became compilable in this
+/// harness, exposing 5 divergences hidden behind a unit-never-type-fallback
+/// compile error); before that 4 (digicus); 60 → 4 came from the
+/// fallible-storage-get recovery (`detect_fallible_storage_get_helper`)
+/// eliminating `unknown-oracle`'s 56 empty-storage divergences; 75 → 60
+/// from the `checked_add`/`checked_sub` recovery
+/// (`recover_checked_arith_from_body`).
+const DIVERGENCE_CEILING: usize = 8;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).
