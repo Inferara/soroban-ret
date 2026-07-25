@@ -14650,16 +14650,24 @@ fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<C
 /// loop-recovery effect gates, or every fee-fold loop that delegates its
 /// arithmetic stays unrecovered. `CallIndirect` is conservatively treated as
 /// host-reaching (the table's targets are unknown).
+/// `seen` plays a dual role: cycle guard for the current DFS path AND
+/// "already scanned in this query" skip. A `seen` entry answers `false`, which
+/// is only sound because every consumer is an `Iterator::any` over one query
+/// (a fresh set per `loop_body_has_*` call): the first host-reaching answer
+/// short-circuits the whole query before any stale entry for a host-reaching
+/// function can be consulted, so surviving `false` answers always refer to
+/// genuinely pure functions. Do NOT reuse a `seen` set across queries — an
+/// entry left by a `true`-returning path would then wrongly answer `false`.
 fn fn_reaches_host_call(
     wasm_module: &WasmModule,
     idx: u32,
-    visited: &mut std::collections::HashSet<u32>,
+    seen: &mut std::collections::HashSet<u32>,
 ) -> bool {
     use crate::wasm::ir::WasmInstr;
     if idx < wasm_module.num_imported_functions {
         return true;
     }
-    if !visited.insert(idx) {
+    if !seen.insert(idx) {
         return false;
     }
     let Some(func) = wasm_module.get_function(idx) else {
@@ -14667,7 +14675,7 @@ fn fn_reaches_host_call(
         return true;
     };
     func.body.iter().any(|i| match i {
-        WasmInstr::Call(f) => fn_reaches_host_call(wasm_module, *f, visited),
+        WasmInstr::Call(f) => fn_reaches_host_call(wasm_module, *f, seen),
         WasmInstr::CallIndirect(_) => true,
         _ => false,
     })
