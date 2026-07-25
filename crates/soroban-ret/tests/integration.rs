@@ -1831,9 +1831,14 @@ fn loop_recovery_loop_variants() {
         "non-dividing step must not become a for range:\n{nondiv}"
     );
 
-    // An accumulator initialized from a parameter (non-literal init) is NOT
-    // recovered — recovering it would rename the `let mut` onto the immutable
-    // param, mutating it (non-compiling). Falls back to valid output instead.
+    // An accumulator initialized from a parameter (non-literal seed) IS
+    // recovered (issue #38 seed-admissibility widening): the seed is
+    // effect-free, so `let mut var_N = arg0` is a faithful initializer. The
+    // mutable let must keep its `var_N` name — renaming it onto the param
+    // (`let mut arg0 = arg0`) would be dropped by `remove_self_assignments`,
+    // leaving an assignment to the immutable param (the hazard the old
+    // literal-only gate guarded against, now closed in
+    // `propagate_variable_names` itself).
     let param_init = decomp(
         r#"(module (func (export "f") (param $base i64) (result i64)
             (local $i i64) (local $acc i64)
@@ -1847,5 +1852,40 @@ fn loop_recovery_loop_variants() {
     assert!(
         !param_init.contains("arg0 = ") && !param_init.contains("arg0 +="),
         "must not emit assignment to an immutable parameter:\n{param_init}"
+    );
+    assert!(
+        param_init.contains("= arg0;") && param_init.contains("let mut"),
+        "param-seeded accumulator must recover as a mutable let seeded from the param:\n{param_init}"
+    );
+    assert!(
+        !param_init.contains("todo!"),
+        "param-seeded accumulator regressed to todo!:\n{param_init}"
+    );
+
+    // A variable exit bound (`i < n` against another local — here a param)
+    // is a bounded index walk like any constant bound (issue #38 exit-shape
+    // widening): the accumulator recovers, and the loop renders as a `while`
+    // against the bound.
+    let var_bound = decomp(
+        r#"(module (func (export "f") (param $base i64) (param $n i64) (result i64)
+            (local $i i64) (local $acc i64)
+            (local.set $acc (local.get $base)) (local.set $i (i64.const 0))
+            (block $e (loop $t
+              (br_if $e (i64.ge_u (local.get $i) (local.get $n)))
+              (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+              (local.set $i (i64.add (local.get $i) (i64.const 1))) (br $t)))
+            (local.get $acc)))"#,
+    );
+    assert!(
+        var_bound.contains("while") && var_bound.contains("arg1"),
+        "variable-bound accumulator loop must render as a while against the bound:\n{var_bound}"
+    );
+    assert!(
+        var_bound.contains("= arg0;") && var_bound.contains("let mut"),
+        "variable-bound accumulator must recover its param seed:\n{var_bound}"
+    );
+    assert!(
+        !var_bound.contains("todo!"),
+        "variable-bound accumulator regressed to todo!:\n{var_bound}"
     );
 }

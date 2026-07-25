@@ -89,12 +89,12 @@
     {
       "file": "blend-pool-factory-CDSYOAVX.wasm",
       "entity": "Blend Pool Factory",
-      "restoration_pct": 79.5,
+      "restoration_pct": 79.7,
       "spec_functions": 3,
       "fn_clean": 1,
       "fn_partial": 2,
       "fn_logic_lost": 0,
-      "artifacts_total": 9,
+      "artifacts_total": 8,
       "wasm_size": 3230,
       "error": null
     },
