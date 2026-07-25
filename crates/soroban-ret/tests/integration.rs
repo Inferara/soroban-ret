@@ -774,6 +774,40 @@ fn test_decompile_macros() {
 }
 
 #[test]
+fn inlined_pure_helper_accumulator_loop_is_adopted() {
+    // A host-call-free internal helper whose value is a recovered loop
+    // accumulator: the caller must ADOPT the helper's statements (issue #38
+    // t19) instead of discarding them (the pre-t19 `content: None` path) and
+    // feeding the one-iteration artifact onward — the xycloans `&14`
+    // fabrication class.
+    let decomp = |wat: &str| {
+        let wasm = wat::parse_str(wat).expect("wat assembles");
+        decompile(&wasm).expect("decompile must not error")
+    };
+    let src = decomp(
+        r#"(module
+            (func $sum (param $n i64) (result i64)
+                (local $i i64) (local $acc i64)
+                (local.set $acc (i64.const 0)) (local.set $i (i64.const 0))
+                (block $e (loop $t
+                  (br_if $e (i64.ge_u (local.get $i) (local.get $n)))
+                  (local.set $acc (i64.add (local.get $acc) (local.get $i)))
+                  (local.set $i (i64.add (local.get $i) (i64.const 1))) (br $t)))
+                (local.get $acc))
+            (func (export "f") (param $n i64) (result i64)
+                (call $sum (local.get $n))))"#,
+    );
+    assert!(
+        src.contains("let mut") && src.contains("while"),
+        "helper accumulator loop must be adopted into the caller:\n{src}"
+    );
+    assert!(
+        !src.contains("todo!"),
+        "fully-recovered helper accumulator must not degrade to todo!:\n{src}"
+    );
+}
+
+#[test]
 fn test_decompile_alloc() {
     // `num_list(count)` builds `[0, 1, …, count-1]` by pushing in a loop. The
     // loop-carried pushes are still lost (issue #38 frontier), but the LOSS
@@ -788,8 +822,12 @@ fn test_decompile_alloc() {
         "missing Vec<u32> return type"
     );
     assert!(source.contains("count: u32"), "missing count param");
+    // t19 carried-recovery renders the loop as a real counted `while` against
+    // the promoted counter (`while count != var_N`); older shapes rendered
+    // `while count != 0` or a bare `loop`. Any of those keeps the iteration
+    // structure visible — the assertion is that the loop is NOT dropped.
     assert!(
-        source.contains("while count != 0") || source.contains("loop"),
+        source.contains("while count != ") || source.contains("loop"),
         "the vec-building loop must not be dropped:\n{source}"
     );
     // The lost pushes/return must surface as honest holes. The positive

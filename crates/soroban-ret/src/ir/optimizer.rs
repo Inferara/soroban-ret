@@ -6854,7 +6854,7 @@ fn deshadow_variable_names(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
 }
 
 /// Rename variable references in a statement.
-fn rename_in_stmt(
+pub(crate) fn rename_in_stmt(
     stmt: SorobanStmt,
     renames: &std::collections::HashMap<String, String>,
 ) -> SorobanStmt {

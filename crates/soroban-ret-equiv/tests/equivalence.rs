@@ -37,20 +37,28 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// recovers more behavior; never raise without understanding the new divergence.
 ///
 /// Measured baseline = 4, the sole remaining decompiler limitation the harness
-/// surfaced (63 fns / 474 cases executed; 63 contracts checked — 39 fixtures +
-/// 24 corpus, of which 22 do not yet recompile — 99.2% match):
-///   - `test_alloc` (4): `num_list` loses its `alloc`-vec population loop and
-///     returns an empty `Vec` instead of `[0..count]`.
+/// surfaced (68 fns / 479 cases executed; 63 contracts checked — 39 fixtures +
+/// 24 corpus — 98.1% match). Every entry is an HONEST todo-panic (the
+/// recompiled function hits a `todo!()` hole and traps as
+/// `Error(Context, InvalidAction)`), never a fabricated wrong value:
+///   - `digicus` (4): `clear_repos`/`get_repos`/`get_repos_and_issues`/
+///     `version` — recompiled bodies still hole values the lifter has not
+///     recovered (the long-standing set previously misattributed here to
+///     `test_alloc`).
+///   - `test_alloc` (5, issue #38 t19 unmask): `num_list` now COMPILES in
+///     this harness — the t19 carried-loop recovery replaced the
+///     `Vec::new(&env).push_back(todo!())` husk (whose unit-never-type
+///     fallback was a compile error here, hiding the function entirely)
+///     with a clean counted `while` + honest `todo!()` tail. The 5 cases
+///     that now execute diverge because the vec-population loop's VALUE is
+///     still unrecovered — the issue #38 buffer-iteration target. Driving
+///     this back down is the next tranche's job (vec-accumulator model).
 ///
-/// Previously 60; the fallible-storage-get recovery
-/// (`detect_fallible_storage_get_helper` in the lifter) eliminated
-/// `unknown-oracle`'s 56 empty-storage divergences — getters whose value + the
-/// missing-key contract-error branch were lost to a `has`/`extend_ttl` + `todo!()`
-/// husk now recover `env.storage().<dur>().get(&key).ok_or(Error::Variant)` (the
-/// error code read from the helper's bytecode), so the recompiled contract returns
-/// the same `Error(Contract, #code)` the original does. Before that, 75 → 60 came
-/// from the `checked_add`/`checked_sub` recovery (`recover_checked_arith_from_body`).
-const DIVERGENCE_CEILING: usize = 4;
+/// Previously 4 (digicus); 60 → 4 came from the fallible-storage-get
+/// recovery (`detect_fallible_storage_get_helper`) eliminating
+/// `unknown-oracle`'s 56 empty-storage divergences; 75 → 60 from the
+/// `checked_add`/`checked_sub` recovery (`recover_checked_arith_from_body`).
+const DIVERGENCE_CEILING: usize = 9;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).
