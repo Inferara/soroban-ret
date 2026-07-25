@@ -2783,7 +2783,7 @@ fn crypto_field_width(ty: &ScSpecTypeDef) -> Option<u32> {
 /// found `EnumConstruct`/`MapConstruct` payloads invisible to all walkers;
 /// t14 completed the remaining variants — crypto/invoke/event/prng/ttl
 /// carriers — after the unbound-local pass missed uses inside them.)
-fn child_exprs(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
+pub(crate) fn child_exprs(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
     match expr {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)

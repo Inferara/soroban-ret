@@ -584,6 +584,12 @@ static DBG_LOOPRBW: std::sync::LazyLock<bool> =
 /// candidate counts / seed literality). Measurement-only.
 static DBG_LOOPGATE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_LOOPGATE").is_ok());
+
+/// Issue #38 t19 census probe: report host-call-free inlined helpers whose
+/// discarded statement stream contains loops (the invisible-accumulator
+/// population). Measurement-only.
+static DBG_INLINEDROP: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_INLINEDROP").is_ok());
 static DBG_FDK: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_FDK").is_ok());
 static DBG_DKTRACE: std::sync::LazyLock<bool> =
@@ -988,8 +994,8 @@ impl<'a> LiftContext<'a> {
             return;
         }
         let counted = detect_counted_loop(body).is_some();
-        let calls = loop_body_has_calls(body);
-        let stores = loop_body_has_side_effects(body);
+        let calls = loop_body_has_calls(body, self.wasm_module);
+        let stores = loop_body_has_side_effects(body, self.wasm_module);
         let locals = self.analyze_loop_carried_locals(body);
         let slots = self.analyze_loop_carried_slots(body);
         let accums = locals
@@ -5286,11 +5292,12 @@ impl<'a> LiftContext<'a> {
                     // counted loops. The genuine-accumulator gate (not a pure
                     // counter) excludes boilerplate index loops the baseline
                     // already collapses.
-                    let local_analyzed = if counted && !loop_body_has_side_effects(body) {
-                        self.analyze_loop_carried_locals(body)
-                    } else {
-                        Vec::new()
-                    };
+                    let local_analyzed =
+                        if counted && !loop_body_has_side_effects(body, self.wasm_module) {
+                            self.analyze_loop_carried_locals(body)
+                        } else {
+                            Vec::new()
+                        };
                     let has_local_accumulator = local_analyzed
                         .iter()
                         .any(|(idx, val)| !is_pure_counter_update(val, *idx));
@@ -5298,7 +5305,7 @@ impl<'a> LiftContext<'a> {
                     // Step 3 — accumulators spilled to the shadow-stack frame.
                     // Allowed to contain memory stores (the spill is a store)
                     // but never calls.
-                    let slot_analyzed = if counted && !loop_body_has_calls(body) {
+                    let slot_analyzed = if counted && !loop_body_has_calls(body, self.wasm_module) {
                         self.analyze_loop_carried_slots(body)
                     } else {
                         Vec::new()
@@ -8645,6 +8652,104 @@ fn lift_inline_call(
         } else {
             ctx.stack.last().cloned()
         };
+        // Issue #38 t19 census probe: a host-call-free helper whose lifted
+        // statements contain a Loop (with mutation Assigns) is a discarded
+        // iteration — the accumulator loops the t18 census found invisible.
+        if *DBG_INLINEDROP {
+            let mut loops = 0usize;
+            let mut assigns = 0usize;
+            fn scan(stmts: &[SorobanStmt], loops: &mut usize, assigns: &mut usize) {
+                for s in stmts {
+                    match s {
+                        SorobanStmt::Loop { body } => {
+                            *loops += 1;
+                            scan(body, loops, assigns);
+                        }
+                        SorobanStmt::Assign { .. } => *assigns += 1,
+                        SorobanStmt::If {
+                            then_body,
+                            else_body,
+                            ..
+                        } => {
+                            scan(then_body, loops, assigns);
+                            scan(else_body, loops, assigns);
+                        }
+                        SorobanStmt::Match { arms, .. } => {
+                            for a in arms {
+                                scan(&a.body, loops, assigns);
+                            }
+                        }
+                        SorobanStmt::Block(body) => scan(body, loops, assigns),
+                        _ => {}
+                    }
+                }
+            }
+            scan(&ctx.stmts, &mut loops, &mut assigns);
+            if loops > 0 {
+                let sr = match &stack_result {
+                    None => "none",
+                    Some(v) if stack_val_contains_unknown(v) => "unknown",
+                    Some(_) => "clean",
+                };
+                eprintln!(
+                    "[INLINEDROP] func={target_idx} depth={inline_depth} stmts={} loops={loops} assigns={assigns} sr={sr}",
+                    ctx.stmts.len(),
+                );
+            }
+        }
+        // Issue #38 t19 — helper statement ADOPTION. A host-call-free helper
+        // is normally not worth inlining as statements: the abstract sim
+        // computes its value exactly and the statement stream is boilerplate.
+        // That stops being true when the carried-loop recovery FIRED inside
+        // the helper (a `let mut var_N` + a Loop assigning it) AND the
+        // helper's value references that recovered binding: the value now
+        // NEEDS its statements — dropping them leaves a dangling name and the
+        // one-iteration artifact the t18 census measured. Splice instead:
+        // rename every helper-local binding onto a fresh `_iK` namespace
+        // (the shared frame-id counter guarantees uniqueness across splices,
+        // including two splices of the same helper whose results are
+        // consumed later together) and return the stream as real content.
+        // A value NOT referencing recovered state keeps today's drop — the
+        // sound clean-value case and the honest-todo degraded case alike.
+        if stmts_contain_promoted_loop(&ctx.stmts)
+            && let Some(v) = &stack_result
+            && stack_result_references_binding(v)
+        {
+            let mut renames: HashMap<String, String> = HashMap::new();
+            let suffix = {
+                let mut ctr = ctx.next_frame_id.borrow_mut();
+                *ctr += 1;
+                *ctr
+            };
+            collect_let_names(&ctx.stmts, &mut |name: &str| {
+                renames
+                    .entry(name.to_string())
+                    .or_insert_with(|| format!("{name}_i{suffix}"));
+            });
+            let renamed: Vec<SorobanStmt> = ctx
+                .stmts
+                .into_iter()
+                .map(|s| crate::ir::optimizer::rename_in_stmt(s, &renames))
+                .collect();
+            let return_expr = match stack_result {
+                Some(StackVal::HostCallResult(e)) => Some(rename_expr_via_stmt(*e, &renames)),
+                Some(v) => {
+                    let e =
+                        stack_val_to_expr(&v, params, registry, Some(&ctx.frame_slots.borrow()));
+                    match e {
+                        SorobanExpr::Void | SorobanExpr::UnknownVal => None,
+                        e => Some(rename_expr_via_stmt(e, &renames)),
+                    }
+                }
+                None => None,
+            };
+            cov_mark::hit!(inline_promoted_loop_adopted);
+            return InlineResult {
+                content: Some((renamed, return_expr)),
+                memory_stores: ctx.memory_stores,
+                stack_result: None,
+            };
+        }
         cov_mark::hit!(inline_content_none);
         return InlineResult {
             content: None,
@@ -14373,8 +14478,10 @@ fn detect_memory_copy_loop(
 struct CountedLoopInfo {
     #[allow(dead_code)]
     counter_local: u32,
+    /// The constant stride, when the step adds/subs a constant. `None` = a
+    /// variable stride (`i += x`, issue #38 t19 widening).
     #[allow(dead_code)]
-    step: i64,
+    step: Option<i64>,
     /// The constant exit bound, when the exit test compares against a
     /// constant. `None` = the exit compares the counter against another
     /// local (`i < len` — a variable-bound index walk, issue #38 widening).
@@ -14397,48 +14504,66 @@ fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<C
     let mut all_instrs = Vec::new();
     collect_instrs(body, &mut all_instrs);
 
-    // Step: `local.get C; const S; (add|sub); local.set C` (same C, S != 0).
-    // A `sub` is a descending counter, recorded as a negative step.
-    let mut counter_step: Option<(u32, i64)> = None;
+    // Step: a self-update of the counter through an add/sub window ending in
+    // `local.set C` or `local.tee C` (issue #38 t19 widening — LLVM emits
+    // tee-stepped counters and variable strides):
+    //   `local.get C; const S;      add|sub; set|tee C`  (classic, ±S)
+    //   `const S;     local.get C;  add;     set|tee C`  (const-first; sub
+    //                                                     would be S-C, not a
+    //                                                     counter)
+    //   `local.get C; local.get X;  add|sub; set|tee C`  (variable stride,
+    //   `local.get X; local.get C;  add;     set|tee C`   X != C; recorded as
+    //                                                     step None)
+    // Collect ALL self-update candidates in instruction order; the counter is
+    // selected below as the candidate that also has an exit compare. Breaking
+    // on the first window would mis-pick an accumulator: `acc = acc + i` is
+    // itself a variable-stride self-update window.
+    let mut candidates: Vec<(u32, Option<i64>)> = Vec::new();
     for w in all_instrs.windows(4) {
-        let (cnt, s) = match (w[0], w[1], w[2], w[3]) {
-            (
-                WasmInstr::LocalGet(c),
-                WasmInstr::I32Const(s),
-                WasmInstr::I32Add,
-                WasmInstr::LocalSet(c2),
-            ) if c == c2 => (*c, *s as i64),
-            (
-                WasmInstr::LocalGet(c),
-                WasmInstr::I64Const(s),
-                WasmInstr::I64Add,
-                WasmInstr::LocalSet(c2),
-            ) if c == c2 => (*c, *s),
-            (
-                WasmInstr::LocalGet(c),
-                WasmInstr::I32Const(s),
-                WasmInstr::I32Sub,
-                WasmInstr::LocalSet(c2),
-            ) if c == c2 => (*c, -(*s as i64)),
-            (
-                WasmInstr::LocalGet(c),
-                WasmInstr::I64Const(s),
-                WasmInstr::I64Sub,
-                WasmInstr::LocalSet(c2),
-                // `-i64::MIN` overflows; such a pathological step isn't a real
-                // counter, so skip it rather than panic.
-            ) if c == c2 => match s.checked_neg() {
-                Some(neg) => (*c, neg),
-                None => continue,
-            },
+        let dest = match w[3] {
+            WasmInstr::LocalSet(c) | WasmInstr::LocalTee(c) => *c,
             _ => continue,
         };
-        if s != 0 {
-            counter_step = Some((cnt, s));
-            break;
+        let (cnt, s) = match (w[0], w[1], w[2]) {
+            (WasmInstr::LocalGet(c), WasmInstr::I32Const(s), WasmInstr::I32Add) if *c == dest => {
+                (*c, Some(*s as i64))
+            }
+            (WasmInstr::LocalGet(c), WasmInstr::I64Const(s), WasmInstr::I64Add) if *c == dest => {
+                (*c, Some(*s))
+            }
+            (WasmInstr::LocalGet(c), WasmInstr::I32Const(s), WasmInstr::I32Sub) if *c == dest => {
+                (*c, Some(-(*s as i64)))
+            }
+            (WasmInstr::LocalGet(c), WasmInstr::I64Const(s), WasmInstr::I64Sub) if *c == dest => {
+                // `-i64::MIN` overflows; such a pathological step isn't a
+                // real counter, so skip it rather than panic.
+                match s.checked_neg() {
+                    Some(neg) => (*c, Some(neg)),
+                    None => continue,
+                }
+            }
+            (WasmInstr::I32Const(s), WasmInstr::LocalGet(c), WasmInstr::I32Add) if *c == dest => {
+                (*c, Some(*s as i64))
+            }
+            (WasmInstr::I64Const(s), WasmInstr::LocalGet(c), WasmInstr::I64Add) if *c == dest => {
+                (*c, Some(*s))
+            }
+            (
+                WasmInstr::LocalGet(c),
+                WasmInstr::LocalGet(x),
+                WasmInstr::I32Add | WasmInstr::I64Add | WasmInstr::I32Sub | WasmInstr::I64Sub,
+            ) if *c == dest && *x != dest => (*c, None),
+            (
+                WasmInstr::LocalGet(x),
+                WasmInstr::LocalGet(c),
+                WasmInstr::I32Add | WasmInstr::I64Add,
+            ) if *c == dest && *x != dest => (*c, None),
+            _ => continue,
+        };
+        if s != Some(0) && !candidates.iter().any(|(c, _)| *c == cnt) {
+            candidates.push((cnt, s));
         }
     }
-    let (counter_local, step) = counter_step?;
 
     // Exit test: a comparison on the same counter, against a constant
     // (`local.get C; const N; cmp` / `const N; local.get C; cmp`) or against
@@ -14469,37 +14594,48 @@ fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<C
                 | WasmInstr::I64GeU
         )
     };
-    let mut bound: Option<Option<i64>> = None;
-    for w in all_instrs.windows(3) {
-        if !is_cmp(w[2]) {
-            continue;
+    let find_bound = |counter_local: u32| -> Option<Option<i64>> {
+        for w in all_instrs.windows(3) {
+            if !is_cmp(w[2]) {
+                continue;
+            }
+            let found = match (w[0], w[1]) {
+                (WasmInstr::LocalGet(c), WasmInstr::I32Const(n)) if *c == counter_local => {
+                    Some(Some(*n as i64))
+                }
+                (WasmInstr::LocalGet(c), WasmInstr::I64Const(n)) if *c == counter_local => {
+                    Some(Some(*n))
+                }
+                (WasmInstr::I32Const(n), WasmInstr::LocalGet(c)) if *c == counter_local => {
+                    Some(Some(*n as i64))
+                }
+                (WasmInstr::I64Const(n), WasmInstr::LocalGet(c)) if *c == counter_local => {
+                    Some(Some(*n))
+                }
+                (WasmInstr::LocalGet(a), WasmInstr::LocalGet(b))
+                    if (*a == counter_local) != (*b == counter_local) =>
+                {
+                    Some(None)
+                }
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
+            }
         }
-        let found = match (w[0], w[1]) {
-            (WasmInstr::LocalGet(c), WasmInstr::I32Const(n)) if *c == counter_local => {
-                Some(Some(*n as i64))
-            }
-            (WasmInstr::LocalGet(c), WasmInstr::I64Const(n)) if *c == counter_local => {
-                Some(Some(*n))
-            }
-            (WasmInstr::I32Const(n), WasmInstr::LocalGet(c)) if *c == counter_local => {
-                Some(Some(*n as i64))
-            }
-            (WasmInstr::I64Const(n), WasmInstr::LocalGet(c)) if *c == counter_local => {
-                Some(Some(*n))
-            }
-            (WasmInstr::LocalGet(a), WasmInstr::LocalGet(b))
-                if (*a == counter_local) != (*b == counter_local) =>
-            {
-                Some(None)
-            }
-            _ => None,
-        };
-        if let Some(b) = found {
-            bound = Some(b);
-            break;
-        }
-    }
-    let bound = bound?;
+        None
+    };
+
+    // Select the counter: the self-updated local that ALSO has an exit
+    // compare. Constant-stride candidates take priority over variable-stride
+    // ones — an accumulator (`acc = acc + i`) is itself a variable-stride
+    // self-update and may incidentally be compared, but a const-stepped
+    // local with an exit compare is the canonical induction variable.
+    let (counter_local, step, bound) = candidates
+        .iter()
+        .filter(|(_, s)| s.is_some())
+        .chain(candidates.iter().filter(|(_, s)| s.is_none()))
+        .find_map(|&(c, s)| find_bound(c).map(|b| (c, s, b)))?;
 
     Some(CountedLoopInfo {
         counter_local,
@@ -14508,42 +14644,89 @@ fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<C
     })
 }
 
-/// True if the loop body performs observable side effects — a call (host or
-/// internal) or a memory store. Loop-carried recovery is restricted to
-/// side-effect-free bodies: loops that publish events, copy memory, or invoke
-/// contracts are handled by the existing idiom recognizers and must not be
-/// rewritten into a `let mut` + mutation loop.
-fn loop_body_has_side_effects(body: &[super::structurize::StructuredBlock]) -> bool {
+/// True if calling function `idx` can transitively reach a host import.
+/// An internal call to a host-call-free helper is pure computation (i128
+/// soft-arith, Val encoding) — issue #38 t19: such calls must not trip the
+/// loop-recovery effect gates, or every fee-fold loop that delegates its
+/// arithmetic stays unrecovered. `CallIndirect` is conservatively treated as
+/// host-reaching (the table's targets are unknown).
+/// `seen` plays a dual role: cycle guard for the current DFS path AND
+/// "already scanned in this query" skip. A `seen` entry answers `false`, which
+/// is only sound because every consumer is an `Iterator::any` over one query
+/// (a fresh set per `loop_body_has_*` call): the first host-reaching answer
+/// short-circuits the whole query before any stale entry for a host-reaching
+/// function can be consulted, so surviving `false` answers always refer to
+/// genuinely pure functions. Do NOT reuse a `seen` set across queries — an
+/// entry left by a `true`-returning path would then wrongly answer `false`.
+fn fn_reaches_host_call(
+    wasm_module: &WasmModule,
+    idx: u32,
+    seen: &mut std::collections::HashSet<u32>,
+) -> bool {
     use crate::wasm::ir::WasmInstr;
-    let mut instrs = Vec::new();
-    collect_instrs(body, &mut instrs);
-    instrs.iter().any(|i| {
-        matches!(
-            i,
-            WasmInstr::Call(_)
-                | WasmInstr::CallIndirect(_)
-                | WasmInstr::I32Store(_)
-                | WasmInstr::I64Store(_)
-                | WasmInstr::I32Store8(_)
-                | WasmInstr::I32Store16(_)
-                | WasmInstr::I64Store8(_)
-                | WasmInstr::I64Store16(_)
-                | WasmInstr::I64Store32(_)
-        )
+    if idx < wasm_module.num_imported_functions {
+        return true;
+    }
+    if !seen.insert(idx) {
+        return false;
+    }
+    let Some(func) = wasm_module.get_function(idx) else {
+        // Unresolvable body — assume the worst.
+        return true;
+    };
+    func.body.iter().any(|i| match i {
+        WasmInstr::Call(f) => fn_reaches_host_call(wasm_module, *f, seen),
+        WasmInstr::CallIndirect(_) => true,
+        _ => false,
     })
 }
 
-/// True if the loop body contains a call (host or internal). Frame-slot
-/// promotion tolerates memory stores (the spill is itself a store) but never
-/// calls — a loop that invokes a contract, requires auth, or publishes an event
-/// is handled by the existing recognizers and left untouched.
-fn loop_body_has_calls(body: &[super::structurize::StructuredBlock]) -> bool {
+/// True if the loop body performs observable side effects — a host-reaching
+/// call or a memory store. Loop-carried recovery is restricted to bodies free
+/// of those: loops that publish events, copy memory, or invoke contracts are
+/// handled by the existing idiom recognizers and must not be rewritten into a
+/// `let mut` + mutation loop. Internal calls to transitively host-call-free
+/// helpers are pure computation and do NOT count (issue #38 t19).
+fn loop_body_has_side_effects(
+    body: &[super::structurize::StructuredBlock],
+    wasm_module: &WasmModule,
+) -> bool {
     use crate::wasm::ir::WasmInstr;
     let mut instrs = Vec::new();
     collect_instrs(body, &mut instrs);
-    instrs
-        .iter()
-        .any(|i| matches!(i, WasmInstr::Call(_) | WasmInstr::CallIndirect(_)))
+    let mut visited = std::collections::HashSet::new();
+    instrs.iter().any(|i| match i {
+        WasmInstr::Call(f) => fn_reaches_host_call(wasm_module, *f, &mut visited),
+        WasmInstr::CallIndirect(_) => true,
+        WasmInstr::I32Store(_)
+        | WasmInstr::I64Store(_)
+        | WasmInstr::I32Store8(_)
+        | WasmInstr::I32Store16(_)
+        | WasmInstr::I64Store8(_)
+        | WasmInstr::I64Store16(_)
+        | WasmInstr::I64Store32(_) => true,
+        _ => false,
+    })
+}
+
+/// True if the loop body contains a host-reaching call. Frame-slot promotion
+/// tolerates memory stores (the spill is itself a store) but never a call
+/// that can reach the host — a loop that invokes a contract, requires auth,
+/// or publishes an event is handled by the existing recognizers and left
+/// untouched. Internal pure-computation calls do NOT count (issue #38 t19).
+fn loop_body_has_calls(
+    body: &[super::structurize::StructuredBlock],
+    wasm_module: &WasmModule,
+) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    let mut instrs = Vec::new();
+    collect_instrs(body, &mut instrs);
+    let mut visited = std::collections::HashSet::new();
+    instrs.iter().any(|i| match i {
+        WasmInstr::Call(f) => fn_reaches_host_call(wasm_module, *f, &mut visited),
+        WasmInstr::CallIndirect(_) => true,
+        _ => false,
+    })
 }
 
 /// Extract an i32-compatible constant from a StackVal (for cross-type constant folding).
@@ -16221,6 +16404,121 @@ fn is_int_literal_expr(expr: &SorobanExpr) -> bool {
 /// param_seed` test.
 fn is_admissible_seed_expr(expr: &SorobanExpr) -> bool {
     is_int_literal_expr(expr) || expr.is_never_rooted() || expr.is_effect_free()
+}
+
+/// True if `stmts` contain the carried-recovery output shape at any nesting
+/// level: a `let mut var_N` whose name a later `Loop` body assigns. This is
+/// the structural fingerprint of `loop_carried_recovered` — only the t18
+/// promotion machinery emits it during a lift (issue #38 t19 adoption gate).
+fn stmts_contain_promoted_loop(stmts: &[SorobanStmt]) -> bool {
+    fn scan(stmts: &[SorobanStmt], muts: &mut Vec<String>) -> bool {
+        let depth = muts.len();
+        for s in stmts {
+            match s {
+                SorobanStmt::Let {
+                    name,
+                    mutable: true,
+                    ..
+                } => muts.push(name.clone()),
+                SorobanStmt::Loop { body } => {
+                    if assigns_any(body, muts) || scan(body, muts) {
+                        return true;
+                    }
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    if scan(then_body, muts) || scan(else_body, muts) {
+                        return true;
+                    }
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    if arms.iter().any(|a| scan(&a.body, muts)) {
+                        return true;
+                    }
+                }
+                SorobanStmt::Block(body) if scan(body, muts) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        muts.truncate(depth);
+        false
+    }
+    fn assigns_any(stmts: &[SorobanStmt], muts: &[String]) -> bool {
+        stmts.iter().any(|s| match s {
+            SorobanStmt::Assign { target, .. } => muts.iter().any(|m| m == target),
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => assigns_any(body, muts),
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => assigns_any(then_body, muts) || assigns_any(else_body, muts),
+            SorobanStmt::Match { arms, .. } => arms.iter().any(|a| assigns_any(&a.body, muts)),
+            _ => false,
+        })
+    }
+    let mut muts = Vec::new();
+    scan(stmts, &mut muts)
+}
+
+/// True if the helper's stack result references a local binding (by index or
+/// name) — i.e. the value depends on statements the caller would otherwise
+/// discard (issue #38 t19 adoption gate).
+fn stack_result_references_binding(v: &StackVal) -> bool {
+    fn expr_refs(e: &SorobanExpr) -> bool {
+        matches!(e, SorobanExpr::Local(_) | SorobanExpr::NamedLocal(_))
+            || crate::pipeline::child_exprs(e).iter().any(|c| expr_refs(c))
+    }
+    match v {
+        StackVal::LetBinding(_) | StackVal::LoopPhi(_) => true,
+        StackVal::HostCallResult(e) => expr_refs(e),
+        StackVal::BinOp(a, _, b) | StackVal::Compare(a, _, b) => {
+            stack_result_references_binding(a) || stack_result_references_binding(b)
+        }
+        StackVal::Eqz(a) => stack_result_references_binding(a),
+        _ => false,
+    }
+}
+
+/// Collect every `Let` binding name in `stmts`, at any nesting depth.
+fn collect_let_names(stmts: &[SorobanStmt], f: &mut impl FnMut(&str)) {
+    for s in stmts {
+        match s {
+            SorobanStmt::Let { name, .. } => f(name),
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_let_names(then_body, f);
+                collect_let_names(else_body, f);
+            }
+            SorobanStmt::Match { arms, .. } => {
+                for a in arms {
+                    collect_let_names(&a.body, f);
+                }
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => collect_let_names(body, f),
+            _ => {}
+        }
+    }
+}
+
+/// Rename references in a bare expression by round-tripping it through
+/// `rename_in_stmt` (keeps the optimizer's rename walker as the single
+/// authority on reference coverage).
+fn rename_expr_via_stmt(
+    e: SorobanExpr,
+    renames: &std::collections::HashMap<String, String>,
+) -> SorobanExpr {
+    match crate::ir::optimizer::rename_in_stmt(SorobanStmt::Expr(e), renames) {
+        SorobanStmt::Expr(e) => e,
+        _ => unreachable!("rename_in_stmt preserves the Expr variant"),
+    }
 }
 
 /// True if `val` transitively references a `LetBinding` or `LoopPhi` — i.e. a
