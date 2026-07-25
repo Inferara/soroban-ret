@@ -15395,8 +15395,8 @@ struct RelayProtocol {
 /// `old_cap << log2(stride)` bytes from it to the new buffer via a pure
 /// memory-copy callee, and (d) writes the new capacity and the copy's
 /// destination pointer back to `param[0]` / `param[4]`. Together with the
-/// caller-side idiom (canonical `(0, dangling)` pair init + cap-guarded grow
-/// + counter-at-walking-offset store, see [`RelayProtocol`]) this is the
+/// caller-side idiom (canonical `(0, dangling)` pair init, cap-guarded grow,
+/// counter-at-walking-offset store — see [`RelayProtocol`]) this is the
 /// compiled `RawVec::grow` shape — the recognizer proves the parts a value
 /// relay depends on (contents survive the move, the pair tracks the live
 /// buffer) and refuses anything that deviates.
