@@ -584,6 +584,12 @@ static DBG_LOOPRBW: std::sync::LazyLock<bool> =
 /// candidate counts / seed literality). Measurement-only.
 static DBG_LOOPGATE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_LOOPGATE").is_ok());
+
+/// Issue #38 t19 census probe: report host-call-free inlined helpers whose
+/// discarded statement stream contains loops (the invisible-accumulator
+/// population). Measurement-only.
+static DBG_INLINEDROP: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_INLINEDROP").is_ok());
 static DBG_FDK: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_FDK").is_ok());
 static DBG_DKTRACE: std::sync::LazyLock<bool> =
@@ -8645,6 +8651,51 @@ fn lift_inline_call(
         } else {
             ctx.stack.last().cloned()
         };
+        // Issue #38 t19 census probe: a host-call-free helper whose lifted
+        // statements contain a Loop (with mutation Assigns) is a discarded
+        // iteration — the accumulator loops the t18 census found invisible.
+        if *DBG_INLINEDROP {
+            let mut loops = 0usize;
+            let mut assigns = 0usize;
+            fn scan(stmts: &[SorobanStmt], loops: &mut usize, assigns: &mut usize) {
+                for s in stmts {
+                    match s {
+                        SorobanStmt::Loop { body } => {
+                            *loops += 1;
+                            scan(body, loops, assigns);
+                        }
+                        SorobanStmt::Assign { .. } => *assigns += 1,
+                        SorobanStmt::If {
+                            then_body,
+                            else_body,
+                            ..
+                        } => {
+                            scan(then_body, loops, assigns);
+                            scan(else_body, loops, assigns);
+                        }
+                        SorobanStmt::Match { arms, .. } => {
+                            for a in arms {
+                                scan(&a.body, loops, assigns);
+                            }
+                        }
+                        SorobanStmt::Block(body) => scan(body, loops, assigns),
+                        _ => {}
+                    }
+                }
+            }
+            scan(&ctx.stmts, &mut loops, &mut assigns);
+            if loops > 0 {
+                let sr = match &stack_result {
+                    None => "none",
+                    Some(v) if stack_val_contains_unknown(v) => "unknown",
+                    Some(_) => "clean",
+                };
+                eprintln!(
+                    "[INLINEDROP] func={target_idx} depth={inline_depth} stmts={} loops={loops} assigns={assigns} sr={sr}",
+                    ctx.stmts.len(),
+                );
+            }
+        }
         cov_mark::hit!(inline_content_none);
         return InlineResult {
             content: None,
