@@ -849,9 +849,26 @@ impl<'a> LiftContext<'a> {
             let slots = self.frame_slots.borrow();
             stack_val_to_expr(val, self.params, self.registry, Some(&slots))
         };
-        let assign = SorobanStmt::Assign {
-            target: format!("var_{}", idx),
-            value: value.clone(),
+        // A functional collection self-update (`v = vec_push_back(v, x)`,
+        // issue #38 t21) renders as the SDK's mutable API — `v.push_back(x);`
+        // as a statement. The SDK mutators are `&mut self -> ()`, so the
+        // `v = v.push_back(x)` assign form would not type-check (`()` into a
+        // collection binding).
+        let self_mutating_method = matches!(
+            &value,
+            SorobanExpr::MethodCall { object, method, .. }
+                if matches!(
+                    method.as_str(),
+                    "push_back" | "push_front" | "append" | "insert" | "set"
+                ) && expr_references_local_idx(object, idx)
+        );
+        let stmt = if self_mutating_method {
+            SorobanStmt::Expr(value.clone())
+        } else {
+            SorobanStmt::Assign {
+                target: format!("var_{}", idx),
+                value: value.clone(),
+            }
         };
         // Only rewrite the trailing `Expr` in place when it is exactly the call
         // that produced this value (same guard as the implicit-return path);
@@ -859,9 +876,9 @@ impl<'a> LiftContext<'a> {
         if matches!(val, StackVal::HostCallResult(_))
             && matches!(self.stmts.last(), Some(SorobanStmt::Expr(e)) if *e == value)
         {
-            *self.stmts.last_mut().unwrap() = assign;
+            *self.stmts.last_mut().unwrap() = stmt;
         } else {
-            self.stmts.push(assign);
+            self.stmts.push(stmt);
         }
         if let Some(local) = self.locals.get_mut(idx as usize) {
             *local = StackVal::LetBinding(idx);
@@ -993,7 +1010,7 @@ impl<'a> LiftContext<'a> {
         if !*DBG_LOOPGATE || self.in_analysis_sim {
             return;
         }
-        let counted = detect_counted_loop(body).is_some();
+        let counted = detect_counted_loop(body, self.wasm_module).is_some();
         let calls = loop_body_has_calls(body, self.wasm_module);
         let stores = loop_body_has_side_effects(body, self.wasm_module);
         let locals = self.analyze_loop_carried_locals(body);
@@ -2198,10 +2215,15 @@ impl<'a> LiftContext<'a> {
 
         let mut instrs = Vec::new();
         collect_instrs(body, &mut instrs);
+        // Body-written locals are candidates INCLUDING param-index slots
+        // (issue #38 t21): LLVM reuses a dead param slot as a loop register —
+        // `num_list`'s vec accumulator (`v = vec_push_back(v, x)`) lives in
+        // the reused param-0 local. A param slot never written in the body is
+        // never a candidate anyway, and promotion emits a fresh `let mut
+        // var_N` copy, so the rendered param binding is untouched.
         let mut written: Vec<u32> = Vec::new();
         for &i in &instrs {
             if let WasmInstr::LocalSet(idx) | WasmInstr::LocalTee(idx) = i
-                && *idx >= self.num_wasm_params
                 && !written.contains(idx)
             {
                 written.push(*idx);
@@ -2250,7 +2272,28 @@ impl<'a> LiftContext<'a> {
                 // Exclude a local left as its bare `LoopPhi` seed (written with an
                 // identity value) — it isn't genuinely loop-carried.
                 let modified = !matches!(v, StackVal::LoopPhi(i) if *i == l);
-                (modified && stackval_references_loop_phi(v, l)).then(|| (l, v.clone()))
+                // A PARAM-index slot qualifies only on the exact functional
+                // collection-accumulator evidence (`v = vec_push_back(v, x)`
+                // in the reused param-0 register — the `num_list` shape).
+                // Reused param slots carry many other loop roles (Val
+                // re-encode walks, scratch registers) where promotion
+                // measurably regressed the corpus (fxdao-oracle lost its
+                // clean-compile status); body-local slots keep the general
+                // self-reference criterion.
+                let param_ok = l >= self.num_wasm_params
+                    || matches!(
+                        v,
+                        StackVal::HostCallResult(e)
+                            if matches!(
+                                e.as_ref(),
+                                SorobanExpr::MethodCall { object, method, .. }
+                                    if matches!(
+                                        method.as_str(),
+                                        "push_back" | "push_front" | "append" | "insert" | "set"
+                                    ) && expr_references_local_idx(object, l)
+                            )
+                    );
+                (modified && param_ok && stackval_references_loop_phi(v, l)).then(|| (l, v.clone()))
             })
             .collect()
     }
@@ -5286,7 +5329,8 @@ impl<'a> LiftContext<'a> {
                     // recognizer). Cost without benefit — revisit only when
                     // helper statement adoption improves.
                     let mut carried: Vec<u32> = Vec::new();
-                    let counted = detect_counted_loop(body).is_some();
+                    let counted_info = detect_counted_loop(body, self.wasm_module);
+                    let counted = counted_info.is_some();
 
                     // Step 1 — local accumulators, only in side-effect-free
                     // counted loops. The genuine-accumulator gate (not a pure
@@ -5329,6 +5373,38 @@ impl<'a> LiftContext<'a> {
                     // `0` from being Val-decoded into `false`.
                     let local_inits: Vec<(u32, SorobanExpr)> = local_candidates
                         .iter()
+                        .filter(|(l, v)| {
+                            // A secondary PURE COUNTER with a non-literal seed
+                            // is dropped: it carries no recoverable value (it
+                            // only steps itself), and its seed expression can
+                            // husk to a diverging `todo!()` downstream (e.g. a
+                            // reference to a binding that never materializes),
+                            // poisoning the loop's rendering with E0277
+                            // never-operand arithmetic — issue #38 t21, the
+                            // `num_list` dead buf-pointer. The loop's EXIT
+                            // counter always survives (the `while` condition
+                            // needs it), literal-seeded counters render
+                            // harmlessly, and accumulators are untouched.
+                            if !is_pure_counter_update(v, *l) {
+                                return true;
+                            }
+                            if counted_info.as_ref().is_some_and(|i| i.counter_local == *l) {
+                                return true;
+                            }
+                            let pre = self
+                                .locals
+                                .get(*l as usize)
+                                .cloned()
+                                .unwrap_or(StackVal::Unknown);
+                            let slots = self.frame_slots.borrow();
+                            let seed = stack_val_to_arith_expr(
+                                &pre,
+                                self.params,
+                                self.registry,
+                                Some(&slots),
+                            );
+                            is_int_literal_expr(&seed)
+                        })
                         .map(|(l, _)| {
                             let pre = self
                                 .locals
@@ -14498,7 +14574,10 @@ struct CountedLoopInfo {
 /// identifies the bounded-iteration shape and leaves every other loop (memory
 /// copies, host-call-driven iteration, SDK limb arithmetic) on the existing
 /// single-pass path untouched.
-fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<CountedLoopInfo> {
+fn detect_counted_loop(
+    body: &[super::structurize::StructuredBlock],
+    wasm_module: &WasmModule,
+) -> Option<CountedLoopInfo> {
     use crate::wasm::ir::WasmInstr;
 
     let mut all_instrs = Vec::new();
@@ -14594,7 +14673,29 @@ fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<C
                 | WasmInstr::I64GeU
         )
     };
+    let has_builder_call = all_instrs.iter().any(|i| {
+        matches!(i, WasmInstr::Call(f)
+            if wasm_module.imports.get_by_index(*f).is_some_and(is_functional_collection_builder))
+    });
     let find_bound = |counter_local: u32| -> Option<Option<i64>> {
+        // `local.get C; i(32|64).eqz` — an exit against zero (issue #38 t21:
+        // countdown loops exit through eqz, not a 2-operand compare).
+        // Certified ONLY when the body also calls a functional collection
+        // builder (the `v = vec_push_back(v, x)` accumulator shape): an
+        // eqz-countdown WITHOUT host calls is an encode/fold loop (symbol
+        // builders, memcpy tails) whose value belongs to a concrete
+        // evaluator, not to promotion — certifying those surfaced
+        // fxdao-oracle's fabricated `SymbolSmall` keys as raw holes and
+        // regressed its clean-compile status (+16 corpus errors).
+        if has_builder_call {
+            for w in all_instrs.windows(2) {
+                if matches!(w[0], WasmInstr::LocalGet(c) if *c == counter_local)
+                    && matches!(w[1], WasmInstr::I32Eqz | WasmInstr::I64Eqz)
+                {
+                    return Some(Some(0));
+                }
+            }
+        }
         for w in all_instrs.windows(3) {
             if !is_cmp(w[2]) {
                 continue;
@@ -14650,6 +14751,23 @@ fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<C
 /// loop-recovery effect gates, or every fee-fold loop that delegates its
 /// arithmetic stays unrecovered. `CallIndirect` is conservatively treated as
 /// host-reaching (the table's targets are unknown).
+/// Host functions that are pure value→value collection builders: they
+/// allocate and return a NEW host object and neither observe nor mutate any
+/// contract state (no storage, no events, no auth, no cross-contract calls;
+/// Soroban collections are immutable — `vec_push_back(v, x)` returns a new
+/// handle). A loop whose only host effect is building a collection is an
+/// accumulator loop (issue #38 t21), not recognizer territory, so a DIRECT
+/// call to one of these does not trip the loop-recovery effect gates.
+fn is_functional_collection_builder(hf: &crate::wasm::imports::HostFunction) -> bool {
+    matches!(
+        (&hf.module, hf.name.as_str()),
+        (
+            HostModule::Vec,
+            "vec_new" | "vec_push_back" | "vec_push_front" | "vec_append" | "vec_put"
+        ) | (HostModule::Map, "map_new" | "map_put")
+    )
+}
+
 /// `seen` plays a dual role: cycle guard for the current DFS path AND
 /// "already scanned in this query" skip. A `seen` entry answers `false`, which
 /// is only sound because every consumer is an `Iterator::any` over one query
@@ -14696,7 +14814,15 @@ fn loop_body_has_side_effects(
     collect_instrs(body, &mut instrs);
     let mut visited = std::collections::HashSet::new();
     instrs.iter().any(|i| match i {
-        WasmInstr::Call(f) => fn_reaches_host_call(wasm_module, *f, &mut visited),
+        WasmInstr::Call(f) => {
+            if let Some(hf) = wasm_module.imports.get_by_index(*f)
+                && is_functional_collection_builder(hf)
+            {
+                false
+            } else {
+                fn_reaches_host_call(wasm_module, *f, &mut visited)
+            }
+        }
         WasmInstr::CallIndirect(_) => true,
         WasmInstr::I32Store(_)
         | WasmInstr::I64Store(_)
@@ -14723,7 +14849,15 @@ fn loop_body_has_calls(
     collect_instrs(body, &mut instrs);
     let mut visited = std::collections::HashSet::new();
     instrs.iter().any(|i| match i {
-        WasmInstr::Call(f) => fn_reaches_host_call(wasm_module, *f, &mut visited),
+        WasmInstr::Call(f) => {
+            if let Some(hf) = wasm_module.imports.get_by_index(*f)
+                && is_functional_collection_builder(hf)
+            {
+                false
+            } else {
+                fn_reaches_host_call(wasm_module, *f, &mut visited)
+            }
+        }
         WasmInstr::CallIndirect(_) => true,
         _ => false,
     })
@@ -16320,7 +16454,24 @@ fn stackval_references_loop_phi(val: &StackVal, idx: u32) -> bool {
             stackval_references_loop_phi(a, idx) || stackval_references_loop_phi(b, idx)
         }
         StackVal::Eqz(a) => stackval_references_loop_phi(a, idx),
+        // A functional collection update (`v = vec_push_back(v, x)`, issue
+        // #38 t21) materializes the phi as its expr rendering (`LoopPhi(i)`
+        // → `Local(i)`, see `stack_val_to_expr`), so the self-reference
+        // lives inside the host-call expr tree.
+        StackVal::HostCallResult(e) => expr_references_local_idx(e, idx),
         _ => false,
+    }
+}
+
+/// True if `e` transitively references local `idx` (`Local(idx)` or its
+/// `var_{idx}` named form).
+fn expr_references_local_idx(e: &SorobanExpr, idx: u32) -> bool {
+    match e {
+        SorobanExpr::Local(i) => *i == idx,
+        SorobanExpr::NamedLocal(n) => *n == format!("var_{idx}"),
+        _ => crate::pipeline::child_exprs(e)
+            .iter()
+            .any(|c| expr_references_local_idx(c, idx)),
     }
 }
 
@@ -16403,7 +16554,14 @@ fn is_int_literal_expr(expr: &SorobanExpr) -> bool {
 /// `collect_assign_targets` and the `mutable_let_never_renamed_onto_its_
 /// param_seed` test.
 fn is_admissible_seed_expr(expr: &SorobanExpr) -> bool {
-    is_int_literal_expr(expr) || expr.is_never_rooted() || expr.is_effect_free()
+    is_int_literal_expr(expr)
+        || expr.is_never_rooted()
+        || expr.is_effect_free()
+        // Empty-collection constructors (`Vec::new(&env)` / `Map::new(&env)`)
+        // are pure allocations — re-evaluating one in an initializer observes
+        // nothing and builds the same empty value. The seed of a functional
+        // collection-accumulator loop (issue #38 t21).
+        || matches!(expr, SorobanExpr::CollectionNew(_))
 }
 
 /// True if `stmts` contain the carried-recovery output shape at any nesting

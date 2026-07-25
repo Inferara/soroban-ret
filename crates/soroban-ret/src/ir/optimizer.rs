@@ -3792,6 +3792,16 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
                 // idiom (both operands comparisons) is left for its own recognizer.
                 _ if is_carry_borrow_flag(&b) && !is_carry_borrow_flag(&a) => a,
                 _ if is_carry_borrow_flag(&a) && !is_carry_borrow_flag(&b) => b,
+                // `x + (-k)` → `x - k` (descending counters lift as adds of a
+                // negative constant; the `+ -k` form needs `Neg` and fails on
+                // unsigned bindings — issue #38 t21). `MIN` has no positive
+                // negation and stays as-is.
+                (_, SorobanExpr::I32Literal(n)) if *n < 0 && *n != i32::MIN => {
+                    SorobanExpr::Sub(Box::new(a), Box::new(SorobanExpr::I32Literal(-n)))
+                }
+                (_, SorobanExpr::I64Literal(n)) if *n < 0 && *n != i64::MIN => {
+                    SorobanExpr::Sub(Box::new(a), Box::new(SorobanExpr::I64Literal(-n)))
+                }
                 _ => SorobanExpr::Add(Box::new(a), Box::new(b)),
             }
         }
