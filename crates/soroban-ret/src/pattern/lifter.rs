@@ -578,6 +578,12 @@ static DBG_SLOTREAD: std::sync::LazyLock<bool> =
 /// pre-loop value). Measurement-only; no behavior change.
 static DBG_LOOPRBW: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_LOOPRBW").is_ok());
+
+/// Issue #38 census probe: report, for every structured loop, which
+/// carried-state recovery gate blocks promotion (loop shape / body effects /
+/// candidate counts / seed literality). Measurement-only.
+static DBG_LOOPGATE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_LOOPGATE").is_ok());
 static DBG_FDK: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_FDK").is_ok());
 static DBG_DKTRACE: std::sync::LazyLock<bool> =
@@ -739,6 +745,11 @@ struct LiftContext<'a> {
     /// the linear sim shows the pre-loop value). Empty unless the flag is
     /// set; measurement-only, never changes lifting behavior.
     slot_read_log: Rc<RefCell<SlotReadLog>>,
+    /// True inside a throwaway loop-analysis simulation context. Suppresses
+    /// the `DBG_LOOPGATE` probe (whose own analysis sims would otherwise
+    /// recurse exponentially through nested loops) — and documents which
+    /// contexts must never leak observations into shared state.
+    in_analysis_sim: bool,
 }
 
 /// `(slot key, write-log length at read time)` — see `slot_read_log`.
@@ -782,6 +793,7 @@ impl<'a> LiftContext<'a> {
             slot_write_log: Rc::new(RefCell::new(Vec::new())),
             slot_taints: Rc::new(RefCell::new(HashMap::new())),
             slot_read_log: Rc::new(RefCell::new(Vec::new())),
+            in_analysis_sim: false,
         }
     }
 
@@ -817,6 +829,7 @@ impl<'a> LiftContext<'a> {
             slot_write_log: Rc::clone(&self.slot_write_log),
             slot_taints: Rc::clone(&self.slot_taints),
             slot_read_log: Rc::clone(&self.slot_read_log),
+            in_analysis_sim: self.in_analysis_sim,
         }
     }
 
@@ -961,6 +974,72 @@ impl<'a> LiftContext<'a> {
                 },
             );
         }
+    }
+
+    /// Issue #38 census probe (`DBG_LOOPGATE` only): for one structured loop,
+    /// report every gate the carried-state recovery consults — the counted
+    /// shape, the body-effect class (calls / stores), the carried local & slot
+    /// candidate counts, how many candidate seeds pass the integer-literal
+    /// gate, and a compact dump of each non-literal seed (the class the
+    /// `all_literal` gate currently rejects). The analysis sims detach all
+    /// shared state, so running them on gate-rejected loops is behavior-inert.
+    fn report_loop_gates(&self, body: &[super::structurize::StructuredBlock], nested: bool) {
+        if !*DBG_LOOPGATE || self.in_analysis_sim {
+            return;
+        }
+        let counted = detect_counted_loop(body).is_some();
+        let calls = loop_body_has_calls(body);
+        let stores = loop_body_has_side_effects(body);
+        let locals = self.analyze_loop_carried_locals(body);
+        let slots = self.analyze_loop_carried_slots(body);
+        let accums = locals
+            .iter()
+            .filter(|(idx, val)| !is_pure_counter_update(val, *idx))
+            .count();
+        let mut lits = 0usize;
+        let mut nonlit: Vec<String> = Vec::new();
+        {
+            let slots_map = self.frame_slots.borrow();
+            for (l, _) in &locals {
+                let pre = self
+                    .locals
+                    .get(*l as usize)
+                    .cloned()
+                    .unwrap_or(StackVal::Unknown);
+                let e = stack_val_to_arith_expr(&pre, self.params, self.registry, Some(&slots_map));
+                if is_int_literal_expr(&e) {
+                    lits += 1;
+                } else {
+                    let mut k = format!("L{l}={pre:?}");
+                    k.truncate(80);
+                    nonlit.push(k);
+                }
+            }
+            for (key, pre) in &slots {
+                let e = stack_val_to_arith_expr(pre, self.params, self.registry, Some(&slots_map));
+                if is_int_literal_expr(&e) {
+                    lits += 1;
+                } else {
+                    let mut k = format!("S{key:?}={pre:?}");
+                    k.truncate(80);
+                    nonlit.push(k);
+                }
+            }
+        }
+        eprintln!(
+            "[LOOPGATE] nested={} counted={} calls={} stores={} local_cands={} accums={} slot_cands={} lits={} loop={} inline={} nonlit=[{}]",
+            nested as u32,
+            counted,
+            calls,
+            stores,
+            locals.len(),
+            accums,
+            slots.len(),
+            lits,
+            self.loop_depth,
+            self.inline_depth,
+            nonlit.join(" | ")
+        );
     }
 
     /// Lower a classified i128/u128 soft-arith helper call to a clean `Mul`/`Div`.
@@ -2140,6 +2219,16 @@ impl<'a> LiftContext<'a> {
         sim.slot_write_log = Rc::new(RefCell::new(self.slot_write_log.borrow().clone()));
         sim.slot_taints = Rc::new(RefCell::new(self.slot_taints.borrow().clone()));
         sim.slot_read_log = Rc::new(RefCell::new(Vec::new()));
+        // Detach the remaining Rc-shared state too (issue #38): a call-bearing
+        // body sim would otherwise record fallible-getter observations and
+        // dynamic-slot writes into the REAL lift's state. Dynamic slots keep a
+        // copy (body loads may read pre-loop indexed entries); the fallible-get
+        // observer starts empty (sim observations must never reach
+        // `lift_function_body`).
+        sim.dynamic_slots = Rc::new(RefCell::new(self.dynamic_slots.borrow().clone()));
+        sim.fallible_get_recovery = Rc::new(RefCell::new(None));
+        sim.fallible_get_count = Rc::new(RefCell::new(0));
+        sim.in_analysis_sim = true;
         sim.loop_depth += 1;
         for &l in &written {
             if let Some(slot) = sim.locals.get_mut(l as usize) {
@@ -2194,6 +2283,13 @@ impl<'a> LiftContext<'a> {
         sim.slot_write_log = Rc::new(RefCell::new(self.slot_write_log.borrow().clone()));
         sim.slot_taints = Rc::new(RefCell::new(self.slot_taints.borrow().clone()));
         sim.slot_read_log = Rc::new(RefCell::new(Vec::new()));
+        // Detach the remaining Rc-shared state (issue #38, same as
+        // `analyze_loop_carried_locals`): sim-side fallible-getter observations
+        // and dynamic-slot writes must never reach the real lift.
+        sim.dynamic_slots = Rc::new(RefCell::new(self.dynamic_slots.borrow().clone()));
+        sim.fallible_get_recovery = Rc::new(RefCell::new(None));
+        sim.fallible_get_count = Rc::new(RefCell::new(0));
+        sim.in_analysis_sim = true;
         sim.loop_depth += 1;
         // Also seed body-written locals with LoopPhi so an accumulator that adds
         // the counter (`acc += i`) stays symbolic — otherwise the counter's
@@ -5151,6 +5247,7 @@ impl<'a> LiftContext<'a> {
                     }
                 }
                 StructuredBlock::Loop { body, .. } => {
+                    self.report_loop_gates(body, false);
                     // Detect register-rotation copy loops BEFORE lifting.
                     // Pattern: 2-iteration loop that copies local[SOURCE] to
                     // local[TARGET] via a temporary. The lifter simulates one
@@ -5165,19 +5262,30 @@ impl<'a> LiftContext<'a> {
                     // and post-loop reads resolve to the variable instead of Unknown.
                     //
                     // Gated on a positive counted-loop match: only the bounded
-                    // `i += step; i == N` shape opts into recovery. Every other loop
-                    // (memory copies, host-call-driven iteration, SDK limb arithmetic
-                    // whose value strips cleanly out of the stack top) stays on the
-                    // single-pass path with byte-identical output.
+                    // `i += step; i cmp bound` index-walk shape opts into
+                    // recovery. Every other loop (memory copies, decode loops,
+                    // SDK limb arithmetic whose value strips cleanly out of the
+                    // stack top) stays on the single-pass path with
+                    // byte-identical output.
                     //
-                    // Recovery only fires for locals whose pre-loop init is a known
-                    // value — otherwise the initializer would itself be `todo!()`.
+                    // The body-effect gates below (no side effects for local
+                    // recovery, no calls for slot recovery) were experimentally
+                    // removed during the t18 census and RESTORED: relaxing them
+                    // fired 31+ new promotion sites corpus-wide with ZERO
+                    // visible output change (every site sits in a region a
+                    // later stage discards — inlined-helper statement streams,
+                    // guard-chain skeletons, post-return dead code), while
+                    // fixtures showed real damage (promoted counter residue in
+                    // enum-decode match arms broke the identity-roundtrip
+                    // recognizer). Cost without benefit — revisit only when
+                    // helper statement adoption improves.
                     let mut carried: Vec<u32> = Vec::new();
                     let counted = detect_counted_loop(body).is_some();
 
-                    // Step 1 — local accumulators, only in side-effect-free counted
-                    // loops. The genuine-accumulator gate (not a pure counter)
-                    // excludes boilerplate index loops the baseline already collapses.
+                    // Step 1 — local accumulators, only in side-effect-free
+                    // counted loops. The genuine-accumulator gate (not a pure
+                    // counter) excludes boilerplate index loops the baseline
+                    // already collapses.
                     let local_analyzed = if counted && !loop_body_has_side_effects(body) {
                         self.analyze_loop_carried_locals(body)
                     } else {
@@ -5187,8 +5295,9 @@ impl<'a> LiftContext<'a> {
                         .iter()
                         .any(|(idx, val)| !is_pure_counter_update(val, *idx));
 
-                    // Step 3 — accumulators spilled to the shadow-stack frame. Allowed
-                    // to contain memory stores (the spill is a store) but never calls.
+                    // Step 3 — accumulators spilled to the shadow-stack frame.
+                    // Allowed to contain memory stores (the spill is a store)
+                    // but never calls.
                     let slot_analyzed = if counted && !loop_body_has_calls(body) {
                         self.analyze_loop_carried_slots(body)
                     } else {
@@ -5197,8 +5306,9 @@ impl<'a> LiftContext<'a> {
                     let has_slot_accumulator = !slot_analyzed.is_empty();
 
                     // Locals to recover. The slot path needs the loop's counter
-                    // local(s) too (for the `while` condition), even though the loop
-                    // stores — so re-derive carried locals without the side-effect gate.
+                    // local(s) too (for the `while` condition), even though the
+                    // loop stores — so re-derive carried locals without the
+                    // side-effect gate.
                     let local_candidates: Vec<(u32, StackVal)> = if has_local_accumulator {
                         local_analyzed
                     } else if has_slot_accumulator {
@@ -5246,17 +5356,27 @@ impl<'a> LiftContext<'a> {
                         })
                         .collect();
 
-                    // Recovery is all-or-nothing and requires every init to be an
-                    // integer literal. A non-literal init (param/field) would be
-                    // renamed onto its source by name propagation, turning the
-                    // recovered `let mut` into a mutation of an immutable binding.
-                    // Recovering only some carried values (e.g. the counter but not
-                    // its accumulator) would lose the rest, so bail on the whole loop.
+                    // Recovery is all-or-nothing and requires every init to be
+                    // an admissible seed (issue #38 widening: an integer
+                    // literal, an effect-free expr, or a never-rooted expr that
+                    // renders as an honest bare `todo!()` — see
+                    // `is_admissible_seed_expr`). Recovering only some carried
+                    // values (e.g. the counter but not its accumulator) would
+                    // lose the rest, so bail on the whole loop.
                     let any = !local_inits.is_empty() || !slot_inits.is_empty();
-                    let all_literal = local_inits.iter().all(|(_, e)| is_int_literal_expr(e))
-                        && slot_inits.iter().all(|(_, e)| is_int_literal_expr(e));
+                    let all_admissible =
+                        local_inits.iter().all(|(_, e)| is_admissible_seed_expr(e))
+                            && slot_inits.iter().all(|(_, e)| is_admissible_seed_expr(e));
 
-                    if any && all_literal {
+                    if any && all_admissible {
+                        if *DBG_LOOPGATE {
+                            eprintln!(
+                                "[LOOPGATE] FIRED locals={:?} slots={:?} inline={}",
+                                local_inits.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+                                slot_inits.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                                self.inline_depth
+                            );
+                        }
                         for (l, init) in local_inits {
                             self.stmts.push(SorobanStmt::Let {
                                 name: format!("var_{}", l),
@@ -7102,6 +7222,7 @@ impl<'a> LiftContext<'a> {
                     // Nested loop — same one-iteration-artifact discipline as
                     // the top-level loop site (no copy-loop model runs here,
                     // so body-written slots always stamp).
+                    self.report_loop_gates(body, true);
                     let loop_pre_wpos = self.slot_write_log.borrow().len();
                     let mut inner_ctx = self.child_context();
                     inner_ctx.loop_depth += 1;
@@ -14254,17 +14375,22 @@ struct CountedLoopInfo {
     counter_local: u32,
     #[allow(dead_code)]
     step: i64,
+    /// The constant exit bound, when the exit test compares against a
+    /// constant. `None` = the exit compares the counter against another
+    /// local (`i < len` — a variable-bound index walk, issue #38 widening).
     #[allow(dead_code)]
-    bound: i64,
+    bound: Option<i64>,
 }
 
 /// Recognize a counted loop: a body containing both a counter step
 /// `local.get C; (i32|i64).const S; (i32|i64).add; local.set C` (S != 0) and an
-/// exit test against a constant `local.get C; (i32|i64).const N; (i32|i64).(eq|ne)`
-/// on the same counter `C`. This is the gate for loop-carried value recovery —
-/// it positively identifies the bounded-iteration shape (`for i in ..` /
-/// `while i != N`) and leaves every other loop (memory copies, host-call-driven
-/// iteration, SDK limb arithmetic) on the existing single-pass path untouched.
+/// exit test on the same counter `C` — a comparison (`eq|ne|lt|gt|le|ge`)
+/// against either a constant (`while i != N`) or another local (`while
+/// i < len`, issue #38 widening: a runtime bound is equally a bounded index
+/// walk). This is the gate for loop-carried value recovery — it positively
+/// identifies the bounded-iteration shape and leaves every other loop (memory
+/// copies, host-call-driven iteration, SDK limb arithmetic) on the existing
+/// single-pass path untouched.
 fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<CountedLoopInfo> {
     use crate::wasm::ir::WasmInstr;
 
@@ -14314,24 +14440,62 @@ fn detect_counted_loop(body: &[super::structurize::StructuredBlock]) -> Option<C
     }
     let (counter_local, step) = counter_step?;
 
-    // Exit test: `local.get C; const N; (eq|ne)` on the same counter.
-    let mut bound: Option<i64> = None;
+    // Exit test: a comparison on the same counter, against a constant
+    // (`local.get C; const N; cmp` / `const N; local.get C; cmp`) or against
+    // another local (`local.get C; local.get B; cmp`, either operand order,
+    // B != C — the variable-bound `i < len` walk, issue #38 widening).
+    let is_cmp = |i: &WasmInstr| {
+        matches!(
+            i,
+            WasmInstr::I32Eq
+                | WasmInstr::I32Ne
+                | WasmInstr::I32LtS
+                | WasmInstr::I32LtU
+                | WasmInstr::I32GtS
+                | WasmInstr::I32GtU
+                | WasmInstr::I32LeS
+                | WasmInstr::I32LeU
+                | WasmInstr::I32GeS
+                | WasmInstr::I32GeU
+                | WasmInstr::I64Eq
+                | WasmInstr::I64Ne
+                | WasmInstr::I64LtS
+                | WasmInstr::I64LtU
+                | WasmInstr::I64GtS
+                | WasmInstr::I64GtU
+                | WasmInstr::I64LeS
+                | WasmInstr::I64LeU
+                | WasmInstr::I64GeS
+                | WasmInstr::I64GeU
+        )
+    };
+    let mut bound: Option<Option<i64>> = None;
     for w in all_instrs.windows(3) {
-        let (c, n) = match (w[0], w[1], w[2]) {
-            (
-                WasmInstr::LocalGet(c),
-                WasmInstr::I32Const(n),
-                WasmInstr::I32Eq | WasmInstr::I32Ne,
-            ) => (*c, *n as i64),
-            (
-                WasmInstr::LocalGet(c),
-                WasmInstr::I64Const(n),
-                WasmInstr::I64Eq | WasmInstr::I64Ne,
-            ) => (*c, *n),
-            _ => continue,
+        if !is_cmp(w[2]) {
+            continue;
+        }
+        let found = match (w[0], w[1]) {
+            (WasmInstr::LocalGet(c), WasmInstr::I32Const(n)) if *c == counter_local => {
+                Some(Some(*n as i64))
+            }
+            (WasmInstr::LocalGet(c), WasmInstr::I64Const(n)) if *c == counter_local => {
+                Some(Some(*n))
+            }
+            (WasmInstr::I32Const(n), WasmInstr::LocalGet(c)) if *c == counter_local => {
+                Some(Some(*n as i64))
+            }
+            (WasmInstr::I64Const(n), WasmInstr::LocalGet(c)) if *c == counter_local => {
+                Some(Some(*n))
+            }
+            (WasmInstr::LocalGet(a), WasmInstr::LocalGet(b))
+                if (*a == counter_local) != (*b == counter_local) =>
+            {
+                Some(None)
+            }
+            _ => None,
         };
-        if c == counter_local {
-            bound = Some(n);
+        if let Some(b) = found {
+            bound = Some(b);
             break;
         }
     }
@@ -16019,12 +16183,7 @@ fn is_pure_counter_update(val: &StackVal, idx: u32) -> bool {
     (is_self(a) && is_const(b)) || (is_const(a) && is_self(b))
 }
 
-/// True if `expr` is a plain integer literal. Loop-carried recovery only fires
-/// when the pre-loop init is a literal: a named init (param, field access, ...)
-/// would be renamed onto its source by variable-name propagation, turning the
-/// recovered `let mut` into a mutation of an immutable binding (e.g. a function
-/// parameter) that does not compile. A literal has no derivable name, so the
-/// recovered variable keeps its `let mut var_N` declaration.
+/// True if `expr` is a plain integer literal.
 fn is_int_literal_expr(expr: &SorobanExpr) -> bool {
     matches!(
         expr,
@@ -16033,6 +16192,30 @@ fn is_int_literal_expr(expr: &SorobanExpr) -> bool {
             | SorobanExpr::U32Literal(_)
             | SorobanExpr::U64Literal(_)
     )
+}
+
+/// True if `expr` is admissible as a recovered loop-accumulator seed (the
+/// `let mut var_N = <seed>` initializer). Three classes are safe (issue #38,
+/// widened from the original integer-literal-only gate):
+///
+/// - **integer literals** — the original gate: no derivable name, no effects;
+/// - **never-rooted exprs** (t14 discipline) — they render as a bare, honest
+///   `todo!()`: the accumulator STRUCTURE is recovered even when the
+///   pre-loop seed value itself is lost;
+/// - **effect-free exprs** (identifiers, field chains, arithmetic over
+///   those) — evaluating them once in the initializer duplicates no work
+///   and observes no mutable state.
+///
+/// Host-call results and any other effectful values stay inadmissible:
+/// inlining them into an initializer would re-evaluate the call. The
+/// original gate's rationale — variable-name propagation folding the
+/// `let mut` onto its named source, leaving a mutation of an immutable
+/// binding — no longer applies: name propagation reserves parameter names
+/// (a param-seeded `let mut` gets a suffixed fresh name), and
+/// `remove_self_assignments` keeps every mutable self-`let` that is not a
+/// bare param copy (`let mut x = x` is a valid mutable shadow).
+fn is_admissible_seed_expr(expr: &SorobanExpr) -> bool {
+    is_int_literal_expr(expr) || expr.is_never_rooted() || expr.is_effect_free()
 }
 
 /// True if `val` transitively references a `LetBinding` or `LoopPhi` — i.e. a
@@ -21112,6 +21295,31 @@ mod tests {
             Rc::new(RefCell::new(Vec::new())),
         );
         result.stack_result.expect("the tail load leaves a value")
+    }
+
+    #[test]
+    fn seed_admissibility_classes() {
+        // Literals, effect-free identifiers/arithmetic, and never-rooted
+        // exprs are admissible loop-accumulator seeds; effectful values
+        // (host-call results) are not — inlining them into a `let mut`
+        // initializer would re-evaluate the call.
+        assert!(is_admissible_seed_expr(&SorobanExpr::I64Literal(0)));
+        assert!(is_admissible_seed_expr(&SorobanExpr::Param("base".into())));
+        assert!(is_admissible_seed_expr(&SorobanExpr::Add(
+            Box::new(SorobanExpr::Param("a".into())),
+            Box::new(SorobanExpr::U64Literal(1)),
+        )));
+        assert!(is_admissible_seed_expr(&SorobanExpr::UnknownVal));
+        assert!(is_admissible_seed_expr(&SorobanExpr::Add(
+            Box::new(SorobanExpr::UnknownVal),
+            Box::new(SorobanExpr::Param("a".into())),
+        )));
+        assert!(!is_admissible_seed_expr(&SorobanExpr::StorageGet {
+            storage_type: StorageType::Persistent,
+            key: Box::new(SorobanExpr::SymbolLiteral("K".into())),
+            unwrap: true,
+            on_missing: None,
+        }));
     }
 
     #[test]

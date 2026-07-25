@@ -6409,6 +6409,14 @@ pub fn propagate_variable_names(
     }
     collect_used_names(&stmts, &mut used_names);
 
+    // Names genuinely mutated later (an `Assign` targets them, at any nesting
+    // depth — loop-accumulator assigns live inside `Loop` bodies). Used to
+    // scope the mutable-self-rename guard below: a mutated binding must keep
+    // its `var_N` name, while a never-mutated param spill keeps the old
+    // rename-then-drop behavior downstream passes rely on.
+    let mut mutated_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_assign_targets(&stmts, &mut mutated_names);
+
     // Pre-pass: detect let-match pairs where `let mut var_N = init` is followed
     // by `Match { scrutinee: Param(p), arms all assign to var_N }`. Derive the
     // variable name from the match scrutinee instead of the init value.
@@ -6448,7 +6456,7 @@ pub fn propagate_variable_names(
             let new_rename = if let SorobanStmt::Let {
                 ref name,
                 ref value,
-                ..
+                ref mutable,
             } = stmt
             {
                 if name.starts_with("var_") {
@@ -6477,6 +6485,31 @@ pub fn propagate_variable_names(
                         } else {
                             new_name
                         };
+                        // A MUTATED mutable let renamed onto its own init
+                        // identifier (`let mut x = x;` from `let mut var_N =
+                        // x` with later `var_N = ...` assigns) is
+                        // self-defeating: `remove_self_assignments` drops the
+                        // param form, leaving the body's `x = ...` assigns
+                        // mutating an immutable binding. Reachable when the
+                        // identifier is not in `used_names` (e.g. synthesized
+                        // `argN` params of spec-less functions, which are
+                        // never in `reserved_names`). Keep the `var_N` name
+                        // instead (issue #38 loop-accumulator seeds). A
+                        // never-mutated spill (`let mut var_N = to` with no
+                        // assigns) deliberately keeps the rename-then-drop
+                        // behavior: downstream passes (move-clone repair, type
+                        // annotation) rely on the spill collapsing onto its
+                        // param.
+                        if *mutable
+                            && mutated_names.contains(name)
+                            && matches!(
+                                value,
+                                SorobanExpr::Param(p) | SorobanExpr::NamedLocal(p)
+                                    if *p == final_name
+                            )
+                        {
+                            return None;
+                        }
                         if final_name != *name {
                             used_names.insert(final_name.clone());
                             Some((name.clone(), final_name))
@@ -6709,6 +6742,36 @@ fn derive_name_from_expr(expr: &SorobanExpr) -> Option<String> {
 }
 
 /// Collect all non-var names already used in the statement tree.
+/// Collect every `Assign` target name, at any nesting depth (loop-accumulator
+/// assigns live inside `Loop` bodies). Drives the mutable-self-rename guard in
+/// `propagate_variable_names`.
+fn collect_assign_targets(stmts: &[SorobanStmt], names: &mut std::collections::HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Assign { target, .. } => {
+                names.insert(target.clone());
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_assign_targets(then_body, names);
+                collect_assign_targets(else_body, names);
+            }
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms {
+                    collect_assign_targets(&arm.body, names);
+                }
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+                collect_assign_targets(body, names);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_used_names(stmts: &[SorobanStmt], names: &mut std::collections::HashSet<String>) {
     for stmt in stmts {
         match stmt {
@@ -7338,6 +7401,48 @@ fn stmt_refs_local(stmt: &SorobanStmt, idx: u32) -> bool {
 mod tests {
     use super::*;
     use crate::ir::soroban_ir::StorageType;
+
+    #[test]
+    fn mutable_let_never_renamed_onto_its_param_seed() {
+        // `let mut var_2 = arg0; var_2 = var_2 + 1;` — renaming var_2 onto
+        // "arg0" (reachable when the param name is NOT in reserved/used names,
+        // e.g. synthesized `argN` params of spec-less functions) would create
+        // `let mut arg0 = arg0`, which `remove_self_assignments` drops,
+        // leaving `arg0 = ...` mutating the immutable param. The mutable let
+        // must keep its var_N name (issue #38 loop-accumulator seeds).
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_2".into(),
+                mutable: true,
+                value: SorobanExpr::Param("arg0".into()),
+            },
+            SorobanStmt::Assign {
+                target: "var_2".into(),
+                value: SorobanExpr::Add(
+                    Box::new(SorobanExpr::NamedLocal("var_2".into())),
+                    Box::new(SorobanExpr::U32Literal(1)),
+                ),
+            },
+        ];
+        let out = propagate_variable_names(stmts, &[]);
+        let SorobanStmt::Let { name, mutable, .. } = &out[0] else {
+            panic!("expected the let to survive, got {:?}", out[0]);
+        };
+        assert!(*mutable);
+        assert_eq!(name, "var_2", "mutable let renamed onto its param seed");
+        // An IMMUTABLE copy is still renamed (existing benign behavior: the
+        // self-let is dropped and uses collapse onto the param).
+        let stmts = vec![SorobanStmt::Let {
+            name: "var_3".into(),
+            mutable: false,
+            value: SorobanExpr::Param("arg0".into()),
+        }];
+        let out = propagate_variable_names(stmts, &[]);
+        let SorobanStmt::Let { name, .. } = &out[0] else {
+            panic!("expected a let, got {:?}", out[0]);
+        };
+        assert_eq!(name, "arg0");
+    }
 
     #[test]
     fn fold_drops_leaked_borrow_and_carry_flags() {
