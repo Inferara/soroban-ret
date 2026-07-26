@@ -809,11 +809,14 @@ fn inlined_pure_helper_accumulator_loop_is_adopted() {
 
 #[test]
 fn test_decompile_alloc() {
-    // `num_list(count)` builds `[0, 1, …, count-1]` by pushing in a loop. The
-    // loop-carried pushes are still lost (issue #38 frontier), but the LOSS
-    // must surface as honest `todo!()` holes — issue #36: before, the whole
-    // loop was dropped and the fn fabricated a bare `Vec::new(&env)` return,
-    // silently-wrong "always empty" output that read as intentional.
+    // `num_list(count)` builds `[0, 1, …, count-1]` by pushing each index of
+    // a std-alloc scratch vec into an SDK Vec. The full recovery arc: issue
+    // #36 stopped the fabricated always-empty `Vec::new(&env)` return, t19
+    // surfaced the loop with holed pushes, t21 recovered the vec accumulator,
+    // and t23's populate→push value relay recovers the pushed VALUE itself —
+    // the populate loop provably writes its counter at `buf + 4*i` (RawVec
+    // idiom), so the push loop's element is its own push ordinal, rendered
+    // as a synthesized index variable. The function is now hole-free.
     let wasm = include_bytes!("../../../tests/fixtures/test_alloc.wasm");
     let source = decompile(wasm).expect("decompilation failed");
     assert!(source.contains("pub fn num_list"), "missing num_list fn");
@@ -830,24 +833,27 @@ fn test_decompile_alloc() {
         source.contains("while count != ") || source.contains("loop"),
         "the vec-building loop must not be dropped:\n{source}"
     );
-    // The lost pushes/return must surface as honest holes. The positive
-    // todo!() check is the load-bearing assertion — the whitespace-sensitive
-    // negative alone would silently pass if codegen's indentation changed.
+    // Issue #38 t21: the vec ACCUMULATOR recovers end-to-end — seeded from
+    // the empty constructor, mutated through the SDK's `push_back`, and
+    // returned.
     assert!(
-        source.contains("todo!("),
-        "num_list's lost loop content must surface as todo!() holes:\n{source}"
+        source.contains("vec.push_back(") && source.contains("= Vec::new(&env)"),
+        "num_list's vec accumulator must recover as a push_back loop:\n{source}"
+    );
+    // Issue #38 t23: the pushed value is the synthesized push-ordinal index,
+    // 0-seeded and incremented after the push — never a hole, never a
+    // fabricated constant.
+    assert!(
+        source.contains("vec.push_back(var_"),
+        "num_list's pushed value must recover as the relay index:\n{source}"
+    );
+    assert!(
+        !source.contains("todo!("),
+        "num_list must be fully recovered, hole-free:\n{source}"
     );
     assert!(
         !source.contains("Vec::new(&env)\n    }"),
         "num_list must not fabricate an empty-vec return:\n{source}"
-    );
-    // Issue #38 t21: the vec ACCUMULATOR recovers end-to-end — seeded from
-    // the empty constructor, mutated through the SDK's `push_back`, and
-    // returned. (The pushed value stays holed until the populate-loop value
-    // link lands.)
-    assert!(
-        source.contains("vec.push_back(") && source.contains("= Vec::new(&env)"),
-        "num_list's vec accumulator must recover as a push_back loop:\n{source}"
     );
 }
 

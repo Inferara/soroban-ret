@@ -36,31 +36,35 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// recompiled contracts differ). A ratchet: drive DOWN as the decompiler
 /// recovers more behavior; never raise without understanding the new divergence.
 ///
-/// Measured baseline = 4, the sole remaining decompiler limitation the harness
-/// surfaced (68 fns / 479 cases executed; 63 contracts checked — 39 fixtures +
-/// 24 corpus — 98.1% match). Every entry is an HONEST todo-panic (the
-/// recompiled function hits a `todo!()` hole and traps as
-/// `Error(Context, InvalidAction)`), never a fabricated wrong value:
+/// Measured baseline = 6 (68 fns / 479 cases executed; 63 contracts checked —
+/// 39 fixtures + 24 corpus — 98.7% match). No entry is a fabricated wrong
+/// value:
 ///   - `digicus` (4): `clear_repos`/`get_repos`/`get_repos_and_issues`/
-///     `version` — recompiled bodies still hole values the lifter has not
-///     recovered (the long-standing set previously misattributed here to
-///     `test_alloc`).
-///   - `test_alloc` (4, issue #38 t21): `num_list`'s vec accumulator now
-///     recovers end-to-end (`let mut vec = Vec::new(&env); while … {
-///     vec.push_back(todo!()) } vec`), so the `count = 0` case RETURNS THE
-///     EMPTY VEC and matches. The remaining 4 cases (`count > 0`) diverge
-///     as honest todo-panics because the pushed VALUE still reads an
-///     unmodeled heap buffer (the std-alloc grow protocol) — closing them
-///     needs the populate-loop → push-loop value link.
+///     `version` — honest todo-panics (the recompiled function hits a
+///     `todo!()` hole and traps as `Error(Context, InvalidAction)`); the
+///     long-standing set, values the lifter has not recovered.
+///   - `test_alloc` (2, issue #38 t23): the populate→push value relay
+///     recovered `num_list`'s pushed VALUE (the synthesized push-ordinal
+///     index), so every in-range case now returns the CORRECT FULL VEC —
+///     execution-verified. The 2 remaining cases are `count` values where
+///     `count * 4` overflows u32: the original computes the byte count with
+///     a compiler-internal UNCHECKED `i32.shl` (wraps), while the
+///     reconstruction materializes it as user-level `count * 4`, which this
+///     harness's canonical `overflow-checks = true` profile traps on
+///     (orig=Panic vs recomp=InvalidAction — both fail, different class).
+///     Closing these needs a wrapping-exact render of size arithmetic
+///     (`count << 2` — Rust `<<` never value-checks), a corpus-wide render
+///     change with its own audit.
 ///
-/// Previously 9 (t19 unmask: `num_list` first became compilable in this
+/// Previously 8 (t21: the vec accumulator recovered, `count = 0` matched);
+/// 9 before that (t19 unmask: `num_list` first became compilable in this
 /// harness, exposing 5 divergences hidden behind a unit-never-type-fallback
 /// compile error); before that 4 (digicus); 60 → 4 came from the
 /// fallible-storage-get recovery (`detect_fallible_storage_get_helper`)
 /// eliminating `unknown-oracle`'s 56 empty-storage divergences; 75 → 60
 /// from the `checked_add`/`checked_sub` recovery
 /// (`recover_checked_arith_from_body`).
-const DIVERGENCE_CEILING: usize = 8;
+const DIVERGENCE_CEILING: usize = 6;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).

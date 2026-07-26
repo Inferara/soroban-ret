@@ -585,6 +585,11 @@ static DBG_LOOPRBW: std::sync::LazyLock<bool> =
 static DBG_LOOPGATE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_LOOPGATE").is_ok());
 
+/// Issue #38 t23 probe: report populate→push relay arming, invalidation and
+/// consume decisions. Measurement-only.
+static DBG_RELAY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_RELAY").is_ok());
+
 /// Issue #38 t19 census probe: report host-call-free inlined helpers whose
 /// discarded statement stream contains loops (the invisible-accumulator
 /// population). Measurement-only.
@@ -756,6 +761,18 @@ struct LiftContext<'a> {
     /// recurse exponentially through nested loops) — and documents which
     /// contexts must never leak observations into shared state.
     in_analysis_sim: bool,
+    /// Armed populate→push relay (issue #38 t23, see [`RelayProtocol`]).
+    /// Set after a loop proves the RawVec populate idiom; cleared
+    /// (single-shot) by the next loop, and invalidated by any event that
+    /// could alias the buffer (see the store/call hooks). Shared via `Rc`
+    /// like `frame_slots`; throwaway analysis sims get a detached fresh
+    /// `None` so speculative lifts can neither consume nor arm it.
+    relay: Rc<RefCell<Option<RelayProtocol>>>,
+    /// The synthesized push-ordinal index local, armed ONLY on the body
+    /// context of a verified relay-consume loop. The element load through
+    /// [`StackVal::RelayBufPtr`] reads it; unset, the load stays `Unknown`
+    /// (today's honest `todo!()`).
+    relay_index: Option<u32>,
 }
 
 /// `(slot key, write-log length at read time)` — see `slot_read_log`.
@@ -800,6 +817,8 @@ impl<'a> LiftContext<'a> {
             slot_taints: Rc::new(RefCell::new(HashMap::new())),
             slot_read_log: Rc::new(RefCell::new(Vec::new())),
             in_analysis_sim: false,
+            relay: Rc::new(RefCell::new(None)),
+            relay_index: None,
         }
     }
 
@@ -836,6 +855,10 @@ impl<'a> LiftContext<'a> {
             slot_taints: Rc::clone(&self.slot_taints),
             slot_read_log: Rc::clone(&self.slot_read_log),
             in_analysis_sim: self.in_analysis_sim,
+            relay: Rc::clone(&self.relay),
+            // NOT inherited: only the verified consume loop's body context is
+            // armed, explicitly, by the Loop arm.
+            relay_index: None,
         }
     }
 
@@ -2388,6 +2411,7 @@ impl<'a> LiftContext<'a> {
         sim.fallible_get_recovery = Rc::new(RefCell::new(None));
         sim.fallible_get_count = Rc::new(RefCell::new(0));
         sim.in_analysis_sim = true;
+        sim.relay = Rc::new(RefCell::new(None));
         sim.loop_depth += 1;
         for &l in &written {
             if let Some(slot) = sim.locals.get_mut(l as usize) {
@@ -2427,6 +2451,369 @@ impl<'a> LiftContext<'a> {
                 (modified && param_ok && stackval_references_loop_phi(v, l)).then(|| (l, v.clone()))
             })
             .collect()
+    }
+
+    /// Detect the RawVec populate idiom (issue #38 t23) — see
+    /// [`RelayProtocol`] for the proof obligations. Runs pre-body-lift (the
+    /// pre-loop local/slot state is still pristine), purely syntactic over
+    /// the flattened body plus the current abstract state. Every check that
+    /// fails simply refuses the protocol — the loop lifts exactly as today.
+    fn detect_populate_protocol(
+        &self,
+        body: &[super::structurize::StructuredBlock],
+        counted: &CountedLoopInfo,
+    ) -> Option<RelayProtocol> {
+        use crate::wasm::ir::WasmInstr as WI;
+        let c = counted.counter_local;
+        // The stored value is the counter itself: only a 0-seeded, +1-stepped
+        // counter makes `value == index` hold.
+        if counted.step != Some(1) {
+            return None;
+        }
+        let seed = self.local_arith_expr(c);
+        if !matches!(
+            seed,
+            SorobanExpr::I32Literal(0) | SorobanExpr::U32Literal(0)
+        ) {
+            return None;
+        }
+        // No nested loops: an inner loop could re-write the buffer.
+        let mut instrs = Vec::new();
+        collect_instrs(body, &mut instrs);
+        if body_contains_nested_loop(body) {
+            return None;
+        }
+
+        // Exit: `while trip != i` (either operand order), a variable bound.
+        let bound_local = instrs
+            .windows(4)
+            .find_map(|w| match (w[0], w[1], w[2], w[3]) {
+                (WI::LocalGet(b), WI::LocalGet(cc), WI::I32Eq, WI::BrIf(_))
+                    if *cc == c && *b != c =>
+                {
+                    Some(*b)
+                }
+                (WI::LocalGet(cc), WI::LocalGet(b), WI::I32Eq, WI::BrIf(_))
+                    if *cc == c && *b != c =>
+                {
+                    Some(*b)
+                }
+                _ => None,
+            })?;
+        let trip = self.local_arith_expr(bound_local);
+        if !matches!(
+            trip,
+            SorobanExpr::Param(_) | SorobanExpr::I32Literal(_) | SorobanExpr::U32Literal(_)
+        ) {
+            return None;
+        }
+
+        // Cap guard: `if i == pair.cap { grow(&pair) }`.
+        let (f, cap_off) =
+            instrs
+                .windows(5)
+                .find_map(|w| match (w[0], w[1], w[2], w[3], w[4]) {
+                    (
+                        WI::LocalGet(cc),
+                        WI::LocalGet(f),
+                        WI::I32Load(off),
+                        WI::I32Ne,
+                        WI::BrIf(_),
+                    ) if *cc == c => Some((*f, *off as i32)),
+                    _ => None,
+                })?;
+        // Grow call: `call g(&pair)`.
+        let g = instrs
+            .windows(4)
+            .find_map(|w| match (w[0], w[1], w[2], w[3]) {
+                (WI::LocalGet(ff), WI::I32Const(k), WI::I32Add, WI::Call(g))
+                    if *ff == f && *k == cap_off =>
+                {
+                    Some(*g)
+                }
+                _ => None,
+            })?;
+        // Pointer reload after grow: `p = pair.ptr`.
+        let ptr_off = cap_off + 4;
+        let p = instrs.windows(3).find_map(|w| match (w[0], w[1], w[2]) {
+            (WI::LocalGet(ff), WI::I32Load(po), WI::LocalSet(p))
+                if *ff == f && *po as i32 == ptr_off =>
+            {
+                Some(*p)
+            }
+            _ => None,
+        })?;
+        // The element store: `mem[p + off] = i`.
+        let off_local = instrs
+            .windows(5)
+            .find_map(|w| match (w[0], w[1], w[2], w[3], w[4]) {
+                (
+                    WI::LocalGet(pp),
+                    WI::LocalGet(o),
+                    WI::I32Add,
+                    WI::LocalGet(cc),
+                    WI::I32Store(0),
+                ) if *pp == p && *cc == c && *o != c => Some(*o),
+                _ => None,
+            })?;
+        // The walking offset: 0-seeded, stride-stepped.
+        let stride = instrs
+            .windows(4)
+            .find_map(|w| match (w[0], w[1], w[2], w[3]) {
+                (WI::LocalGet(oo), WI::I32Const(s), WI::I32Add, WI::LocalSet(o2))
+                    if *oo == off_local && *o2 == off_local =>
+                {
+                    Some(*s)
+                }
+                _ => None,
+            })?;
+        // Only the u32-element stride is consumed (the load side accepts
+        // 4-byte loads only); other widths refuse rather than half-match.
+        if stride != 4 {
+            return None;
+        }
+        let off_seed = self.local_arith_expr(off_local);
+        if !matches!(
+            off_seed,
+            SorobanExpr::I32Literal(0) | SorobanExpr::U32Literal(0)
+        ) {
+            return None;
+        }
+
+        // Store discipline: every store in the body is either the recognized
+        // element store (offset 0, EXACTLY ONE — a second zero-offset store
+        // could overwrite a populated element with a non-counter value while
+        // the relay still substitutes the ordinal) or the RawVec len update
+        // (`pair.len`, `cap_off + 8` from the frame base). Any other store
+        // could alias the buffer.
+        let mut zero_offset_stores = 0usize;
+        for i in &instrs {
+            match i {
+                WI::I32Store(0) => zero_offset_stores += 1,
+                WI::I32Store(o) if *o as i32 == cap_off + 8 => {}
+                WI::I32Store(_)
+                | WI::I64Store(_)
+                | WI::I32Store8(_)
+                | WI::I32Store16(_)
+                | WI::I64Store8(_)
+                | WI::I64Store16(_)
+                | WI::I64Store32(_) => return None,
+                _ => {}
+            }
+        }
+        if zero_offset_stores != 1 {
+            return None;
+        }
+        // Call discipline: the grow helper is the body's only call.
+        if instrs.iter().any(|i| match i {
+            WI::Call(t) => *t != g,
+            WI::CallIndirect(_) => true,
+            _ => false,
+        }) {
+            return None;
+        }
+
+        // The pair local is a frame base; resolve the frame id.
+        let frame_id = match self.locals.get(f as usize) {
+            Some(StackVal::FrameSlot(id, so)) if so.base == 0 && so.term.is_none() => *id,
+            _ => return None,
+        };
+        // Canonical `RawVec::NEW` pair init: cap = 0, ptr = dangling(align).
+        // rustc spills it as one i64 store (`(align << 32) | 0`) or two i32s.
+        let cap_key = frame_slot_key(0, cap_off as u32)?;
+        let ptr_key = frame_slot_key(0, ptr_off as u32)?;
+        let slots = self.frame_slots.borrow();
+        let pair_init_ok = match slots.get(&(frame_id, cap_key)) {
+            Some(StackVal::I64(v)) => *v == (stride as i64) << 32,
+            Some(StackVal::I32(0)) => {
+                matches!(slots.get(&(frame_id, ptr_key)), Some(StackVal::I32(s)) if *s == stride)
+            }
+            _ => false,
+        };
+        drop(slots);
+        if !pair_init_ok {
+            return None;
+        }
+
+        // The grow helper is content-preserving.
+        if !is_rawvec_grow_helper(self.wasm_module, g, stride) {
+            return None;
+        }
+
+        if *DBG_RELAY {
+            eprintln!(
+                "[RELAY] populate detected frame={frame_id} cap_off={cap_key} ptr_off={ptr_key} stride={stride} trip={trip:?}"
+            );
+        }
+        Some(RelayProtocol {
+            frame_id,
+            cap_off: cap_key,
+            ptr_off: ptr_key,
+            stride,
+            trip,
+        })
+    }
+
+    /// Verify a loop consumes an armed relay (issue #38 t23): it walks the
+    /// relay buffer forward at the relay stride for provably exactly
+    /// `relay.trip` iterations, reading each element once, with nothing else
+    /// touching memory. Then element `j` equals `j` (the push ordinal), and
+    /// the load may read the synthesized index. Runs pre-body-lift.
+    fn relay_consume_ok(
+        &self,
+        body: &[super::structurize::StructuredBlock],
+        relay: &RelayProtocol,
+        counted: Option<&CountedLoopInfo>,
+    ) -> bool {
+        use crate::wasm::ir::WasmInstr as WI;
+        let Some(ci) = counted else {
+            return false;
+        };
+        // Byte down-counter: stride bytes per iteration, exit at zero.
+        if ci.step != Some(-(relay.stride as i64)) {
+            return refuse_relay("counter step");
+        }
+        let mut instrs = Vec::new();
+        collect_instrs(body, &mut instrs);
+        if body_contains_nested_loop(body) {
+            return refuse_relay("nested loop");
+        }
+        let eqz_exit = instrs.windows(3).any(|w| {
+            matches!(
+                (w[0], w[1], w[2]),
+                (WI::LocalGet(cc), WI::I32Eqz, WI::BrIf(_)) if *cc == ci.counter_local
+            )
+        });
+        if !eqz_exit {
+            return refuse_relay("exit shape");
+        }
+        // Trip equality: counter seed = trip * stride ⇒ the loop iterates
+        // exactly `trip` times — every load hits a written slot, in order.
+        let seed = self.local_arith_expr(ci.counter_local);
+        let trips_match = match &seed {
+            SorobanExpr::Mul(a, b) => {
+                **a == relay.trip
+                    && matches!(
+                        b.as_ref(),
+                        SorobanExpr::I32Literal(k) if *k == relay.stride
+                    )
+            }
+            _ => false,
+        };
+        if !trips_match {
+            return refuse_relay("trip mismatch");
+        }
+        // The walking pointer: seeded from the relay buffer (provenance via
+        // RelayBufPtr), stepped by exactly the relay stride.
+        let walk = instrs
+            .windows(4)
+            .find_map(|w| match (w[0], w[1], w[2], w[3]) {
+                (WI::LocalGet(q), WI::I32Const(s), WI::I32Add, WI::LocalSet(q2))
+                    if *q == *q2 && *s == relay.stride =>
+                {
+                    Some(*q)
+                }
+                _ => None,
+            });
+        let Some(q) = walk else {
+            return refuse_relay("no pointer walk");
+        };
+        if !matches!(self.locals.get(q as usize), Some(StackVal::RelayBufPtr)) {
+            return refuse_relay("pointer provenance");
+        }
+        // Exactly one element load, 4-byte, at offset 0 through the walker;
+        // no other load may read through it.
+        let elem_loads = instrs
+            .windows(2)
+            .filter(|w| matches!((w[0], w[1]), (WI::LocalGet(qq), WI::I64Load32U(0)) if *qq == q))
+            .count();
+        let other_q_loads = instrs.windows(2).any(|w| {
+            matches!(w[0], WI::LocalGet(qq) if *qq == q)
+                && match w[1] {
+                    WI::I64Load32U(0) => false,
+                    WI::I32Load(_)
+                    | WI::I64Load(_)
+                    | WI::I32Load8S(_)
+                    | WI::I32Load8U(_)
+                    | WI::I32Load16S(_)
+                    | WI::I32Load16U(_)
+                    | WI::I64Load8S(_)
+                    | WI::I64Load8U(_)
+                    | WI::I64Load16S(_)
+                    | WI::I64Load16U(_)
+                    | WI::I64Load32S(_)
+                    | WI::I64Load32U(_) => true,
+                    _ => false,
+                }
+        });
+        if elem_loads != 1 || other_q_loads {
+            return refuse_relay("element load shape");
+        }
+        // Nothing else may touch memory: no stores, and only
+        // memory-oblivious host calls (a host function cannot write guest
+        // linear memory except the `*_to_linear_memory` family).
+        let memory_safe = instrs.iter().all(|i| match i {
+            WI::I32Store(_)
+            | WI::I64Store(_)
+            | WI::I32Store8(_)
+            | WI::I32Store16(_)
+            | WI::I64Store8(_)
+            | WI::I64Store16(_)
+            | WI::I64Store32(_) => false,
+            WI::CallIndirect(_) => false,
+            WI::Call(t) => match self.wasm_module.imports.get_by_index(*t) {
+                Some(hf) => !hf.name.ends_with("to_linear_memory"),
+                None => false,
+            },
+            _ => true,
+        });
+        if !memory_safe {
+            return refuse_relay("body touches memory");
+        }
+        if *DBG_RELAY {
+            eprintln!("[RELAY] consume verified: walker={q} trip={:?}", relay.trip);
+        }
+        true
+    }
+
+    /// Issue #38 t23: clear an armed relay when a store could alias the
+    /// buffer (any non-frame or dynamic-offset address) or rewrites the
+    /// pair itself. Static frame stores to other slots (spilled scalars,
+    /// the pair's len) cannot alias a malloc'd buffer and keep it.
+    fn relay_invalidate_on_store(&self, addr: &StackVal, store_off: u32) {
+        let clears = {
+            let relay = self.relay.borrow();
+            let Some(r) = relay.as_ref() else { return };
+            match addr {
+                StackVal::FrameSlot(id, so) => {
+                    match (so.term, frame_slot_key(so.base, store_off)) {
+                        (None, Some(key)) => {
+                            *id == r.frame_id && (key == r.cap_off || key == r.ptr_off)
+                        }
+                        _ => true,
+                    }
+                }
+                _ => true,
+            }
+        };
+        if clears {
+            if *DBG_RELAY {
+                eprintln!("[RELAY] invalidated by store");
+            }
+            *self.relay.borrow_mut() = None;
+        }
+    }
+
+    /// Convert a local's current abstract value to its arithmetic expression
+    /// (the same conversion the carried-seed path uses).
+    fn local_arith_expr(&self, l: u32) -> SorobanExpr {
+        let pre = self
+            .locals
+            .get(l as usize)
+            .cloned()
+            .unwrap_or(StackVal::Unknown);
+        let slots = self.frame_slots.borrow();
+        stack_val_to_arith_expr(&pre, self.params, self.registry, Some(&slots))
     }
 
     /// Find loop-carried frame slots: shadow-stack slots whose value flows across
@@ -2470,6 +2857,7 @@ impl<'a> LiftContext<'a> {
         sim.fallible_get_recovery = Rc::new(RefCell::new(None));
         sim.fallible_get_count = Rc::new(RefCell::new(0));
         sim.in_analysis_sim = true;
+        sim.relay = Rc::new(RefCell::new(None));
         sim.loop_depth += 1;
         // Also seed body-written locals with LoopPhi so an accumulator that adds
         // the counter (`acc += i`) stays symbolic — otherwise the counter's
@@ -2631,6 +3019,24 @@ impl<'a> LiftContext<'a> {
 
             // Call instructions - the core of lifting
             WasmInstr::Call(target_idx) => {
+                // Issue #38 t23: a call that could write linear memory
+                // invalidates an armed relay — any local function (its
+                // stores may or may not be simulated) and the
+                // `*_to_linear_memory` host family (the only host calls
+                // that write guest memory). Memory-oblivious host calls
+                // keep it.
+                if self.relay.borrow().is_some()
+                    && !self
+                        .wasm_module
+                        .imports
+                        .get_by_index(*target_idx)
+                        .is_some_and(|hf| !hf.name.ends_with("to_linear_memory"))
+                {
+                    if *DBG_RELAY {
+                        eprintln!("[RELAY] invalidated by call {target_idx}");
+                    }
+                    *self.relay.borrow_mut() = None;
+                }
                 if let Some(host_fn) = self.wasm_module.imports.get_by_index(*target_idx) {
                     // Determine how many args this host function expects
                     let host_type = self.wasm_module.get_func_type(*target_idx);
@@ -4747,6 +5153,22 @@ impl<'a> LiftContext<'a> {
                 let addr = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let loaded = if let StackVal::FrameSlot(id, slot_off) = addr {
                     match (slot_off.term, frame_slot_key(slot_off.base, *off)) {
+                        // Issue #38 t23: a 4-byte read of the armed relay
+                        // pair's ptr slot is the consume loop seeding its
+                        // walking pointer — give it the buffer's symbolic
+                        // identity (the slot's abstract value is a
+                        // one-iteration artifact of the populate loop's grow
+                        // calls; the relay proof is the stronger fact).
+                        (None, Some(slot))
+                            if matches!(instr, WasmInstr::I32Load(_))
+                                && self
+                                    .relay
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|r| id == r.frame_id && slot == r.ptr_off) =>
+                        {
+                            StackVal::RelayBufPtr
+                        }
                         // A static slot promoted to a loop-carried scalar reads as
                         // its synthetic `var_{idx}` rather than the spilled value.
                         (None, Some(slot)) if self.promoted_slots.contains_key(&(id, slot)) => {
@@ -4895,6 +5317,18 @@ impl<'a> LiftContext<'a> {
                             .unwrap_or(StackVal::Unknown),
                         _ => StackVal::Unknown,
                     }
+                } else if matches!(addr, StackVal::RelayBufPtr)
+                    && matches!(instr, WasmInstr::I64Load32U(_))
+                    && *off == 0
+                    && let Some(idx) = self.relay_index
+                {
+                    // Issue #38 t23: the verified consume loop's element load
+                    // — element `j` was written as `j` by the proven populate
+                    // protocol, so the load reads the synthesized push-ordinal
+                    // index. Without an armed `relay_index` (any consume gate
+                    // failed) the pointer read stays `Unknown` below —
+                    // today's honest `todo!()`.
+                    StackVal::LetBinding(idx)
                 } else {
                     StackVal::Unknown
                 };
@@ -4903,6 +5337,7 @@ impl<'a> LiftContext<'a> {
             WasmInstr::I64Store(offset) => {
                 let value = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let addr = self.stack.pop().unwrap_or(StackVal::Unknown);
+                self.relay_invalidate_on_store(&addr, *offset);
                 self.memory_stores.push(MemoryStore {
                     offset: *offset,
                     value: value.clone(),
@@ -4928,6 +5363,7 @@ impl<'a> LiftContext<'a> {
             WasmInstr::I32Store(offset) => {
                 let value = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let addr = self.stack.pop().unwrap_or(StackVal::Unknown);
+                self.relay_invalidate_on_store(&addr, *offset);
                 // Note: I32Store is NOT recorded in memory_stores because it's typically
                 // used for bookkeeping (lengths, offsets), not Val-encoded fields.
                 // Val-encoded fields are stored via I64Store (Soroban Vals are 64-bit).
@@ -4956,6 +5392,7 @@ impl<'a> LiftContext<'a> {
             | WasmInstr::I64Store32(offset) => {
                 let value = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let addr = self.stack.pop().unwrap_or(StackVal::Unknown);
+                self.relay_invalidate_on_store(&addr, *offset);
                 // Track sub-word stores in frame_slots so subsequent loads
                 // (e.g., I64Load8U) can resolve discriminant bytes written by
                 // struct/enum decoders. Not added to memory_stores (these are
@@ -5069,6 +5506,10 @@ impl<'a> LiftContext<'a> {
                 self.stack.push(StackVal::Unknown);
             }
             WasmInstr::CallIndirect(type_index) => {
+                // Issue #38 t23: unknown target — could write memory.
+                if self.relay.borrow().is_some() {
+                    *self.relay.borrow_mut() = None;
+                }
                 // Pop the table index operand
                 self.stack.pop();
                 // Look up the type signature to get param/result counts
@@ -5428,6 +5869,12 @@ impl<'a> LiftContext<'a> {
                 }
                 StructuredBlock::Loop { body, .. } => {
                     self.report_loop_gates(body, false);
+                    // Issue #38 t23: an armed populate→push relay is
+                    // single-shot — the next loop (this one) either consumes
+                    // it (verified below, after `counted_info`) or forfeits
+                    // it. Taking it first keeps every early-exit path
+                    // (const-eval, unrecognized shapes) conservative.
+                    let pending_relay = self.relay.borrow_mut().take();
                     // Issue #38 t22 (#61): a fully-static loop (pure register
                     // arithmetic + static-data loads, all touched locals
                     // concrete) is EVALUATED at lift time — the final local
@@ -5486,6 +5933,37 @@ impl<'a> LiftContext<'a> {
                     let mut carried: Vec<u32> = Vec::new();
                     let counted_info = detect_counted_loop(body, self.wasm_module);
                     let counted = counted_info.is_some();
+
+                    // Issue #38 t23 (populate→push value relay). Consume
+                    // side: with a relay armed by the PREVIOUS loop, verify
+                    // this loop provably walks that buffer forward over
+                    // exactly the written range — then each loaded element
+                    // equals its push ordinal, recovered as a synthesized
+                    // index variable (allocated past the real locals like a
+                    // promoted slot; the element-load hook reads it). Any
+                    // failed check keeps today's honest `todo!()`.
+                    let relay_index: Option<u32> = if self.loop_depth == 0
+                        && !self.in_analysis_sim
+                        && pending_relay
+                            .as_ref()
+                            .is_some_and(|r| self.relay_consume_ok(body, r, counted_info.as_ref()))
+                    {
+                        let idx = self.locals.len() as u32;
+                        self.locals.push(StackVal::LetBinding(idx));
+                        Some(idx)
+                    } else {
+                        None
+                    };
+                    // Populate side: prove the RawVec populate idiom and arm
+                    // the relay for the NEXT loop (armed at the end of this
+                    // arm, after the body's own stores have been processed).
+                    let populate_proto = if self.loop_depth == 0 && !self.in_analysis_sim {
+                        counted_info
+                            .as_ref()
+                            .and_then(|ci| self.detect_populate_protocol(body, ci))
+                    } else {
+                        None
+                    };
 
                     // Step 1 — local accumulators, only in side-effect-free
                     // counted loops. The genuine-accumulator gate (not a pure
@@ -5652,8 +6130,9 @@ impl<'a> LiftContext<'a> {
                     let mut loop_ctx = self.child_context();
                     loop_ctx.loop_carried_locals = carried;
                     loop_ctx.loop_depth += 1;
+                    loop_ctx.relay_index = relay_index;
                     loop_ctx.lift_structured_loop(body);
-                    let loop_stmts = loop_ctx.stmts;
+                    let mut loop_stmts = loop_ctx.stmts;
                     self.memory_stores = loop_ctx.memory_stores;
                     self.found_host_calls |= loop_ctx.found_host_calls;
 
@@ -5779,8 +6258,66 @@ impl<'a> LiftContext<'a> {
                         self.taint_loop_variant_slots(loop_pre_wpos);
                     }
 
+                    // Issue #38 t23: materialize the synthesized push-ordinal
+                    // index. The verified body is straight-line (no nested
+                    // control flow) and reads the element exactly once, so
+                    // the index reference lands in exactly one top-level
+                    // statement; the increment goes right after it (the
+                    // ordinal counts completed pushes, so its position
+                    // relative to the byte counter's decrement is
+                    // irrelevant). Zero references means the load never
+                    // resolved (the arg stayed the honest `todo!()`) — emit
+                    // nothing. Any other count is unreachable under the
+                    // consume gates; emitting no `let` then turns a stray
+                    // reference into a LOUD compile error (`var_N`
+                    // undeclared, caught by every gate), never a silently
+                    // wrong value.
+                    if let Some(idx) = relay_index {
+                        let refs: Vec<usize> = loop_stmts
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, s)| stmt_references_local_idx(s, idx).then_some(i))
+                            .collect();
+                        debug_assert!(
+                            refs.len() <= 1,
+                            "relay index referenced by {} stmts",
+                            refs.len()
+                        );
+                        if let [pos] = refs.as_slice() {
+                            cov_mark::hit!(relay_index_recovered);
+                            if *DBG_RELAY {
+                                eprintln!("[RELAY] index var_{idx} recovered");
+                            }
+                            self.stmts.push(SorobanStmt::Let {
+                                name: format!("var_{idx}"),
+                                mutable: true,
+                                value: SorobanExpr::U32Literal(0),
+                            });
+                            loop_stmts.insert(
+                                pos + 1,
+                                SorobanStmt::Assign {
+                                    target: format!("var_{idx}"),
+                                    value: SorobanExpr::Add(
+                                        Box::new(SorobanExpr::Local(idx)),
+                                        Box::new(SorobanExpr::U32Literal(1)),
+                                    ),
+                                },
+                            );
+                        }
+                    }
+
                     if !loop_stmts.is_empty() {
                         self.stmts.push(SorobanStmt::Loop { body: loop_stmts });
+                    }
+
+                    // Issue #38 t23: arm the relay for the next loop. Armed
+                    // last so the populate loop's own stores (processed
+                    // above) cannot invalidate it; every event between here
+                    // and the next loop that could alias the buffer clears
+                    // it (see the store/call hooks).
+                    if let Some(proto) = populate_proto {
+                        cov_mark::hit!(relay_populate_armed);
+                        *self.relay.borrow_mut() = Some(proto);
                     }
                 }
                 StructuredBlock::IfElse {
@@ -14820,6 +15357,232 @@ fn detect_memory_copy_loop(
 
 /// A loop recognized as counted: a single induction variable stepped by a
 /// constant and compared against a constant bound to decide the exit.
+/// Proof record of a RawVec populate loop (issue #38 t23, the populate→push
+/// value relay). Armed by [`LiftContext::detect_populate_protocol`] after a
+/// loop provably writes its counter value `i` at `buf + stride*i` for
+/// `i in 0..trip` through the canonical RawVec push-grow protocol:
+///
+/// 1. the (cap, ptr) pair on the shadow-stack frame is initialized to the
+///    canonical `RawVec::NEW` (`cap = 0`, `ptr = dangling(align)`);
+/// 2. every store goes through a cap-guarded, content-preserving grow helper
+///    ([`is_rawvec_grow_helper`]: reallocates, memcpys `old_cap * stride`
+///    bytes from the old buffer, writes the new (cap, ptr) back to the pair);
+/// 3. the element store writes exactly the loop counter at the walking
+///    offset (`mem[ptr + off] = i`, `off += stride` per iteration).
+///
+/// A subsequent loop that provably reads the same buffer forward at the same
+/// stride for exactly `trip` iterations (`relay_consume_ok`) then knows each
+/// loaded element equals its own push ordinal — the honest recovery is a
+/// synthesized index variable, not a fabricated value. The record is
+/// single-shot (the next loop consumes or forfeits it) and is invalidated by
+/// anything that could alias the buffer in between: a local-function call, a
+/// host call that writes linear memory, a store through a non-frame address,
+/// or a rewrite of the pair itself.
+struct RelayProtocol {
+    frame_id: u32,
+    cap_off: i32,
+    ptr_off: i32,
+    /// Element byte stride (4 = the u32-element idiom; the only one consumed).
+    stride: i32,
+    /// Trip-count expression: the populate loop's variable exit bound
+    /// (`while i != trip`), restricted to a pure param/literal at arm time.
+    trip: SorobanExpr,
+}
+
+/// Recognize a content-preserving RawVec grow helper (issue #38 t23): a
+/// single-`i32`-param, no-result function that (a) never reaches a host call,
+/// (b) loads the old buffer pointer from `param[4]`, (c) copies
+/// `old_cap << log2(stride)` bytes from it to the new buffer via a pure
+/// memory-copy callee, and (d) writes the new capacity and the copy's
+/// destination pointer back to `param[0]` / `param[4]`. Together with the
+/// caller-side idiom (canonical `(0, dangling)` pair init, cap-guarded grow,
+/// counter-at-walking-offset store — see [`RelayProtocol`]) this is the
+/// compiled `RawVec::grow` shape — the recognizer proves the parts a value
+/// relay depends on (contents survive the move, the pair tracks the live
+/// buffer) and refuses anything that deviates.
+fn is_rawvec_grow_helper(wasm_module: &WasmModule, g: u32, stride: i32) -> bool {
+    use crate::wasm::ir::WasmInstr as WI;
+    if g < wasm_module.num_imported_functions {
+        return false;
+    }
+    let Some(ft) = wasm_module.get_func_type(g) else {
+        return false;
+    };
+    if ft.params.len() != 1 || !ft.results.is_empty() {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    if fn_reaches_host_call(wasm_module, g, &mut seen) {
+        return false;
+    }
+    let Some(func) = wasm_module.get_function(g) else {
+        return false;
+    };
+    let body = &func.body;
+
+    // (d) pair writeback: `param[0] = new_cap` and `param[4] = new_ptr`.
+    let cap_writeback = body.windows(3).any(|w| {
+        matches!(
+            (&w[0], &w[1], &w[2]),
+            (WI::LocalGet(0), WI::LocalGet(_), WI::I32Store(0))
+        )
+    });
+    let new_ptr_local = body.windows(3).find_map(|w| match (&w[0], &w[1], &w[2]) {
+        (WI::LocalGet(0), WI::LocalGet(np), WI::I32Store(4)) => Some(*np),
+        _ => None,
+    });
+    // (b) old buffer pointer: `old_ptr = param[4]`.
+    let old_ptr_local = body.windows(3).find_map(|w| match (&w[0], &w[1], &w[2]) {
+        (WI::LocalGet(0), WI::I32Load(4), WI::LocalSet(s)) => Some(*s),
+        _ => None,
+    });
+    let (Some(np), Some(s)) = (new_ptr_local, old_ptr_local) else {
+        return false;
+    };
+    if !cap_writeback {
+        return false;
+    }
+    // (c) the copy: `memcpy(new_ptr, old_ptr, old_cap << log2(stride))`.
+    let copy_callee =
+        body.windows(6)
+            .find_map(|w| match (&w[0], &w[1], &w[2], &w[3], &w[4], &w[5]) {
+                (
+                    WI::LocalGet(dst),
+                    WI::LocalGet(src),
+                    WI::LocalGet(_),
+                    WI::I32Const(sh),
+                    WI::I32Shl,
+                    WI::Call(m),
+                ) if *dst == np
+                    && *src == s
+                    // Checked: a hostile/degenerate shift count must refuse,
+                    // not panic the recognizer.
+                    && u32::try_from(*sh)
+                        .ok()
+                        .and_then(|s| 1i32.checked_shl(s))
+                        == Some(stride) =>
+                {
+                    Some(*m)
+                }
+                _ => None,
+            });
+    let Some(m) = copy_callee else {
+        return false;
+    };
+    is_pure_copy_fn(wasm_module, m, 1)
+}
+
+/// True when the structured body nests another loop at any depth (issue #38
+/// t23): both relay sides must be single loops — an inner loop could
+/// re-write or re-read the buffer outside the proven protocol.
+fn body_contains_nested_loop(body: &[super::structurize::StructuredBlock]) -> bool {
+    use super::structurize::StructuredBlock as SB;
+    body.iter().any(|b| match b {
+        SB::Loop { .. } => true,
+        SB::Block { body, .. } => body_contains_nested_loop(body),
+        SB::IfElse {
+            then_body,
+            else_body,
+            ..
+        } => body_contains_nested_loop(then_body) || body_contains_nested_loop(else_body),
+        SB::Instruction(_) | SB::SafetyNetUnreachable => false,
+    })
+}
+
+/// Log a relay-consume refusal under `DBG_RELAY` and return `false`.
+fn refuse_relay(reason: &str) -> bool {
+    if *DBG_RELAY {
+        eprintln!("[RELAY] consume refused: {reason}");
+    }
+    false
+}
+
+/// True when `m` is a pure memory-copy function: `(i32, i32, i32) -> i32`,
+/// no global writes, no indirect calls, and either call-free or a thin
+/// wrapper around exactly one such function (`hops` bounds the unwrap —
+/// rustc emits `memcpy` as a wrapper over the aligned-copy worker).
+///
+/// The call-free leaf must additionally show COPY dataflow: at least one
+/// store whose value operand is the immediately-preceding memory load
+/// (WASM's stack discipline makes load→store adjacency the transfer of a
+/// loaded value; every rustc memcpy emission has it in its byte head/tail
+/// loops). A fill/memset-shaped `(dst, val, n)` function stores constants or
+/// locals and performs no loads at all, so it can never satisfy this — it
+/// would zero the relay buffer while the relay still substitutes ordinals.
+/// Full copy verification (offsets line up, all bytes transferred) stays out
+/// of scope: the caller-side idiom (the grow's argument provenance — dst is
+/// the pointer written back to the pair, src the old buffer pointer, length
+/// the old capacity in bytes) carries the rest of the proof.
+fn is_pure_copy_fn(wasm_module: &WasmModule, m: u32, hops: u32) -> bool {
+    use crate::wasm::ir::WasmInstr as WI;
+    if m < wasm_module.num_imported_functions {
+        return false;
+    }
+    let Some(ft) = wasm_module.get_func_type(m) else {
+        return false;
+    };
+    if ft.params.len() != 3 || ft.results.len() != 1 {
+        return false;
+    }
+    let Some(func) = wasm_module.get_function(m) else {
+        return false;
+    };
+    if func
+        .body
+        .iter()
+        .any(|i| matches!(i, WI::GlobalSet(_) | WI::CallIndirect(_)))
+    {
+        return false;
+    }
+    let callees: Vec<u32> = func
+        .body
+        .iter()
+        .filter_map(|i| match i {
+            WI::Call(t) => Some(*t),
+            _ => None,
+        })
+        .collect();
+    let is_mem_load = |i: &WI| {
+        matches!(
+            i,
+            WI::I32Load(_)
+                | WI::I64Load(_)
+                | WI::I32Load8S(_)
+                | WI::I32Load8U(_)
+                | WI::I32Load16S(_)
+                | WI::I32Load16U(_)
+                | WI::I64Load8S(_)
+                | WI::I64Load8U(_)
+                | WI::I64Load16S(_)
+                | WI::I64Load16U(_)
+                | WI::I64Load32S(_)
+                | WI::I64Load32U(_)
+        )
+    };
+    let is_mem_store = |i: &WI| {
+        matches!(
+            i,
+            WI::I32Store(_)
+                | WI::I64Store(_)
+                | WI::I32Store8(_)
+                | WI::I32Store16(_)
+                | WI::I64Store8(_)
+                | WI::I64Store16(_)
+                | WI::I64Store32(_)
+        )
+    };
+    let has_copy_dataflow = || {
+        func.body
+            .windows(2)
+            .any(|w| is_mem_load(&w[0]) && is_mem_store(&w[1]))
+    };
+    match callees.as_slice() {
+        [] => has_copy_dataflow(),
+        [inner] => hops > 0 && is_pure_copy_fn(wasm_module, *inner, hops - 1),
+        _ => false,
+    }
+}
+
 struct CountedLoopInfo {
     #[allow(dead_code)]
     counter_local: u32,
@@ -15523,6 +16286,13 @@ enum StackVal {
     /// that must stay, and a `panic_with_error!` guard carries an error code
     /// the fold would lose.
     OptionDecodeDisc,
+    /// The base pointer of a proven populate→push relay buffer (issue #38
+    /// t23), produced by reading the RawVec pair's ptr slot while a
+    /// [`RelayProtocol`] is armed. Consumed by the element load inside the
+    /// verified consume loop, which yields the loop's synthesized push-ordinal
+    /// index (`relay_index`); every other consumer degrades to `Unknown` —
+    /// the pointer value itself is a lift-time-unknowable heap address.
+    RelayBufPtr,
     /// Transitional: `global_get 0` (the WASM stack pointer)
     StackPtrRef,
     /// Transitional: `StackPtrRef - frame_size` before local_tee assigns it.
@@ -16751,6 +17521,39 @@ fn expr_references_local_idx(e: &SorobanExpr, idx: u32) -> bool {
     }
 }
 
+/// True if any expression in the statement (recursively) references local
+/// `idx` — the statement-level extension of [`expr_references_local_idx`],
+/// used to place the relay's synthesized index increment (issue #38 t23).
+fn stmt_references_local_idx(s: &SorobanStmt, idx: u32) -> bool {
+    let in_body = |b: &[SorobanStmt]| b.iter().any(|s| stmt_references_local_idx(s, idx));
+    match s {
+        SorobanStmt::Expr(e)
+        | SorobanStmt::Let { value: e, .. }
+        | SorobanStmt::Assign { value: e, .. }
+        | SorobanStmt::Return(Some(e)) => expr_references_local_idx(e, idx),
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => expr_references_local_idx(condition, idx) || in_body(then_body) || in_body(else_body),
+        SorobanStmt::Match { scrutinee, arms } => {
+            expr_references_local_idx(scrutinee, idx) || arms.iter().any(|a| in_body(&a.body))
+        }
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => in_body(body),
+        SorobanStmt::For {
+            start, end, body, ..
+        } => {
+            expr_references_local_idx(start, idx)
+                || expr_references_local_idx(end, idx)
+                || in_body(body)
+        }
+        SorobanStmt::Return(None)
+        | SorobanStmt::Comment(_)
+        | SorobanStmt::Break
+        | SorobanStmt::Continue => false,
+    }
+}
+
 /// True if `val` transitively references `FrameSlotPhi(id, off)` — the slot
 /// analogue of [`stackval_references_loop_phi`]. Decides whether a frame slot is
 /// genuinely loop-carried (its new value depends on its own loop-head value).
@@ -17483,6 +18286,9 @@ fn stack_val_to_expr_inner(
             SorobanExpr::UnknownVal
         }
         StackVal::FrameBase(_) | StackVal::StackPtrRef => SorobanExpr::UnknownVal,
+        // A relay buffer pointer that escapes to expr conversion is a raw
+        // heap address — lift-time unknowable (issue #38 t23).
+        StackVal::RelayBufPtr => SorobanExpr::UnknownVal,
         StackVal::Unknown => SorobanExpr::UnknownVal,
     }
 }
@@ -22079,6 +22885,181 @@ mod tests {
             matches!(result.stack_result, Some(StackVal::I64(v)) if v == expect),
             "static fold must evaluate concretely, got {:?}",
             result.stack_result
+        );
+    }
+
+    /// The RawVec populate→push relay idiom in miniature (issue #38 t23):
+    /// func 2 = the grow helper (loads `param[4]`, memcpys `cap << 2` bytes
+    /// to the new buffer, writes the pair back), func 3 = a pure copy fn,
+    /// func 4 = the two-loop pair over a raw i32 `count` param — populate
+    /// writes the counter at `buf + 4*i` through the cap-guarded grow
+    /// protocol, push walks the buffer forward Val-encoding each element.
+    fn relay_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "v" "_" (func (;0;) (result i64)))
+                (import "v" "6" (func (;1;) (param i64 i64) (result i64)))
+                (memory 1)
+                (global (mut i32) (i32.const 1048576))
+                (func (;2;) (param i32)
+                    (local i32 i32 i32)
+                    local.get 0 i32.load offset=4 local.set 1
+                    i32.const 2048 local.set 2
+                    local.get 0 i32.load local.set 3
+                    local.get 2 local.get 1 local.get 3 i32.const 2 i32.shl
+                    call 3 drop
+                    local.get 3 i32.const 4 i32.add local.set 3
+                    local.get 0 local.get 3 i32.store
+                    local.get 0 local.get 2 i32.store offset=4)
+                (func (;3;) (param i32 i32 i32) (result i32)
+                    (local i32)
+                    block
+                      loop
+                        local.get 3 local.get 2 i32.ge_u br_if 1
+                        local.get 0 local.get 3 i32.add
+                        local.get 1 local.get 3 i32.add
+                        i32.load8_u i32.store8
+                        local.get 3 i32.const 1 i32.add local.set 3
+                        br 0
+                      end
+                    end
+                    local.get 0)
+                (func (;4;) (param i32) (result i64)
+                    (local i32 i32 i32 i32 i32 i64)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 global.set 0
+                    local.get 1 i64.const 17179869184 i64.store offset=4 align=4
+                    local.get 1 i32.const 0 i32.store offset=12
+                    i32.const 0 local.set 2
+                    i32.const 0 local.set 3
+                    i32.const 4 local.set 4
+                    block
+                      loop
+                        local.get 0 local.get 2 i32.eq br_if 1
+                        block
+                          local.get 2 local.get 1 i32.load offset=4 i32.ne br_if 0
+                          local.get 1 i32.const 4 i32.add call 2
+                          local.get 1 i32.load offset=8 local.set 4
+                        end
+                        local.get 4 local.get 3 i32.add local.get 2 i32.store
+                        local.get 1 local.get 2 i32.const 1 i32.add local.tee 2
+                        i32.store offset=12
+                        local.get 3 i32.const 4 i32.add local.set 3
+                        br 0
+                      end
+                    end
+                    local.get 0 i32.const 2 i32.shl local.set 3
+                    call 0 local.set 6
+                    local.get 1 i32.load offset=8 local.set 4
+                    block
+                      loop
+                        local.get 3 i32.eqz br_if 1
+                        local.get 3 i32.const -4 i32.add local.set 3
+                        local.get 6
+                        local.get 4 i64.load32_u
+                        i64.const 32 i64.shl i64.const 4 i64.or
+                        call 1 local.set 6
+                        local.get 4 i32.const 4 i32.add local.set 4
+                        br 0
+                      end
+                    end
+                    local.get 1 i32.const 16 i32.add global.set 0
+                    local.get 6)
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn relay_recovers_push_ordinal_index() {
+        // The full relay fires: the populate loop arms the protocol
+        // (canonical pair init + cap-guarded content-preserving grow +
+        // counter-at-walking-offset store), the push loop verifies (trip
+        // equality, forward walk, single element load) and reads the
+        // synthesized push-ordinal index instead of `Unknown`.
+        cov_mark::check!(relay_populate_armed);
+        cov_mark::check!(relay_index_recovered);
+        let module = relay_module();
+        let reg = empty_registry();
+        // The cov marks are the assertions: the lift must arm the populate
+        // protocol AND recover the index (the host-call-bearing inline path
+        // reports no stack_result; the corpus-level rendering is pinned by
+        // `test_decompile_alloc`).
+        let _ = lift_inline_call(
+            &module,
+            &reg,
+            4,
+            vec![StackVal::Param("count".into())],
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
+        );
+    }
+
+    #[test]
+    fn relay_refused_without_grow_protocol() {
+        // Negative: a populate loop whose store does NOT go through the
+        // cap-guarded grow protocol (no grow call — the buffer pointer is a
+        // bare constant) must not arm the relay; the push loop's element
+        // load stays Unknown (today's honest `todo!()`).
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "v" "_" (func (;0;) (result i64)))
+                (import "v" "6" (func (;1;) (param i64 i64) (result i64)))
+                (memory 1)
+                (global (mut i32) (i32.const 1048576))
+                (func (;2;) (param i32) (result i64)
+                    (local i32 i32 i32 i32 i32 i64)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 global.set 0
+                    local.get 1 i64.const 17179869184 i64.store offset=4 align=4
+                    i32.const 0 local.set 2
+                    i32.const 0 local.set 3
+                    i32.const 2048 local.set 4
+                    block
+                      loop
+                        local.get 0 local.get 2 i32.eq br_if 1
+                        local.get 4 local.get 3 i32.add local.get 2 i32.store
+                        local.get 2 i32.const 1 i32.add local.set 2
+                        local.get 3 i32.const 4 i32.add local.set 3
+                        br 0
+                      end
+                    end
+                    local.get 0 i32.const 2 i32.shl local.set 3
+                    call 0 local.set 6
+                    local.get 1 i32.load offset=8 local.set 4
+                    block
+                      loop
+                        local.get 3 i32.eqz br_if 1
+                        local.get 3 i32.const -4 i32.add local.set 3
+                        local.get 6
+                        local.get 4 i64.load32_u
+                        i64.const 32 i64.shl i64.const 4 i64.or
+                        call 1 local.set 6
+                        local.get 4 i32.const 4 i32.add local.set 4
+                        br 0
+                      end
+                    end
+                    local.get 1 i32.const 16 i32.add global.set 0
+                    local.get 6)
+            )"#,
+        )
+        .expect("wat parses");
+        let module = WasmModule::parse(&wasm).expect("module parses");
+        let reg = empty_registry();
+        // Nothing proves the stored values survive into the read-back
+        // buffer, so the relay must not arm (and a fortiori never recover).
+        cov_mark::check_count!(relay_populate_armed, 0);
+        cov_mark::check_count!(relay_index_recovered, 0);
+        let _ = lift_inline_call(
+            &module,
+            &reg,
+            2,
+            vec![StackVal::Param("count".into())],
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
         );
     }
 
