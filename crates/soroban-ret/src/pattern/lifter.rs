@@ -2689,6 +2689,9 @@ impl<'a> LiftContext<'a> {
         }
         // Trip equality: counter seed = trip * stride ⇒ the loop iterates
         // exactly `trip` times — every load hits a written slot, in order.
+        // The seed converts as `trip << log2(stride)` (the wrapping-exact
+        // render of the byte-count shl, issue #38 t24) or as a plain
+        // multiply.
         let seed = self.local_arith_expr(ci.counter_local);
         let trips_match = match &seed {
             SorobanExpr::Mul(a, b) => {
@@ -2696,6 +2699,13 @@ impl<'a> LiftContext<'a> {
                     && matches!(
                         b.as_ref(),
                         SorobanExpr::I32Literal(k) if *k == relay.stride
+                    )
+            }
+            SorobanExpr::Shl(a, b) => {
+                **a == relay.trip
+                    && matches!(
+                        b.as_ref(),
+                        SorobanExpr::U32Literal(k) if *k < 31 && (1i32 << *k) == relay.stride
                     )
             }
             _ => false,
@@ -5025,11 +5035,21 @@ impl<'a> LiftContext<'a> {
                         self.stack
                             .push(StackVal::I32(((av as u32) << (bv as u32 & 31)) as i32));
                     }
+                    // Small-shift i32 shl is compiler-internal size arithmetic
+                    // (byte offsets, element counts scaled to bytes). Keep the
+                    // TRUE Shl provenance: it renders `x << n`, which wraps
+                    // under every build profile exactly like the WASM op —
+                    // rendering `x * 2^n` traps on overflow under the
+                    // canonical `overflow-checks = true` rebuild, a semantics
+                    // the original binary provably does not have (issue #38
+                    // t24). The i32 shift operand keys the render (the
+                    // conversion arm and `is_meaningful_for_phi` match it);
+                    // i64 shls keep their existing lowering.
                     (_, Some(n)) if n <= 3 => {
                         self.stack.push(StackVal::BinOp(
                             Box::new(a),
-                            BinOper::Mul,
-                            Box::new(StackVal::I32(1i32 << n)),
+                            BinOper::Shl,
+                            Box::new(StackVal::I32(n as i32)),
                         ));
                     }
                     // Sign-extend idiom `(x << k) >> k` (k ∈ {8,16,24} narrows to i8/i16/i24).
@@ -9170,6 +9190,7 @@ fn expr_contains_unknown(expr: &SorobanExpr) -> bool {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
@@ -16873,6 +16894,14 @@ fn is_meaningful_for_phi(val: &StackVal) -> bool {
         val,
         StackVal::BinOp(_, BinOper::Add | BinOper::Sub | BinOper::Mul, _)
     )
+    // The tracked small-i32-shl (size arithmetic, issue #38 t24) was
+    // Mul-lowered before and must stay phi-meaningful; Val-encode shls
+    // (i64 / shift 8+) keep their existing non-meaningful status.
+    || matches!(
+        val,
+        StackVal::BinOp(_, BinOper::Shl, b)
+            if matches!(**b, StackVal::I32(n) if (0..=3).contains(&n))
+    )
 }
 
 /// Checks whether a `let mut var_N` binding already exists in the statement list.
@@ -18129,8 +18158,33 @@ fn stack_val_to_expr_inner(
                         StackVal::BinOp(Box::new((**a).clone()), *op, Box::new((**b).clone()));
                     match strip_val_encode(reconstructed) {
                         StackVal::Unknown => {
-                            // Shl with small shift amounts (1-3) is likely real arithmetic (multiply
-                            // by power of 2), not Val encoding (which uses shift 8 or 32).
+                            // An i32-const small shift (0-3) is the tracked
+                            // compiler-internal size arithmetic from the
+                            // `I32Shl` arm — render the wrapping-exact
+                            // `x << n` (issue #38 t24; `x * 2^n` traps on
+                            // overflow under checked rebuilds where the
+                            // original shl wrapped).
+                            if *op == BinOper::Shl
+                                && let StackVal::I32(shift) = **b
+                                && (0..=3).contains(&shift)
+                            {
+                                let a_expr = stack_val_to_arith_expr_inner(
+                                    a,
+                                    params,
+                                    registry,
+                                    frame_slots,
+                                    visiting,
+                                );
+                                return SorobanExpr::Shl(
+                                    Box::new(a_expr),
+                                    Box::new(SorobanExpr::U32Literal(shift as u32)),
+                                );
+                            }
+                            // Shl with small i64 shift amounts (1-3) is real
+                            // arithmetic (an SDK multiplication optimization on
+                            // a decoded value), not Val encoding (shift 8/32).
+                            // Kept as `* 2^n` — the i64 path renders user-level
+                            // arithmetic where the multiply mirrors the source.
                             if *op == BinOper::Shl
                                 && let StackVal::I64(shift) = **b
                                 && (1..=3).contains(&shift)

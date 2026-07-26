@@ -32,6 +32,15 @@ pub enum SorobanExpr {
     Mul(Box<SorobanExpr>, Box<SorobanExpr>),
     Div(Box<SorobanExpr>, Box<SorobanExpr>),
     Rem(Box<SorobanExpr>, Box<SorobanExpr>),
+    /// Wrapping left shift — the render of a WASM `i32.shl` whose shift count
+    /// is a small constant (compiler-internal size arithmetic: byte offsets,
+    /// element counts scaled to bytes). Rendered `a << k`, NOT `a * 2^k`:
+    /// Rust's `<<` wraps the value under every build profile (only the shift
+    /// count is checked), exactly like the WASM op, while `*` traps on
+    /// overflow under the canonical Soroban `overflow-checks = true` profile
+    /// — a semantics the original binary provably does not have (a checked
+    /// source-level multiply compiles to a guarded mul, never a bare shl).
+    Shl(Box<SorobanExpr>, Box<SorobanExpr>),
 
     // Comparison
     Eq(Box<SorobanExpr>, Box<SorobanExpr>),
@@ -282,6 +291,7 @@ impl SorobanExpr {
             | SorobanExpr::Mul(a, b)
             | SorobanExpr::Div(a, b)
             | SorobanExpr::Rem(a, b)
+            | SorobanExpr::Shl(a, b)
             | SorobanExpr::Eq(a, b)
             | SorobanExpr::Ne(a, b)
             | SorobanExpr::Lt(a, b)
@@ -329,6 +339,7 @@ impl SorobanExpr {
             SorobanExpr::Add(a, b)
             | SorobanExpr::Sub(a, b)
             | SorobanExpr::Mul(a, b)
+            | SorobanExpr::Shl(a, b)
             | SorobanExpr::Eq(a, b)
             | SorobanExpr::Ne(a, b)
             | SorobanExpr::Lt(a, b)

@@ -21,7 +21,7 @@ impl Contract {
             .set(&DataKey::Persistent(init_key), &init_value);
         env.storage()
             .temporary()
-            .set(&DataKey::Temp(init_key * 2), &init_value);
+            .set(&DataKey::Temp(init_key << 1), &init_value);
         env.storage()
             .instance()
             .set(&DataKey::Instance(init_key * 3), &init_value);

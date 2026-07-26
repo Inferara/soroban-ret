@@ -200,6 +200,19 @@ fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<
     );
     let stmts = remove_dead_code(stmts);
     log::trace!("Optimizer pass: remove_dead_code ({} stmts)", stmts.len());
+    // A promoted loop-carried counter that nothing ever reads (`let mut
+    // var_N = 0; loop { …; var_N = var_N + 4; }`) is dead vestige of a
+    // dropped protocol (e.g. the byte-offset walker of an unmodeled buffer
+    // store). Dropping it is not only decluttering — under the canonical
+    // `overflow-checks = true` rebuild the checked `var_N + 4` TRAPS on
+    // inputs where the original's wrapping `i32.add` did not (issue #38
+    // t24: num_list's vestigial byte counter overflows u32 while the live
+    // exit counter exits at equality before ever wrapping).
+    let stmts = remove_dead_carried_counters(stmts);
+    log::trace!(
+        "Optimizer pass: remove_dead_carried_counters ({} stmts)",
+        stmts.len()
+    );
     let stmts = collapse_trivial_loops(stmts);
     log::trace!(
         "Optimizer pass: collapse_trivial_loops [3] ({} stmts)",
@@ -543,6 +556,7 @@ fn expr_children(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
@@ -2152,6 +2166,7 @@ fn expr_contains(haystack: &SorobanExpr, needle: &SorobanExpr) -> bool {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
@@ -2494,6 +2509,7 @@ fn expr_contains_param(expr: &SorobanExpr) -> bool {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
@@ -2822,6 +2838,217 @@ fn extract_storage_get_without_unwrap(
         });
     }
     None
+}
+
+/// Issue #38 t24: remove a mutable, effect-free-seeded `let` whose ONLY uses
+/// in the whole subtree are effect-free assignments to itself (`let mut
+/// var_N = 0; loop { …; var_N = var_N + 4; }` with nothing ever reading
+/// `var_N`) — the dead vestige of a promoted loop counter whose consumer (a
+/// dropped buffer-store protocol) never materialized. Beyond decluttering,
+/// removal is a FIDELITY fix: under the canonical `overflow-checks = true`
+/// rebuild the checked self-update traps on inputs where the original's
+/// wrapping `i32.add` did not. Fires only when the name is bound by exactly
+/// ONE `Let` in the subtree — pre-`deshadow` bodies can bind the same
+/// `var_N` twice, and name-based reference analysis would conflate them.
+fn remove_dead_carried_counters(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    let dead: Vec<(String, Option<u32>)> = stmts
+        .iter()
+        .filter_map(|s| match s {
+            SorobanStmt::Let {
+                name,
+                mutable: true,
+                value,
+            } if value.is_effect_free() => {
+                let idx = name
+                    .strip_prefix("var_")
+                    .and_then(|r| r.parse::<u32>().ok());
+                (count_lets_named(&stmts, name) == 1
+                    && !var_read_outside_self_assigns(&stmts, idx, name))
+                .then(|| (name.clone(), idx))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut stmts = stmts;
+    for (name, _) in &dead {
+        cov_mark::hit!(dead_carried_counter_removed);
+        stmts = strip_var_let_and_assigns(stmts, name);
+    }
+    // Recurse: a candidate `let` may itself live inside a nested body.
+    stmts
+        .into_iter()
+        .map(|s| match s {
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => SorobanStmt::If {
+                condition,
+                then_body: remove_dead_carried_counters(then_body),
+                else_body: remove_dead_carried_counters(else_body),
+            },
+            SorobanStmt::Match { scrutinee, arms } => SorobanStmt::Match {
+                scrutinee,
+                arms: arms
+                    .into_iter()
+                    .map(|mut a| {
+                        a.body = remove_dead_carried_counters(a.body);
+                        a
+                    })
+                    .collect(),
+            },
+            SorobanStmt::Loop { body } => SorobanStmt::Loop {
+                body: remove_dead_carried_counters(body),
+            },
+            SorobanStmt::Block(body) => SorobanStmt::Block(remove_dead_carried_counters(body)),
+            SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body: remove_dead_carried_counters(body),
+            },
+            other => other,
+        })
+        .collect()
+}
+
+/// True when any expression in the subtree reads the variable OUTSIDE the
+/// values of effect-free assignments to it (those reads die with the
+/// assigns). An assignment to the variable whose value is NOT effect-free
+/// counts as a read — it must be kept, so the variable is alive.
+fn var_read_outside_self_assigns(stmts: &[SorobanStmt], idx: Option<u32>, name: &str) -> bool {
+    let refs = |e: &SorobanExpr| expr_refs_var(e, idx, name);
+    stmts.iter().any(|s| match s {
+        SorobanStmt::Assign { target, value } if target == name => !value.is_effect_free(),
+        SorobanStmt::Expr(e)
+        | SorobanStmt::Let { value: e, .. }
+        | SorobanStmt::Assign { value: e, .. }
+        | SorobanStmt::Return(Some(e)) => refs(e),
+        SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            refs(condition)
+                || var_read_outside_self_assigns(then_body, idx, name)
+                || var_read_outside_self_assigns(else_body, idx, name)
+        }
+        SorobanStmt::Match { scrutinee, arms } => {
+            refs(scrutinee)
+                || arms
+                    .iter()
+                    .any(|a| var_read_outside_self_assigns(&a.body, idx, name))
+        }
+        SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
+            var_read_outside_self_assigns(body, idx, name)
+        }
+        SorobanStmt::For {
+            var,
+            start,
+            end,
+            body,
+            ..
+        } => {
+            var == name
+                || refs(start)
+                || refs(end)
+                || var_read_outside_self_assigns(body, idx, name)
+        }
+        SorobanStmt::Return(None)
+        | SorobanStmt::Comment(_)
+        | SorobanStmt::Break
+        | SorobanStmt::Continue => false,
+    })
+}
+
+/// True when the expression (transitively) references the variable, by
+/// lifter index (`Local(idx)`) or by name (`NamedLocal`).
+fn expr_refs_var(e: &SorobanExpr, idx: Option<u32>, name: &str) -> bool {
+    match e {
+        SorobanExpr::Local(i) => Some(*i) == idx,
+        SorobanExpr::NamedLocal(n) => n == name,
+        _ => crate::pipeline::child_exprs(e)
+            .iter()
+            .any(|c| expr_refs_var(c, idx, name)),
+    }
+}
+
+/// Count `Let` bindings of `name` in the whole subtree.
+fn count_lets_named(stmts: &[SorobanStmt], name: &str) -> usize {
+    stmts
+        .iter()
+        .map(|s| match s {
+            SorobanStmt::Let { name: n, .. } => usize::from(n == name),
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => count_lets_named(then_body, name) + count_lets_named(else_body, name),
+            SorobanStmt::Match { arms, .. } => {
+                arms.iter().map(|a| count_lets_named(&a.body, name)).sum()
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => count_lets_named(body, name),
+            SorobanStmt::For { body, .. } => count_lets_named(body, name),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Remove the `Let` of `name` and every assignment to it, recursively.
+fn strip_var_let_and_assigns(stmts: Vec<SorobanStmt>, name: &str) -> Vec<SorobanStmt> {
+    stmts
+        .into_iter()
+        .filter_map(|s| match s {
+            SorobanStmt::Let { name: n, .. } if n == name => None,
+            SorobanStmt::Assign { target, .. } if target == name => None,
+            SorobanStmt::If {
+                condition,
+                then_body,
+                else_body,
+            } => Some(SorobanStmt::If {
+                condition,
+                then_body: strip_var_let_and_assigns(then_body, name),
+                else_body: strip_var_let_and_assigns(else_body, name),
+            }),
+            SorobanStmt::Match { scrutinee, arms } => Some(SorobanStmt::Match {
+                scrutinee,
+                arms: arms
+                    .into_iter()
+                    .map(|mut a| {
+                        a.body = strip_var_let_and_assigns(a.body, name);
+                        a
+                    })
+                    .collect(),
+            }),
+            SorobanStmt::Loop { body } => Some(SorobanStmt::Loop {
+                body: strip_var_let_and_assigns(body, name),
+            }),
+            SorobanStmt::Block(body) => {
+                Some(SorobanStmt::Block(strip_var_let_and_assigns(body, name)))
+            }
+            SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => Some(SorobanStmt::For {
+                var,
+                start,
+                end,
+                step,
+                body: strip_var_let_and_assigns(body, name),
+            }),
+            other => Some(other),
+        })
+        .collect()
 }
 
 /// Remove unreachable statements after terminators.
@@ -3856,6 +4083,24 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
                 _ => SorobanExpr::Mul(Box::new(a), Box::new(b)),
             }
         }
+        // Shl: recurse and const-fold with WRAPPING semantics (that is the
+        // variant's contract — it renders the WASM `shl`). `x << 0 → x`.
+        // Deliberately NO `x << k == 0 → x == 0` style algebra: shl wraps,
+        // so a non-zero x can shift to zero.
+        SorobanExpr::Shl(a, b) => {
+            let a = fold_expr(*a);
+            let b = fold_expr(*b);
+            match (&a, &b) {
+                (SorobanExpr::U32Literal(x), SorobanExpr::U32Literal(y)) if *y < 32 => {
+                    SorobanExpr::U32Literal(x.wrapping_shl(*y))
+                }
+                (SorobanExpr::I32Literal(x), SorobanExpr::I32Literal(y)) if (0..32).contains(y) => {
+                    SorobanExpr::I32Literal(x.wrapping_shl(*y as u32))
+                }
+                _ if is_zero_literal(&b) => a,
+                _ => SorobanExpr::Shl(Box::new(a), Box::new(b)),
+            }
+        }
         // Div: recurse into sub-expressions and apply algebraic identities
         SorobanExpr::Div(a, b) => {
             let a = fold_expr(*a);
@@ -4773,6 +5018,7 @@ fn invalidate_seen_gets_for_expr(
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
@@ -5370,6 +5616,7 @@ fn count_local_in_expr(expr: &SorobanExpr, idx: u32) -> u32 {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
@@ -5550,6 +5797,7 @@ fn substitute_local_in_expr(expr: &mut SorobanExpr, idx: u32, value: &SorobanExp
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
@@ -6192,6 +6440,7 @@ fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
@@ -7411,6 +7660,115 @@ fn stmt_refs_local(stmt: &SorobanStmt, idx: u32) -> bool {
 mod tests {
     use super::*;
     use crate::ir::soroban_ir::StorageType;
+
+    #[test]
+    fn dead_carried_counter_removed_live_counter_kept() {
+        // `let mut var_4 = 0; loop { if count != var_3 …; var_3 += 1;
+        // var_4 += 4; }` — var_4 is written but never read: its Let and
+        // self-assignments go (under a checked rebuild the `var_4 + 4`
+        // would trap where the original's wrapping add did not — issue #38
+        // t24). var_3 is read by the exit condition and stays.
+        cov_mark::check!(dead_carried_counter_removed);
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(0),
+            },
+            SorobanStmt::Let {
+                name: "var_4".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(0),
+            },
+            SorobanStmt::Loop {
+                body: vec![
+                    SorobanStmt::If {
+                        condition: SorobanExpr::Eq(
+                            Box::new(SorobanExpr::Param("count".into())),
+                            Box::new(SorobanExpr::Local(3)),
+                        ),
+                        then_body: vec![SorobanStmt::Break],
+                        else_body: vec![],
+                    },
+                    SorobanStmt::Assign {
+                        target: "var_3".into(),
+                        value: SorobanExpr::Add(
+                            Box::new(SorobanExpr::Local(3)),
+                            Box::new(SorobanExpr::I32Literal(1)),
+                        ),
+                    },
+                    SorobanStmt::Assign {
+                        target: "var_4".into(),
+                        value: SorobanExpr::Add(
+                            Box::new(SorobanExpr::Local(4)),
+                            Box::new(SorobanExpr::I32Literal(4)),
+                        ),
+                    },
+                    SorobanStmt::Continue,
+                ],
+            },
+        ];
+        let out = remove_dead_carried_counters(stmts);
+        let repr = format!("{out:?}");
+        assert!(
+            !repr.contains("var_4"),
+            "dead counter must be removed:\n{repr}"
+        );
+        assert!(
+            repr.contains("var_3") && repr.contains("Local(3)"),
+            "live exit counter must survive:\n{repr}"
+        );
+    }
+
+    #[test]
+    fn shadowed_and_read_counters_are_kept() {
+        // Two Lets binding the same name: name-based analysis would conflate
+        // them — the exactly-one-Let gate must refuse. And a counter READ
+        // after the loop is alive.
+        let shadowed = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(0),
+            },
+            SorobanStmt::Assign {
+                target: "var_3".into(),
+                value: SorobanExpr::Add(
+                    Box::new(SorobanExpr::Local(3)),
+                    Box::new(SorobanExpr::I32Literal(4)),
+                ),
+            },
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(7),
+            },
+        ];
+        let out = format!("{:?}", remove_dead_carried_counters(shadowed));
+        assert_eq!(
+            out.matches("var_3").count(),
+            3,
+            "shadowed lets untouched:\n{out}"
+        );
+
+        let read_after = vec![
+            SorobanStmt::Let {
+                name: "var_4".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(0),
+            },
+            SorobanStmt::Assign {
+                target: "var_4".into(),
+                value: SorobanExpr::Add(
+                    Box::new(SorobanExpr::Local(4)),
+                    Box::new(SorobanExpr::I32Literal(4)),
+                ),
+            },
+            SorobanStmt::Return(Some(SorobanExpr::Local(4))),
+        ];
+        let out = format!("{:?}", remove_dead_carried_counters(read_after));
+        assert!(out.contains("var_4"), "read counter must be kept:\n{out}");
+    }
 
     #[test]
     fn mutable_let_never_renamed_onto_its_param_seed() {

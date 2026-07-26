@@ -90,6 +90,12 @@ fn expr_precedence(expr: &SorobanExpr) -> Option<u8> {
         | SorobanExpr::Ge(..) => Some(PREC_CMP),
         SorobanExpr::Add(..) | SorobanExpr::Sub(..) => Some(PREC_ADD),
         SorobanExpr::Mul(..) | SorobanExpr::Div(..) | SorobanExpr::Rem(..) => Some(PREC_MUL),
+        // Rust slots shift between comparison and additive, but clippy's
+        // `precedence` lint wants parens whenever shift mixes with arithmetic
+        // in either direction — `generate_expr_prec` renders Shl with forced
+        // parens on operator children and on itself when nested, so the
+        // precedence value only needs to trigger wrapping (CMP-level works).
+        SorobanExpr::Shl(..) => Some(PREC_CMP),
         SorobanExpr::Not(..) => Some(PREC_NOT),
         _ => None,
     }
@@ -155,12 +161,27 @@ fn generate_expr_prec(expr: &SorobanExpr, parent_prec: u8, is_right: bool) -> To
         return quote! { !#inner };
     }
 
+    // Shl renders with forced parens on operator children and on itself
+    // whenever nested — clippy's `precedence` lint rejects unparenthesized
+    // shift/arithmetic mixes in either direction.
+    if let SorobanExpr::Shl(a, b) = expr {
+        let left = generate_expr_prec(a, PREC_NOT, false);
+        let right = generate_expr_prec(b, PREC_NOT, true);
+        let inner = quote! { #left << #right };
+        return if parent_prec > 0 {
+            quote! { (#inner) }
+        } else {
+            inner
+        };
+    }
+
     let wrap = needs_parens(own_prec, parent_prec, is_right, is_comparison(expr));
 
     let (a, b) = match expr {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
@@ -304,6 +325,7 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
         SorobanExpr::Add(..)
         | SorobanExpr::Sub(..)
         | SorobanExpr::Mul(..)
+        | SorobanExpr::Shl(..)
         | SorobanExpr::Div(..)
         | SorobanExpr::Rem(..)
         | SorobanExpr::Eq(..)
