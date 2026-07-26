@@ -902,7 +902,11 @@ fn test_decompile_contract_with_constructor() {
             "&init_value",
             "env.storage()",
             ".temporary()",
-            ".set(&DataKey::Temp(init_key * 2)",
+            // `* 2` compiled to a bare (wrapping) i32.shl; the wrapping-exact
+            // render is `<< 1` — `* 2` would trap on overflow under the
+            // canonical checked rebuild where the original wrapped (issue #38
+            // t24). `* 3` below is a genuine multiply and keeps its render.
+            ".set(&DataKey::Temp(init_key << 1)",
             "&init_value",
             "env.storage()",
             ".instance()",

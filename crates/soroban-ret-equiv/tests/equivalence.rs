@@ -36,35 +36,29 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// recompiled contracts differ). A ratchet: drive DOWN as the decompiler
 /// recovers more behavior; never raise without understanding the new divergence.
 ///
-/// Measured baseline = 6 (68 fns / 479 cases executed; 63 contracts checked —
-/// 39 fixtures + 24 corpus — 98.7% match). No entry is a fabricated wrong
-/// value:
-///   - `digicus` (4): `clear_repos`/`get_repos`/`get_repos_and_issues`/
-///     `version` — honest todo-panics (the recompiled function hits a
-///     `todo!()` hole and traps as `Error(Context, InvalidAction)`); the
-///     long-standing set, values the lifter has not recovered.
-///   - `test_alloc` (2, issue #38 t23): the populate→push value relay
-///     recovered `num_list`'s pushed VALUE (the synthesized push-ordinal
-///     index), so every in-range case now returns the CORRECT FULL VEC —
-///     execution-verified. The 2 remaining cases are `count` values where
-///     `count * 4` overflows u32: the original computes the byte count with
-///     a compiler-internal UNCHECKED `i32.shl` (wraps), while the
-///     reconstruction materializes it as user-level `count * 4`, which this
-///     harness's canonical `overflow-checks = true` profile traps on
-///     (orig=Panic vs recomp=InvalidAction — both fail, different class).
-///     Closing these needs a wrapping-exact render of size arithmetic
-///     (`count << 2` — Rust `<<` never value-checks), a corpus-wide render
-///     change with its own audit.
+/// Measured baseline = 4 (68 fns / 479 cases executed; 63 contracts checked —
+/// 39 fixtures + 24 corpus — 99.2% match). The whole set is `digicus`:
+/// `clear_repos`/`get_repos`/`get_repos_and_issues`/`version` — honest
+/// todo-panics (the recompiled function hits a `todo!()` hole and traps as
+/// `Error(Context, InvalidAction)`); the long-standing values the lifter has
+/// not recovered. No entry is a fabricated wrong value.
 ///
-/// Previously 8 (t21: the vec accumulator recovered, `count = 0` matched);
-/// 9 before that (t19 unmask: `num_list` first became compilable in this
-/// harness, exposing 5 divergences hidden behind a unit-never-type-fallback
-/// compile error); before that 4 (digicus); 60 → 4 came from the
-/// fallible-storage-get recovery (`detect_fallible_storage_get_helper`)
-/// eliminating `unknown-oracle`'s 56 empty-storage divergences; 75 → 60
-/// from the `checked_add`/`checked_sub` recovery
-/// (`recover_checked_arith_from_body`).
-const DIVERGENCE_CEILING: usize = 6;
+/// Previously 6 (issue #38 t24 closed the 2 `test_alloc` overflow cases:
+/// the byte-count `i32.shl` now renders wrapping-exact `count << 2` instead
+/// of `count * 4`, and the vestigial never-read byte-offset counter — whose
+/// checked `var_4 + 4` trapped where the original's wrapping add did not —
+/// is removed by `remove_dead_carried_counters`; both sides now exhaust the
+/// host budget identically on overflow inputs). Previously 8 (t21: the vec
+/// accumulator recovered, `count = 0` matched; t23's populate→push value
+/// relay then recovered the pushed VALUE, making every in-range case return
+/// the correct full vec); 9 before that (t19 unmask: `num_list` first became
+/// compilable in this harness, exposing 5 divergences hidden behind a
+/// unit-never-type-fallback compile error); before that 4 (digicus); 60 → 4
+/// came from the fallible-storage-get recovery
+/// (`detect_fallible_storage_get_helper`) eliminating `unknown-oracle`'s 56
+/// empty-storage divergences; 75 → 60 from the `checked_add`/`checked_sub`
+/// recovery (`recover_checked_arith_from_body`).
+const DIVERGENCE_CEILING: usize = 4;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).

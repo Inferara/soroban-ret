@@ -335,6 +335,7 @@ fn walk_expr(e: &SorobanExpr, s: &mut NodeStats) {
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
+        | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
         | SorobanExpr::Rem(a, b)
         | SorobanExpr::Eq(a, b)
