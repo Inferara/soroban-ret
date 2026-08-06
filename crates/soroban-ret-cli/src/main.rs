@@ -34,7 +34,10 @@ struct Cli {
     /// display decompiled source and need an honest, per-contract confidence
     /// signal — the project's corpus-wide accuracy figures do not transfer to
     /// an individual contract.
-    #[arg(long, conflicts_with = "info")]
+    ///
+    /// Incompatible with --spec-only, which skips body lifting: there would be
+    /// no recovery to measure, and the counts would be pure noise.
+    #[arg(long, conflicts_with_all = ["info", "spec_only"])]
     report: bool,
 
     /// Force generic WASM decompilation mode (no Soroban assumptions).
@@ -54,8 +57,11 @@ struct Cli {
 /// are corpus metrics and say nothing about any individual contract; a
 /// per-contract percentage derived from them would overstate. Counts of
 /// functions and holes are checkable against the source next to them.
-fn render_report(wasm: &[u8], result: &soroban_ret::DecompileResult) -> String {
-    let r = &result.recovery;
+fn render_report(wasm: &[u8], result: &soroban_ret::DecompileResult) -> Option<String> {
+    // `None` under `--spec-only`, which clap already rejects for `--report`;
+    // handled rather than unwrapped so a future flag combination cannot turn an
+    // un-measurable report into a confident-looking one.
+    let r = result.recovery.as_ref()?;
 
     let diagnostics: Vec<_> = result
         .validation
@@ -117,10 +123,10 @@ fn render_report(wasm: &[u8], result: &soroban_ret::DecompileResult) -> String {
                    not correctness.",
     });
 
-    format!(
+    Some(format!(
         "{}\n",
         serde_json::to_string_pretty(&doc).unwrap_or_default()
-    )
+    ))
 }
 
 fn main() {
@@ -210,7 +216,16 @@ fn main() {
 
     if cli.report {
         match soroban_ret::decompile_with_options(&wasm, &options) {
-            Ok(result) => print!("{}", render_report(&wasm, &result)),
+            Ok(result) => match render_report(&wasm, &result) {
+                Some(json) => print!("{json}"),
+                None => {
+                    eprintln!(
+                        "Error: no recovery report available for this decompilation \
+                         (function bodies were not lifted)."
+                    );
+                    std::process::exit(1);
+                }
+            },
             Err(e) => {
                 eprintln!("Decompilation error: {e}");
                 std::process::exit(1);

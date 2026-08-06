@@ -22,6 +22,14 @@
 //! recovered · 379 unresolved holes" is verifiable and hard to misread; a bare
 //! "92 % recovered" invites exactly the misreading this module exists to avoid.
 //!
+//! # Not available under `spec_only`
+//!
+//! `DecompileOptions::spec_only` skips body lifting altogether, so every
+//! function would be graded on its declared return type alone — a
+//! fully-recovered contract would report most of its functions as lost. The
+//! report is therefore `None` in that mode rather than zeroed: a measurement
+//! that was never taken must not be mistakable for one that was.
+//!
 //! # Two views of the same thing
 //!
 //! - [`RecoveryReport::functions`] — a per-function verdict ([`FnStatus`]),

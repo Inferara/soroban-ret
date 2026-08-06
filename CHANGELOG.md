@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   individual contract.
 - `soroban_ret::VERSION`, and an optional `serde` feature deriving
   `Serialize`/`Deserialize` on the recovery types.
+- The report is `None` under `DecompileOptions::spec_only`, which skips body
+  lifting: grading those empty bodies would report a fully-recovered contract
+  as mostly "logic lost". `--report` rejects `--spec-only` for the same reason.
+  An unmeasured result must not be mistakable for a measured one.
 - The library now owns the canonical artifact counter. `soroban-ret-bench` and
   `soroban-ret-accuracy` each kept their own copy; both now delegate.
 

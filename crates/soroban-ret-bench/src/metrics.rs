@@ -196,9 +196,17 @@ pub fn bench_wasm(
     // The per-function verdicts and hole counts are computed by the decompiler
     // itself (`soroban_ret::recovery`), so this benchmark and any embedder read
     // the same numbers off the same code path.
-    c.artifacts = ir.recovery.artifacts.clone();
+    //
+    // Absent only under `spec_only`, which this benchmark never sets. Recorded
+    // as an error rather than defaulted to zeros: a contract silently scoring
+    // 0 % would read as a catastrophic regression in the ratchet.
+    let Some(recovery) = ir.recovery else {
+        c.error = Some("no recovery report (bodies not lifted)".to_string());
+        return c;
+    };
+    c.artifacts = recovery.artifacts.clone();
 
-    let fns = ir.recovery.functions.clone();
+    let fns = recovery.functions.clone();
     c.spec_functions = fns.len();
     for f in &fns {
         // `FnStatus` is `#[non_exhaustive]`; a future variant lands in the

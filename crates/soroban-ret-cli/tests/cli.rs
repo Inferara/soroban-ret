@@ -233,3 +233,17 @@ fn report_conflicts_with_info() {
         .assert()
         .failure();
 }
+
+/// `--spec-only` skips body lifting, so every function would be graded on its
+/// return type alone: `test_add_u64` is fully recovered, yet a report built in
+/// that mode claimed "1 of 3 fully recovered, 2 logic lost". Rejecting the
+/// combination is the only honest answer.
+#[test]
+fn report_conflicts_with_spec_only() {
+    bin()
+        .arg(fixture("test_add_u64.wasm"))
+        .arg("--report")
+        .arg("--spec-only")
+        .assert()
+        .failure();
+}

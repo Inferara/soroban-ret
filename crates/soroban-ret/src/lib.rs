@@ -115,7 +115,12 @@ pub struct DecompileResult {
     /// unresolved-hole counts, computed with no reference to any corpus
     /// baseline. See [`recovery`] for what these numbers do and do not mean —
     /// in particular, they grade completeness, not correctness.
-    pub recovery: RecoveryReport,
+    ///
+    /// `None` when [`DecompileOptions::spec_only`] was set: that mode skips
+    /// body lifting entirely, so every function would grade as lost or trivial
+    /// on the strength of its return type alone. There is nothing to measure,
+    /// and reporting zeros would be indistinguishable from a real result.
+    pub recovery: Option<RecoveryReport>,
 }
 
 /// Full intermediate results from the decompilation pipeline.
@@ -138,8 +143,9 @@ pub struct DecompileIR {
     /// Standard interfaces detected (SEP-41, etc.)
     pub standard_interfaces: Vec<String>,
     /// Per-contract recovery signals derived from the lifted module, the spec
-    /// function list and the emitted source. See [`recovery`].
-    pub recovery: RecoveryReport,
+    /// function list and the emitted source. `None` under
+    /// [`DecompileOptions::spec_only`] — see [`DecompileResult::recovery`].
+    pub recovery: Option<RecoveryReport>,
 }
 
 /// Decompile a Soroban WASM binary to Rust source code.

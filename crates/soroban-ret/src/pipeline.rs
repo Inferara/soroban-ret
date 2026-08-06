@@ -986,7 +986,21 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
     // Computed once here so `DecompileResult` and `DecompileIR` agree and no
     // consumer has to re-derive it (which is how the two prior copies of this
     // logic, in the bench and accuracy crates, were able to drift).
-    let recovery = crate::recovery::report(&contract_module, &registry, &source);
+    //
+    // Deliberately NOT computed under `spec_only`: that mode skips body lifting
+    // (`lift_functions` returns empty stmts with `found_host_calls: false`), so
+    // every function would be graded on its return type alone — a
+    // fully-recovered contract would report most of its functions "logic lost".
+    // A report that cannot be measured must be absent, not zeroed.
+    let recovery = if options.spec_only {
+        None
+    } else {
+        Some(crate::recovery::report(
+            &contract_module,
+            &registry,
+            &source,
+        ))
+    };
 
     Ok(DecompileIR {
         contract_module,

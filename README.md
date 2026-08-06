@@ -81,7 +81,7 @@ Flags:
 | `--spec-only` | Emit only type definitions and function signatures |
 | `-O, --pre-optimize` | Pre-optimize the WASM with `wasm-opt` before decompilation (requires binaryen) |
 | `--info` | Print contract metadata (SDK version, functions, types, events) and exit |
-| `--report` | Emit per-contract recovery signals as JSON and exit (see [below](#per-contract-recovery-signals)) |
+| `--report` | Emit per-contract recovery signals as JSON and exit (see [below](#per-contract-recovery-signals)); incompatible with `--spec-only` |
 | `--generic` | Force generic WASM mode (no Soroban assumptions) |
 | `-v, --verbose` | Enable debug logging |
 
@@ -153,15 +153,18 @@ in front of you, with no corpus or baseline involved:
 
 ```rust
 let result = soroban_ret::decompile_with_options(&wasm, &options)?;
-let r = &result.recovery;
 
-println!("{}", r.summary());        // "38 of 75 functions fully recovered · 379 unresolved holes"
-println!("holes: {}", r.holes());   // total todo!()/var_N markers
-println!("lost:  {}", r.lost());    // functions whose logic is gone
+// `None` under `spec_only`, which skips body lifting — there is nothing to
+// measure, so no report is produced rather than a zeroed one.
+if let Some(r) = &result.recovery {
+    println!("{}", r.summary());        // "38 of 75 functions fully recovered · 379 unresolved holes"
+    println!("holes: {}", r.holes());   // total todo!()/var_N markers
+    println!("lost:  {}", r.lost());    // functions whose logic is gone
 
-for f in r.lost_functions() {
-    // Surface these loudly: the body on screen does not represent on-chain behavior.
-    eprintln!("  {} [{}]", f.name, f.status.label());
+    for f in r.lost_functions() {
+        // Surface these loudly: the body on screen does not represent on-chain behavior.
+        eprintln!("  {} [{}]", f.name, f.status.label());
+    }
 }
 ```
 

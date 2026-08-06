@@ -1970,3 +1970,26 @@ fn loop_recovery_loop_variants() {
         "variable-bound accumulator regressed to todo!:\n{var_bound}"
     );
 }
+
+/// `spec_only` skips body lifting entirely, so grading the resulting empty
+/// bodies would report a fully-recovered contract as mostly "logic lost". The
+/// report must therefore be absent, not zeroed — an unmeasured result must not
+/// be mistakable for a measured one.
+#[test]
+fn spec_only_yields_no_recovery_report() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_add_u64.wasm");
+
+    let full = soroban_ret::decompile_with_options(wasm, &soroban_ret::DecompileOptions::default())
+        .expect("decompile");
+    let report = full.recovery.expect("recovery present without spec_only");
+    assert_eq!(report.lost(), 0, "fixture is fully recovered");
+    assert_eq!(report.fully_recovered(), report.spec_functions());
+
+    let mut opts = soroban_ret::DecompileOptions::default();
+    opts.spec_only = true;
+    let spec = soroban_ret::decompile_with_options(wasm, &opts).expect("decompile spec_only");
+    assert!(
+        spec.recovery.is_none(),
+        "spec_only must not produce a recovery report"
+    );
+}
