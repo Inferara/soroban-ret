@@ -15,7 +15,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use soroban_ret::ir::{ContractFn, MatchPattern, SorobanExpr, SorobanStmt};
 
 /// Number of times Stage-1 disassembly is timed; the median is reported.
 const DISASM_SAMPLES: usize = 5;
@@ -24,47 +23,15 @@ const DISASM_SAMPLES: usize = 5;
 // Output shapes
 // ---------------------------------------------------------------------------
 
-/// Per-category `todo!()` / `var_N` artifact counts, matching the accounting in
-/// `soroban-ret-accuracy`'s `count_artifacts` so the numbers line up with the
-/// project's existing artifact tracking.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-pub struct ArtifactCounts {
-    pub unknown_value: usize,
-    pub host_call: usize,
-    pub stub: usize,
-    pub var_n: usize,
-    pub total: usize,
-}
+/// The recovery types are owned by the published `soroban-ret` crate
+/// (`soroban_ret::recovery`) so the decompiler, this benchmark and the accuracy
+/// harness all count the same things. They used to be duplicated here and in
+/// `soroban-ret-accuracy`, which is exactly how three copies drift apart.
+pub use soroban_ret::recovery::{ArtifactCounts, FnStatus, count_artifacts, score_fn};
 
-/// Recovery verdict for a single exported function.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FnStatus {
-    /// Body lifted with zero unrecovered nodes.
-    Clean,
-    /// Body present but contains some unrecovered nodes.
-    Partial,
-    /// Body collapsed to empty although the lifter saw host calls — real logic
-    /// was lost (see `ContractFn::had_host_calls`).
-    LogicLost,
-    /// Empty body with no host calls — an identity/passthrough; nothing to restore.
-    Trivial,
-    /// Declared in the spec but absent from the lifted module.
-    Missing,
-}
-
-/// Per-function benchmark record.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct FnBench {
-    pub name: String,
-    pub status: FnStatus,
-    /// 0.0..=1.0 recovery fraction.
-    pub score: f64,
-    pub total_nodes: usize,
-    pub unknown_nodes: usize,
-    /// Distinct unrecovered host calls (`module::function`) referenced by the body.
-    pub missing_host_calls: Vec<String>,
-}
+/// Per-function benchmark record. Alias kept for the existing report/baseline
+/// field names; the type itself lives in the library.
+pub type FnBench = soroban_ret::recovery::FnRecovery;
 
 /// Per-contract benchmark record (full, volatile — used for `--json` and HTML).
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -156,346 +123,6 @@ impl From<&BenchReport> for Baseline {
 }
 
 // ---------------------------------------------------------------------------
-// Scoring
-// ---------------------------------------------------------------------------
-
-/// Accumulated traversal statistics for one function body.
-#[derive(Default)]
-struct NodeStats {
-    /// Total expression nodes visited.
-    total: usize,
-    /// Nodes the decompiler could not lift (each renders as a `todo!()`):
-    /// `UnknownVal`, `CyclicSlot`, `RawHostCall`.
-    unknown: usize,
-    /// `module::function` of each unrecovered `RawHostCall`.
-    host_calls: Vec<String>,
-}
-
-/// Grade one exported function's recovery in `[0.0, 1.0]`.
-///
-/// - empty body + `had_host_calls` → `0.0` (logic lost)
-/// - empty body + no host calls    → `1.0` (trivial/passthrough)
-/// - non-empty body                → `clean_nodes / total_nodes`
-pub fn score_fn(name: &str, f: &ContractFn) -> FnBench {
-    if f.body.is_empty() {
-        let (status, score) = if f.had_host_calls {
-            (FnStatus::LogicLost, 0.0)
-        } else {
-            (FnStatus::Trivial, 1.0)
-        };
-        return FnBench {
-            name: name.to_string(),
-            status,
-            score,
-            total_nodes: 0,
-            unknown_nodes: 0,
-            missing_host_calls: Vec::new(),
-        };
-    }
-
-    let mut s = NodeStats::default();
-    walk_body(&f.body, &mut s);
-    let score = if s.total == 0 {
-        // Body has only control flow / comments and no expression nodes — nothing
-        // was left unrecovered.
-        1.0
-    } else {
-        (s.total - s.unknown) as f64 / s.total as f64
-    };
-    let status = if s.unknown == 0 {
-        FnStatus::Clean
-    } else {
-        FnStatus::Partial
-    };
-    s.host_calls.sort();
-    s.host_calls.dedup();
-    FnBench {
-        name: name.to_string(),
-        status,
-        score,
-        total_nodes: s.total,
-        unknown_nodes: s.unknown,
-        missing_host_calls: s.host_calls,
-    }
-}
-
-fn walk_body(body: &[SorobanStmt], s: &mut NodeStats) {
-    for st in body {
-        walk_stmt(st, s);
-    }
-}
-
-fn walk_stmt(st: &SorobanStmt, s: &mut NodeStats) {
-    match st {
-        SorobanStmt::Expr(e) => walk_expr(e, s),
-        SorobanStmt::Let { value, .. } => walk_expr(value, s),
-        SorobanStmt::Assign { value, .. } => walk_expr(value, s),
-        SorobanStmt::Return(Some(e)) => walk_expr(e, s),
-        SorobanStmt::Return(None) => {}
-        SorobanStmt::If {
-            condition,
-            then_body,
-            else_body,
-        } => {
-            walk_expr(condition, s);
-            walk_body(then_body, s);
-            walk_body(else_body, s);
-        }
-        SorobanStmt::Match { scrutinee, arms } => {
-            walk_expr(scrutinee, s);
-            for arm in arms {
-                if let MatchPattern::Literal(e) = &arm.pattern {
-                    walk_expr(e, s);
-                }
-                walk_body(&arm.body, s);
-            }
-        }
-        SorobanStmt::Loop { body } => walk_body(body, s),
-        SorobanStmt::For {
-            start, end, body, ..
-        } => {
-            walk_expr(start, s);
-            walk_expr(end, s);
-            walk_body(body, s);
-        }
-        SorobanStmt::Block(b) => walk_body(b, s),
-        SorobanStmt::Comment(_) | SorobanStmt::Break | SorobanStmt::Continue => {}
-    }
-}
-
-/// Visit every expression node, counting totals and the unrecovered markers.
-///
-/// The match is exhaustive on purpose: if `SorobanExpr` gains a variant, this
-/// fails to compile and forces the metric to account for it.
-fn walk_expr(e: &SorobanExpr, s: &mut NodeStats) {
-    s.total += 1;
-    match e {
-        // Unrecovered markers (each renders as a `todo!()`).
-        SorobanExpr::UnknownVal | SorobanExpr::CyclicSlot { .. } => s.unknown += 1,
-        SorobanExpr::RawHostCall {
-            module,
-            function,
-            args,
-        } => {
-            s.unknown += 1;
-            s.host_calls.push(format!("{module}::{function}"));
-            for a in args {
-                walk_expr(a, s);
-            }
-        }
-
-        // Leaves with no expression children.
-        SorobanExpr::U32Literal(_)
-        | SorobanExpr::I32Literal(_)
-        | SorobanExpr::U64Literal(_)
-        | SorobanExpr::I64Literal(_)
-        | SorobanExpr::U128Literal(_)
-        | SorobanExpr::I128Literal(_)
-        | SorobanExpr::BoolLiteral(_)
-        | SorobanExpr::SymbolLiteral(_)
-        | SorobanExpr::StringLiteral(_)
-        | SorobanExpr::BytesLiteral(_)
-        | SorobanExpr::Void
-        | SorobanExpr::None
-        | SorobanExpr::Param(_)
-        | SorobanExpr::Local(_)
-        | SorobanExpr::NamedLocal(_)
-        | SorobanExpr::Env
-        | SorobanExpr::ContractError { .. }
-        | SorobanExpr::Panic
-        | SorobanExpr::LedgerSequence
-        | SorobanExpr::LedgerTimestamp
-        | SorobanExpr::LedgerNetworkId
-        | SorobanExpr::CurrentContractAddress
-        | SorobanExpr::MaxLiveUntilLedger
-        | SorobanExpr::CollectionNew(_)
-        | SorobanExpr::ValTagName(_) => {}
-
-        // Single child.
-        SorobanExpr::Some(b)
-        | SorobanExpr::Not(b)
-        | SorobanExpr::RequireAuth(b)
-        | SorobanExpr::AuthorizeAsCurrContract(b)
-        | SorobanExpr::ErrorFromCode(b)
-        | SorobanExpr::PanicWithError(b)
-        | SorobanExpr::CryptoSha256(b)
-        | SorobanExpr::CryptoKeccak256(b)
-        | SorobanExpr::PrngReseed(b)
-        | SorobanExpr::PrngBytesNew(b)
-        | SorobanExpr::PrngVecShuffle(b)
-        | SorobanExpr::StrkeyToAddress(b)
-        | SorobanExpr::AddressToStrkey(b)
-        | SorobanExpr::SretResult(b)
-        | SorobanExpr::ValTag(b)
-        | SorobanExpr::ValConvert { value: b, .. }
-        | SorobanExpr::CastAs { value: b, .. }
-        | SorobanExpr::Try(b) => walk_expr(b, s),
-
-        // Two children.
-        SorobanExpr::Add(a, b)
-        | SorobanExpr::Sub(a, b)
-        | SorobanExpr::Mul(a, b)
-        | SorobanExpr::Shl(a, b)
-        | SorobanExpr::Div(a, b)
-        | SorobanExpr::Rem(a, b)
-        | SorobanExpr::Eq(a, b)
-        | SorobanExpr::Ne(a, b)
-        | SorobanExpr::Lt(a, b)
-        | SorobanExpr::Le(a, b)
-        | SorobanExpr::Gt(a, b)
-        | SorobanExpr::Ge(a, b)
-        | SorobanExpr::And(a, b)
-        | SorobanExpr::Or(a, b)
-        | SorobanExpr::RequireAuthForArgs {
-            address: a,
-            args: b,
-        }
-        | SorobanExpr::ExtendInstanceAndCodeTtl {
-            threshold: a,
-            extend_to: b,
-        }
-        | SorobanExpr::VecTryIterFold { vec: a, init: b } => {
-            walk_expr(a, s);
-            walk_expr(b, s);
-        }
-
-        // Storage.
-        SorobanExpr::StorageGet { key, .. }
-        | SorobanExpr::StorageHas { key, .. }
-        | SorobanExpr::StorageRemove { key, .. } => walk_expr(key, s),
-        SorobanExpr::StorageSet { key, value, .. } => {
-            walk_expr(key, s);
-            walk_expr(value, s);
-        }
-        SorobanExpr::StorageExtendTtl {
-            key,
-            threshold,
-            extend_to,
-            ..
-        } => {
-            walk_expr(key, s);
-            walk_expr(threshold, s);
-            walk_expr(extend_to, s);
-        }
-
-        // Events / calls.
-        SorobanExpr::PublishEvent { topics, data, .. } => {
-            for t in topics {
-                walk_expr(t, s);
-            }
-            walk_expr(data, s);
-        }
-        SorobanExpr::InvokeContract {
-            address,
-            function,
-            args,
-            ..
-        }
-        | SorobanExpr::TryInvokeContract {
-            address,
-            function,
-            args,
-            ..
-        } => {
-            walk_expr(address, s);
-            walk_expr(function, s);
-            for a in args {
-                walk_expr(a, s);
-            }
-        }
-
-        // Constructors / access.
-        SorobanExpr::StructConstruct { fields, .. } => {
-            for (_, v) in fields {
-                walk_expr(v, s);
-            }
-        }
-        SorobanExpr::EnumConstruct { fields, .. } => {
-            for v in fields {
-                walk_expr(v, s);
-            }
-        }
-        SorobanExpr::TupleConstruct(items)
-        | SorobanExpr::VecConstruct(items)
-        | SorobanExpr::Log(items) => {
-            for v in items {
-                walk_expr(v, s);
-            }
-        }
-        SorobanExpr::MapConstruct(pairs) => {
-            for (k, v) in pairs {
-                walk_expr(k, s);
-                walk_expr(v, s);
-            }
-        }
-        SorobanExpr::FieldAccess { object, .. } => walk_expr(object, s),
-        SorobanExpr::MethodCall { object, args, .. } => {
-            walk_expr(object, s);
-            for a in args {
-                walk_expr(a, s);
-            }
-        }
-
-        // Crypto with multiple children.
-        SorobanExpr::CryptoEd25519Verify {
-            public_key,
-            message,
-            signature,
-        } => {
-            walk_expr(public_key, s);
-            walk_expr(message, s);
-            walk_expr(signature, s);
-        }
-        SorobanExpr::CryptoSecp256k1Recover {
-            msg_digest,
-            signature,
-            recovery_id,
-        } => {
-            walk_expr(msg_digest, s);
-            walk_expr(signature, s);
-            walk_expr(recovery_id, s);
-        }
-        SorobanExpr::PrngU64InRange { low, high } => {
-            walk_expr(low, s);
-            walk_expr(high, s);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Artifact counting (mirrors soroban-ret-accuracy::ast_compare::count_artifacts)
-// ---------------------------------------------------------------------------
-
-/// Count `todo!()` / `var_N` artifacts in generated source, by category.
-pub fn count_artifacts(src: &str) -> ArtifactCounts {
-    let count_both = |a: &str, b: &str| src.matches(a).count() + src.matches(b).count();
-    let unknown_value = count_both("todo!(\"unknown value\")", "todo !(\"unknown value\")");
-    let host_call = count_both("todo!(\"host call", "todo !(\"host call");
-    let stub = count_both(
-        "todo!(\"decompiled function body\")",
-        "todo !(\"decompiled function body\")",
-    );
-
-    let mut var_n = 0;
-    for word in src.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if word.len() > 4
-            && word.starts_with("var_")
-            && word[4..].chars().all(|c| c.is_ascii_digit())
-        {
-            var_n += 1;
-        }
-    }
-
-    ArtifactCounts {
-        unknown_value,
-        host_call,
-        stub,
-        var_n,
-        total: unknown_value + host_call + stub + var_n,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Per-contract benchmark
 // ---------------------------------------------------------------------------
 
@@ -566,52 +193,29 @@ pub fn bench_wasm(
         .iter()
         .map(|d| d.to_string())
         .collect();
-    c.artifacts = count_artifacts(&ir.source);
+    // The per-function verdicts and hole counts are computed by the decompiler
+    // itself (`soroban_ret::recovery`), so this benchmark and any embedder read
+    // the same numbers off the same code path.
+    c.artifacts = ir.recovery.artifacts.clone();
 
-    // Index lifted functions by name for spec lookup.
-    let lifted: BTreeMap<&str, &ContractFn> = ir
-        .contract_module
-        .functions
-        .iter()
-        .map(|f| (f.name.as_str(), f))
-        .collect();
-
-    // Denominator = spec (contractspecv0) functions; fall back to the lifted set
-    // when there is no spec (non-Rust SDK contracts).
-    let names: Vec<String> = if !ir.registry.functions.is_empty() {
-        ir.registry.functions.keys().cloned().collect()
-    } else {
-        ir.contract_module
-            .functions
-            .iter()
-            .map(|f| f.name.clone())
-            .collect()
-    };
-
-    let mut fns = Vec::with_capacity(names.len());
-    for name in &names {
-        let fb = match lifted.get(name.as_str()) {
-            Some(f) => score_fn(name, f),
-            None => FnBench {
-                name: name.clone(),
-                status: FnStatus::Missing,
-                score: 0.0,
-                total_nodes: 0,
-                unknown_nodes: 0,
-                missing_host_calls: Vec::new(),
-            },
-        };
-        fns.push(fb);
-    }
-
+    let fns = ir.recovery.functions.clone();
     c.spec_functions = fns.len();
     for f in &fns {
-        match f.status {
-            FnStatus::Clean | FnStatus::Trivial => c.fn_clean += 1,
-            FnStatus::Partial => c.fn_partial += 1,
-            FnStatus::LogicLost | FnStatus::Missing => c.fn_logic_lost += 1,
+        // `FnStatus` is `#[non_exhaustive]`; a future variant lands in the
+        // partial bucket until this is taught about it.
+        if f.status.is_fully_recovered() {
+            c.fn_clean += 1;
+        } else if f.status.is_lost() {
+            c.fn_logic_lost += 1;
+        } else {
+            c.fn_partial += 1;
         }
     }
+    // The mean lives here, not in the library: a single contract-level
+    // percentage is the number most likely to be misread as a correctness
+    // claim, so the library deliberately exposes only counts and per-function
+    // scores. As a corpus-wide *trend* line, which is all this benchmark uses
+    // it for, it is sound.
     let mean = if fns.is_empty() {
         0.0
     } else {

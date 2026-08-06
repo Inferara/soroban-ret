@@ -28,6 +28,15 @@ struct Cli {
     #[arg(long)]
     info: bool,
 
+    /// Emit per-contract recovery signals as JSON to stdout and exit: how many
+    /// exported functions were fully recovered, which ones lost their logic,
+    /// and how many unresolved `todo!()` holes remain. Intended for UIs that
+    /// display decompiled source and need an honest, per-contract confidence
+    /// signal — the project's corpus-wide accuracy figures do not transfer to
+    /// an individual contract.
+    #[arg(long, conflicts_with = "info")]
+    report: bool,
+
     /// Force generic WASM decompilation mode (no Soroban assumptions).
     /// Incompatible with --info (which always runs in Auto mode).
     #[arg(long, conflicts_with = "info")]
@@ -36,6 +45,82 @@ struct Cli {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+}
+
+/// Render the per-contract recovery signals as a JSON document.
+///
+/// Deliberately reports **counts**, not a single "recovered %". The project's
+/// published aggregates (corpus mean restoration, corpus behavioral-match rate)
+/// are corpus metrics and say nothing about any individual contract; a
+/// per-contract percentage derived from them would overstate. Counts of
+/// functions and holes are checkable against the source next to them.
+fn render_report(wasm: &[u8], result: &soroban_ret::DecompileResult) -> String {
+    let r = &result.recovery;
+
+    let diagnostics: Vec<_> = result
+        .validation
+        .diagnostics
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "severity": match d.severity {
+                    soroban_ret::DiagnosticSeverity::Warning => "warning",
+                    soroban_ret::DiagnosticSeverity::Info => "info",
+                    _ => "unknown",
+                },
+                "category": d.category.to_string(),
+                "message": d.message,
+                "function_index": d.function_index,
+            })
+        })
+        .collect();
+
+    let functions: Vec<_> = r
+        .functions
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.name,
+                "status": f.status.label(),
+                "fully_recovered": f.status.is_fully_recovered(),
+                "logic_lost": f.status.is_lost(),
+                "unknown_nodes": f.unknown_nodes,
+                "total_nodes": f.total_nodes,
+                "missing_host_calls": f.missing_host_calls,
+            })
+        })
+        .collect();
+
+    let doc = serde_json::json!({
+        "soroban_ret_version": soroban_ret::VERSION,
+        "wasm_size": wasm.len(),
+        "sdk_version": result.sdk_version,
+        "standard_interfaces": result.standard_interfaces,
+        "soroban_compliant": result.validation.is_soroban_compliant(),
+        "diagnostics": diagnostics,
+        "summary": r.summary(),
+        "functions_total": r.spec_functions(),
+        "functions_fully_recovered": r.fully_recovered(),
+        "functions_partial": r.partial(),
+        "functions_logic_lost": r.lost(),
+        "holes": {
+            "total": r.artifacts.total,
+            "unknown_value": r.artifacts.unknown_value,
+            "host_call": r.artifacts.host_call,
+            "stub": r.artifacts.stub,
+            "var_n": r.artifacts.var_n,
+        },
+        "functions": functions,
+        "notice": "Experimental reconstruction. Signatures and types come from the \
+                   contract's own contractspecv0 metadata; function bodies are inferred \
+                   from bytecode and may be incomplete. These counts measure completeness, \
+                   not correctness.",
+    });
+
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&doc).unwrap_or_default()
+    )
 }
 
 fn main() {
@@ -122,6 +207,17 @@ fn main() {
     options.spec_only = cli.spec_only;
     options.pre_optimize = cli.pre_optimize;
     options.mode = mode;
+
+    if cli.report {
+        match soroban_ret::decompile_with_options(&wasm, &options) {
+            Ok(result) => print!("{}", render_report(&wasm, &result)),
+            Err(e) => {
+                eprintln!("Decompilation error: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     match soroban_ret::decompile_with_options(&wasm, &options) {
         Ok(result) => {

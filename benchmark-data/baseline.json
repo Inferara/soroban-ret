@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 92.8,
+  "overall_restoration": 92.4,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -17,11 +17,11 @@
     {
       "file": "aqua-rewards-CCY2PXGM.wasm",
       "entity": "Aqua Rewards",
-      "restoration_pct": 95.2,
+      "restoration_pct": 93.9,
       "spec_functions": 76,
-      "fn_clean": 23,
+      "fn_clean": 22,
       "fn_partial": 53,
-      "fn_logic_lost": 0,
+      "fn_logic_lost": 1,
       "artifacts_total": 209,
       "wasm_size": 54833,
       "error": null
@@ -125,11 +125,11 @@
     {
       "file": "digicus-CCZLARB4.wasm",
       "entity": "Digicus",
-      "restoration_pct": 96.1,
+      "restoration_pct": 87.8,
       "spec_functions": 12,
-      "fn_clean": 9,
+      "fn_clean": 8,
       "fn_partial": 3,
-      "fn_logic_lost": 0,
+      "fn_logic_lost": 1,
       "artifacts_total": 7,
       "wasm_size": 6373,
       "error": null

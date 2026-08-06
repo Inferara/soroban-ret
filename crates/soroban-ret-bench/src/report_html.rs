@@ -97,12 +97,15 @@ fn bar_class(pct: f64) -> &'static str {
 }
 
 fn status_badge(s: FnStatus) -> &'static str {
+    // `FnStatus` is `#[non_exhaustive]` — a variant added to the library must
+    // not break this report, so unknown ones fall back to a neutral badge.
     match s {
         FnStatus::Clean => "<span class=\"badge b-clean\">clean</span>",
         FnStatus::Partial => "<span class=\"badge b-partial\">partial</span>",
         FnStatus::LogicLost => "<span class=\"badge b-lost\">logic lost</span>",
         FnStatus::Trivial => "<span class=\"badge b-triv\">trivial</span>",
         FnStatus::Missing => "<span class=\"badge b-miss\">missing</span>",
+        _ => "<span class=\"badge b-partial\">unknown</span>",
     }
 }
 

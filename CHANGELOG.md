@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — per-contract recovery signals
+
+- New public `soroban_ret::recovery` module: per-function recovery verdicts
+  (`FnStatus::{Clean, Partial, LogicLost, Trivial, Missing}`) and
+  unresolved-hole counts by category, computed from the contract in front of
+  you with no corpus baseline involved. Surfaced on `DecompileResult::recovery`
+  and `DecompileIR::recovery` (both `#[non_exhaustive]`, so this is additive),
+  and as JSON via the new `soroban-ret --report` CLI flag. Intended for UIs that
+  display decompiled source and need an honest per-contract confidence signal:
+  the project's corpus-wide figures are corpus means and do not describe an
+  individual contract.
+- `soroban_ret::VERSION`, and an optional `serde` feature deriving
+  `Serialize`/`Deserialize` on the recovery types.
+- The library now owns the canonical artifact counter. `soroban-ret-bench` and
+  `soroban-ret-accuracy` each kept their own copy; both now delegate.
+
+### Fixed — deceptively-clean function grading
+
+- `FnStatus::Trivial` no longer covers a function whose empty body must still
+  return a value. Codegen renders such a body as
+  `todo!("decompiled function body")`, which traps at runtime, so grading it
+  "fully recovered" was the deceptively-clean bug class. Two corpus functions
+  were affected — `aqua-rewards::get_pools_plane` and `digicus::version`, the
+  latter independently recorded by the equivalence harness as diverging
+  (original returns `U32(0)`, recompiled traps). Both are now `LogicLost`.
+  Corpus mean restoration moves **92.8 % → 92.4 %** with **no change to any
+  decompiled output** (`artifacts_total` is identical for all 24 contracts);
+  `benchmark-data/baseline.json` refreshed accordingly.
+
+### Documentation
+
+- `README.md` and `docs/pattern-coverage.md` re-measured against `main`: the
+  compile-back gate is **38/39 = 97 %**, not the previously documented 38/38 =
+  100 % (`test_liquidity_pool` regressed to 3 hard errors); the 4 equivalence
+  divergences are `digicus`, not `test_alloc::num_list` (closed in #64). Added
+  the corpus-soundness gate, refreshed every stale count, and replaced rotted
+  line-number code references with greppable symbol names.
+
 ## [0.0.4] - 2026-07-26
 
 The correctness-first release: two multi-tranche programs — memory-SSA-style

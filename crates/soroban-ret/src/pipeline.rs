@@ -43,6 +43,7 @@ pub fn run(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileResult, D
         sdk_version: ir.sdk_version,
         standard_interfaces: ir.standard_interfaces,
         validation: ir.validation,
+        recovery: ir.recovery,
     })
 }
 
@@ -982,6 +983,11 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
 
     let standard_interfaces = contract_module.standard_interfaces.clone();
 
+    // Computed once here so `DecompileResult` and `DecompileIR` agree and no
+    // consumer has to re-derive it (which is how the two prior copies of this
+    // logic, in the bench and accuracy crates, were able to drift).
+    let recovery = crate::recovery::report(&contract_module, &registry, &source);
+
     Ok(DecompileIR {
         contract_module,
         registry,
@@ -989,6 +995,7 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         source,
         sdk_version,
         standard_interfaces,
+        recovery,
     })
 }
 
