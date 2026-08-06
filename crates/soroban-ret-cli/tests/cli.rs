@@ -187,3 +187,63 @@ fn pre_optimize_flag_either_succeeds_or_reports_missing_tool() {
             .stderr(predicate::str::contains("wasm-opt"));
     }
 }
+
+#[test]
+fn report_emits_valid_json_with_recovery_signals() {
+    let out = bin()
+        .arg(fixture("test_add_u64.wasm"))
+        .arg("--report")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).expect("report should be utf-8");
+
+    // Structural checks without pulling a JSON parser into dev-deps: the payload
+    // a UI consumes must carry the version, the counts, and the caveat.
+    for needle in [
+        "\"soroban_ret_version\"",
+        "\"summary\"",
+        "\"functions_total\"",
+        "\"functions_fully_recovered\"",
+        "\"functions_logic_lost\"",
+        "\"holes\"",
+        "\"unknown_value\"",
+        "\"notice\"",
+    ] {
+        assert!(text.contains(needle), "report missing {needle}:\n{text}");
+    }
+    // A fully-recovered fixture must report no holes and no lost functions.
+    assert!(text.contains("\"functions_logic_lost\": 0"), "{text}");
+    assert!(text.contains("\"total\": 0"), "{text}");
+    // Deliberately NOT a percentage — see `soroban_ret::recovery`.
+    assert!(
+        !text.contains("recovered_pct") && !text.contains("restoration_pct"),
+        "report must expose counts, not a headline percentage:\n{text}"
+    );
+}
+
+#[test]
+fn report_conflicts_with_info() {
+    bin()
+        .arg(fixture("test_add_u64.wasm"))
+        .arg("--report")
+        .arg("--info")
+        .assert()
+        .failure();
+}
+
+/// `--spec-only` skips body lifting, so every function would be graded on its
+/// return type alone: `test_add_u64` is fully recovered, yet a report built in
+/// that mode claimed "1 of 3 fully recovered, 2 logic lost". Rejecting the
+/// combination is the only honest answer.
+#[test]
+fn report_conflicts_with_spec_only() {
+    bin()
+        .arg(fixture("test_add_u64.wasm"))
+        .arg("--report")
+        .arg("--spec-only")
+        .assert()
+        .failure();
+}

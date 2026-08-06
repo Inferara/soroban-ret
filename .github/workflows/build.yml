@@ -59,7 +59,8 @@ jobs:
       # calibrated against exact rustc diagnostics — all of which drift across
       # floating `stable` releases. RUSTUP_TOOLCHAIN overrides rust-toolchain.toml
       # so the gates are reproducible against the locally-measured baselines
-      # (corpus 1134, equiv 75, compile-back 38/38). Bump with the baselines.
+      # (corpus 326 errors / 3 clean, equiv 4 divergences, compile-back 38/39
+      # = 97%). Bump with the baselines.
       RUSTUP_TOOLCHAIN: "1.95.0"
     steps:
       - uses: actions/checkout@v4

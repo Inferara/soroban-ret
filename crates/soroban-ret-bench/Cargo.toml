@@ -21,7 +21,8 @@ name = "bench"
 path = "src/main.rs"
 
 [dependencies]
-soroban-ret = { workspace = true }
+# `serde` for the recovery types the report and baseline serialize.
+soroban-ret = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }

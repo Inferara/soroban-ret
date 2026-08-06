@@ -3,12 +3,21 @@ pub mod dynamic_hints;
 pub mod ir;
 pub mod pattern;
 pub(crate) mod pipeline;
+pub mod recovery;
 pub mod spec;
 pub mod wasm;
+
+/// Version of this `soroban-ret` build.
+///
+/// Decompiler output is version-dependent: the same WASM decompiled by a later
+/// release can recover strictly more. Record this alongside any stored or
+/// displayed result so a stale rendering is identifiable as stale.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use dynamic_hints::{
     AuthHint, DecompileHints, EventHint, FunctionHints, HintValue, InvokeHint, StorageHint,
 };
+pub use recovery::{ArtifactCounts, FnRecovery, FnStatus, RecoveryReport};
 pub use spec::{registry::TypeRegistry, standard_interfaces::StandardInterface};
 pub use wasm::{
     DataSection, DiagnosticCategory, DiagnosticSeverity, ExportTable, HostFunction, HostModule,
@@ -89,9 +98,8 @@ pub struct DecompileOptions {
 
 /// Result of a decompilation call exposing the source and metadata.
 ///
-/// Marked `#[non_exhaustive]` so future additions (e.g. confidence
-/// annotations, diagnostic summary) don't require a breaking release.
-/// Access fields directly (`result.source`); do not destructure.
+/// Marked `#[non_exhaustive]` so future additions don't require a breaking
+/// release. Access fields directly (`result.source`); do not destructure.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DecompileResult {
@@ -103,6 +111,16 @@ pub struct DecompileResult {
     pub standard_interfaces: Vec<String>,
     /// Soroban compliance validation report
     pub validation: ValidationReport,
+    /// How much of *this* contract was recovered: per-function verdicts and
+    /// unresolved-hole counts, computed with no reference to any corpus
+    /// baseline. See [`recovery`] for what these numbers do and do not mean —
+    /// in particular, they grade completeness, not correctness.
+    ///
+    /// `None` when [`DecompileOptions::spec_only`] was set: that mode skips
+    /// body lifting entirely, so every function would grade as lost or trivial
+    /// on the strength of its return type alone. There is nothing to measure,
+    /// and reporting zeros would be indistinguishable from a real result.
+    pub recovery: Option<RecoveryReport>,
 }
 
 /// Full intermediate results from the decompilation pipeline.
@@ -124,6 +142,10 @@ pub struct DecompileIR {
     pub sdk_version: Option<String>,
     /// Standard interfaces detected (SEP-41, etc.)
     pub standard_interfaces: Vec<String>,
+    /// Per-contract recovery signals derived from the lifted module, the spec
+    /// function list and the emitted source. `None` under
+    /// [`DecompileOptions::spec_only`] — see [`DecompileResult::recovery`].
+    pub recovery: Option<RecoveryReport>,
 }
 
 /// Decompile a Soroban WASM binary to Rust source code.

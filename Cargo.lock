@@ -1916,6 +1916,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
+ "serde",
  "soroban-meta",
  "soroban-spec",
  "soroban-spec-rust",
@@ -1960,6 +1961,7 @@ dependencies = [
  "clap",
  "env_logger",
  "predicates",
+ "serde_json",
  "soroban-ret",
  "tempfile",
 ]

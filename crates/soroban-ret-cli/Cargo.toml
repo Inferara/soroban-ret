@@ -16,9 +16,11 @@ name = "soroban-ret"
 path = "src/main.rs"
 
 [dependencies]
-soroban-ret = { workspace = true }
+# `serde` for the recovery types serialized by `--report`.
+soroban-ret = { workspace = true, features = ["serde"] }
 clap = { workspace = true }
 env_logger = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"

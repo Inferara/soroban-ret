@@ -25,6 +25,13 @@ thiserror = { workspace = true }
 log = { workspace = true }
 cov-mark = { workspace = true }
 wasmprinter = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[features]
+# Derive `Serialize`/`Deserialize` on the `recovery` types so embedders can ship
+# the per-contract signals to a UI as JSON. Off by default: the core library has
+# no need to serialize anything, and library users shouldn't pay for serde.
+serde = ["dep:serde"]
 
 [dev-dependencies]
 insta = "1.40"

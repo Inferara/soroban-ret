@@ -12,26 +12,30 @@ The sixteen items are:
 > Function body codegen (complex) · Validate Level 3 contracts · Validate
 > Level 4 contracts
 
-All file paths below are relative to the repository root.
+All file paths below are relative to the repository root. Code references name
+the **file and the item** (a `fn`, an enum variant, or a `Stage 4x` comment)
+rather than a line number: the lifter and pipeline churn constantly, so line
+numbers rot within a commit or two. Every reference below is greppable —
+`rg '<symbol>' crates/`.
 
 ## Pattern coverage table
 
 | # | Pattern | Code | Fixture(s) | Test(s) |
 |---|---|---|---|---|
-| 1 | Struct pack/unpack | `crates/soroban-ret/src/pattern/lifter.rs:5478` `detect_load_struct_wrapper`; `:5749` `detect_map_unpack_decode_wrapper`; `:5918` `detect_struct_construct_wrapper`; `crates/soroban-ret/src/pipeline.rs:5282` Stage 4s | `tests/fixtures/test_udt.wasm`, `tests/fixtures/test_liquidity_pool.wasm` | `test_decompile_udt`, `test_decompile_liquidity_pool_keys` |
-| 2 | Enum dispatch | `crates/soroban-ret/src/pattern/lifter.rs:7146` `detect_enum_dispatch_wrapper`; `:4041` `symbol_index_in_linear_memory` handler reading the CASES array | `tests/fixtures/test_constructor.wasm`, `tests/fixtures/contract_with_constructor.wasm`, `tests/fixtures/test_liquidity_pool.wasm` | `test_decompile_constructor`, `test_decompile_contract_with_constructor`, `test_decompile_liquidity_pool_keys` |
-| 3 | Integer enum | `crates/soroban-ret/src/pipeline.rs:445` Stage 4j (integer enum cast arm recovery) | `tests/fixtures/test_errors.wasm` (`Flag` is a `u32`-discriminant enum) | `test_decompile_errors` — asserts `if flag == Flag::A` / `else if flag == Flag::C` / `else if flag == Flag::D` chain and `A = 0` … `E = 4` discriminants |
-| 4 | Tuple struct | `crates/soroban-ret/src/pattern/lifter.rs:5392` `detect_vec_unpack_wrapper` | `tests/fixtures/test_tuples.wasm`, `tests/fixtures/test_udt.wasm` | `test_decompile_tuples` (asserts `(u32, i64)`) |
-| 5 | Error handling | `crates/soroban-ret/src/ir/soroban_ir.rs:134` `SorobanExpr::ContractError`; `crates/soroban-ret/src/codegen/functions.rs:533` codegen for `panic_with_error!` and `Error::from_contract_error(N)` | `tests/fixtures/test_errors.wasm` | `test_decompile_errors` — asserts `#[contracterror]`, `AnError = 1`, `panic_with_error!`, `from_contract_error`, `Result<Symbol, Error>` |
-| 6 | Auth | `crates/soroban-ret/src/ir/soroban_ir.rs:77` `SorobanExpr::RequireAuth`; `:78` `RequireAuthForArgs`; `crates/soroban-ret/src/pattern/host_calls.rs:102,107` host-call lifting; `crates/soroban-ret/src/pipeline.rs:601` Stage 4x (RequireAuth + EnumConstruct fixup) | `tests/fixtures/test_auth.wasm`, `tests/fixtures/test_account.wasm` | `test_decompile_auth` — asserts `a.require_auth()` and the in-order chain `require_auth_for_args` → `invoke_contract` in `fn2` |
-| 7 | Event | `crates/soroban-ret/src/ir/soroban_ir.rs:85` `SorobanExpr::PublishEvent`; `crates/soroban-ret/src/pipeline.rs:465` Stage 4l (event publish recovery) | `tests/fixtures/test_events.wasm`, `tests/fixtures/test_events_ref.wasm` | `test_decompile_events`, `test_decompile_events_ref`, `snapshot_test_events` — asserts `#[contractevent]`, `pub struct Transfer`, `#[topic]`, in-fn `.publish(&env)` ordering |
-| 8 | Cross-contract call | `crates/soroban-ret/src/ir/soroban_ir.rs:92` `SorobanExpr::InvokeContract`; `:100` `TryInvokeContract`; `crates/soroban-ret/src/pipeline.rs:302` Stage 4b (cross-contract return type inference) | `tests/fixtures/test_invoke_contract.wasm`, `tests/fixtures/test_import_contract.wasm` | `test_decompile_invoke_contract`, `test_decompile_import_contract` — asserts `env.invoke_contract::<i32>` with `vec![&env, x.into_val(&env), y.into_val(&env)]` argument order |
-| 9 | Crypto | `crates/soroban-ret/src/pattern/host_calls.rs:170` `lift_crypto_call` (BLS12-381 g1/g2/msm/pairing, BN254, SHA-256, Keccak-256, Ed25519, secp256k1); `crates/soroban-ret/src/codegen/types.rs:168` `generate_type_ident_crypto` (Bls12381Fp, Bls12381Fp2, Bls12381G1Affine, Bls12381G2Affine, Bn254G1Affine, Bn254G2Affine, Fr type aliases) | `tests/fixtures/test_bls.wasm`, `tests/fixtures/test_bn254.wasm` | `test_decompile_bls`, `test_decompile_bn254` — asserts `Bls12381` / `Bn254` aliases, `soroban_sdk::crypto::{bls12_381, bn254}` imports, `env.crypto().bls12_381() / .bn254()` dispatch |
-| 10 | Control flow reconstruction | `crates/soroban-ret/src/pattern/structurize.rs:39` `structurize`; `crates/soroban-ret/src/ir/optimizer.rs:665` `collapse_trivial_loops`; `crates/soroban-ret/src/pattern/lifter.rs` BrIf guard-chain handling, match-arm continuation reattachment, phi-merge recovery | `tests/fixtures/test_errors.wasm` (br_table → if-chain), `tests/fixtures/test_auth.wasm`, `tests/fixtures/test_fuzz.wasm` | `test_decompile_errors` (if-chain shape), `test_decompile_auth_control_flow` (no residual `loop {`), `test_decompile_fuzz` |
-| 11 | Variable naming heuristics | `crates/soroban-ret/src/ir/optimizer.rs:4547` `propagate_variable_names`; `:4891` `deshadow_variable_names` | exercised indirectly by every fixture (30) | `test_all_fixtures_no_artifacts` (negative regression sweep across all fixtures: no `var_N`, no `todo!("unknown value")`, no `todo!("host call`) |
-| 12 | Constructor | `crates/soroban-ret/src/pattern/dispatch.rs:30` `__constructor` detection; `crates/soroban-ret/src/ir/high_level_ir.rs:62` `ContractFn::is_constructor`; `crates/soroban-ret/src/codegen/module.rs` constructor emission | `tests/fixtures/test_constructor.wasm`, `tests/fixtures/contract_with_constructor.wasm`, `tests/fixtures/test_liquidity_pool.wasm` | `test_decompile_constructor`, `test_decompile_contract_with_constructor` (asserts in-order DataKey variants + storage tier writes), `test_decompile_liquidity_pool_keys`, `snapshot_contract_with_constructor` |
-| 13 | Check-auth | `crates/soroban-ret/src/pattern/dispatch.rs:31` `__check_auth` detection; `crates/soroban-ret/src/ir/high_level_ir.rs:63` `ContractFn::is_check_auth`; `crates/soroban-ret/src/codegen/imports.rs` `auth::Context` import injection | `tests/fixtures/test_account.wasm` | `test_decompile_account` — asserts `__check_auth`, `auth::Context`, `Vec<Context>` |
-| 14 | Function body codegen (complex) | `crates/soroban-ret/src/codegen/functions.rs` (≈1.4 kLOC: tail-expression returns, `let mut … = match`/`if` combining, while-loop emission, nested struct construction, match arm tail-expression promotion, `Result` wrapping) | every Level 3+4 fixture exercises a non-trivial body | implicit via every full-body test; explicit shapes in `test_decompile_liquidity_pool_keys`, `test_decompile_udt`, `test_decompile_contract_with_constructor` |
+| 1 | Struct pack/unpack | `crates/soroban-ret/src/pattern/lifter.rs` `detect_load_struct_wrapper`, `detect_map_unpack_decode_wrapper`, `detect_struct_construct_wrapper`; `crates/soroban-ret/src/pipeline.rs` Stage 4s | `tests/fixtures/test_udt.wasm`, `tests/fixtures/test_liquidity_pool.wasm` | `test_decompile_udt`, `test_decompile_liquidity_pool_keys` |
+| 2 | Enum dispatch | `crates/soroban-ret/src/pattern/lifter.rs` `detect_enum_dispatch_wrapper`; the `(HostModule::Buf, "symbol_index_in_linear_memory")` handler reading the CASES array | `tests/fixtures/test_constructor.wasm`, `tests/fixtures/contract_with_constructor.wasm`, `tests/fixtures/test_liquidity_pool.wasm` | `test_decompile_constructor`, `test_decompile_contract_with_constructor`, `test_decompile_liquidity_pool_keys` |
+| 3 | Integer enum | `crates/soroban-ret/src/pipeline.rs` Stage 4j (integer enum cast arm recovery) | `tests/fixtures/test_errors.wasm` (`Flag` is a `u32`-discriminant enum) | `test_decompile_errors` — asserts `if flag == Flag::A` / `else if flag == Flag::C` / `else if flag == Flag::D` chain and `A = 0` … `E = 4` discriminants |
+| 4 | Tuple struct | `crates/soroban-ret/src/pattern/lifter.rs` `detect_vec_unpack_wrapper` | `tests/fixtures/test_tuples.wasm`, `tests/fixtures/test_udt.wasm` | `test_decompile_tuples` (asserts `(u32, i64)`) |
+| 5 | Error handling | `crates/soroban-ret/src/ir/soroban_ir.rs` `SorobanExpr::ContractError`; `crates/soroban-ret/src/codegen/functions.rs` codegen for `panic_with_error!` and `Error::from_contract_error(N)` | `tests/fixtures/test_errors.wasm` | `test_decompile_errors` — asserts `#[contracterror]`, `AnError = 1`, `panic_with_error!`, `from_contract_error`, `Result<Symbol, Error>` |
+| 6 | Auth | `crates/soroban-ret/src/ir/soroban_ir.rs` `SorobanExpr::RequireAuth`, `RequireAuthForArgs`; `crates/soroban-ret/src/pattern/host_calls.rs` `"require_auth"` / `"require_auth_for_args"` lifting; `crates/soroban-ret/src/pipeline.rs` Stage 4x (RequireAuth + EnumConstruct fixup) | `tests/fixtures/test_auth.wasm`, `tests/fixtures/test_account.wasm` | `test_decompile_auth` — asserts `a.require_auth()` and the in-order chain `require_auth_for_args` → `invoke_contract` in `fn2` |
+| 7 | Event | `crates/soroban-ret/src/ir/soroban_ir.rs` `SorobanExpr::PublishEvent`; `crates/soroban-ret/src/pipeline.rs` Stage 4l (event publish recovery) | `tests/fixtures/test_events.wasm`, `tests/fixtures/test_events_ref.wasm` | `test_decompile_events`, `test_decompile_events_ref`, `snapshot_test_events` — asserts `#[contractevent]`, `pub struct Transfer`, `#[topic]`, in-fn `.publish(&env)` ordering |
+| 8 | Cross-contract call | `crates/soroban-ret/src/ir/soroban_ir.rs` `SorobanExpr::InvokeContract`, `TryInvokeContract`; `crates/soroban-ret/src/pipeline.rs` Stage 4b (cross-contract return type inference) | `tests/fixtures/test_invoke_contract.wasm`, `tests/fixtures/test_import_contract.wasm` | `test_decompile_invoke_contract`, `test_decompile_import_contract` — asserts `env.invoke_contract::<i32>` with `vec![&env, x.into_val(&env), y.into_val(&env)]` argument order |
+| 9 | Crypto | `crates/soroban-ret/src/pattern/host_calls.rs` `lift_crypto_call` (BLS12-381 g1/g2/msm/pairing, BN254, SHA-256, Keccak-256, Ed25519, secp256k1); `crates/soroban-ret/src/codegen/types.rs` `generate_type_ident_crypto` (Bls12381Fp, Bls12381Fp2, Bls12381G1Affine, Bls12381G2Affine, Bn254G1Affine, Bn254G2Affine, Fr type aliases) | `tests/fixtures/test_bls.wasm`, `tests/fixtures/test_bn254.wasm` | `test_decompile_bls`, `test_decompile_bn254` — asserts `Bls12381` / `Bn254` aliases, `soroban_sdk::crypto::{bls12_381, bn254}` imports, `env.crypto().bls12_381() / .bn254()` dispatch |
+| 10 | Control flow reconstruction | `crates/soroban-ret/src/pattern/structurize.rs` `structurize`; `crates/soroban-ret/src/ir/optimizer.rs` `collapse_trivial_loops`; `crates/soroban-ret/src/pattern/lifter.rs` BrIf guard-chain handling, match-arm continuation reattachment, phi-merge recovery | `tests/fixtures/test_errors.wasm` (br_table → if-chain), `tests/fixtures/test_auth.wasm`, `tests/fixtures/test_fuzz.wasm` | `test_decompile_errors` (if-chain shape), `test_decompile_auth_control_flow` (no residual `loop {`), `test_decompile_fuzz` |
+| 11 | Variable naming heuristics | `crates/soroban-ret/src/ir/optimizer.rs` `propagate_variable_names`, `deshadow_variable_names` | exercised indirectly by every fixture (40) | `test_all_fixtures_no_artifacts` (negative regression sweep across all fixtures: no `var_N`, no `todo!("unknown value")`, no `todo!("host call`) |
+| 12 | Constructor | `crates/soroban-ret/src/pattern/dispatch.rs` `__constructor` detection; `crates/soroban-ret/src/ir/high_level_ir.rs` `ContractFn::is_constructor`; `crates/soroban-ret/src/codegen/module.rs` constructor emission | `tests/fixtures/test_constructor.wasm`, `tests/fixtures/contract_with_constructor.wasm`, `tests/fixtures/test_liquidity_pool.wasm` | `test_decompile_constructor`, `test_decompile_contract_with_constructor` (asserts in-order DataKey variants + storage tier writes), `test_decompile_liquidity_pool_keys`, `snapshot_contract_with_constructor` |
+| 13 | Check-auth | `crates/soroban-ret/src/pattern/dispatch.rs` `__check_auth` detection; `crates/soroban-ret/src/ir/high_level_ir.rs` `ContractFn::is_check_auth`; `crates/soroban-ret/src/codegen/imports.rs` `auth::Context` import injection | `tests/fixtures/test_account.wasm` | `test_decompile_account` — asserts `__check_auth`, `auth::Context`, `Vec<Context>` |
+| 14 | Function body codegen (complex) | `crates/soroban-ret/src/codegen/functions.rs` (≈3.8 kLOC: tail-expression returns, `let mut … = match`/`if` combining, while-loop emission, nested struct construction, match arm tail-expression promotion, `Result` wrapping) | every Level 3+4 fixture exercises a non-trivial body | implicit via every full-body test; explicit shapes in `test_decompile_liquidity_pool_keys`, `test_decompile_udt`, `test_decompile_contract_with_constructor` |
 | 15 | Validate Level 3 (udt, errors, events, constructor) | n/a — validation deliverable | `tests/fixtures/test_udt.wasm`, `tests/fixtures/test_errors.wasm`, `tests/fixtures/test_events.wasm`, `tests/fixtures/test_constructor.wasm` | `test_decompile_udt`, `test_decompile_errors`, `test_decompile_events`, `test_decompile_constructor`, plus `snapshot_test_errors` and `snapshot_test_events` |
 | 16 | Validate Level 4 (auth, account, invoke_contract) | n/a — validation deliverable | `tests/fixtures/test_auth.wasm`, `tests/fixtures/test_account.wasm`, `tests/fixtures/test_invoke_contract.wasm` | `test_decompile_auth`, `test_decompile_auth_control_flow`, `test_decompile_account`, `test_decompile_invoke_contract` |
 
@@ -49,7 +53,7 @@ Each pattern's test uses a combination of:
     function signature.
 - **Negative assertion** on artifact absence — every Level 3+ test ends with
   `assert!(!source.contains("todo!("))`, and the global
-  `test_all_fixtures_no_artifacts` test walks all 30 fixtures asserting that
+  `test_all_fixtures_no_artifacts` test walks all 40 fixtures asserting that
   none emits `todo!("unknown value")`, `todo!("host call`, or `var_N`
   temporary names.
 - **Snapshot regression** via `insta` for the three most attribute-heavy
@@ -71,11 +75,14 @@ checkbox:
   compile time, so there is no Soroban host call to detect; only the function
   signature and surrounding scaffolding can be recovered. `test_logging.wasm`
   asserts the function signature only.
-- **Allowance / balance helper recovery is shipped but partially validated.**
+- **Allowance / balance helper recovery is shipped but still unvalidated.**
   `detect_balance_helper_wrapper`, `detect_spend_allowance_wrapper`, and
   `detect_write_allowance_wrapper` are present in
-  `crates/soroban-ret/src/pattern/lifter.rs` (line 6191+). Full validation is
-  planned in the `v0.0.3`.
+  `crates/soroban-ret/src/pattern/lifter.rs` and carry `cov_mark::hit!`
+  instrumentation, but **no fixture exercises them and no `cov_mark::check!`
+  asserts the hit** — they fire only on mainnet corpus contracts, where there
+  is no reference source to check the result against. A token-contract fixture
+  is the prerequisite for validating them; no target release is committed.
 - **Storage key recovery for unmodelled cross-contract returns falls back to
   heuristics.** When a remote `invoke_contract` return type cannot be
   inferred from the local spec, the post-optimization Stage 4b runs a small
@@ -89,13 +96,21 @@ checkbox:
 
 - Source for the tests above: `crates/soroban-ret/tests/integration.rs`.
 - Smoke list of every fixture exercised today:
-  `ALL_FIXTURES` constant in the same file (30 entries).
+  `ALL_FIXTURES` constant in the same file (40 entries; `tests/fixtures/`
+  holds 43 `.wasm` in total, of which 39 are the `test_*.wasm` the
+  compile-back and equivalence gates sweep).
 - Snapshots: `crates/soroban-ret/tests/snapshots/`.
 - For **quantitative** accuracy measurement (per-contract scoring against a
   reference Rust source), see the `soroban-ret-accuracy` crate
   (`cargo run -p soroban-ret-accuracy --bin accuracy`).
 
-## Tranche 3: accuracy framework, compile-fidelity & known gaps
+## Validation gates: measured status
+
+> All figures in this section were re-measured on **2026-08-06** against `main`
+> at `799aa90` (v0.0.4). The three heavy gates are pinned to **rustc 1.95.0**
+> (`RUSTUP_TOOLCHAIN`, as in `.github/workflows/build.yml`): they are hard
+> error-count ratchets, and rustc diagnostics drift across floating `stable`
+> releases. Numbers measured on another toolchain are not comparable.
 
 ### Accuracy measurement (`soroban-ret-accuracy`)
 
@@ -120,7 +135,9 @@ every fixture reports in `contractmetav0`.
   (exit 1 if any contract drops > 0.5 pp from the committed baseline).
 
 Current status (v26.0.1): **98.3 % overall** over 37 scored contracts
-(`liquidity_pool` is skipped for lacking a reference source), every complexity
+(`liquidity_pool` and `sub_u64` are skipped for lacking a reference source —
+`sub_u64` is a decompiler-authored fixture added with the `checked_sub`
+recovery, not an SDK example), every complexity
 level meets its target (L1 = 100 %, L2 = 100 %, L3 = 100 %, L4 = 100 %,
 L5 = 96.6 % ≥ 80 %). `import_contract` (74.3) and `logging` (70.0, release WASM
 strips `log!`) sit below their individual level targets but are absorbed by the
@@ -133,11 +150,24 @@ The accuracy metric is interface/fingerprint-based and does **not** check that
 output compiles. `scripts/check-compilable.sh` decompiles every fixture and runs
 `cargo check --target wasm32v1-none` against `soroban-sdk` (pin `=26.0.1`); the
 `compile_back` test gate (`SOROBAN_RET_COMPILE_BACK=1`) wraps it with a 95 %
-floor. Current status: **38/38 non-skipped compile (100 %)**, including
-`test_liquidity_pool` (its earlier `E0284 into_val` type-inference failure has
-since been resolved). `test_liquidity_pool` is still *skipped by the accuracy
-metric* — for lack of a reference source to score against, which is unrelated to
-compile-back. Two earlier compile-fidelity codegen fixes landed in
+floor.
+
+Current status: **38 pass / 1 fail / 0 skip of 39 fixtures — 97 %** (gate
+passes; floor is 95 %). The single failure is **`test_liquidity_pool`**, which
+does *not* currently compile back: it emits 3 hard errors (`E0282` un-inferable
+type, `E0369` an operator on a lost-typed value, `E0382` a use-after-move).
+This fixture has regressed since the earlier "38/38, 100 %" reading — its
+original `E0284 into_val` failure was fixed, but the deeper i128 share-math
+reconstruction now surfaces different type errors. It is also *skipped by the
+accuracy metric*, for lack of a reference source — an unrelated exclusion.
+
+Note the difference in denominator between the two fixture gates: compile-back
+sweeps the 39 `test_*.wasm` fixtures, while `ALL_FIXTURES` (the artifact-sweep
+in `integration.rs`) covers 40. `check-compilable.sh` *skips* any output
+containing `todo!` as unscoreable; currently nothing is skipped, so the pass
+rate is over the full set.
+
+Two earlier compile-fidelity codegen fixes landed in
 `crates/soroban-ret/src/ir/optimizer.rs`:
 
 - **`remove_val_tag_guards`** strips SDK argument-validation guards of the shape
@@ -150,7 +180,7 @@ compile-back. Two earlier compile-fidelity codegen fixes landed in
   (e.g. `map_unpack_to_linear_memory`) whose result is discarded — pure SDK
   (de)serialization that codegen rendered as non-public `env.map()…` API.
 
-### Spec-consistency (`tests/spec_consistency.rs`)
+### Spec-consistency (`crates/soroban-ret-accuracy/tests/spec_consistency.rs`)
 
 Beyond *interface similarity vs a reference source* (the accuracy metric, which
 only covers the SDK fixtures), this gate checks the generated Rust against the
@@ -158,9 +188,15 @@ contract's **own** `contractspecv0` — so it covers **every** contract includin
 the 24 mainnet corpus contracts that have no reference source. It builds the
 expected interface from the spec (via the same `generate_type_ident` codegen
 uses) and asserts, across all 63 contracts (39 fixtures + 24 corpus): **0**
-dropped/extra functions and **0** arity mismatches, with mean signature
-similarity **~99 %** and type similarity **~99 %**. Runs in the default
-`cargo test` (decompile + `syn`, no wasm build).
+dropped/extra functions and **0** arity mismatches on both halves, with mean
+signature similarity **98.9 %** and type similarity **98.6 %**. Runs in the
+default `cargo test` (decompile + `syn`, no wasm build; ~12 s).
+
+Run it explicitly:
+
+```text
+cargo test -p soroban-ret-accuracy --test spec_consistency -- --nocapture
+```
 
 ### Structural plausibility (`crates/soroban-ret-bench/tests/plausibility.rs`)
 
@@ -170,6 +206,65 @@ Fails if any corpus contract regresses (fewer clean functions, more logic-lost
 functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
+
+The headline restoration figure this produces — **92.4 %**
+(`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
+mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
+**correctness-blind**: it grades how much of each function lifted to concrete
+Rust versus how much collapsed into `todo!()`, not whether what was recovered is
+right. It is a corpus mean, not a per-contract guarantee, and should never be
+quoted as one.
+
+> Was 92.8 % before the `FnStatus::Trivial` classification was tightened (see
+> below). No decompiler output changed — `artifacts_total` is identical for all
+> 24 contracts — only the grading of two functions whose empty bodies render as
+> `todo!()` stubs. The lower number is the more honest one.
+
+#### Per-contract recovery signals (`soroban_ret::recovery`)
+
+The same per-function verdicts and hole counts this gate aggregates are exposed
+by the published library, on `DecompileResult::recovery` / `DecompileIR::recovery`
+and via `soroban-ret --report` (JSON). That is the supported way to show a
+per-contract confidence signal in a UI — the corpus figures above must not be
+used for it. The module deliberately exposes **counts, not a headline
+percentage**; see its docs for why.
+
+The library owns the canonical implementation. `soroban-ret-bench` and
+`soroban-ret-accuracy` each previously kept their own copy of the artifact
+counter, which is how three copies drift apart; both now delegate.
+
+**`FnStatus::Trivial` is narrower than it was.** An empty body was graded
+`Trivial` ("nothing to restore") whenever the lifter saw no host calls — even
+when the function declares a non-`Void` return type, in which case codegen
+renders the body as `todo!("decompiled function body")` and the function traps
+at runtime. Two corpus functions were affected, `aqua-rewards::get_pools_plane`
+and `digicus::version`; the latter is independently recorded by the equivalence
+harness as diverging (original returns `U32(0)`, recompiled traps). Both are now
+`LogicLost`. A "fully recovered" badge on a function that traps is the
+deceptively-clean bug class this project treats as a defect, so the baseline was
+refreshed rather than the grading kept.
+
+### Corpus soundness (`crates/soroban-ret/tests/corpus_soundness.rs`, `SOROBAN_RET_CORPUS_SOUNDNESS=1`)
+
+The "wrong output" ratchet, and the counterpart to compile-back. It decompiles
+every mainnet corpus contract and `cargo check`s the result for
+`wasm32v1-none`, counting **hard** `error[E…]` diagnostics. Unlike
+`check-compilable.sh` it does **not** skip output containing `todo!` — a
+`todo!()` compiles fine, so every hard error is a genuinely-wrong construct the
+lifter emitted: output that *looks* like code but does not type-check. The
+metric is "wrong output", not "incomplete output".
+
+Current status: **326 hard errors across 24 contracts** (ceiling 326), with
+**3 contracts compiling cleanly** — `digicus`, `fxdao-oracle`, `unknown-oracle`.
+Down from 1042 at the start of the v0.0.4 cycle. Every intermediate *rise* in
+this ratchet has been an audited, deliberate unmask (fixing a type error
+un-suppresses pre-existing brokenness rustc's error recovery was hiding); see
+the running commentary in the `ERROR_CEILING` docstring, which is the
+authoritative history.
+
+```text
+SOROBAN_RET_CORPUS_SOUNDNESS=1 cargo test -p soroban-ret --test corpus_soundness -- --nocapture
+```
 
 ### Functional equivalence (`crates/soroban-ret-equiv`, `SOROBAN_RET_EQUIV=1`)
 
@@ -181,24 +276,41 @@ and compares the outcomes (lowered to canonical `ScVal`). A divergence is a
 decompiler correctness limitation; the gate is a ratchet on the divergence
 count, like the corpus-soundness gate.
 
-Current baseline: **63 functions / 474 cases executed; 63 contracts checked
-(39 fixtures + all 24 mainnet corpus, of which 22 do not yet recompile and are
-reported as `not_recompilable`), 99.2 % behavioral match, 4 known
-divergences** — the sole remaining decompiler limitation the harness surfaced:
-`test_alloc::num_list` loses its populate-loop and returns an empty `Vec`.
-(Previously 60 / 87.3 %; the fallible-storage-get recovery in the lifter
-eliminated `unknown-oracle`'s 56 empty-storage divergences — getters whose value
-and missing-key contract-error branch were lost to a `has`/`extend_ttl` +
-`todo!()` husk now recover `env.storage().<dur>().get(&key).ok_or(Error::Variant)`
-with the error code read from the helper's bytecode. Before that, 75 / 82.3 % → 60
-came from the `checked_add`/`checked_sub` → `.ok_or(..)` recovery.)
+Current baseline: **68 functions / 479 cases executed; 63 contracts checked
+(39 fixtures + all 24 mainnet corpus), 0 errored, 99.2 % behavioral match,
+4 divergences** (ceiling 4).
+
+**22 of the 63 are reported `not_recompilable`** and are therefore never
+executed: 21 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
+fixture. Only `digicus`, `fxdao-oracle` and `unknown-oracle` recompile from the
+corpus — the same three the corpus-soundness gate reports as clean-compiling.
+
+All 4 divergences are in **`digicus`** (`clear_repos`, `get_repos`,
+`get_repos_and_issues`, `version`). Each is an **honest `todo!()` hole**: the
+recompiled function reaches an unrecovered value and traps as
+`Error(Context, InvalidAction)` where the original returns a real value or its
+own `Error(Contract, #1)`. **No divergence is a fabricated wrong value** — the
+distinction that matters for any consumer surfacing these results.
+
+History of this ratchet: 75 / 82.3 % → 60 (the `checked_add`/`checked_sub` →
+`.ok_or(..)` recovery) → 4 (the fallible-storage-get recovery eliminated
+`unknown-oracle`'s 56 empty-storage divergences) → 9 (issue #38 t19 *unmasked*
+`num_list`: the fixture became recompilable for the first time, exposing
+divergences previously hidden behind a compile error) → 8 → 6 → **4** (t21/t23
+recovered the vec accumulator and the populate→push value relay; t24's
+wrapping-exact `<<` render and dead-counter elimination closed the last two
+`test_alloc` overflow cases). `test_alloc` now matches on every generated
+input, including overflow — the earlier claim that `num_list` "loses its
+populate-loop and returns an empty `Vec`" no longer holds.
 
 **Coverage is intrinsically limited** (by design): only functions invocable with
-generated scalar arguments and no required storage/auth state are executed;
+generated scalar arguments (`bool`/`u32`/`i32`/`u64`/`i64`/`u128`/`i128`, ≤48
+input vectors per function) and no required storage/auth state are executed;
 aggregate/UDT-argument functions, and the renamed `__constructor`/`__check_auth`,
 are skipped, as are contracts whose output does not recompile. It is a
-correctness sanity-check + behavioral-match metric, not a full-corpus
-differential test.
+correctness sanity-check + behavioral-match metric, **not** a full-corpus
+differential test — and the 99.2 % is a match rate over that narrow executed
+slice, not a per-contract correctness guarantee.
 
 ### Known gaps
 
@@ -213,3 +325,34 @@ differential test.
   and scores 100 % on the accuracy metric. Recovering the original
   `trait T { … } impl T for Contract` shape is **not possible** from the bytecode
   alone and is out of scope.
+
+- **The remaining frontier is dataflow, not pattern coverage.** The sixteen
+  patterns above are implemented and tested; what still collapses to `todo!()`
+  on large mainnet contracts is value provenance across branches, calls and
+  loops. Tracked as open issues rather than described here, so the list cannot
+  go stale:
+
+  - [#34](https://github.com/Inferara/soroban-ret/issues/34) — no memory-SSA /
+    reaching-definitions: values lost across branches, calls and deep helpers
+    (the master lever).
+  - [#66](https://github.com/Inferara/soroban-ret/issues/66) — lost guard
+    conditions, the 500+ `if todo!("unknown value")` class;
+    [#67](https://github.com/Inferara/soroban-ret/issues/67) is its
+    `ValueNotInitialized` starter bucket.
+  - [#68](https://github.com/Inferara/soroban-ret/issues/68) — `aqua-rewards`
+    checkpoint/derivation math, the deep #34 remainder.
+  - [#69](https://github.com/Inferara/soroban-ret/issues/69) — close the final
+    4 equivalence divergences (the `digicus` todo-panics).
+
+- **No published per-contract accuracy signal.** The benchmark HTML/JSON report
+  is a per-commit GitHub Actions artifact (`.github/workflows/benchmark.yml`),
+  not a hosted page; the only stable, linkable artifact is
+  `benchmark-data/baseline.json`, which CI rewrites on every push to `main`
+  (cite it at a tag, not at `main`). Consumers wanting a per-contract hole
+  count today should count the marker strings in the emitted source
+  (`todo!("unknown value")`, `todo!("host call`, `todo!("decompiled function
+  body")`, `var_N` — matching `count_artifacts` in
+  `crates/soroban-ret-bench/src/metrics.rs`, and noting that `prettyplease` can
+  emit the spaced `todo !(` form), or walk the IR from `decompile_to_ir()`.
+  Neither `soroban-ret-bench` nor `soroban-ret-equiv` is published to
+  crates.io (`publish = false`).

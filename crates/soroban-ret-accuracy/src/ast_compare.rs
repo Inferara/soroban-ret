@@ -888,36 +888,11 @@ fn score_structure(orig: &StructureInfo, decomp: &StructureInfo) -> f64 {
 /// Artifacts are residual decompiler placeholders that indicate incomplete
 /// recovery: `todo!("unknown value")`, `todo!("host call: ...")`,
 /// `todo!("decompiled function body")`, and `var_N` temporary names.
+///
+/// Delegates to `soroban_ret::recovery`, which owns the canonical definition —
+/// this crate and `soroban-ret-bench` each used to keep their own copy.
 fn count_artifacts(body_source: &str) -> usize {
-    let mut count = 0;
-
-    // Count todo!("unknown value") occurrences
-    count += body_source.matches("todo !(\"unknown value\")").count();
-    count += body_source.matches("todo!(\"unknown value\")").count();
-
-    // Count todo!("host call: ...") occurrences
-    count += body_source.matches("todo !(\"host call").count();
-    count += body_source.matches("todo!(\"host call").count();
-
-    // Count todo!("decompiled function body") occurrences
-    count += body_source
-        .matches("todo !(\"decompiled function body\")")
-        .count();
-    count += body_source
-        .matches("todo!(\"decompiled function body\")")
-        .count();
-
-    // Count var_N temporary variable names (word boundary: preceded by space/paren/comma)
-    for word in body_source.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if word.starts_with("var_")
-            && word[4..].chars().all(|c| c.is_ascii_digit())
-            && word.len() > 4
-        {
-            count += 1;
-        }
-    }
-
-    count
+    soroban_ret::recovery::count_artifacts(body_source).total
 }
 
 // ---------------------------------------------------------------------------
