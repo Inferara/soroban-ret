@@ -302,6 +302,35 @@ fn test_option_decode_trap_guard_folds_to_clean_getter() {
 }
 
 #[test]
+fn test_option_decode_valuenotinitialized_guard_folds_to_unwrap_or_else() {
+    // Issue #67: aqua-rewards' inlined storage decode helpers write `[disc@0, value@8]`;
+    // callers guarded by `if disc == 0 { panic_with_error!(&env, StorageError::ValueNotInitialized); }`
+    // are the fallible-get discriminant residue.
+    // The guard folds into the adjacent getter as `.unwrap_or_else(|| panic_with_error!(&env, StorageError::ValueNotInitialized))`,
+    // eliminating the `if todo!("unknown value") { panic_with_error!(..); }` hole.
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/aqua-rewards-CCY2PXGM.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+
+    // The getters must fold to clean unwrap_or_else with StorageError::ValueNotInitialized
+    assert!(
+        source.contains(".unwrap_or_else(|| panic_with_error!(&env, StorageError::ValueNotInitialized))"),
+        "aqua-rewards must recover unwrap_or_else StorageError::ValueNotInitialized getters"
+    );
+
+    // Negative control: initialize's guard carries real control flow and must survive
+    let sig = source.find("pub fn initialize(").unwrap();
+    let end = sig
+        + source[sig..]
+            .find("\n    pub fn ")
+            .unwrap_or(source.len() - sig);
+    let body = &source[sig..end];
+    assert!(
+        body.contains("AlreadyInitialized"),
+        "initialize's already-initialized guard is real control flow and must survive:\n{body}"
+    );
+}
+
+#[test]
 fn test_decompile_blend_backstop_user_balance_body() {
     // `user_balance` is a fallible storage getter: `if has(k) { get + unpack +
     // extend_ttl } else { default }`. `detect_map_unpack_decode_wrapper` used to

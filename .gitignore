@@ -28,3 +28,5 @@ target
 .*/
 # Keep tracking workflow/config files under .github (must come after `.*/`).
 !.github/
+config.bat
+node_modules
