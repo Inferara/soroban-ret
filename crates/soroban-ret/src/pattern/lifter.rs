@@ -6348,27 +6348,35 @@ impl<'a> LiftContext<'a> {
                     // Pop condition from stack
                     let cond_val = self.stack.pop().unwrap_or(StackVal::Unknown);
 
-                    // Issue #35: a fallible storage-decode discriminant guarded
-                    // by a bare trap is the `.unwrap()`'s None-arm re-encoded —
-                    // the same inline already rendered the load as
-                    // `get(..).unwrap()`, which carries the panic-on-missing
-                    // semantics. Fold the guard. ONLY this shape folds: any
-                    // guard with real logic, an else arm, or a specific
-                    // `panic_with_error!` falls through to the generic path,
-                    // where the marker degrades to `UnknownVal` (today's
-                    // honest `todo!()`), never a fabricated fold.
-                    if else_body.is_empty()
-                        && matches!(
+                    // Issue #35 / #67: a fallible storage-decode discriminant guarded
+                    // by a bare trap (issue #35) or a fail_with_error tail (issue #67,
+                    // e.g. StorageError::ValueNotInitialized) is the None-arm check
+                    // of the inlined storage getter re-encoded.
+                    // The getter's load already carries the missing semantics.
+                    if else_body.is_empty() && is_option_decode_none_check(&cond_val) {
+                        if matches!(
                             then_body[..],
                             [StructuredBlock::Instruction(
                                 crate::wasm::ir::WasmInstr::Unreachable
                             )]
-                        )
-                        && is_option_decode_none_check(&cond_val)
-                    {
-                        cov_mark::hit!(option_decode_trap_guard_folded);
-                        i += 1;
-                        continue;
+                        ) {
+                            cov_mark::hit!(option_decode_trap_guard_folded);
+                            i += 1;
+                            continue;
+                        }
+
+                        // Issue #67 starter bucket: ValueNotInitialized / fail_with_error tail
+                        if is_fail_with_error_tail(then_body, self.wasm_module)
+                            && let Some(err_val) = extract_fail_with_error_const_val(then_body)
+                        {
+                            let error_expr = try_decode_val(err_val, self.registry);
+                            if is_value_not_initialized_error(&error_expr) {
+                                cov_mark::hit!(option_decode_value_not_init_guard_folded);
+                                attach_storage_get_on_missing(&mut self.stmts, error_expr);
+                                i += 1;
+                                continue;
+                            }
+                        }
                     }
 
                     // SDK multi-param marshalling guard:
@@ -16867,6 +16875,113 @@ fn is_option_decode_none_check(cond: &StackVal) -> bool {
     }
 }
 
+/// Extracts the constant error Val from a `fail_with_error` tail (issue #67).
+fn extract_fail_with_error_const_val(tail: &[super::structurize::StructuredBlock]) -> Option<i64> {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr;
+    for sb in tail {
+        if let StructuredBlock::Instruction(WasmInstr::I64Const(c)) = sb {
+            return Some(*c);
+        }
+    }
+    None
+}
+
+/// Returns true when an error expression represents `StorageError::ValueNotInitialized`
+/// or contract error code 501 (issue #67 starter bucket).
+fn is_value_not_initialized_error(expr: &SorobanExpr) -> bool {
+    match expr {
+        SorobanExpr::ContractError {
+            error_code,
+            variant_name,
+            error_type,
+        } => {
+            *error_code == 501
+                || variant_name.as_deref() == Some("ValueNotInitialized")
+                || (error_type.as_deref() == Some("StorageError") && *error_code == 501)
+        }
+        _ => false,
+    }
+}
+
+/// Updates preceding storage get expressions in `stmts` to carry `on_missing` error handling (issue #67).
+fn attach_storage_get_on_missing(stmts: &mut [SorobanStmt], error_expr: SorobanExpr) -> bool {
+    let mut attached = false;
+    for stmt in stmts.iter_mut().rev() {
+        match stmt {
+            SorobanStmt::Expr(SorobanExpr::StorageGet {
+                unwrap,
+                on_missing,
+                ..
+            }) => {
+                if on_missing.is_none() {
+                    *unwrap = false;
+                    *on_missing = Some(Box::new(SorobanExpr::PanicWithError(Box::new(
+                        error_expr.clone(),
+                    ))));
+                    attached = true;
+                }
+            }
+            SorobanStmt::Let {
+                value:
+                    SorobanExpr::StorageGet {
+                        unwrap,
+                        on_missing,
+                        ..
+                    },
+                ..
+            } => {
+                if on_missing.is_none() {
+                    *unwrap = false;
+                    *on_missing = Some(Box::new(SorobanExpr::PanicWithError(Box::new(
+                        error_expr.clone(),
+                    ))));
+                    attached = true;
+                }
+            }
+            SorobanStmt::Assign {
+                value:
+                    SorobanExpr::StorageGet {
+                        unwrap,
+                        on_missing,
+                        ..
+                    },
+                ..
+            } => {
+                if on_missing.is_none() {
+                    *unwrap = false;
+                    *on_missing = Some(Box::new(SorobanExpr::PanicWithError(Box::new(
+                        error_expr.clone(),
+                    ))));
+                    attached = true;
+                }
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if attach_storage_get_on_missing(then_body, error_expr.clone()) {
+                    attached = true;
+                    break;
+                }
+                if attach_storage_get_on_missing(else_body, error_expr.clone()) {
+                    attached = true;
+                    break;
+                }
+            }
+            SorobanStmt::Block(body) | SorobanStmt::Loop { body } => {
+                if attach_storage_get_on_missing(body, error_expr.clone()) {
+                    attached = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    attached
+}
+
 /// Returns true when a tracked value is the raw result of an empty-collection
 /// constructor host call (`map_new`/`vec_new`/`bytes_new`). Used by the loop
 /// handler to invalidate such defs when a loop body overwrites the local
@@ -19558,6 +19673,42 @@ mod tests {
             CmpOp::Eq,
             Box::new(StackVal::I64(1)),
         )));
+    }
+
+    #[test]
+    fn option_decode_valuenotinitialized_guard_tests() {
+        use super::super::structurize::StructuredBlock;
+        use crate::wasm::ir::WasmInstr;
+
+        // Tail containing I64Const(2151778615299) correctly extracts
+        let tail = vec![
+            StructuredBlock::Instruction(WasmInstr::I64Const(2151778615299)),
+            StructuredBlock::Instruction(WasmInstr::Call(79)),
+            StructuredBlock::Instruction(WasmInstr::Unreachable),
+        ];
+        assert_eq!(extract_fail_with_error_const_val(&tail), Some(2151778615299));
+
+        let non_const_tail = vec![
+            StructuredBlock::Instruction(WasmInstr::LocalGet(0)),
+            StructuredBlock::Instruction(WasmInstr::Call(79)),
+            StructuredBlock::Instruction(WasmInstr::Unreachable),
+        ];
+        assert_eq!(extract_fail_with_error_const_val(&non_const_tail), None);
+
+        // ValueNotInitialized verification
+        let err501 = SorobanExpr::ContractError {
+            error_code: 501,
+            error_type: Some("StorageError".into()),
+            variant_name: Some("ValueNotInitialized".into()),
+        };
+        assert!(is_value_not_initialized_error(&err501));
+
+        let other_err = SorobanExpr::ContractError {
+            error_code: 201,
+            error_type: Some("StorageError".into()),
+            variant_name: Some("AlreadyInitialized".into()),
+        };
+        assert!(!is_value_not_initialized_error(&other_err));
     }
 
     #[test]
