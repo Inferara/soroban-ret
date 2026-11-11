@@ -599,6 +599,11 @@ static DBG_FDK: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_FDK").is_ok());
 static DBG_DKTRACE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_DKTRACE").is_ok());
+/// Issue #66/#67 census probe: for every constant-argument internal call that
+/// reads storage, print the complete protocol-mode path set (terminal,
+/// decisions, effects per path) and whether it classified. Measurement-only.
+static DBG_PROTO: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_PROTO").is_ok());
 
 /// Issue #34 phase 2: classification of a frame slot whose abstract value was
 /// produced by the then arm of a shared-map `IfElse` join, from the
@@ -1132,6 +1137,7 @@ impl<'a> LiftContext<'a> {
             sp: DkVal::StackPtr(0),
             steps: 0,
             gap_zero: None,
+            proto: None,
         };
         if dk.run_instrs(&frag, &mut dk_locals, 0, 0).is_none() {
             if *DBG_LOOPGATE {
@@ -1506,6 +1512,144 @@ impl<'a> LiftContext<'a> {
         Some(true)
     }
 
+    /// Recover a call to a fallible storage GETTER helper (issue #67) by
+    /// executing it: `get::<_, T>(&KEY).unwrap_or_else(|| panic_with_error!(env, E))`
+    /// in any of the shapes LLVM gives it — the Option decode fused into the
+    /// getter (discriminant round-tripping through its own frame), a wrapper
+    /// over an sret `[disc, value]` helper, a `u32` payload getter, a key
+    /// built by a selector / descriptor-pointer / zero-arg constructor.
+    ///
+    /// Today these inline to a husk whose discriminant dies at a value-`if`
+    /// join: `if todo!() { panic_with_error!(..ValueNotInitialized) }` and a
+    /// lost return value. Here the callee's real bytecode is evaluated along
+    /// EVERY path ([`proto_enumerate`]) with the call's constant arguments,
+    /// and the result is used only when the complete path set is exactly the
+    /// protocol ([`classify_fallible_getter`]). The key constructor executes
+    /// concretely inside that evaluation, so the key is the one this call
+    /// site really reads.
+    ///
+    /// `None` declines (the call falls through to the arms below and, by
+    /// default, to inlining — byte-identical to before); `Some(true)` means
+    /// the call was replaced by TTL statements plus ONE bound read.
+    fn try_lower_proto_fallible_getter(
+        &mut self,
+        target_idx: u32,
+        args: &[StackVal],
+        num_results: usize,
+    ) -> Option<bool> {
+        if num_results != 1 {
+            return None;
+        }
+        // Constant arguments only: selectors and static descriptor pointers.
+        let dk_args: Vec<DkVal> = args
+            .iter()
+            .map(|a| match a {
+                StackVal::I32(v) => Some(DkVal::I32(*v)),
+                StackVal::I64(v) => Some(DkVal::I64(*v)),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let reads = |name: &str| {
+            function_calls_host_in_chain(
+                self.wasm_module,
+                target_idx,
+                HostModule::Ledger,
+                name,
+                MAX_INLINE_CALL_DEPTH,
+            )
+        };
+        if !reads("get_contract_data") || !reads("has_contract_data") {
+            return None;
+        }
+        let paths = proto_enumerate(self.wasm_module, target_idx, &dk_args);
+        let getter = paths.as_deref().and_then(classify_fallible_getter);
+        if *DBG_PROTO {
+            match &paths {
+                None => eprintln!("[PROTO] func={target_idx} args={dk_args:?} out-of-model"),
+                Some(ps) => {
+                    eprintln!(
+                        "[PROTO] func={target_idx} args={dk_args:?} paths={} classified={}",
+                        ps.len(),
+                        getter.is_some()
+                    );
+                    for p in ps {
+                        let preds: Vec<String> = p
+                            .decisions
+                            .iter()
+                            .map(|(n, t)| match proto_pred(&p.nodes, *n) {
+                                Some((pr, pol)) => format!("{pr:?}={}", pol == *t),
+                                None => format!("{:?}={t}", p.nodes.get(*n as usize)),
+                            })
+                            .collect();
+                        eprintln!(
+                            "[PROTO]   end={:?} when=[{}] effects={:?}",
+                            p.end,
+                            preds.join(", "),
+                            p.effects
+                        );
+                    }
+                }
+            }
+        }
+        let getter = getter?;
+        // A fully-constant key (payload-keyed getters are out of scope here).
+        let key = dk_result_to_const_key(&getter.key)?;
+        let error = try_decode_val(getter.error_val, self.registry);
+        if !matches!(error, SorobanExpr::ContractError { .. }) {
+            return None;
+        }
+        for (threshold, extend_to) in &getter.instance_ttl_bumps {
+            self.stmts
+                .push(SorobanStmt::Expr(SorobanExpr::ExtendInstanceAndCodeTtl {
+                    threshold: Box::new(SorobanExpr::U32Literal(*threshold)),
+                    extend_to: Box::new(SorobanExpr::U32Literal(*extend_to)),
+                }));
+        }
+        let get_expr = SorobanExpr::StorageGet {
+            storage_type: getter.storage_type,
+            key: Box::new(key),
+            unwrap: false,
+            on_missing: Some(Box::new(SorobanExpr::PanicWithError(Box::new(error)))),
+        };
+        // The asserted tag names the type where it is unambiguous; other
+        // object tags leave it to inference from the consumer (as tranche 6).
+        let target_type = match getter.value {
+            ProtoGetterValue::Object(77) => Some("Address"),
+            ProtoGetterValue::U32 => Some("u32"),
+            ProtoGetterValue::Object(_) => None,
+        };
+        let value = match target_type {
+            Some(t) => SorobanExpr::CastAs {
+                value: Box::new(get_expr),
+                target_type: t.to_string(),
+            },
+            None => get_expr,
+        };
+        // Bind ONCE and push the binding — the bytecode reads once; see the
+        // tranche-6 arm for why a per-consumer re-read is unsound.
+        //
+        // The binding index comes from the function-wide shared counter, in
+        // a range no WASM-local-derived index reaches: `self.locals.len()`
+        // is per-CONTEXT (an inlined helper starts from its own locals), so
+        // a getter recovered inside an inlined helper and a later recovery
+        // in the caller would both be `var_N` — two unrelated reads sharing
+        // one name, which the naming pass then labels alike.
+        let var_idx = {
+            let mut ctr = self.next_frame_id.borrow_mut();
+            *ctr += 1;
+            PROTO_BINDING_BASE + *ctr
+        };
+        self.stmts.push(SorobanStmt::Let {
+            name: format!("var_{var_idx}"),
+            mutable: false,
+            value,
+        });
+        self.stack.push(StackVal::LetBinding(var_idx));
+        self.found_host_calls = true;
+        cov_mark::hit!(proto_fallible_getter_recovered);
+        Some(true)
+    }
+
     /// Observe a fallible storage-get helper call (see
     /// [`detect_fallible_storage_get_helper`]) and record the FIRST one in the
     /// top-level function for `lift_function_body` to rebuild as
@@ -1750,6 +1894,7 @@ impl<'a> LiftContext<'a> {
             sp: DkVal::StackPtr(0),
             steps: 0,
             gap_zero: None,
+            proto: None,
         };
         let Some(Some(result)) = ev.eval_call(target_idx, vec![DkVal::StackPtr(DESC_BASE)], 0)
         else {
@@ -1840,6 +1985,7 @@ impl<'a> LiftContext<'a> {
             sp: DkVal::StackPtr(0),
             steps: 0,
             gap_zero: None,
+            proto: None,
         };
         let Some(Some(result)) = ev.eval_call(target_idx, dk_args, 0) else {
             if dbg {
@@ -3201,6 +3347,7 @@ impl<'a> LiftContext<'a> {
                                         "symbol_new_from_linear_memory",
                                         3,
                                     )
+                                    && is_pure_key_ctor(self.wasm_module, *target_idx)
                                 {
                                     // Read string references from the function's body
                                     // to determine which union it constructs for.
@@ -3691,6 +3838,10 @@ impl<'a> LiftContext<'a> {
                             self.found_host_calls = true;
                             cov_mark::hit!(defaulting_collection_getter_recovered);
                             true
+                        } else if let Some(h) =
+                            self.try_lower_proto_fallible_getter(*target_idx, &args, num_results)
+                        {
+                            h
                         } else if let Some(getter) = detect_fallible_struct_getter(
                             self.wasm_module,
                             self.registry,
@@ -9981,6 +10132,12 @@ fn descriptor_key_from_ptr(module: &WasmModule, target_idx: u32, ptr: i32) -> Op
     if !func_reaches_symbol_encoder(module, target_idx, 0) {
         return None;
     }
+    // A key constructor only builds a value; a target that reads storage is
+    // a fused getter whose RESULT is the stored value, not the key.
+    if !is_pure_key_ctor(module, target_idx) {
+        cov_mark::hit!(key_ctor_fold_refuses_storage_reader);
+        return None;
+    }
     // The descriptor pointer addresses a 1-byte enum discriminant (win #4's
     // zero-extend reads the byte-or-0 of the covering segment); require the
     // address to lie in real static data so we never resolve runtime memory.
@@ -10122,6 +10279,49 @@ fn func_reaches_symbol_encoder(module: &WasmModule, idx: u32, depth: u32) -> boo
     func.body
         .iter()
         .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_symbol_encoder(module, *t, depth + 1)))
+}
+
+/// True when `idx` can only BUILD a value: its full transitive import closure
+/// (unbounded walk, cycle-safe) stays inside the pure value-construction host
+/// modules (`Int`, `Buf`, `Vec`, `Map`) and it performs no indirect call.
+///
+/// A storage-key constructor is exactly that — it never reads the ledger,
+/// authorizes, invokes or fails. The key folds were gated only on signature
+/// and symbol-encoder reachability, so they also claimed fused storage GETTERS
+/// (`(i32 key) -> i64`: build the key, `has`/`get` it, return the stored
+/// value): `i32.const <ptr>; call $getter` folded to the getter's own KEY,
+/// rendered where the stored value belongs with no `todo!()` (issue #67;
+/// the `DataKey::PairWasmHash.require_auth()` symptom of issue #80).
+/// Fail-closed: an unresolvable callee or `call_indirect` refuses.
+fn is_pure_key_ctor(module: &WasmModule, idx: u32) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut work = vec![idx];
+    while let Some(f) = work.pop() {
+        if !seen.insert(f) {
+            continue;
+        }
+        if let Some(hf) = module.imports.get_by_index(f) {
+            if !matches!(
+                hf.module,
+                HostModule::Int | HostModule::Buf | HostModule::Vec | HostModule::Map
+            ) {
+                return false;
+            }
+            continue;
+        }
+        let Some(func) = module.get_function(f) else {
+            return false;
+        };
+        for ins in &func.body {
+            match ins {
+                WasmInstr::Call(t) => work.push(*t),
+                WasmInstr::CallIndirect(_) => return false,
+                _ => {}
+            }
+        }
+    }
+    true
 }
 
 /// True if `idx` transitively (≤2 call levels) reaches the host function
@@ -10285,6 +10485,335 @@ enum DkVal {
     SymObj(String),
     /// A `Vec` built via host `vec_new_from_linear_memory` from tracked slots.
     VecVal(Vec<DkVal>),
+    /// A symbolic runtime value (index into [`ProtoRun::nodes`]) — only ever
+    /// produced in protocol mode (issue #67), see [`ProtoRun`].
+    Sym(u32),
+}
+
+/// A symbolic value in a protocol-mode evaluation. The arena is deliberately
+/// tiny: exactly the operations the SDK's storage-getter protocol performs on
+/// a `has`/`get` result. Any other operation on a [`DkVal::Sym`] bails the
+/// evaluation (the concrete-only `dk_i32`/`dk_i64` accessors refuse it).
+#[derive(Clone, Debug, PartialEq)]
+enum ProtoNode {
+    /// `has_contract_data(key, storage_type)` — a Bool `Val` (i64).
+    Has { key: DkVal, st: i64 },
+    /// `get_contract_data(key, storage_type)` — the stored `Val` (i64).
+    Get { key: DkVal, st: i64 },
+    /// `node & 0xFF` — the Val tag byte of a `Get` (i64).
+    TagOf(u32),
+    /// `node == konst` (`eq`) / `node != konst` — an i32 boolean.
+    Cmp { eq: bool, node: u32, konst: i64 },
+    /// `node == 0` — an i32 boolean.
+    Eqz(u32),
+    /// `node >> 32` (logical) — the body of a small Val (i64).
+    Shr32(u32),
+    /// `i32.wrap_i64(node)`.
+    Wrap(u32),
+}
+
+/// An observable effect recorded, in execution order, on one evaluated path.
+#[derive(Clone, Debug, PartialEq)]
+enum ProtoEffect {
+    /// `extend_current_contract_instance_and_code_ttl(threshold, extend_to)`.
+    InstanceTtl(u32, u32),
+    /// A `has_contract_data` read (node id).
+    Has(u32),
+    /// A `get_contract_data` read (node id).
+    Get(u32),
+}
+
+/// How one evaluated path ended when it did not return normally.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProtoEnd {
+    /// `fail_with_error(<constant Error Val>)`.
+    Fail(i64),
+    /// `unreachable`.
+    Trap,
+}
+
+/// Base of the binding-index range used for getters recovered by execution
+/// (see `try_lower_proto_fallible_getter`): far above any WASM local index.
+const PROTO_BINDING_BASE: u32 = 1 << 20;
+/// Max symbolic decisions on one path / max paths per evaluated call.
+const PROTO_MAX_DECISIONS: usize = 6;
+const PROTO_MAX_PATHS: usize = 8;
+
+/// Protocol-mode state of one [`DkEval`] run (issue #67). In protocol mode
+/// the evaluator executes a helper's real bytecode along ONE path: the few
+/// whitelisted storage host calls yield symbolic values and are recorded as
+/// ordered effects, a branch on a symbolic condition takes its direction
+/// from `script` (and is recorded in `decisions`), and `unreachable` /
+/// `fail_with_error` end the path through `end` — a channel distinct from
+/// the `None` every out-of-model condition returns. [`proto_enumerate`]
+/// replays the call under every decision vector, so a helper's COMPLETE
+/// path set is known and a recognizer can require it to match a protocol
+/// exactly — a proof by execution, not by instruction co-occurrence.
+#[derive(Default)]
+struct ProtoRun {
+    nodes: Vec<ProtoNode>,
+    effects: Vec<ProtoEffect>,
+    /// Directions to take at successive symbolic branches; past its end a
+    /// branch defaults to `false` (not taken).
+    script: Vec<bool>,
+    /// `(condition node, direction taken)` per symbolic branch, in order.
+    decisions: Vec<(u32, bool)>,
+    end: Option<ProtoEnd>,
+}
+
+/// One fully-evaluated path of a helper call. See [`proto_enumerate`].
+#[derive(Debug)]
+struct ProtoPath {
+    nodes: Vec<ProtoNode>,
+    effects: Vec<ProtoEffect>,
+    decisions: Vec<(u32, bool)>,
+    /// `Ok(result)` for a normal return, `Err` for a fail / trap terminal.
+    end: Result<Option<DkVal>, ProtoEnd>,
+}
+
+/// Enumerate EVERY path of `func_idx(args)` in protocol mode. `None` when
+/// any path leaves the model (unsupported instruction or host call, budget,
+/// a write outside the callee's own shadow-stack frame, a stack pointer not
+/// restored on return, too many paths) — a partial path set proves nothing.
+fn proto_enumerate(module: &WasmModule, func_idx: u32, args: &[DkVal]) -> Option<Vec<ProtoPath>> {
+    let mut pending: Vec<Vec<bool>> = vec![Vec::new()];
+    let mut out = Vec::new();
+    while let Some(script) = pending.pop() {
+        if out.len() >= PROTO_MAX_PATHS {
+            return None;
+        }
+        let prefix = script.len();
+        let mut ev = DkEval {
+            module,
+            mem: HashMap::new(),
+            sp: DkVal::StackPtr(0),
+            steps: 0,
+            gap_zero: None,
+            proto: Some(ProtoRun {
+                script,
+                ..ProtoRun::default()
+            }),
+        };
+        let result = ev.eval_call(func_idx, args.to_vec(), 0);
+        let run = ev.proto.take()?;
+        let end = match (result, run.end) {
+            (Some(v), None) => {
+                // A returning path must leave the machine as it found it:
+                // stack pointer restored, nothing written at or above the
+                // entry stack pointer (the CALLER's frame).
+                if ev.sp != DkVal::StackPtr(0) || ev.mem.keys().any(|a| *a >= 0) {
+                    return None;
+                }
+                Ok(v)
+            }
+            (None, Some(e)) => Err(e),
+            _ => return None,
+        };
+        // Every symbolic branch past the scripted prefix defaulted to
+        // `false`; schedule its `true` sibling.
+        for k in prefix..run.decisions.len() {
+            let mut alt: Vec<bool> = run.decisions[..k].iter().map(|d| d.1).collect();
+            alt.push(true);
+            pending.push(alt);
+        }
+        out.push(ProtoPath {
+            nodes: run.nodes,
+            effects: run.effects,
+            decisions: run.decisions,
+            end,
+        });
+    }
+    Some(out)
+}
+
+/// A branch predicate of the storage-getter protocol, resolved from a
+/// decision's condition node.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProtoPred {
+    /// The key is present (`Has` node id).
+    Has(u32),
+    /// The loaded value's tag byte equals the constant (`Get` node id, tag).
+    TagIs(u32, i64),
+}
+
+/// Resolve boolean node `n` to `(predicate, polarity)`: the node is non-zero
+/// exactly when `predicate == polarity`. `None` for anything that is not a
+/// has-test or a tag-compare of a get (the only decisions the protocol has).
+fn proto_pred(nodes: &[ProtoNode], n: u32) -> Option<(ProtoPred, bool)> {
+    match nodes.get(n as usize)? {
+        ProtoNode::Cmp { eq, node, konst } => match nodes.get(*node as usize)? {
+            // Bool Val: True = 1, False = 0.
+            ProtoNode::Has { .. } if *konst == 1 => Some((ProtoPred::Has(*node), *eq)),
+            ProtoNode::Has { .. } if *konst == 0 => Some((ProtoPred::Has(*node), !*eq)),
+            ProtoNode::TagOf(g) if matches!(nodes.get(*g as usize)?, ProtoNode::Get { .. }) => {
+                Some((ProtoPred::TagIs(*g, *konst), *eq))
+            }
+            // A comparison of an already-boolean node against 0/1.
+            ProtoNode::Cmp { .. } | ProtoNode::Eqz(_) if matches!(*konst, 0 | 1) => {
+                let (p, pol) = proto_pred(nodes, *node)?;
+                Some((p, if (*konst == 1) == *eq { pol } else { !pol }))
+            }
+            _ => None,
+        },
+        ProtoNode::Eqz(m)
+            if matches!(
+                nodes.get(*m as usize)?,
+                ProtoNode::Cmp { .. } | ProtoNode::Eqz(_)
+            ) =>
+        {
+            let (p, pol) = proto_pred(nodes, *m)?;
+            Some((p, !pol))
+        }
+        _ => None,
+    }
+}
+
+/// What a proven fallible getter returns on its success path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProtoGetterValue {
+    /// The stored `Val` itself; the asserted object tag names its type.
+    Object(u8),
+    /// The `u32` payload of a `U32Val` (tag 4): `(val >> 32) as u32`.
+    U32,
+}
+
+/// A helper call PROVEN to be
+/// `env.storage().<st>().get::<_, T>(&KEY).unwrap_or_else(|| panic_with_error!(env, E))`
+/// preceded by constant instance TTL bumps. See [`classify_fallible_getter`].
+#[derive(Debug)]
+struct ProtoFallibleGetter {
+    key: DkVal,
+    storage_type: StorageType,
+    error_val: i64,
+    value: ProtoGetterValue,
+    instance_ttl_bumps: Vec<(u32, u32)>,
+}
+
+/// Accept a complete path set as the fallible-getter protocol only when it
+/// is EXACTLY these three paths (issue #67):
+///
+/// 1. key absent → `fail_with_error(E)`, `E` a constant CONTRACT error;
+/// 2. key present, loaded value's tag ≠ `C` → trap (the SDK's `TryFromVal`
+///    marshalling check, regenerated on recompile);
+/// 3. key present, tag = `C` → returns the loaded value itself (`C` an
+///    object tag) or its `u32` payload (`C` = `U32Val`).
+///
+/// with nothing else observable: every path performs the same constant
+/// instance TTL bumps first, then `has(K)`, then (when present) one
+/// `get(K)` of the SAME key and storage type, and no decision anywhere is
+/// anything but that has-test and that tag compare. The returned value is
+/// tied to the get by NODE IDENTITY — it is the get's result, not a value
+/// that merely appears near one.
+#[allow(clippy::type_complexity)]
+fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> {
+    if paths.len() != 3 {
+        return None;
+    }
+    let mut missing: Option<(i64, Vec<(u32, u32)>, DkVal, i64)> = None;
+    let mut trap: Option<(Vec<(u32, u32)>, DkVal, i64, i64)> = None;
+    let mut success: Option<(Vec<(u32, u32)>, DkVal, i64, i64, ProtoGetterValue)> = None;
+    for p in paths {
+        // Effects: bumps, then Has, then at most one Get — nothing else.
+        let mut bumps = Vec::new();
+        let mut it = p.effects.iter().peekable();
+        while let Some(ProtoEffect::InstanceTtl(t, e)) = it.peek() {
+            bumps.push((*t, *e));
+            it.next();
+        }
+        let Some(ProtoEffect::Has(h)) = it.next() else {
+            return None;
+        };
+        let ProtoNode::Has { key, st } = p.nodes.get(*h as usize)? else {
+            return None;
+        };
+        let get = match it.next() {
+            None => None,
+            Some(ProtoEffect::Get(g)) => {
+                let ProtoNode::Get { key: gk, st: gst } = p.nodes.get(*g as usize)? else {
+                    return None;
+                };
+                if gk != key || gst != st {
+                    return None; // has and get on different keys / durabilities
+                }
+                Some(*g)
+            }
+            Some(_) => return None,
+        };
+        if it.next().is_some() {
+            return None;
+        }
+        let preds: Vec<(ProtoPred, bool)> = p
+            .decisions
+            .iter()
+            .map(|(n, taken)| proto_pred(&p.nodes, *n).map(|(pr, pol)| (pr, pol == *taken)))
+            .collect::<Option<_>>()?;
+        match (preds.as_slice(), &p.end, get) {
+            ([(ProtoPred::Has(ph), false)], Err(ProtoEnd::Fail(e)), None) if ph == h => {
+                if missing.replace((*e, bumps, key.clone(), *st)).is_some() {
+                    return None;
+                }
+            }
+            (
+                [(ProtoPred::Has(ph), true), (ProtoPred::TagIs(pg, c), false)],
+                Err(ProtoEnd::Trap),
+                Some(g),
+            ) if ph == h && *pg == g => {
+                if trap.replace((bumps, key.clone(), *st, *c)).is_some() {
+                    return None;
+                }
+            }
+            (
+                [(ProtoPred::Has(ph), true), (ProtoPred::TagIs(pg, c), true)],
+                Ok(Some(DkVal::Sym(r))),
+                Some(g),
+            ) if ph == h && *pg == g => {
+                let value = if *r == g && (64..=77).contains(c) {
+                    ProtoGetterValue::Object(*c as u8)
+                } else if *c == TAG_U32 as i64
+                    && matches!(p.nodes.get(*r as usize)?, ProtoNode::Wrap(s)
+                        if matches!(p.nodes.get(*s as usize), Some(ProtoNode::Shr32(x)) if *x == g))
+                {
+                    ProtoGetterValue::U32
+                } else {
+                    return None; // returns something other than the get's value
+                };
+                if success
+                    .replace((bumps, key.clone(), *st, *c, value))
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (error_val, m_bumps, m_key, m_st) = missing?;
+    let (t_bumps, t_key, t_st, t_tag) = trap?;
+    let (bumps, key, st, tag, value) = success?;
+    // One key, one durability, one bump prefix, one tag across all paths.
+    if m_bumps != bumps || t_bumps != bumps || m_key != key || t_key != key {
+        return None;
+    }
+    if m_st != st || t_st != st || t_tag != tag {
+        return None;
+    }
+    // A constant CONTRACT error: tag 3, error type (bits 8..32) = 0.
+    if (error_val as u64) & 0xff != TAG_ERROR || ((error_val as u64) >> 8) & 0xff_ffff != 0 {
+        return None;
+    }
+    let storage_type = match st {
+        0 => StorageType::Temporary,
+        1 => StorageType::Persistent,
+        2 => StorageType::Instance,
+        _ => return None,
+    };
+    Some(ProtoFallibleGetter {
+        key,
+        storage_type,
+        error_val,
+        value,
+        instance_ttl_bumps: bumps,
+    })
 }
 
 /// One entered block during evaluation.
@@ -10456,9 +10985,166 @@ struct DkEval<'m> {
     /// linker-elided all-zero descriptor row. Static loads inside it read
     /// `0`; everything else about gap memory stays out of model.
     gap_zero: Option<(u32, u32)>,
+    /// `Some` = protocol mode (issue #67, see [`ProtoRun`]); `None` = the
+    /// original concrete-only evaluator, behavior unchanged.
+    proto: Option<ProtoRun>,
 }
 
 impl DkEval<'_> {
+    /// Allocate a symbolic node (protocol mode only).
+    fn proto_node(&mut self, node: ProtoNode) -> Option<DkVal> {
+        let run = self.proto.as_mut()?;
+        run.nodes.push(node);
+        Some(DkVal::Sym(run.nodes.len() as u32 - 1))
+    }
+
+    /// Direction of a branch on symbolic condition `node`: scripted, else
+    /// `false`; recorded either way.
+    fn proto_decide(&mut self, node: u32) -> Option<bool> {
+        let run = self.proto.as_mut()?;
+        if run.decisions.len() >= PROTO_MAX_DECISIONS {
+            return None;
+        }
+        let take = run
+            .script
+            .get(run.decisions.len())
+            .copied()
+            .unwrap_or(false);
+        run.decisions.push((node, take));
+        Some(take)
+    }
+
+    /// A branch condition: concrete as always, or (protocol mode) a scripted
+    /// decision on a symbolic boolean.
+    fn branch_cond(&mut self, v: DkVal) -> Option<bool> {
+        match v {
+            DkVal::Sym(n) => self.proto_decide(n),
+            other => Some(dk_i32(&other)? != 0),
+        }
+    }
+
+    /// Protocol-mode modeling of a host import call. Only the storage-getter
+    /// protocol's calls are in model; every other import bails, exactly as
+    /// outside protocol mode.
+    fn proto_host_call(
+        &mut self,
+        hf_module: HostModule,
+        name: &str,
+        stack: &mut Vec<DkVal>,
+    ) -> Option<()> {
+        // A storage key is a value the evaluator fully tracks; it is never
+        // itself a symbolic read result.
+        fn is_key(v: &DkVal) -> bool {
+            match v {
+                DkVal::I64(_) | DkVal::SymObj(_) | DkVal::Arg(_) => true,
+                DkVal::VecVal(es) => es.iter().all(is_key),
+                _ => false,
+            }
+        }
+        match (hf_module, name) {
+            (HostModule::Ledger, "has_contract_data" | "get_contract_data") => {
+                let st = dk_i64(&stack.pop()?)?;
+                let key = stack.pop()?;
+                if !is_key(&key) {
+                    return None;
+                }
+                let is_has = name == "has_contract_data";
+                let v = self.proto_node(if is_has {
+                    ProtoNode::Has { key, st }
+                } else {
+                    ProtoNode::Get { key, st }
+                })?;
+                let DkVal::Sym(id) = v else { return None };
+                self.proto.as_mut()?.effects.push(if is_has {
+                    ProtoEffect::Has(id)
+                } else {
+                    ProtoEffect::Get(id)
+                });
+                stack.push(v);
+                Some(())
+            }
+            (HostModule::Ledger, "extend_current_contract_instance_and_code_ttl") => {
+                let extend_to = dk_i64(&stack.pop()?)? as u64;
+                let threshold = dk_i64(&stack.pop()?)? as u64;
+                if threshold & 0xff != TAG_U32 || extend_to & 0xff != TAG_U32 {
+                    return None;
+                }
+                self.proto.as_mut()?.effects.push(ProtoEffect::InstanceTtl(
+                    (threshold >> 32) as u32,
+                    (extend_to >> 32) as u32,
+                ));
+                stack.push(DkVal::I64(2)); // Void
+                Some(())
+            }
+            (HostModule::Context, "fail_with_error") => {
+                let e = dk_i64(&stack.pop()?)?;
+                self.proto.as_mut()?.end = Some(ProtoEnd::Fail(e));
+                None // terminal: the path ends here
+            }
+            _ => None,
+        }
+    }
+
+    /// Protocol-mode arithmetic on symbolic operands. `None` = the
+    /// instruction has no symbolic operand (fall through to the concrete
+    /// arms); `Some(None)` = a symbolic operand in an unmodeled operation
+    /// (bail); `Some(Some(()))` = handled.
+    fn proto_sym_op(
+        &mut self,
+        ins: &crate::wasm::ir::WasmInstr,
+        stack: &mut Vec<DkVal>,
+    ) -> Option<Option<()>> {
+        use crate::wasm::ir::WasmInstr as WI;
+        self.proto.as_ref()?;
+        let n = stack.len();
+        let unary = matches!(ins, WI::I32Eqz | WI::I64Eqz | WI::I32WrapI64);
+        let binary = matches!(
+            ins,
+            WI::I64And | WI::I64Eq | WI::I64Ne | WI::I32Eq | WI::I32Ne | WI::I64ShrU
+        );
+        if unary {
+            let DkVal::Sym(a) = *stack.last()? else {
+                return None;
+            };
+            let node = match ins {
+                WI::I32WrapI64 => ProtoNode::Wrap(a),
+                _ => ProtoNode::Eqz(a),
+            };
+            stack.pop();
+            return Some(self.proto_node(node).map(|v| stack.push(v)));
+        }
+        if !binary || n < 2 {
+            return None;
+        }
+        // Exactly one symbolic operand and one constant, either order (all
+        // modeled binary ops except the shift are commutative).
+        let (sym, konst, sym_is_lhs) = match (&stack[n - 2], &stack[n - 1]) {
+            (DkVal::Sym(a), DkVal::I64(k)) => (*a, *k, true),
+            (DkVal::Sym(a), DkVal::I32(k)) => (*a, *k as i64, true),
+            (DkVal::I64(k), DkVal::Sym(a)) => (*a, *k, false),
+            (DkVal::I32(k), DkVal::Sym(a)) => (*a, *k as i64, false),
+            (DkVal::Sym(_), _) | (_, DkVal::Sym(_)) => return Some(None),
+            _ => return None,
+        };
+        let node = match ins {
+            WI::I64And if konst == 0xff => ProtoNode::TagOf(sym),
+            WI::I64Eq | WI::I32Eq => ProtoNode::Cmp {
+                eq: true,
+                node: sym,
+                konst,
+            },
+            WI::I64Ne | WI::I32Ne => ProtoNode::Cmp {
+                eq: false,
+                node: sym,
+                konst,
+            },
+            WI::I64ShrU if sym_is_lhs && konst == 32 => ProtoNode::Shr32(sym),
+            _ => return Some(None),
+        };
+        stack.truncate(n - 2);
+        Some(self.proto_node(node).map(|v| stack.push(v)))
+    }
+
     fn store(&mut self, addr: i32, val: DkVal, width: u32) {
         // Invalidate any overlapping cell so stale halves can never be re-read.
         self.mem
@@ -10544,17 +11230,25 @@ impl DkEval<'_> {
     /// Any direct host-import call is out of model.
     fn handle_call(&mut self, target: u32, stack: &mut Vec<DkVal>, depth: u32) -> Option<()> {
         use crate::wasm::ir::WasmType;
-        if self.module.imports.get_by_index(target).is_some() {
-            return None;
+        if let Some(hf) = self.module.imports.get_by_index(target) {
+            // Outside protocol mode any host import is out of model.
+            self.proto.as_ref()?;
+            let (hm, name) = (hf.module, hf.name.clone());
+            return self.proto_host_call(hm, &name, stack);
         }
         let ft = self.module.get_func_type(target)?;
         let n = ft.params.len();
         if stack.len() < n {
             return None;
         }
+        // Protocol mode records EFFECTS, so a callee may only be summarized
+        // (the builder shortcuts below never interpret their target) when
+        // it provably has none: its whole import closure builds values.
+        let summarizable = self.proto.is_none() || is_pure_key_ctor(self.module, target);
         let args = stack.split_off(stack.len() - n);
 
-        if ft.params.as_slice() == [WasmType::I32, WasmType::I32]
+        if summarizable
+            && ft.params.as_slice() == [WasmType::I32, WasmType::I32]
             && ft.results.as_slice() == [WasmType::I64]
         {
             let reaches_sym = func_reaches_symbol_encoder(self.module, target, 0);
@@ -10619,7 +11313,8 @@ impl DkEval<'_> {
         // modeling as `try_lower_symbol_builder`: the `0` success
         // discriminant at `out+0`, the symbol Val at `out+8`; the symbol
         // name comes from real static data under the same alnum gates.
-        if ft.params.as_slice() == [WasmType::I32, WasmType::I32, WasmType::I32]
+        if summarizable
+            && ft.params.as_slice() == [WasmType::I32, WasmType::I32, WasmType::I32]
             && ft.results.is_empty()
             && is_symbol_from_lm_builder(self.module, target)
         {
@@ -10747,6 +11442,11 @@ impl DkEval<'_> {
             };
             if *DBG_DKTRACE {
                 eprintln!("[DKTRACE] ip={ip} {ins:?} stack={stack:?}");
+            }
+            if let Some(handled) = self.proto_sym_op(ins, &mut stack) {
+                handled?;
+                ip += 1;
+                continue;
             }
             match ins {
                 WI::I32Const(v) => stack.push(DkVal::I32(*v)),
@@ -10935,7 +11635,7 @@ impl DkEval<'_> {
                     });
                 }
                 WI::If { block_type } => {
-                    let cond = dk_i32(&stack.pop()?)?;
+                    let cond = self.branch_cond(stack.pop()?)?;
                     let (end, els) = *ends.get(&ip)?;
                     let fr = DkFrame {
                         end,
@@ -10943,7 +11643,7 @@ impl DkEval<'_> {
                         height: stack.len(),
                         loop_start: None,
                     };
-                    if cond != 0 {
+                    if cond {
                         frames.push(fr);
                     } else if let Some(e) = els {
                         frames.push(fr);
@@ -10973,8 +11673,8 @@ impl DkEval<'_> {
                     continue;
                 }
                 WI::BrIf(d) => {
-                    let cond = dk_i32(&stack.pop()?)?;
-                    if cond != 0 {
+                    let cond = self.branch_cond(stack.pop()?)?;
+                    if cond {
                         ip = dk_branch(&mut frames, &mut stack, *d)?;
                         continue;
                     }
@@ -10988,7 +11688,14 @@ impl DkEval<'_> {
                 WI::Return => break,
                 // A trapping path means the selector is invalid at runtime —
                 // nothing to recover.
-                WI::Unreachable => return None,
+                WI::Unreachable => {
+                    // Protocol mode: a trap is a path TERMINAL, reported
+                    // apart from the out-of-model `None`.
+                    if let Some(run) = self.proto.as_mut() {
+                        run.end = Some(ProtoEnd::Trap);
+                    }
+                    return None;
+                }
                 WI::Call(t) => self.handle_call(*t, &mut stack, depth)?,
                 _ => return None,
             }
@@ -11916,6 +12623,7 @@ fn load_struct_const_key(
                     sp: DkVal::StackPtr(0),
                     steps: 0,
                     gap_zero,
+                    proto: None,
                 };
                 match ev.eval_call(*t, vec![DkVal::I32(*x)], 0) {
                     Some(Some(result)) => dk_result_to_const_key(&result),
@@ -21180,6 +21888,7 @@ mod tests {
                 sp: DkVal::StackPtr(0),
                 steps: 0,
                 gap_zero,
+                proto: None,
             };
             ev.eval_call(target, vec![DkVal::I32(arg)], 0)
         };
@@ -22546,6 +23255,7 @@ mod tests {
                 sp: DkVal::StackPtr(0),
                 steps: 0,
                 gap_zero: None,
+                proto: None,
             };
             ev.eval_call(disp, vec![sel, payload], 0)
         };
@@ -23338,6 +24048,7 @@ mod tests {
             sp: DkVal::StackPtr(0),
             steps: 0,
             gap_zero: None,
+            proto: None,
         };
         ev.store(0, DkVal::I64(0x1122334455667788), 8);
         ev.store(16, DkVal::Arg(0), 8);
@@ -23425,5 +24136,276 @@ mod tests {
                 .and_then(as_key_vec)
                 .is_none()
         );
+    }
+
+    /// Fixture for the protocol-mode evaluator and the fallible-getter
+    /// classifier (issue #67). Imports: 0=has, 1=get, 2=fail_with_error,
+    /// 3=instance-TTL bump, 4=put. Func 5 = has wrapper (`== 1`), 6 = fail
+    /// wrapper, 7 = TTL wrapper (100, 200), 8 = key ctor (selector →
+    /// "TokA"/"TokB"), then one FUSED keyed getter per `variants` entry
+    /// (func 9 + 2k) each followed by its constant-selector caller
+    /// (func 10 + 2k), then the u32 sret helper / wrapper / caller.
+    fn proto_getter_module() -> (WasmModule, u32) {
+        // (key expr for the get, success-arm tail after the tag check, extra
+        // code run only on the success arm before the tag check)
+        let variants: [(&str, &str, &str); 6] = [
+            // 0: THE getter.
+            (
+                "local.get 2",
+                "local.get 1 local.get 2 i64.store offset=8",
+                "",
+            ),
+            // 1: get on a DIFFERENT key than the has.
+            (
+                "i32.const 0 call 8",
+                "local.get 1 local.get 2 i64.store offset=8",
+                "",
+            ),
+            // 2: returns a constant, not the get's result.
+            (
+                "local.get 2",
+                "local.get 1 i64.const 5 i64.store offset=8",
+                "",
+            ),
+            // 3: a storage WRITE in the body.
+            (
+                "local.get 2",
+                "local.get 2 local.get 2 i64.const 2 call 4 drop local.get 1 local.get 2 i64.store offset=8",
+                "",
+            ),
+            // 4: an extra VALUE-dependent trap behind the tag check.
+            (
+                "local.get 2",
+                "local.get 2 i64.const 32 i64.shr_u i64.const 7 i64.eq br_if 1 local.get 1 local.get 2 i64.store offset=8",
+                "",
+            ),
+            // 5: a TTL bump on the success path only.
+            (
+                "local.get 2",
+                "local.get 1 local.get 2 i64.store offset=8",
+                "call 7",
+            ),
+        ];
+        let mut funcs = String::new();
+        for (k, (get_key, tail, pre)) in variants.iter().enumerate() {
+            let getter = 9 + 2 * k;
+            funcs.push_str(&format!(
+                r#"(func (;{getter};) (param i32) (result i64) (local i32 i64)
+                    global.get 0 i32.const 16 i32.sub local.tee 1 global.set 0
+                    call 7
+                    block
+                        block
+                            local.get 1
+                            local.get 0 call 8 local.tee 2 i64.const 2 call 5
+                            if (result i64)
+                                {pre}
+                                {get_key} i64.const 2 call 1 local.tee 2
+                                i64.const 255 i64.and i64.const 77 i64.ne br_if 1
+                                {tail}
+                                i64.const 1
+                            else
+                                i64.const 0
+                            end
+                            i64.store
+                            br 1
+                        end
+                        unreachable
+                    end
+                    local.get 1 i64.load i64.const 1 i64.eq
+                    if
+                        local.get 1 i64.load offset=8
+                        local.get 1 i32.const 16 i32.add global.set 0
+                        return
+                    end
+                    i64.const 2151778615299 call 6
+                    unreachable)
+                (func (result i64) i32.const 1 call {getter})
+                "#
+            ));
+        }
+        let u32_helper = 9 + 2 * variants.len() as u32;
+        let u32_getter = u32_helper + 1;
+        let wat = format!(
+            r#"(module
+                (import "l" "0" (func (param i64 i64) (result i64)))
+                (import "l" "1" (func (param i64 i64) (result i64)))
+                (import "x" "5" (func (param i64) (result i64)))
+                (import "l" "8" (func (param i64 i64) (result i64)))
+                (import "l" "_" (func (param i64 i64 i64) (result i64)))
+                (memory 1)
+                (global (mut i32) (i32.const 65536))
+                (func (;5;) (param i64 i64) (result i32)
+                    local.get 0 local.get 1 call 0 i64.const 1 i64.eq)
+                (func (;6;) (param i64) local.get 0 call 2 drop)
+                (func (;7;) i64.const 429496729604 i64.const 858993459204 call 3 drop)
+                (func (;8;) (param i32) (result i64)
+                    local.get 0
+                    if (result i64) i64.const 2135690510 else i64.const 2135690254 end)
+                {funcs}
+                (func (;{u32_helper};) (param i32 i32) (local i64 i32)
+                    block
+                        local.get 1 call 8 local.tee 2 i64.const 2 call 5
+                        if (result i32)
+                            local.get 2 i64.const 2 call 1 local.tee 2
+                            i64.const 255 i64.and i64.const 4 i64.ne br_if 1
+                            local.get 2 i64.const 32 i64.shr_u i32.wrap_i64 local.set 3
+                            i32.const 1
+                        else
+                            i32.const 0
+                        end
+                        local.set 1
+                        local.get 0 local.get 3 i32.store offset=4
+                        local.get 0 local.get 1 i32.store
+                        return
+                    end
+                    unreachable)
+                (func (;{u32_getter};) (result i32) (local i32)
+                    global.get 0 i32.const 16 i32.sub local.tee 0 global.set 0
+                    call 7
+                    local.get 0 i32.const 8 i32.add i32.const 0 call {u32_helper}
+                    local.get 0 i32.load offset=8 i32.const 1 i32.eq
+                    if
+                        local.get 0 i32.load offset=12
+                        local.get 0 i32.const 16 i32.add global.set 0
+                        return
+                    end
+                    i64.const 2151778615299 call 6
+                    unreachable)
+                (func (result i32) call {u32_getter})
+            )"#
+        );
+        let wasm = wat::parse_str(&wat).expect("wat parses");
+        (WasmModule::parse(&wasm).expect("module parses"), u32_getter)
+    }
+
+    fn proto_lift(m: &WasmModule, caller: u32) -> InlineResult {
+        lift_inline_call(
+            m,
+            &empty_registry(),
+            caller,
+            Vec::new(),
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
+        )
+    }
+
+    #[test]
+    fn proto_enumerates_and_classifies_fused_keyed_getter() {
+        let (m, u32_getter) = proto_getter_module();
+        // The fused keyed Address getter: three paths, classified, and the
+        // key is the one THIS selector builds (the ctor ran concretely).
+        let paths = proto_enumerate(&m, 9, &[DkVal::I32(1)]).expect("in model");
+        assert_eq!(paths.len(), 3, "absent / wrong-tag / present: {paths:?}");
+        let g = classify_fallible_getter(&paths).expect("the fused getter classifies");
+        assert_eq!(g.value, ProtoGetterValue::Object(77));
+        assert_eq!(g.storage_type, StorageType::Instance);
+        assert_eq!(g.instance_ttl_bumps, vec![(100, 200)]);
+        assert_eq!(g.error_val, 2151778615299);
+        assert_eq!(
+            dk_result_to_const_key(&g.key),
+            Some(SorobanExpr::SymbolLiteral("TokB".to_string()))
+        );
+        let other = proto_enumerate(&m, 9, &[DkVal::I32(0)])
+            .as_deref()
+            .and_then(classify_fallible_getter)
+            .expect("selector 0 classifies too");
+        assert_eq!(
+            dk_result_to_const_key(&other.key),
+            Some(SorobanExpr::SymbolLiteral("TokA".to_string()))
+        );
+        // The u32 getter over an sret `[disc:i32, value:i32]` helper.
+        let g = proto_enumerate(&m, u32_getter, &[])
+            .as_deref()
+            .and_then(classify_fallible_getter)
+            .expect("the u32 getter classifies");
+        assert_eq!(g.value, ProtoGetterValue::U32);
+        // The key ctor is a pure value builder; the getter is not.
+        assert!(is_pure_key_ctor(&m, 8));
+        assert!(!is_pure_key_ctor(&m, 9));
+    }
+
+    #[test]
+    fn proto_classifier_refuses_everything_but_the_exact_protocol() {
+        let (m, _) = proto_getter_module();
+        let classify = |f: u32| {
+            proto_enumerate(&m, f, &[DkVal::I32(1)])
+                .as_deref()
+                .and_then(classify_fallible_getter)
+        };
+        assert!(classify(11).is_none(), "has and get on different keys");
+        assert!(classify(13).is_none(), "returns a constant, not the get");
+        assert!(
+            proto_enumerate(&m, 15, &[DkVal::I32(1)]).is_none(),
+            "a storage write is out of model"
+        );
+        assert!(classify(17).is_none(), "extra value-dependent trap");
+        assert!(classify(19).is_none(), "TTL bump on one path only");
+        // A non-constant selector never reaches the evaluator's model: a
+        // branch on an opaque argument bails.
+        assert!(proto_enumerate(&m, 9, &[DkVal::Arg(0)]).is_none());
+        // Outside protocol mode the evaluator is unchanged: host calls bail.
+        let mut ev = DkEval {
+            module: &m,
+            mem: HashMap::new(),
+            sp: DkVal::StackPtr(0),
+            steps: 0,
+            gap_zero: None,
+            proto: None,
+        };
+        assert!(ev.eval_call(9, vec![DkVal::I32(1)], 0).is_none());
+    }
+
+    #[test]
+    fn proto_fallible_getter_call_recovers_one_bound_read() {
+        cov_mark::check!(proto_fallible_getter_recovered);
+        let (m, u32_getter) = proto_getter_module();
+        for (caller, ty) in [(10, "Address"), (u32_getter + 1, "u32")] {
+            let (stmts, _) = proto_lift(&m, caller)
+                .content
+                .expect("the recovery is effectful");
+            assert!(
+                matches!(
+                    stmts.first(),
+                    Some(SorobanStmt::Expr(
+                        SorobanExpr::ExtendInstanceAndCodeTtl { .. }
+                    ))
+                ),
+                "the proven TTL bump is emitted first: {stmts:?}"
+            );
+            let gets: Vec<_> = stmts
+                .iter()
+                .filter_map(|s| match s {
+                    SorobanStmt::Let {
+                        value: SorobanExpr::CastAs { value, target_type },
+                        ..
+                    } => Some((value.as_ref(), target_type.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(gets.len(), 1, "exactly one bound read: {stmts:?}");
+            assert_eq!(gets[0].1, ty);
+            assert!(
+                matches!(
+                    gets[0].0,
+                    SorobanExpr::StorageGet {
+                        unwrap: false,
+                        on_missing: Some(miss),
+                        ..
+                    } if matches!(miss.as_ref(), SorobanExpr::PanicWithError(_))
+                ),
+                "the missing path is the proven panic_with_error: {stmts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proto_fallible_getter_call_declines_non_protocol_helpers() {
+        cov_mark::check_count!(proto_fallible_getter_recovered, 0);
+        let (m, _) = proto_getter_module();
+        for caller in [12, 14, 16, 18, 20] {
+            let _ = proto_lift(&m, caller);
+        }
     }
 }

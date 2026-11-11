@@ -379,7 +379,28 @@ use std::process::Command;
 /// toolchain, see CI) — measure with `RUSTUP_TOOLCHAIN=1.95.0` locally
 /// before touching this ceiling; newer rustc dedups some E0283/E0284
 /// pairs and reports fewer.
-const ERROR_CEILING: u32 = 326;
+/// → 318 (issue #67, starter bucket of #66: fallible storage getters
+/// recovered by EXECUTION, −8). The micro-evaluator gained a protocol mode
+/// (symbolic `has`/`get` results, `fail_with_error`/`unreachable` as path
+/// terminals, every path enumerated by replay); a helper call is replaced
+/// by `get::<_, T>(&KEY).unwrap_or_else(|| panic_with_error!(env, E))`
+/// only when its COMPLETE path set is exactly absent→fail(E) /
+/// wrong-tag→trap / present→the get's own value. Covers the shapes the
+/// tranche-6 window detector could not: the Option decode fused into a
+/// selector- or descriptor-keyed getter, and the u32 payload getter.
+/// Prerequisite soundness fix: the key-constructor folds claimed these
+/// getters (`i32.const <ptr>; call $getter` folded to the getter's own
+/// KEY, rendered where the stored value belongs with no `todo!()` — 30
+/// sites in aqua-amm, 4 in soroswap; the issue-#80 class-A symptom) and
+/// now refuse any target whose import closure is not pure value building.
+/// aqua-amm 55→46 (key-as-value `Vec<Symbol>` where an `Address` belongs
+/// → typed reads). aqua-rewards 24→25 = audited faithful unmask:
+/// `get_info` was a `todo!()` husk and is now its real body, exposing the
+/// pre-existing functional `Map::new().set(..).set(..)` chain render gap
+/// (E0599 on `()`; same class as the t15 Bytes append chain). soroswap
+/// 3→3: its getter is the plain-`.unwrap()` protocol (no error code), so
+/// the un-claimed sites are honest husks pending that classifier.
+const ERROR_CEILING: u32 = 318;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

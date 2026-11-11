@@ -1,11 +1,11 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 92.4,
+  "overall_restoration": 92.5,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
       "entity": "Aqua AMM",
-      "restoration_pct": 92.5,
+      "restoration_pct": 92.6,
       "spec_functions": 75,
       "fn_clean": 21,
       "fn_partial": 54,
@@ -17,12 +17,12 @@
     {
       "file": "aqua-rewards-CCY2PXGM.wasm",
       "entity": "Aqua Rewards",
-      "restoration_pct": 93.9,
+      "restoration_pct": 96.1,
       "spec_functions": 76,
-      "fn_clean": 22,
-      "fn_partial": 53,
-      "fn_logic_lost": 1,
-      "artifacts_total": 209,
+      "fn_clean": 25,
+      "fn_partial": 51,
+      "fn_logic_lost": 0,
+      "artifacts_total": 203,
       "wasm_size": 54833,
       "error": null
     },
@@ -233,12 +233,12 @@
     {
       "file": "soroswap-CA4HEQTL.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 92.1,
+      "restoration_pct": 91.4,
       "spec_functions": 12,
-      "fn_clean": 4,
-      "fn_partial": 8,
+      "fn_clean": 3,
+      "fn_partial": 9,
       "fn_logic_lost": 0,
-      "artifacts_total": 20,
+      "artifacts_total": 24,
       "wasm_size": 9894,
       "error": null
     },

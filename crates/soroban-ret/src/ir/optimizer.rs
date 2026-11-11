@@ -5973,6 +5973,18 @@ fn substitute_local_in_expr(expr: &mut SorobanExpr, idx: u32, value: &SorobanExp
 /// because moving the call from a guaranteed-execute position into a
 /// conditional branch would change semantics.
 fn expr_has_side_effects(expr: &SorobanExpr) -> bool {
+    // A type annotation around a TRAPPING storage read is still that read:
+    // `CastAs { StorageGet { on_missing: panic_with_error!(..) } }` (the
+    // fallible-getter recoveries) panics on a missing key, so deleting an
+    // unused binding of it drops the panic, and relocating it past a later
+    // `set` reads a different value (issue #67). Deliberately narrow: the
+    // defaulting forms (`unwrap_or(..)`) cannot trap and stay droppable.
+    if let SorobanExpr::CastAs { value, .. } = expr
+        && let SorobanExpr::StorageGet { on_missing, .. } = value.as_ref()
+        && matches!(on_missing.as_deref(), Some(SorobanExpr::PanicWithError(_)))
+    {
+        return true;
+    }
     matches!(
         expr,
         SorobanExpr::StorageGet { .. }
@@ -9917,6 +9929,76 @@ mod tests {
             out.len(),
             1,
             "guard with a value body must be kept: {out:?}"
+        );
+    }
+
+    /// Issue #67: a fallible-getter read (`CastAs { StorageGet { on_missing:
+    /// panic_with_error!(..) } }`) traps on a missing key, so it is NOT a
+    /// pure expression — an unused binding of it must survive as a statement
+    /// (not be deleted), and a single use must not pull it past a later
+    /// storage write. The defaulting form cannot trap and stays droppable.
+    #[test]
+    fn trapping_getter_binding_is_not_treated_as_pure() {
+        let key = || Box::new(SorobanExpr::SymbolLiteral("K".to_string()));
+        let read = |on_missing: SorobanExpr| SorobanExpr::CastAs {
+            value: Box::new(SorobanExpr::StorageGet {
+                storage_type: StorageType::Instance,
+                key: key(),
+                unwrap: false,
+                on_missing: Some(Box::new(on_missing)),
+            }),
+            target_type: "Address".to_string(),
+        };
+        let trapping = || {
+            read(SorobanExpr::PanicWithError(Box::new(
+                SorobanExpr::ContractError {
+                    error_code: 501,
+                    error_type: None,
+                    variant_name: None,
+                },
+            )))
+        };
+        assert!(expr_has_side_effects(&trapping()));
+        assert!(!expr_has_side_effects(&read(SorobanExpr::U32Literal(0))));
+
+        // Unused: the read (and its panic) stays, as an expression statement.
+        let out = remove_redundant_lets(vec![SorobanStmt::Let {
+            name: "var_3".to_string(),
+            mutable: false,
+            value: trapping(),
+        }]);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SorobanStmt::Expr(SorobanExpr::CastAs { .. })]
+            ),
+            "an unused trapping read must not be deleted: {out:?}"
+        );
+
+        // read; set(K); use — the read must stay BEFORE the write.
+        let out = remove_redundant_lets(vec![
+            SorobanStmt::Let {
+                name: "var_3".to_string(),
+                mutable: false,
+                value: trapping(),
+            },
+            SorobanStmt::Expr(SorobanExpr::StorageSet {
+                storage_type: StorageType::Instance,
+                key: key(),
+                value: Box::new(SorobanExpr::U32Literal(1)),
+            }),
+            SorobanStmt::Return(Some(SorobanExpr::Local(3))),
+        ]);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [
+                    SorobanStmt::Let { .. },
+                    SorobanStmt::Expr(SorobanExpr::StorageSet { .. }),
+                    SorobanStmt::Return(Some(SorobanExpr::Local(3))),
+                ]
+            ),
+            "the read must not move past the storage write: {out:?}"
         );
     }
 }
