@@ -400,7 +400,25 @@ use std::process::Command;
 /// (E0599 on `()`; same class as the t15 Bytes append chain). soroswap
 /// 3→3: its getter is the plain-`.unwrap()` protocol (no error code), so
 /// the un-claimed sites are honest husks pending that classifier.
-const ERROR_CEILING: u32 = 318;
+/// → 304 (issue #66 bucket 2: plain `.unwrap()` storage getters, −14).
+/// Same execution proof as #67 with one more accepted path set: absent
+/// key → bare trap (instead of `fail_with_error(E)`), rendered as ONE
+/// bound, typed `get::<_, T>(&KEY).unwrap()`. Because the key constructor
+/// runs concretely per call site, the key is the one that site reads.
+/// ybx-claim 10→2, soroswap-CA4HEQTL 3→0 (`DataKey::PairWasmHash
+/// .require_auth()` → `get::<_, Address>(&DataKey::FeeToSetter).unwrap()
+/// .require_auth()` — issue #80 class A items 1–2; zero E-coded errors
+/// but still rejected by a deny-level overflowing-literal lint, so not
+/// yet counted clean), blend-backstop 6→4, comet 21→19, blend pools
+/// 24→23 each, band/xycloans unchanged. Audited faithful unmasks:
+/// blend-emitter 7→8 (keys-as-values such as `&symbol_short!("BLNDTkn")`
+/// as an invoke address became the real `backstop`/token bindings; the
+/// two Symbol-vs-Address E0308s are gone and three E0382 use-after-move
+/// surface on the now-real `backstop` — the existing clone-repair gap);
+/// soroswap-CAG5LRYQ 17→19 (a `panic!()`-collapsed body in
+/// `router_get_amounts_out` is now a partially recovered loop, +2 of the
+/// pre-existing functional-`push_back` E0599).
+const ERROR_CEILING: u32 = 304;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
