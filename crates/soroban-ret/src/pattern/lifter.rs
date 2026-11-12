@@ -711,6 +711,10 @@ struct LiftContext<'a> {
     /// BrIf(0) handler can safely treat constant-true conditions as pass-through
     /// (instead of no-ops) because the enclosing block has an error path.
     guard_block_depth: u32,
+    /// How many `child_context` hops separate this context from the one
+    /// lifting the function's own top-level block list (0 = that context).
+    /// Only the top-level list's last block is the function's tail.
+    child_depth: u32,
     /// First fallible storage-get helper observed in the top-level function (only
     /// recorded at `inline_depth == 0`). Shared across same-function child
     /// contexts via `Rc<RefCell>` so a record made while lifting a nested block
@@ -814,6 +818,7 @@ impl<'a> LiftContext<'a> {
             promoted_slots: HashMap::new(),
             dynamic_slots: Rc::new(RefCell::new(HashMap::new())),
             guard_block_depth: 0,
+            child_depth: 0,
             fallible_get_recovery: Rc::new(RefCell::new(None)),
             fallible_get_count: Rc::new(RefCell::new(0)),
             slot_defs: Rc::new(RefCell::new(HashMap::new())),
@@ -851,6 +856,7 @@ impl<'a> LiftContext<'a> {
             promoted_slots: self.promoted_slots.clone(),
             dynamic_slots: Rc::clone(&self.dynamic_slots),
             guard_block_depth: self.guard_block_depth,
+            child_depth: self.child_depth + 1,
             // Shared so a record made in a nested block reaches the top-level ctx.
             fallible_get_recovery: Rc::clone(&self.fallible_get_recovery),
             fallible_get_count: Rc::clone(&self.fallible_get_count),
@@ -1630,8 +1636,12 @@ impl<'a> LiftContext<'a> {
             key: Box::new(key),
             // Absent key: the proven `panic_with_error!(E)`, or — when the
             // helper bare-traps — the `.unwrap()` that traps the same way.
-            unwrap: error.is_none(),
-            on_missing: error.map(|e| Box::new(SorobanExpr::PanicWithError(Box::new(e)))),
+            unwrap: error.is_none() && getter.default_u32.is_none(),
+            // …or the proven constant default (`unwrap_or(d)`).
+            on_missing: match getter.default_u32 {
+                Some(d) => Some(Box::new(SorobanExpr::U32Literal(d))),
+                None => error.map(|e| Box::new(SorobanExpr::PanicWithError(Box::new(e)))),
+            },
         };
         let value = SorobanExpr::CastAs {
             value: Box::new(get_expr),
@@ -5822,12 +5832,88 @@ impl<'a> LiftContext<'a> {
                 StructuredBlock::Instruction(instr) => {
                     self.lift_instruction(instr);
                 }
-                StructuredBlock::Block { body, .. } => {
+                StructuredBlock::Block { body, block_type } => {
                     // Try to recognize br_table match pattern first
                     if let Some(match_stmt) = self.try_recognize_match(body) {
                         self.stmts.push(match_stmt);
                         i += 1;
                         continue;
+                    }
+
+                    // `Result`-returning export, early error exit (issue #80):
+                    //   block (result i64)
+                    //     i64.const <Err E>; <cond>; br_if 0; drop; <ok path..>
+                    //   end; <frame epilogue>; return
+                    // The block's result is returned as-is, and a taken
+                    // `br_if` leaves with the carried constant error — i.e.
+                    // `if cond { return Err(E) }`. The generic handler has
+                    // no way to carry that value out, so the error exit was
+                    // dropped and the function fell through to its success
+                    // path. Emit the early return, then lift the rest of the
+                    // SAME block (later branches still target it).
+                    if self.inline_depth == 0
+                        && matches!(self.return_type, Some(ScSpecTypeDef::Result(_)))
+                        && matches!(block_type, crate::wasm::ir::BlockType::Value(_))
+                        && epilogue_returns_stack(&blocks[i + 1..])
+                        && let Some((cond_end, err)) = carried_error_exit(body)
+                    {
+                        let mut pre_ctx = self.child_context();
+                        pre_ctx.lift_structured(&body[1..cond_end]);
+                        if pre_ctx.stack.len() == self.stack.len() + 1
+                            && let Some(cond_val) = pre_ctx.stack.pop()
+                        {
+                            cov_mark::hit!(result_carried_error_exit_returned);
+                            let condition = stack_val_to_expr(
+                                &cond_val,
+                                self.params,
+                                self.registry,
+                                Some(&self.frame_slots.borrow()),
+                            );
+                            let err_expr = stack_val_to_expr(
+                                &StackVal::I64(err),
+                                self.params,
+                                self.registry,
+                                None,
+                            );
+                            self.stack = pre_ctx.stack;
+                            self.locals = pre_ctx.locals;
+                            self.memory_stores = pre_ctx.memory_stores;
+                            self.stmts.extend(pre_ctx.stmts);
+                            self.found_host_calls |= pre_ctx.found_host_calls;
+                            self.stmts.push(SorobanStmt::If {
+                                condition,
+                                then_body: vec![SorobanStmt::Return(Some(err_expr))],
+                                else_body: Vec::new(),
+                            });
+                            // `br_if 0; drop` consumed; the remainder is the
+                            // same block minus its error-exit prefix.
+                            let rest = StructuredBlock::Block {
+                                block_type: block_type.clone(),
+                                body: body[cond_end + 2..].to_vec(),
+                            };
+                            let base = self.stack.len();
+                            self.lift_structured(std::slice::from_ref(&rest));
+                            // The remainder's RESULT is whatever its exit
+                            // paths carry. A straight-line remainder has one
+                            // exit and the lifted value is it; with further
+                            // branches the value is path-dependent and the
+                            // sequential lift only saw one of them (a later
+                            // `i64.const 0; ..; br_if 0` default would
+                            // surface as an unconditional `Ok(false)`).
+                            // Never guess: the result becomes an explicit
+                            // returned hole (the block's result IS the
+                            // function's return — `epilogue_returns_stack`),
+                            // so no trailing statement can be mistaken for
+                            // the tail value either.
+                            if blocks_contain_branch(&body[cond_end + 2..]) {
+                                self.stack.truncate(base);
+                                self.stack.push(StackVal::Unknown);
+                                self.stmts
+                                    .push(SorobanStmt::Return(Some(SorobanExpr::UnknownVal)));
+                            }
+                            i += 1;
+                            continue;
+                        }
                     }
 
                     // Vec-front `Option` idiom: `if v.is_empty() { None } else
@@ -6787,6 +6873,66 @@ impl<'a> LiftContext<'a> {
                     {
                         cov_mark::hit!(if_result_value_joined);
                         self.stack.push(joined);
+                    }
+
+                    // `Result`-returning exports (issue #80): the SDK lowers
+                    // `if ok { Ok(v) } else { Err(E) }` so that ONE path
+                    // yields a constant contract `Error` Val and the other
+                    // the success value. Neither generic join can express
+                    // that (the two values are different by design), so the
+                    // error path was silently dropped and the function fell
+                    // through to its success tail. Make each path's return
+                    // explicit instead — only where the bytecode proves the
+                    // value IS the function's result on that path.
+                    if self.inline_depth == 0
+                        && matches!(self.return_type, Some(ScSpecTypeDef::Result(_)))
+                        && !then_terminates
+                        && !else_terminates
+                    {
+                        // Frame slots are shared by every context of this
+                        // function, so the parent resolves arm values too.
+                        let (params, registry) = (self.params, self.registry);
+                        let slots_rc = Rc::clone(&self.frame_slots);
+                        let ret_of = |v: &StackVal| {
+                            SorobanStmt::Return(Some(stack_val_to_expr(
+                                v,
+                                params,
+                                registry,
+                                Some(&slots_rc.borrow()),
+                            )))
+                        };
+                        // (A) TAIL value-`if`: the function's last block, so
+                        // each arm's result is the function's result.
+                        if self.child_depth == 0
+                            && i + 1 == blocks.len()
+                            && matches!(block_type, crate::wasm::ir::BlockType::Value(_))
+                            && then_ctx.stack.len() == self.stack.len() + 1
+                            && else_ctx.stack.len() == self.stack.len() + 1
+                            && let (Some(tv), Some(ev)) =
+                                (then_ctx.stack.last(), else_ctx.stack.last())
+                            && (is_contract_error_const(tv) != is_contract_error_const(ev))
+                        {
+                            cov_mark::hit!(result_tail_if_arms_returned);
+                            then_stmts.push(ret_of(tv));
+                            else_stmts.push(ret_of(ev));
+                        }
+                        // (B) Preset error local: `r = Err; if c { ..; r = ok }
+                        // <frame epilogue>; return r`. With no else arm, the
+                        // not-taken path returns the preset error untouched.
+                        else if else_body.is_empty()
+                            && let Some(l) = epilogue_returned_local(&blocks[i + 1..])
+                            && let Some(pre) = pre_locals.get(l as usize)
+                            && is_contract_error_const(pre)
+                            && then_ctx
+                                .locals
+                                .get(l as usize)
+                                .is_some_and(|v| v != pre && !is_contract_error_const(v))
+                        {
+                            cov_mark::hit!(result_preset_error_local_returned);
+                            else_stmts.push(ret_of(pre));
+                            // Past the `if` only the success path remains.
+                            self.locals[l as usize] = then_ctx.locals[l as usize].clone();
+                        }
                     }
 
                     // Only emit If when there's meaningful content
@@ -10166,6 +10312,29 @@ fn descriptor_key_from_ptr(module: &WasmModule, target_idx: u32, ptr: i32) -> Op
         .data_sections
         .read_bytes_zero_extended(ptr as u32, 1)
         .map(|b| b[0] as usize)?;
+    // EXECUTE the constructor when the evaluator can: the string-table
+    // shortcut below pairs the discriminant with the variant strings in BODY
+    // order, which is only right when the `br_table` arms are laid out in
+    // discriminant order. They need not be — soroswap factory's ctor places
+    // its default arm (`FeeTo`, discriminant 0) LAST, so every other variant
+    // resolved to its successor (`TotalPairs` read as
+    // `PairAddressesNIndexed`: the "shifted keys" of issue #80). Execution
+    // follows the real `br_table`. The shortcut stays for constructors the
+    // evaluator declines (oversize bodies), as before.
+    let mut ev = DkEval {
+        module,
+        mem: HashMap::new(),
+        sp: DkVal::StackPtr(0),
+        steps: 0,
+        gap_zero: None,
+        proto: None,
+    };
+    if let Some(Some(result)) = ev.eval_call(target_idx, vec![DkVal::I32(ptr)], 0)
+        && let Some(key) = dk_result_to_const_key(&result)
+    {
+        cov_mark::hit!(descriptor_key_resolved_by_execution);
+        return Some(key);
+    }
     let strings = extract_data_strings(module, target_idx);
     let name = strings.get(disc)?;
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -10291,6 +10460,117 @@ fn func_reaches_symbol_encoder(module: &WasmModule, idx: u32, depth: u32) -> boo
     func.body
         .iter()
         .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_symbol_encoder(module, *t, depth + 1)))
+}
+
+/// A constant CONTRACT `Error` Val: tag 3, error type (bits 8..32) zero.
+fn is_contract_error_const(v: &StackVal) -> bool {
+    matches!(v, StackVal::I64(e)
+        if (*e as u64) & 0xff == TAG_ERROR && ((*e as u64) >> 8) & 0xff_ffff == 0)
+}
+
+/// If `rest` is exactly a shadow-stack frame epilogue followed by
+/// `local.get L; return` — nothing that could change `L` or have an effect
+/// (only `local.get` / `i32.const` / `i32.add` / `global.set 0` before it) —
+/// return `L`: the function returns local `L` as it stands at this point.
+fn epilogue_returned_local(rest: &[super::structurize::StructuredBlock]) -> Option<u32> {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr as WI;
+    let instrs: Vec<&WI> = rest
+        .iter()
+        .map(|b| match b {
+            StructuredBlock::Instruction(i) => Some(i),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let [epilogue @ .., WI::LocalGet(l), WI::Return] = instrs.as_slice() else {
+        return None;
+    };
+    epilogue
+        .iter()
+        .all(|i| {
+            matches!(
+                i,
+                WI::LocalGet(_) | WI::I32Const(_) | WI::I32Add | WI::GlobalSet(0)
+            )
+        })
+        .then_some(*l)
+}
+
+/// True if `rest` is exactly a shadow-stack frame epilogue followed by
+/// `return`: stack-neutral, effect-free instructions only, so the value on
+/// the operand stack when `rest` starts is the function's return value.
+fn epilogue_returns_stack(rest: &[super::structurize::StructuredBlock]) -> bool {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr as WI;
+    let Some((StructuredBlock::Instruction(WI::Return), epilogue)) = rest.split_last() else {
+        return false;
+    };
+    let mut depth = 0i32;
+    for b in epilogue {
+        depth += match b {
+            StructuredBlock::Instruction(WI::LocalGet(_) | WI::I32Const(_)) => 1,
+            StructuredBlock::Instruction(WI::I32Add | WI::GlobalSet(0)) => -1,
+            _ => return false,
+        };
+        if depth < 0 {
+            return false;
+        }
+    }
+    depth == 0
+}
+
+/// True if any block in the tree branches (`br`, `br_if`, `br_table`).
+fn blocks_contain_branch(blocks: &[super::structurize::StructuredBlock]) -> bool {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr as WI;
+    blocks.iter().any(|b| match b {
+        StructuredBlock::Instruction(WI::Br(_) | WI::BrIf(_) | WI::BrTable { .. }) => true,
+        StructuredBlock::Instruction(_) | StructuredBlock::SafetyNetUnreachable => false,
+        StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+            blocks_contain_branch(body)
+        }
+        StructuredBlock::IfElse {
+            then_body,
+            else_body,
+            ..
+        } => blocks_contain_branch(then_body) || blocks_contain_branch(else_body),
+    })
+}
+
+/// The error-exit prefix of a value block: `i64.const <contract Err E>` as
+/// the FIRST instruction, a straight-line condition, `br_if 0`, `drop`.
+/// Returns `(index of the br_if, E)`. The constant sits under the condition
+/// for the whole prefix (flat instructions only, the first `br_if` must be
+/// the one at depth 0 and be followed by the `drop` that discards the
+/// constant on the not-taken path).
+fn carried_error_exit(body: &[super::structurize::StructuredBlock]) -> Option<(usize, i64)> {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr as WI;
+    let Some(StructuredBlock::Instruction(WI::I64Const(e))) = body.first() else {
+        return None;
+    };
+    if !is_contract_error_const(&StackVal::I64(*e)) {
+        return None;
+    }
+    for (k, b) in body.iter().enumerate().skip(1) {
+        match b {
+            StructuredBlock::Instruction(WI::BrIf(0)) => {
+                return matches!(
+                    body.get(k + 1),
+                    Some(StructuredBlock::Instruction(WI::Drop))
+                )
+                .then_some((k, *e));
+            }
+            // Anything that could consume or branch past the carried
+            // constant before the exit voids the shape.
+            StructuredBlock::Instruction(
+                WI::Br(_) | WI::BrIf(_) | WI::BrTable { .. } | WI::Return | WI::Drop | WI::Select,
+            ) => return None,
+            StructuredBlock::Instruction(_) => {}
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// True when `idx` can only BUILD a value: its full transitive import closure
@@ -10700,6 +10980,10 @@ struct ProtoFallibleGetter {
     /// (`unwrap_or_else(|| panic_with_error!(env, E))`). `None`: it is a
     /// bare trap (`.unwrap()`).
     error_val: Option<i64>,
+    /// `Some(d)`: the absent-key path RETURNS the constant `d` instead of
+    /// failing — `get::<_, u32>(&KEY).unwrap_or(d)`. Only for the `u32`
+    /// payload getter, where the constant is the Rust-level default itself.
+    default_u32: Option<u32>,
     value: ProtoGetterValue,
     instance_ttl_bumps: Vec<(u32, u32)>,
 }
@@ -10724,7 +11008,7 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
     if paths.len() != 3 {
         return None;
     }
-    let mut missing: Option<(Option<i64>, Vec<(u32, u32)>, DkVal, i64)> = None;
+    let mut missing: Option<(Option<i64>, Option<u32>, Vec<(u32, u32)>, DkVal, i64)> = None;
     let mut trap: Option<(Vec<(u32, u32)>, DkVal, i64, i64)> = None;
     let mut success: Option<(Vec<(u32, u32)>, DkVal, i64, i64, ProtoGetterValue)> = None;
     for p in paths {
@@ -10770,7 +11054,19 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
                     ProtoEnd::Fail(e) => Some(*e),
                     ProtoEnd::Trap => None,
                 };
-                if missing.replace((e, bumps, key.clone(), *st)).is_some() {
+                if missing
+                    .replace((e, None, bumps, key.clone(), *st))
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            // Absent key: the helper returns a constant default.
+            ([(ProtoPred::Has(ph), false)], Ok(Some(DkVal::I32(d))), None) if ph == h => {
+                if missing
+                    .replace((None, Some(*d as u32), bumps, key.clone(), *st))
+                    .is_some()
+                {
                     return None;
                 }
             }
@@ -10808,9 +11104,13 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
             _ => return None,
         }
     }
-    let (error_val, m_bumps, m_key, m_st) = missing?;
+    let (error_val, default_u32, m_bumps, m_key, m_st) = missing?;
     let (t_bumps, t_key, t_st, t_tag) = trap?;
     let (bumps, key, st, tag, value) = success?;
+    // A constant default is only meaningful for the scalar `u32` getter.
+    if default_u32.is_some() && value != ProtoGetterValue::U32 {
+        return None;
+    }
     // One key, one durability, one bump prefix, one tag across all paths.
     if m_bumps != bumps || t_bumps != bumps || m_key != key || t_key != key {
         return None;
@@ -10834,6 +11134,7 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
         key,
         storage_type,
         error_val,
+        default_u32,
         value,
         instance_ttl_bumps: bumps,
     })

@@ -36,7 +36,7 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// recompiled contracts differ). A ratchet: drive DOWN as the decompiler
 /// recovers more behavior; never raise without understanding the new divergence.
 ///
-/// Measured baseline = 4 (68 fns / 479 cases executed; 63 contracts checked —
+/// Measured baseline = 4 (74 fns / 490 cases executed; 63 contracts checked —
 /// 39 fixtures + 24 corpus — 99.2% match). The whole set is `digicus`:
 /// `clear_repos`/`get_repos`/`get_repos_and_issues`/`version` — honest
 /// todo-panics (the recompiled function hits a `todo!()` hole and traps as

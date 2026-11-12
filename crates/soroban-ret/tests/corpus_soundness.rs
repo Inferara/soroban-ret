@@ -418,6 +418,13 @@ use std::process::Command;
 /// soroswap-CAG5LRYQ 17→19 (a `panic!()`-collapsed body in
 /// `router_get_amounts_out` is now a partially recovered loop, +2 of the
 /// pre-existing functional-`push_back` E0599).
+/// → 304 held, clean contracts 3 → 4 (issue #80): soroswap-CA4HEQTL now
+/// compiles and runs under the equivalence gate (11 cases, 100 % match).
+/// It had zero E-coded errors but two deny-level lints this count does not
+/// see — a raw `U32Val`-space length constant (`len() != 137438953472`,
+/// decoded corpus-wide to the u32 length) and never-typed
+/// `publish(todo!(), ..)` (type parameters now pinned). No per-contract
+/// count moved.
 const ERROR_CEILING: u32 = 304;
 
 #[test]
