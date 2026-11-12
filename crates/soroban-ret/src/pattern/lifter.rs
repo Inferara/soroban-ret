@@ -1598,6 +1598,23 @@ impl<'a> LiftContext<'a> {
         if !matches!(error, SorobanExpr::ContractError { .. }) {
             return None;
         }
+        // The helper TRAPS unless the loaded value carries the asserted tag,
+        // so the read must be pinned to a type whose `TryFromVal` performs
+        // exactly that check — an untyped read would be annotated `Val` when
+        // its result is discarded and then accept ANY present value. Only
+        // tags with such a type are recovered; every other tag declines (a
+        // scalar's object tag, e.g. `U64Object`, is not exact either: the
+        // Rust type also accepts the small form the helper rejects).
+        let target_type = match getter.value {
+            ProtoGetterValue::Object(77) => "Address",
+            ProtoGetterValue::Object(76) => "Map<Val, Val>",
+            ProtoGetterValue::Object(75) => "Vec<Val>",
+            ProtoGetterValue::U32 => "u32",
+            ProtoGetterValue::Object(_) => {
+                cov_mark::hit!(proto_fallible_getter_untypable_tag_declined);
+                return None;
+            }
+        };
         for (threshold, extend_to) in &getter.instance_ttl_bumps {
             self.stmts
                 .push(SorobanStmt::Expr(SorobanExpr::ExtendInstanceAndCodeTtl {
@@ -1611,19 +1628,9 @@ impl<'a> LiftContext<'a> {
             unwrap: false,
             on_missing: Some(Box::new(SorobanExpr::PanicWithError(Box::new(error)))),
         };
-        // The asserted tag names the type where it is unambiguous; other
-        // object tags leave it to inference from the consumer (as tranche 6).
-        let target_type = match getter.value {
-            ProtoGetterValue::Object(77) => Some("Address"),
-            ProtoGetterValue::U32 => Some("u32"),
-            ProtoGetterValue::Object(_) => None,
-        };
-        let value = match target_type {
-            Some(t) => SorobanExpr::CastAs {
-                value: Box::new(get_expr),
-                target_type: t.to_string(),
-            },
-            None => get_expr,
+        let value = SorobanExpr::CastAs {
+            value: Box::new(get_expr),
+            target_type: target_type.to_string(),
         };
         // Bind ONCE and push the binding — the bytecode reads once; see the
         // tranche-6 arm for why a per-consumer re-read is unsound.
@@ -24148,7 +24155,7 @@ mod tests {
     fn proto_getter_module() -> (WasmModule, u32) {
         // (key expr for the get, success-arm tail after the tag check, extra
         // code run only on the success arm before the tag check)
-        let variants: [(&str, &str, &str); 6] = [
+        let variants: [(&str, &str, &str); 7] = [
             // 0: THE getter.
             (
                 "local.get 2",
@@ -24185,10 +24192,18 @@ mod tests {
                 "local.get 1 local.get 2 i64.store offset=8",
                 "call 7",
             ),
+            // 6: a VALID getter asserting BytesObject (72) — a tag this
+            // recovery cannot pin to an exactly-matching type.
+            (
+                "local.get 2",
+                "local.get 1 local.get 2 i64.store offset=8",
+                "",
+            ),
         ];
         let mut funcs = String::new();
         for (k, (get_key, tail, pre)) in variants.iter().enumerate() {
             let getter = 9 + 2 * k;
+            let tag = if k == 6 { 72 } else { 77 };
             funcs.push_str(&format!(
                 r#"(func (;{getter};) (param i32) (result i64) (local i32 i64)
                     global.get 0 i32.const 16 i32.sub local.tee 1 global.set 0
@@ -24200,7 +24215,7 @@ mod tests {
                             if (result i64)
                                 {pre}
                                 {get_key} i64.const 2 call 1 local.tee 2
-                                i64.const 255 i64.and i64.const 77 i64.ne br_if 1
+                                i64.const 255 i64.and i64.const {tag} i64.ne br_if 1
                                 {tail}
                                 i64.const 1
                             else
@@ -24407,5 +24422,30 @@ mod tests {
         for caller in [12, 14, 16, 18, 20] {
             let _ = proto_lift(&m, caller);
         }
+    }
+
+    /// A proven getter whose asserted tag has no exactly-matching Rust type
+    /// must DECLINE: an untyped read would be annotated `Val` when unused
+    /// and accept any present value where the helper traps (PR #82 review).
+    #[test]
+    fn proto_fallible_getter_declines_tag_without_exact_type() {
+        cov_mark::check!(proto_fallible_getter_untypable_tag_declined);
+        let (m, _) = proto_getter_module();
+        let g = proto_enumerate(&m, 21, &[DkVal::I32(1)])
+            .as_deref()
+            .and_then(classify_fallible_getter)
+            .expect("the protocol itself classifies");
+        assert_eq!(g.value, ProtoGetterValue::Object(72));
+        let stmts = proto_lift(&m, 22).content.map(|c| c.0).unwrap_or_default();
+        assert!(
+            !stmts.iter().any(|s| matches!(
+                s,
+                SorobanStmt::Let {
+                    value: SorobanExpr::CastAs { .. },
+                    ..
+                }
+            )),
+            "no recovered read for an untypable tag: {stmts:?}"
+        );
     }
 }
