@@ -5272,8 +5272,13 @@ fn remove_redundant_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             // Immutable single-use with side effects, used in immediately next
             // statement → safe to inline (execution order unchanged).
             if !*mutable && uses == 1 && !in_loop && side_effect && i + 1 < stmts.len() {
-                let (next_uses, _) = count_local_uses(&stmts[i + 1..i + 2], idx);
-                if next_uses == 1 {
+                // The use must be in a position the next statement ALWAYS
+                // evaluates. Counting uses anywhere in it also accepted a
+                // use nested in an `if`/`match` arm: the read then moved
+                // into the branch, so the path not taking it skipped a
+                // trapping read the original always performs (PR #83
+                // review).
+                if count_unconditional_uses(&stmts[i + 1], idx) == 1 {
                     let SorobanStmt::Let { value, .. } = stmts.remove(i) else {
                         unreachable!()
                     };
@@ -5606,6 +5611,22 @@ fn count_local_in_stmt(stmt: &SorobanStmt, idx: u32, inside_loop: bool) -> (u32,
             (total, total > 0)
         }
         SorobanStmt::Block(stmts) => count_local_in_stmts(stmts, idx, inside_loop),
+    }
+}
+
+/// Uses of local `idx` in the positions `stmt` evaluates UNCONDITIONALLY,
+/// before any nested body runs: a plain statement's own expression, an
+/// `if` condition, a `match` scrutinee. Uses inside branch arms, loop
+/// bodies or loop bounds do not count.
+fn count_unconditional_uses(stmt: &SorobanStmt, idx: u32) -> u32 {
+    match stmt {
+        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => count_local_in_expr(e, idx),
+        SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
+            count_local_in_expr(value, idx)
+        }
+        SorobanStmt::If { condition, .. } => count_local_in_expr(condition, idx),
+        SorobanStmt::Match { scrutinee, .. } => count_local_in_expr(scrutinee, idx),
+        _ => 0,
     }
 }
 
@@ -9932,6 +9953,57 @@ mod tests {
             out.len(),
             1,
             "guard with a value body must be kept: {out:?}"
+        );
+    }
+
+    /// PR #83 review: `let s = <trapping read>; if flag { use(s) }` must keep
+    /// the read OUTSIDE the branch — inlining it into the arm would skip the
+    /// trap whenever the branch is not taken. A use the next statement
+    /// always evaluates (its `if` condition) still inlines.
+    #[test]
+    fn side_effecting_let_is_not_inlined_into_a_branch_arm() {
+        let read = || SorobanExpr::CastAs {
+            value: Box::new(SorobanExpr::StorageGet {
+                storage_type: StorageType::Instance,
+                key: Box::new(SorobanExpr::SymbolLiteral("K".to_string())),
+                unwrap: true,
+                on_missing: None,
+            }),
+            target_type: "Address".to_string(),
+        };
+        let binding = || SorobanStmt::Let {
+            name: "var_3".to_string(),
+            mutable: false,
+            value: read(),
+        };
+        let out = remove_redundant_lets(vec![
+            binding(),
+            SorobanStmt::If {
+                condition: SorobanExpr::Param("flag".to_string()),
+                then_body: vec![SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(
+                    SorobanExpr::Local(3),
+                )))],
+                else_body: Vec::new(),
+            },
+        ]);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SorobanStmt::Let { .. }, SorobanStmt::If { .. }]
+            ),
+            "the read must stay unconditional: {out:?}"
+        );
+        let out = remove_redundant_lets(vec![
+            binding(),
+            SorobanStmt::If {
+                condition: SorobanExpr::Local(3),
+                then_body: vec![SorobanStmt::Break],
+                else_body: Vec::new(),
+            },
+        ]);
+        assert!(
+            matches!(out.as_slice(), [SorobanStmt::If { condition, .. }] if *condition == read()),
+            "a use in the condition is unconditional and still inlines: {out:?}"
         );
     }
 
