@@ -5100,6 +5100,26 @@ impl<'a> LiftContext<'a> {
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
                 match (to_u64(&a), to_u64(&b)) {
                     (Some(av), Some(bv)) => self.stack.push(StackVal::I64((av & bv) as i64)),
+                    // `<x>.len() & 0xFFFF_FFFF_0000_0000`: the tag-clearing mask
+                    // on a raw `U32Val` length. KEEP it (as a marked value that
+                    // still renders as the bare `.len()`): an equality against
+                    // `N << 32` means `len == N` only WITH the mask — unmasked,
+                    // the tag bits make it constant false — so the compare
+                    // arms need to see it (PR #84 review).
+                    (_, Some(LEN_VAL_MASK)) if is_len_call(&a) => {
+                        self.stack.push(StackVal::BinOp(
+                            Box::new(a),
+                            BinOper::And,
+                            Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+                        ));
+                    }
+                    (Some(LEN_VAL_MASK), _) if is_len_call(&b) => {
+                        self.stack.push(StackVal::BinOp(
+                            Box::new(b),
+                            BinOper::And,
+                            Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+                        ));
+                    }
                     // Param/HostCallResult & val-preserving-mask: mask clears tag bits
                     // but keeps the value field. This is inline Val arithmetic (e.g., v+1
                     // encoded as (v & ~3) + (1<<32)). Pass the value through.
@@ -10460,6 +10480,43 @@ fn func_reaches_symbol_encoder(module: &WasmModule, idx: u32, depth: u32) -> boo
     func.body
         .iter()
         .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_symbol_encoder(module, *t, depth + 1)))
+}
+
+/// The mask that clears a `U32Val`'s tag/minor bits, leaving `len << 32`.
+const LEN_VAL_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+
+/// A `*_len` host-call result (the lifter's `.len()` method vocabulary).
+fn is_len_call(v: &StackVal) -> bool {
+    matches!(v, StackVal::HostCallResult(e)
+        if matches!(e.as_ref(), SorobanExpr::MethodCall { method, args, .. }
+            if method == "len" && args.is_empty()))
+}
+
+/// `(len_val & LEN_VAL_MASK) ==/!= (N << 32)` is exactly `len ==/!= N`: with
+/// the mask PROVEN present (the marked value from the `I64And` arm), decode
+/// both sides to the u32 length domain. Anything else is returned untouched
+/// — in particular an UNMASKED length against `N << 32`, which is constant
+/// (the tag bits never match) and must not be read as `len == N`.
+fn decode_masked_len_compare(a: StackVal, b: StackVal) -> (StackVal, StackVal) {
+    fn parts(m: &StackVal, k: &StackVal) -> Option<(StackVal, StackVal)> {
+        let StackVal::BinOp(len, BinOper::And, mask) = m else {
+            return None;
+        };
+        if to_u64(mask) != Some(LEN_VAL_MASK) || !is_len_call(len) {
+            return None;
+        }
+        let k = to_u64(k)?;
+        (k & 0xFFFF_FFFF == 0).then(|| ((**len).clone(), StackVal::I64((k >> 32) as i64)))
+    }
+    if let Some((len, n)) = parts(&a, &b) {
+        cov_mark::hit!(masked_len_compare_decoded);
+        return (len, n);
+    }
+    if let Some((len, n)) = parts(&b, &a) {
+        cov_mark::hit!(masked_len_compare_decoded);
+        return (n, len);
+    }
+    (a, b)
 }
 
 /// A constant CONTRACT `Error` Val: tag 3, error type (bits 8..32) zero.
@@ -19243,6 +19300,12 @@ fn stack_val_to_expr_inner(
                 }
                 // Tag extraction `v & 0xFF` → `v.get_tag()`. Anything else AND-shaped
                 // wasn't a recognized Val pattern, so it stays unknown.
+                // The tag-cleared length (see the `I64And` arm): outside an
+                // equality compare it reads as the length itself, exactly
+                // what the mask pass-through rendered before.
+                BinOper::And if to_u64(b) == Some(LEN_VAL_MASK) && is_len_call(a) => {
+                    stack_val_to_expr_inner(a, params, registry, frame_slots, visiting)
+                }
                 BinOper::And => {
                     if to_u64(b) == Some(0xFF) {
                         SorobanExpr::ValTag(Box::new(stack_val_to_expr_inner(
@@ -19259,6 +19322,19 @@ fn stack_val_to_expr_inner(
             }
         }
         StackVal::Compare(a, op, b) => {
+            // A masked length against `N << 32` decodes to the u32 length
+            // domain at RENDER time only: the abstract value keeps its raw
+            // Val-space constant, so the guard-chain classifiers that drop
+            // SDK marshalling checks (`stack_val_has_val_constant`) still
+            // recognize and drop it exactly as before.
+            let decoded: (Box<StackVal>, Box<StackVal>);
+            let (a, b) = if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                let (da, db) = decode_masked_len_compare((**a).clone(), (**b).clone());
+                decoded = (Box::new(da), Box::new(db));
+                (&decoded.0, &decoded.1)
+            } else {
+                (a, b)
+            };
             // Use arithmetic conversion for comparison operands: I64 constants
             // like 0 should stay as I64Literal(0), not decode to BoolLiteral(false)
             // via try_decode_val. The host-call result on one side still goes through
@@ -24802,6 +24878,55 @@ mod tests {
                 }
             )),
             "no recovered read for an untypable tag: {stmts:?}"
+        );
+    }
+
+    /// PR #84 review: `len ==/!= N << 32` decodes to the u32 length ONLY when
+    /// the tag-clearing mask is proven on the length operand. Unmasked, the
+    /// raw compare is constant (the `U32Val` tag bits never match) and must
+    /// not be rewritten into a real length test.
+    #[test]
+    fn len_equality_decodes_only_under_the_proven_mask() {
+        let len = || {
+            StackVal::HostCallResult(Box::new(SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::Param("hash".to_string())),
+                method: "len".to_string(),
+                args: Vec::new(),
+            }))
+        };
+        let masked = || {
+            StackVal::BinOp(
+                Box::new(len()),
+                BinOper::And,
+                Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+            )
+        };
+        let k = StackVal::I64(32 << 32);
+        // Masked, either operand order.
+        assert_eq!(
+            decode_masked_len_compare(masked(), k.clone()),
+            (len(), StackVal::I64(32))
+        );
+        assert_eq!(
+            decode_masked_len_compare(k.clone(), masked()),
+            (StackVal::I64(32), len())
+        );
+        // Unmasked: untouched.
+        assert_eq!(
+            decode_masked_len_compare(len(), k.clone()),
+            (len(), k.clone())
+        );
+        // Masked, but the constant has low bits set: untouched.
+        let odd = StackVal::I64((32 << 32) | 4);
+        assert_eq!(
+            decode_masked_len_compare(masked(), odd.clone()),
+            (masked(), odd)
+        );
+        // Outside a compare the marked value still reads as the length.
+        let reg = empty_registry();
+        assert_eq!(
+            stack_val_to_expr(&masked(), &[], &reg, None),
+            stack_val_to_expr(&len(), &[], &reg, None)
         );
     }
 }

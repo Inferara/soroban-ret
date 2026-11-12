@@ -280,10 +280,11 @@ Current baseline: **74 functions / 490 cases executed; 63 contracts checked
 (39 fixtures + all 24 mainnet corpus), 0 errored, 99.2 % behavioral match,
 4 divergences** (ceiling 4).
 
-**22 of the 63 are reported `not_recompilable`** and are therefore never
-executed: 21 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
-fixture. Only `digicus`, `fxdao-oracle`, `soroswap-CA4HEQTL` and `unknown-oracle` recompile from the
-corpus — the same three the corpus-soundness gate reports as clean-compiling.
+**21 of the 63 are reported `not_recompilable`** and are therefore never
+executed: 20 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
+fixture. Only `digicus`, `fxdao-oracle`, `soroswap-CA4HEQTL` and
+`unknown-oracle` recompile from the corpus — the same four the
+corpus-soundness gate reports as clean-compiling.
 
 All 4 divergences are in **`digicus`** (`clear_repos`, `get_repos`,
 `get_repos_and_issues`, `version`). Each is an **honest `todo!()` hole**: the
