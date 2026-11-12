@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — plain `.unwrap()` storage getters recovered by execution (#66)
+
+- The getter classifier from #67 also accepts the protocol whose absent-key
+  path is a bare trap, and renders it as one bound, typed
+  `get::<_, T>(&KEY).unwrap()`. Soroswap factory's setter guard is now
+  `get::<_, Address>(&DataKey::FeeToSetter).unwrap().require_auth()` (was
+  `DataKey::PairWasmHash.require_auth()`, #80); blend-emitter, comet, ybx-claim
+  and xycloans getters recover their values the same way.
+- Corpus soundness ratchet **318 → 304** hard errors.
+
 ### Added — fallible storage getters recovered by execution (#67)
 
 - The micro-evaluator has a protocol mode: storage `has`/`get` results are

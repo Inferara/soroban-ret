@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 92.5,
+  "overall_restoration": 92.9,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -65,12 +65,12 @@
     {
       "file": "blend-emitter-CCOQM6S7.wasm",
       "entity": "Blend Emitter",
-      "restoration_pct": 95.7,
+      "restoration_pct": 97.2,
       "spec_functions": 9,
       "fn_clean": 6,
       "fn_partial": 3,
       "fn_logic_lost": 0,
-      "artifacts_total": 24,
+      "artifacts_total": 16,
       "wasm_size": 10448,
       "error": null
     },
@@ -113,12 +113,12 @@
     {
       "file": "comet-blnd-usdc-amm-CAS3FL6T.wasm",
       "entity": "Comet BLND-USDC AMM",
-      "restoration_pct": 95.9,
+      "restoration_pct": 96.6,
       "spec_functions": 30,
-      "fn_clean": 9,
-      "fn_partial": 21,
+      "fn_clean": 12,
+      "fn_partial": 18,
       "fn_logic_lost": 0,
-      "artifacts_total": 37,
+      "artifacts_total": 34,
       "wasm_size": 29046,
       "error": null
     },
@@ -233,24 +233,24 @@
     {
       "file": "soroswap-CA4HEQTL.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 91.4,
+      "restoration_pct": 92.9,
       "spec_functions": 12,
-      "fn_clean": 3,
-      "fn_partial": 9,
+      "fn_clean": 4,
+      "fn_partial": 8,
       "fn_logic_lost": 0,
-      "artifacts_total": 24,
+      "artifacts_total": 19,
       "wasm_size": 9894,
       "error": null
     },
     {
       "file": "soroswap-CAG5LRYQ.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 89.7,
+      "restoration_pct": 89.4,
       "spec_functions": 20,
       "fn_clean": 8,
       "fn_partial": 12,
       "fn_logic_lost": 0,
-      "artifacts_total": 83,
+      "artifacts_total": 98,
       "wasm_size": 34253,
       "error": null
     },
@@ -269,24 +269,24 @@
     {
       "file": "xycloans-CBV4OSTR.wasm",
       "entity": "XycLoans",
-      "restoration_pct": 98.2,
+      "restoration_pct": 99.8,
       "spec_functions": 9,
-      "fn_clean": 7,
-      "fn_partial": 2,
+      "fn_clean": 8,
+      "fn_partial": 1,
       "fn_logic_lost": 0,
-      "artifacts_total": 13,
+      "artifacts_total": 9,
       "wasm_size": 11188,
       "error": null
     },
     {
       "file": "ybx-claim-contract-CBBM3WOK.wasm",
       "entity": "YBX Claim Contract",
-      "restoration_pct": 91.8,
+      "restoration_pct": 96.1,
       "spec_functions": 10,
-      "fn_clean": 3,
-      "fn_partial": 7,
+      "fn_clean": 6,
+      "fn_partial": 4,
       "fn_logic_lost": 0,
-      "artifacts_total": 34,
+      "artifacts_total": 16,
       "wasm_size": 9990,
       "error": null
     }

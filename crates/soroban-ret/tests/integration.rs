@@ -278,7 +278,8 @@ fn test_option_decode_trap_guard_folds_to_clean_getter() {
             .unwrap_or(source.len() - sig);
     let body = &source[sig..end];
     assert!(
-        body.contains(".get(&symbol_short!(\"Backstop\"))") && body.contains(".unwrap()"),
+        body.contains(".get::<_, Address>(&symbol_short!(\"Backstop\"))")
+            && body.contains(".unwrap()"),
         "get_backstop must recover the clean `get(..).unwrap()` getter:\n{body}"
     );
     assert!(
@@ -1571,6 +1572,30 @@ fn key_constructor_folds_do_not_claim_storage_getters() {
         !src[start..end].contains("{\n        vec![&env"),
         "get_plane must not return its storage key:\n{}",
         &src[start..end]
+    );
+}
+
+/// Issue #66 / #80: the plain `.unwrap()` storage getter is recovered by
+/// execution too. Soroswap factory's setter guard is
+/// `get::<_, Address>(&DataKey::FeeToSetter).unwrap().require_auth()`; it
+/// used to render `DataKey::PairWasmHash.require_auth()` — a storage KEY
+/// (and the wrong variant) where the stored signer belongs.
+#[test]
+fn soroswap_factory_recovers_unwrap_getter_and_its_key() {
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/soroswap-CA4HEQTL.wasm");
+    let src = decompile(wasm).expect("soroswap factory should decompile");
+    assert_in_fn(
+        &src,
+        "pub fn set_fee_to",
+        &[
+            ".get::<_, Address>(&DataKey::FeeToSetter)",
+            ".unwrap()",
+            ".require_auth()",
+        ],
+    );
+    assert!(
+        !src.contains("DataKey::PairWasmHash.require_auth()"),
+        "a storage key must never be the require_auth receiver:\n{src}"
     );
 }
 

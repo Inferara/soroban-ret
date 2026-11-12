@@ -5977,11 +5977,14 @@ fn expr_has_side_effects(expr: &SorobanExpr) -> bool {
     // `CastAs { StorageGet { on_missing: panic_with_error!(..) } }` (the
     // fallible-getter recoveries) panics on a missing key, so deleting an
     // unused binding of it drops the panic, and relocating it past a later
-    // `set` reads a different value (issue #67). Deliberately narrow: the
+    // `set` reads a different value (issue #67); `.unwrap()` traps the same
+    // way. Deliberately narrow: the
     // defaulting forms (`unwrap_or(..)`) cannot trap and stay droppable.
     if let SorobanExpr::CastAs { value, .. } = expr
-        && let SorobanExpr::StorageGet { on_missing, .. } = value.as_ref()
-        && matches!(on_missing.as_deref(), Some(SorobanExpr::PanicWithError(_)))
+        && let SorobanExpr::StorageGet {
+            on_missing, unwrap, ..
+        } = value.as_ref()
+        && (*unwrap || matches!(on_missing.as_deref(), Some(SorobanExpr::PanicWithError(_))))
     {
         return true;
     }

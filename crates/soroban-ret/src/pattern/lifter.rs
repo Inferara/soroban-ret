@@ -1594,10 +1594,13 @@ impl<'a> LiftContext<'a> {
         let getter = getter?;
         // A fully-constant key (payload-keyed getters are out of scope here).
         let key = dk_result_to_const_key(&getter.key)?;
-        let error = try_decode_val(getter.error_val, self.registry);
-        if !matches!(error, SorobanExpr::ContractError { .. }) {
-            return None;
-        }
+        let error = match getter.error_val {
+            Some(e) => match try_decode_val(e, self.registry) {
+                err @ SorobanExpr::ContractError { .. } => Some(err),
+                _ => return None,
+            },
+            None => None,
+        };
         // The helper TRAPS unless the loaded value carries the asserted tag,
         // so the read must be pinned to a type whose `TryFromVal` performs
         // exactly that check — an untyped read would be annotated `Val` when
@@ -1625,8 +1628,10 @@ impl<'a> LiftContext<'a> {
         let get_expr = SorobanExpr::StorageGet {
             storage_type: getter.storage_type,
             key: Box::new(key),
-            unwrap: false,
-            on_missing: Some(Box::new(SorobanExpr::PanicWithError(Box::new(error)))),
+            // Absent key: the proven `panic_with_error!(E)`, or — when the
+            // helper bare-traps — the `.unwrap()` that traps the same way.
+            unwrap: error.is_none(),
+            on_missing: error.map(|e| Box::new(SorobanExpr::PanicWithError(Box::new(e)))),
         };
         let value = SorobanExpr::CastAs {
             value: Box::new(get_expr),
@@ -10691,7 +10696,10 @@ enum ProtoGetterValue {
 struct ProtoFallibleGetter {
     key: DkVal,
     storage_type: StorageType,
-    error_val: i64,
+    /// `Some(E)`: the absent-key path is `fail_with_error(E)`
+    /// (`unwrap_or_else(|| panic_with_error!(env, E))`). `None`: it is a
+    /// bare trap (`.unwrap()`).
+    error_val: Option<i64>,
     value: ProtoGetterValue,
     instance_ttl_bumps: Vec<(u32, u32)>,
 }
@@ -10716,7 +10724,7 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
     if paths.len() != 3 {
         return None;
     }
-    let mut missing: Option<(i64, Vec<(u32, u32)>, DkVal, i64)> = None;
+    let mut missing: Option<(Option<i64>, Vec<(u32, u32)>, DkVal, i64)> = None;
     let mut trap: Option<(Vec<(u32, u32)>, DkVal, i64, i64)> = None;
     let mut success: Option<(Vec<(u32, u32)>, DkVal, i64, i64, ProtoGetterValue)> = None;
     for p in paths {
@@ -10755,8 +10763,14 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
             .map(|(n, taken)| proto_pred(&p.nodes, *n).map(|(pr, pol)| (pr, pol == *taken)))
             .collect::<Option<_>>()?;
         match (preds.as_slice(), &p.end, get) {
-            ([(ProtoPred::Has(ph), false)], Err(ProtoEnd::Fail(e)), None) if ph == h => {
-                if missing.replace((*e, bumps, key.clone(), *st)).is_some() {
+            ([(ProtoPred::Has(ph), false)], Err(end), None) if ph == h => {
+                // Absent key: a constant contract error, or a bare trap
+                // (the `.unwrap()` form, issue #66).
+                let e = match end {
+                    ProtoEnd::Fail(e) => Some(*e),
+                    ProtoEnd::Trap => None,
+                };
+                if missing.replace((e, bumps, key.clone(), *st)).is_some() {
                     return None;
                 }
             }
@@ -10805,7 +10819,9 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
         return None;
     }
     // A constant CONTRACT error: tag 3, error type (bits 8..32) = 0.
-    if (error_val as u64) & 0xff != TAG_ERROR || ((error_val as u64) >> 8) & 0xff_ffff != 0 {
+    if let Some(e) = error_val
+        && ((e as u64) & 0xff != TAG_ERROR || ((e as u64) >> 8) & 0xff_ffff != 0)
+    {
         return None;
     }
     let storage_type = match st {
@@ -24155,7 +24171,7 @@ mod tests {
     fn proto_getter_module() -> (WasmModule, u32) {
         // (key expr for the get, success-arm tail after the tag check, extra
         // code run only on the success arm before the tag check)
-        let variants: [(&str, &str, &str); 7] = [
+        let variants: [(&str, &str, &str); 8] = [
             // 0: THE getter.
             (
                 "local.get 2",
@@ -24199,11 +24215,22 @@ mod tests {
                 "local.get 1 local.get 2 i64.store offset=8",
                 "",
             ),
+            // 7: the plain `.unwrap()` getter — an absent key bare-traps.
+            (
+                "local.get 2",
+                "local.get 1 local.get 2 i64.store offset=8",
+                "",
+            ),
         ];
         let mut funcs = String::new();
         for (k, (get_key, tail, pre)) in variants.iter().enumerate() {
             let getter = 9 + 2 * k;
             let tag = if k == 6 { 72 } else { 77 };
+            let fail = if k == 7 {
+                ""
+            } else {
+                "i64.const 2151778615299 call 6"
+            };
             funcs.push_str(&format!(
                 r#"(func (;{getter};) (param i32) (result i64) (local i32 i64)
                     global.get 0 i32.const 16 i32.sub local.tee 1 global.set 0
@@ -24232,7 +24259,7 @@ mod tests {
                         local.get 1 i32.const 16 i32.add global.set 0
                         return
                     end
-                    i64.const 2151778615299 call 6
+                    {fail}
                     unreachable)
                 (func (result i64) i32.const 1 call {getter})
                 "#
@@ -24317,7 +24344,7 @@ mod tests {
         assert_eq!(g.value, ProtoGetterValue::Object(77));
         assert_eq!(g.storage_type, StorageType::Instance);
         assert_eq!(g.instance_ttl_bumps, vec![(100, 200)]);
-        assert_eq!(g.error_val, 2151778615299);
+        assert_eq!(g.error_val, Some(2151778615299));
         assert_eq!(
             dk_result_to_const_key(&g.key),
             Some(SorobanExpr::SymbolLiteral("TokB".to_string()))
@@ -24422,6 +24449,34 @@ mod tests {
         for caller in [12, 14, 16, 18, 20] {
             let _ = proto_lift(&m, caller);
         }
+    }
+
+    /// Issue #66: the plain `.unwrap()` getter — same protocol, but the
+    /// absent-key path is a bare trap instead of `fail_with_error(E)` —
+    /// recovers as ONE bound `get::<_, T>(&KEY).unwrap()`.
+    #[test]
+    fn proto_unwrap_getter_recovers_bound_unwrap_read() {
+        let (m, _) = proto_getter_module();
+        let g = proto_enumerate(&m, 23, &[DkVal::I32(1)])
+            .as_deref()
+            .and_then(classify_fallible_getter)
+            .expect("the unwrap getter classifies");
+        assert_eq!(g.error_val, None, "absent key bare-traps");
+        assert_eq!(g.value, ProtoGetterValue::Object(77));
+        let (stmts, _) = proto_lift(&m, 24).content.expect("effectful");
+        assert!(
+            stmts.iter().any(|s| matches!(
+                s,
+                SorobanStmt::Let {
+                    value: SorobanExpr::CastAs { value, target_type },
+                    ..
+                } if target_type == "Address" && matches!(
+                    value.as_ref(),
+                    SorobanExpr::StorageGet { unwrap: true, on_missing: None, .. }
+                )
+            )),
+            "one bound `.unwrap()` read: {stmts:?}"
+        );
     }
 
     /// A proven getter whose asserted tag has no exactly-matching Rust type
