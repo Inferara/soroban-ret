@@ -1514,6 +1514,66 @@ fn aquarius_recovers_invoke_return_types_and_drops_tag_assert_husks() {
     );
 }
 
+/// Issue #67: the aquarius fallible storage getters
+/// (`get::<_, T>(&KEY).unwrap_or_else(|| panic_with_error!(e, ValueNotInitialized))`)
+/// are recovered by EXECUTING the helper along every path, in the shapes the
+/// tranche-6 window detector could not see: the Option decode fused into a
+/// selector-keyed getter, and the `u32` payload getter over an sret helper.
+/// Before, each rendered `if todo!("unknown value") { panic_with_error!(..) }`
+/// with the value lost.
+#[test]
+fn aqua_rewards_recovers_fallible_getters_by_execution() {
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/aqua-rewards-CCY2PXGM.wasm");
+    let src = decompile(wasm).expect("aqua-rewards should decompile");
+    for (sig, ty, key) in [
+        ("pub fn get_fee_fraction", "u32", "DataKey::FeeFraction"),
+        ("pub fn get_pools_plane", "Address", "DataKey::Plane"),
+    ] {
+        let get = format!(".get::<_, {ty}>(&{key})");
+        assert_in_fn(
+            &src,
+            sig,
+            &[
+                ".extend_ttl(2592000, 3110400)",
+                &get,
+                ".unwrap_or_else(|| panic_with_error!(&env, StorageError::ValueNotInitialized))",
+            ],
+        );
+        let start = src.find(sig).unwrap();
+        let end = start + src[start..].find("\n    pub fn ").unwrap();
+        assert!(
+            !src[start..end].contains("todo!("),
+            "{sig} must be fully recovered:\n{}",
+            &src[start..end]
+        );
+    }
+}
+
+/// Issue #67 (and the class-A symptom of issue #80): a key-constructor fold
+/// must never claim a storage GETTER. `i32.const <descriptor>; call $getter`
+/// used to fold to the getter's own key, so the storage KEY was rendered
+/// where the stored value belongs, with no `todo!()` to flag it.
+#[test]
+fn key_constructor_folds_do_not_claim_storage_getters() {
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/aqua-amm-CBQDHNBF.wasm");
+    let src = decompile(wasm).expect("aqua-amm should decompile");
+    assert_in_fn(
+        &src,
+        "pub fn get_plane",
+        &[
+            ".get::<_, Address>(&vec![&env, symbol_short!(\"PoolPlane\")])",
+            "panic_with_error!(&env, StorageError::ValueNotInitialized)",
+        ],
+    );
+    let start = src.find("pub fn get_plane").unwrap();
+    let end = start + src[start..].find("\n    pub fn ").unwrap();
+    assert!(
+        !src[start..end].contains("{\n        vec![&env"),
+        "get_plane must not return its storage key:\n{}",
+        &src[start..end]
+    );
+}
+
 #[test]
 fn aquarius_recovers_descriptor_pointer_datakey_storage_keys() {
     // Long-symbol storage keys built via a constant descriptor-pointer chain
@@ -1557,9 +1617,17 @@ fn aquarius_recovers_descriptor_pointer_datakey_storage_keys() {
     );
 
     // Sibling accessors through the same constructor resolve their own discriminants.
-    assert!(
-        src.contains(r#"Symbol::new(&env, "InitPoolPaymentToken")"#),
-        "get_init_pool_payment_token should recover its key symbol"
+    // `get_init_pool_payment_token` must READ storage under that key — before
+    // issue #67 the key fold claimed the whole getter and the bare key symbol
+    // was returned where the stored Address belongs, which also satisfied a
+    // plain `contains` on the symbol.
+    assert_in_fn(
+        &src,
+        "pub fn get_init_pool_payment_token",
+        &[
+            ".get::<_, Address>(&vec![&env, Symbol::new(&env, \"InitPoolPaymentToken\")])",
+            "panic_with_error!(&env, StorageError::ValueNotInitialized)",
+        ],
     );
     assert!(
         src.contains(r#"Symbol::new(&env, "InitStablePoolPaymentAmount")"#),

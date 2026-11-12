@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — fallible storage getters recovered by execution (#67)
+
+- The micro-evaluator has a protocol mode: storage `has`/`get` results are
+  symbolic, `fail_with_error` and `unreachable` are path terminals, and every
+  path of a helper is enumerated. A helper call is rewritten to
+  `get::<_, T>(&KEY).unwrap_or_else(|| panic_with_error!(&env, E))` only when
+  its complete path set is exactly that protocol. This recovers the aquarius
+  `StorageError::ValueNotInitialized` getters in the shapes the window
+  detector missed (selector- and descriptor-keyed `Address` getters, the `u32`
+  fee getter): the lost `if todo!("unknown value") { panic_with_error!(..) }`
+  guard and the lost value both come back as one typed, bound read.
+- `DBG_PROTO=1` prints the path set of every constant-argument helper call
+  that reads storage, as a census tool for the remaining guard classes (#66).
+
+### Fixed — storage key rendered in place of the stored value (#67, #80)
+
+- The key-constructor folds also claimed storage *getters*, so a call to the
+  getter was replaced by its own key (`vec![&env, Symbol::new(&env,
+  "RewardToken")]` where the stored `Address` belongs) with no `todo!()`. They
+  now refuse any target that does more than build a value.
+- A trapping getter read wrapped in a type annotation was treated as pure, so
+  an unused one was deleted together with its panic-on-missing.
+- Corpus soundness ratchet **326 → 318** hard errors (aqua-amm 55 → 46;
+  aqua-rewards 24 → 25 is an audited unmask of a pre-existing render gap).
+  Soroswap factory's four key-as-value sites are now honest holes: its getter
+  uses plain `.unwrap()` and is not yet recovered.
+
 ### Added — per-contract recovery signals
 
 - New public `soroban_ret::recovery` module: per-function recovery verdicts
