@@ -1515,6 +1515,32 @@ fn aquarius_recovers_invoke_return_types_and_drops_tag_assert_husks() {
     );
 }
 
+/// Issue #69: digicus `version()` is a looped parse of a static version
+/// string — a constant — and `clear_repos`'s admin check fails with the
+/// contract's own error when no admin is stored (it rendered `.unwrap()`,
+/// and the `repos` reset that follows was dropped).
+#[test]
+fn digicus_recovers_constant_version_and_auth_guard() {
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/digicus-CCZLARB4.wasm");
+    let src = decompile(wasm).expect("digicus should decompile");
+    assert_in_fn(&src, "pub fn version", &["0"]);
+    let start = src.find("pub fn version").unwrap();
+    let end = start + src[start..].find("\n    pub fn ").unwrap();
+    assert!(!src[start..end].contains("todo!("), "{}", &src[start..end]);
+    assert_in_fn(
+        &src,
+        "pub fn clear_repos",
+        &[
+            ".get::<_, Address>(&String::from_str(&env, \"admin\"))",
+            ".unwrap_or_else(|| panic_with_error!(&env, Error::Unauthorized))",
+            ".require_auth()",
+            ".set(",
+            "&String::from_str(&env, \"repos\")",
+            "Map::<soroban_sdk::Val, soroban_sdk::Val>::new(&env)",
+        ],
+    );
+}
+
 /// Issue #67: the aquarius fallible storage getters
 /// (`get::<_, T>(&KEY).unwrap_or_else(|| panic_with_error!(e, ValueNotInitialized))`)
 /// are recovered by EXECUTING the helper along every path, in the shapes the

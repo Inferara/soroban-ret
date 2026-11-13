@@ -210,7 +210,7 @@ Note the CLI binary is built from `soroban-ret-cli`, not `soroban-ret` —
 
 - **Accuracy** — interface similarity vs the SDK reference sources: **98.3 %** over 37 scored contracts (2 skipped for lacking a reference source).
 - **Spec-consistency** — generated signatures/types vs each contract's own `contractspecv0`, across all 63 contracts including the mainnet corpus, which has no reference source: **0** dropped/extra functions, **0** arity mismatches, mean signature similarity **98.9 %**.
-- **Structural plausibility** — a ratchet on per-contract recovery vs `benchmark-data/baseline.json` (corpus mean restoration **92.8 %**).
+- **Structural plausibility** — a ratchet on per-contract recovery vs `benchmark-data/baseline.json` (corpus mean restoration **93.3 %**).
 
 Three heavier gates compile decompiled output back for `wasm32v1-none` and are opt-in via env var (also run in CI):
 
@@ -218,12 +218,12 @@ Three heavier gates compile decompiled output back for `wasm32v1-none` and are o
 # ≥95% of fixtures recompile (cargo check) — currently 38/39 = 97%
 SOROBAN_RET_COMPILE_BACK=1 cargo test -p soroban-ret --test compile_back
 
-# mainnet corpus hard-error ratchet — currently 304 errors, 4 of 24 clean
+# mainnet corpus hard-error ratchet — currently 303 errors, 4 of 24 clean
 SOROBAN_RET_CORPUS_SOUNDNESS=1 cargo test -p soroban-ret --test corpus_soundness
 
 # functional equivalence: recompile to wasm, run BOTH the original and
 # recompiled contract through soroban-env-host, and diff their outputs
-# — currently 99.2% behavioral match, 4 divergences
+# — currently 99.6% behavioral match, 2 divergences
 SOROBAN_RET_EQUIV=1 cargo test -p soroban-ret-equiv --test equivalence
 ```
 
@@ -231,17 +231,17 @@ These three are **error-count ratchets pinned to rustc 1.95.0**
 (`RUSTUP_TOOLCHAIN`, as in CI): rustc diagnostics drift across floating
 `stable` releases, so numbers measured on another toolchain are not comparable.
 
-> **These are corpus metrics, not per-contract guarantees.** 92.8 % is an
+> **These are corpus metrics, not per-contract guarantees.** 93.3 % is an
 > equal-weight mean across 24 mainnet contracts, and it is *correctness-blind* —
 > it grades how much lifted to concrete Rust, not whether the result is right.
-> 99.2 % is a match rate over the narrow slice the equivalence harness can
+> 99.6 % is a match rate over the narrow slice the equivalence harness can
 > actually execute (scalar-argument functions on contracts whose output
 > recompiles — 4 of the 24 corpus contracts today). Neither figure transfers to
 > an arbitrary contract; for a per-contract signal use
 > [`DecompileResult::recovery`](#per-contract-recovery-signals), which is
 > computed from that contract alone.
 
-All four remaining equivalence divergences are honest `todo!()` holes that trap,
+Both remaining equivalence divergences are honest `todo!()` holes that trap,
 not fabricated values. See [`docs/pattern-coverage.md`](docs/pattern-coverage.md)
 for each gate's scope, methodology and current baseline.
 

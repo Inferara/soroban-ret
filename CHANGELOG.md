@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — two of the four digicus divergences (#69)
+
+- A zero-parameter export that is a pure computation over static data
+  (digicus `version()` parses a version string in nested loops) is executed
+  and rendered as its constant.
+- Getter recovery by execution now covers `String::from_str` storage keys and
+  the auth guard `get::<_, Address>(&KEY).unwrap_or_else(|| panic_with_error!(..))
+  .require_auth()`. digicus `clear_repos` keeps its `Unauthorized` error and
+  the storage write that was being dropped; fxdao-liquidity's `NotStarted`
+  manager guards are recovered (15 → 10 errors).
+- An empty `Map`/`Vec` stored directly pins its element types to `Val`.
+- Equivalence divergences **4 → 2** (99.6 % match); corpus hard errors
+  **304 → 303**. The remaining two (`get_repos`, `get_repos_and_issues`) need
+  the proven empty-map default, which is withheld until the loops that mutate
+  that map lift correctly.
+
 ### Fixed — soroswap factory compiles and matches the original (#80)
 
 - `Result`-returning exports keep their error path. The SDK lowers

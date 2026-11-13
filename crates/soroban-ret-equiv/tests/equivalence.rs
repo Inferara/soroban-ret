@@ -36,13 +36,19 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// recompiled contracts differ). A ratchet: drive DOWN as the decompiler
 /// recovers more behavior; never raise without understanding the new divergence.
 ///
-/// Measured baseline = 4 (74 fns / 490 cases executed; 63 contracts checked —
-/// 39 fixtures + 24 corpus — 99.2% match). The whole set is `digicus`:
-/// `clear_repos`/`get_repos`/`get_repos_and_issues`/`version` — honest
-/// todo-panics (the recompiled function hits a `todo!()` hole and traps as
-/// `Error(Context, InvalidAction)`); the long-standing values the lifter has
-/// not recovered. No entry is a fabricated wrong value.
+/// Measured baseline = 2 (74 fns / 490 cases executed; 63 contracts checked —
+/// 39 fixtures + 24 corpus — 99.6% match). Both are `digicus`:
+/// `get_repos` / `get_repos_and_issues` — honest todo-panics (the recompiled
+/// function hits a `todo!()` hole and traps as `Error(Context,
+/// InvalidAction)` where the original returns an empty collection). No
+/// entry is a fabricated wrong value. Their getter IS proven
+/// (`get(&"repos").unwrap_or(Map::new(&env))`) but its recovery is withheld
+/// until the collection-mutation loops that consume the same value lift
+/// (see `proto_defaulting_collection_withheld`).
 ///
+/// Previously 4 (issue #69: `version` — a looped parse of a static string —
+/// is evaluated as the constant it is; `clear_repos`'s admin check renders
+/// its real `panic_with_error!(Error::Unauthorized)` instead of `.unwrap()`).
 /// Previously 6 (issue #38 t24 closed the 2 `test_alloc` overflow cases:
 /// the byte-count `i32.shl` now renders wrapping-exact `count << 2` instead
 /// of `count * 4`, and the vestigial never-read byte-offset counter — whose
@@ -58,7 +64,7 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// (`detect_fallible_storage_get_helper`) eliminating `unknown-oracle`'s 56
 /// empty-storage divergences; 75 → 60 from the `checked_add`/`checked_sub`
 /// recovery (`recover_checked_arith_from_body`).
-const DIVERGENCE_CEILING: usize = 4;
+const DIVERGENCE_CEILING: usize = 2;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).
