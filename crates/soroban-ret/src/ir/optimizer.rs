@@ -3990,7 +3990,48 @@ fn is_carry_borrow_flag(e: &SorobanExpr) -> bool {
     )
 }
 
+/// Decode a raw-`Val` length ORDER comparison. Every `*_len` host function
+/// returns a `U32Val` — `(len << 32) | 4` — and the SDK's inlined checks
+/// compare it without decoding: `len_val < (N << 32)`. The lifter models the
+/// host call as the u32 `.len()`, but the constant kept its Val-space bits
+/// (`x.len() < 4294967296`, an out-of-range literal for `u32`; issue #80).
+///
+/// A `.len()` is a `u32`, so a comparison against a constant above
+/// `u32::MAX` whose low 32 bits are zero can only be that raw form. Only
+/// `<` and `>=` decode here: for those two the answer is `len </>= N`
+/// whether or not the tag bits were masked off first. `==` / `!=` are NOT
+/// decoded here — unmasked they are constant (the tag bits never match), so
+/// they decode only in the lifter, where the mask is proven
+/// (`decode_masked_len_compare`). `<=` / `>` differ by one between the two
+/// readings and are left untouched.
+fn decode_raw_val_len_compare(expr: SorobanExpr) -> SorobanExpr {
+    fn is_len(e: &SorobanExpr) -> bool {
+        matches!(e, SorobanExpr::MethodCall { method, args, .. } if method == "len" && args.is_empty())
+    }
+    fn decoded(e: &SorobanExpr) -> Option<SorobanExpr> {
+        let k = match e {
+            SorobanExpr::I64Literal(k) => *k as u64,
+            SorobanExpr::U64Literal(k) => *k,
+            _ => return None,
+        };
+        (k > u32::MAX as u64 && k & 0xFFFF_FFFF == 0)
+            .then_some(SorobanExpr::I64Literal((k >> 32) as i64))
+    }
+    match expr {
+        SorobanExpr::Lt(a, b) if is_len(&a) => match decoded(&b) {
+            Some(n) => SorobanExpr::Lt(a, Box::new(n)),
+            None => SorobanExpr::Lt(a, b),
+        },
+        SorobanExpr::Ge(a, b) if is_len(&a) => match decoded(&b) {
+            Some(n) => SorobanExpr::Ge(a, Box::new(n)),
+            None => SorobanExpr::Ge(a, b),
+        },
+        other => other,
+    }
+}
+
 fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
+    let expr = decode_raw_val_len_compare(expr);
     match expr {
         SorobanExpr::Add(a, b) => {
             let a = fold_expr(*a);
@@ -9953,6 +9994,53 @@ mod tests {
             out.len(),
             1,
             "guard with a value body must be kept: {out:?}"
+        );
+    }
+
+    /// Issue #80: a `.len()` compared against a raw `U32Val`-space constant
+    /// (`N << 32`) decodes to the comparison against `N`, for the ORDER
+    /// operators where the masked and unmasked raw forms agree.
+    #[test]
+    fn raw_val_len_compare_decodes_to_the_u32_length() {
+        let len = || {
+            Box::new(SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::Param("hash".to_string())),
+                method: "len".to_string(),
+                args: Vec::new(),
+            })
+        };
+        let k = |v: i64| Box::new(SorobanExpr::I64Literal(v));
+        assert_eq!(
+            fold_expr(SorobanExpr::Lt(len(), k(1 << 32))),
+            SorobanExpr::Lt(len(), k(1))
+        );
+        assert_eq!(
+            fold_expr(SorobanExpr::Ge(len(), k(2 << 32))),
+            SorobanExpr::Ge(len(), k(2))
+        );
+        // `==` / `!=`: constant unless the tag bits were masked off, which
+        // only the lifter can prove — never decoded here (PR #84 review).
+        assert_eq!(
+            fold_expr(SorobanExpr::Ne(len(), k(32 << 32))),
+            SorobanExpr::Ne(len(), k(32 << 32))
+        );
+        assert_eq!(
+            fold_expr(SorobanExpr::Eq(len(), k(32 << 32))),
+            SorobanExpr::Eq(len(), k(32 << 32))
+        );
+        // `<=` / `>`: the two raw readings disagree — left untouched.
+        assert_eq!(
+            fold_expr(SorobanExpr::Le(len(), k(2 << 32))),
+            SorobanExpr::Le(len(), k(2 << 32))
+        );
+        // Tag bits present, an in-range constant, a non-len operand: untouched.
+        assert_eq!(
+            fold_expr(SorobanExpr::Ne(len(), k((32 << 32) | 4))),
+            SorobanExpr::Ne(len(), k((32 << 32) | 4))
+        );
+        assert_eq!(
+            fold_expr(SorobanExpr::Ne(len(), k(32))),
+            SorobanExpr::Ne(len(), k(32))
         );
     }
 

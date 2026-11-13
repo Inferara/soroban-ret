@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — soroswap factory compiles and matches the original (#80)
+
+- `Result`-returning exports keep their error path. The SDK lowers
+  `if ok { Ok(v) } else { Err(E) }` three ways (a tail value-`if`, an error
+  preset in a local, an error carried out of a block by `br_if`); each now
+  renders an explicit `Err(E)` return instead of silently falling through to
+  the success path. Where the success value is path-dependent and unproven it
+  is an explicit hole, never a guessed constant.
+- Descriptor-pointer storage keys are resolved by executing the key
+  constructor. The body-order string shortcut picked the wrong variant when the
+  constructor's arms are not in discriminant order: soroswap factory read
+  `TotalPairs` as `PairAddressesNIndexed`, and fxdao-oracle's `AssetsData`
+  keys rendered as `AssetRecord`.
+- A `.len()` compared against a raw `U32Val` constant decodes to the u32
+  length (`len() != 32`, was `!= 137438953472`); 30 sites corpus-wide.
+- `publish` with a lost (`todo!()`) topic or data pins the type rustc was
+  falling back to, which a deny-by-default lint rejected.
+- The `u32` getter that defaults on a missing key recovers as
+  `get::<_, u32>(&KEY).unwrap_or(d)` (was `.unwrap()` or a hole).
+- Clean-compiling corpus contracts **3 → 4**; the factory runs under the
+  equivalence gate with 11 cases at 100 % match. Divergences stay at 4.
+
 ### Added — plain `.unwrap()` storage getters recovered by execution (#66)
 
 - The getter classifier from #67 also accepts the protocol whose absent-key

@@ -207,7 +207,7 @@ functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
 
-The headline restoration figure this produces — **92.9 %**
+The headline restoration figure this produces — **92.8 %**
 (`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
 mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
 **correctness-blind**: it grades how much of each function lifted to concrete
@@ -255,7 +255,7 @@ lifter emitted: output that *looks* like code but does not type-check. The
 metric is "wrong output", not "incomplete output".
 
 Current status: **304 hard errors across 24 contracts** (ceiling 304), with
-**3 contracts compiling cleanly** — `digicus`, `fxdao-oracle`, `unknown-oracle`.
+**4 contracts compiling cleanly** — `digicus`, `fxdao-oracle`, `soroswap-CA4HEQTL`, `unknown-oracle`.
 Down from 1042 at the start of the v0.0.4 cycle. Every intermediate *rise* in
 this ratchet has been an audited, deliberate unmask (fixing a type error
 un-suppresses pre-existing brokenness rustc's error recovery was hiding); see
@@ -276,14 +276,15 @@ and compares the outcomes (lowered to canonical `ScVal`). A divergence is a
 decompiler correctness limitation; the gate is a ratchet on the divergence
 count, like the corpus-soundness gate.
 
-Current baseline: **68 functions / 479 cases executed; 63 contracts checked
+Current baseline: **74 functions / 490 cases executed; 63 contracts checked
 (39 fixtures + all 24 mainnet corpus), 0 errored, 99.2 % behavioral match,
 4 divergences** (ceiling 4).
 
-**22 of the 63 are reported `not_recompilable`** and are therefore never
-executed: 21 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
-fixture. Only `digicus`, `fxdao-oracle` and `unknown-oracle` recompile from the
-corpus — the same three the corpus-soundness gate reports as clean-compiling.
+**21 of the 63 are reported `not_recompilable`** and are therefore never
+executed: 20 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
+fixture. Only `digicus`, `fxdao-oracle`, `soroswap-CA4HEQTL` and
+`unknown-oracle` recompile from the corpus — the same four the
+corpus-soundness gate reports as clean-compiling.
 
 All 4 divergences are in **`digicus`** (`clear_repos`, `get_repos`,
 `get_repos_and_issues`, `version`). Each is an **honest `todo!()` hole**: the

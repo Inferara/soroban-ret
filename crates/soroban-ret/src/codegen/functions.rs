@@ -467,6 +467,7 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 let data_expr = generate_expr(data);
                 quote! { #data_expr.publish(&env) }
             } else {
+                let never_data = is_never_rooted(data.as_ref());
                 let data = generate_expr(data);
                 // Flatten: if topics is a single TupleConstruct, use its inner fields
                 let topic_list: Vec<&SorobanExpr> = if topics.len() == 1 {
@@ -479,7 +480,30 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                     topics.iter().collect()
                 };
                 let topic_exprs: Vec<_> = topic_list.iter().map(|t| generate_expr(t)).collect();
-                quote! { env.events().publish((#(#topic_exprs),*), #data) }
+                // A lost topic tuple / lost data renders as a bare `todo!()`
+                // (`!`). `publish<T: Topics, D: IntoVal<..>>` cannot infer a
+                // type from `!`, so rustc falls back to `()` — which the
+                // deny-by-default `dependency_on_unit_never_type_fallback`
+                // lint rejects (a hard error in edition 2024). Pin exactly
+                // that fallback explicitly: the `todo!()` panics before the
+                // call either way, so behavior is unchanged and an intact
+                // operand keeps its inferred type (`_`).
+                let never_topics = matches!(topic_list.as_slice(), [t] if is_never_rooted(t));
+                if never_topics || never_data {
+                    let t = if never_topics {
+                        quote! { () }
+                    } else {
+                        quote! { _ }
+                    };
+                    let d = if never_data {
+                        quote! { () }
+                    } else {
+                        quote! { _ }
+                    };
+                    quote! { env.events().publish::<#t, #d>((#(#topic_exprs),*), #data) }
+                } else {
+                    quote! { env.events().publish((#(#topic_exprs),*), #data) }
+                }
             }
         }
 

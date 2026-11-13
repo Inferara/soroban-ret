@@ -1599,6 +1599,71 @@ fn soroswap_factory_recovers_unwrap_getter_and_its_key() {
     );
 }
 
+/// Issue #80 item 4 + the never-typed event publish: the two constructs
+/// that kept soroswap factory from compiling after its getters were
+/// recovered. A raw `U32Val`-space length constant decodes to the u32
+/// length (`len() != 32`, not `!= 137438953472`), and a `publish` whose
+/// topics are a lost `todo!()` pins the `()` type rustc would otherwise
+/// fall back to (a deny-by-default lint).
+#[test]
+fn soroswap_factory_decodes_len_compare_and_pins_never_publish() {
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/soroswap-CA4HEQTL.wasm");
+    let src = decompile(wasm).expect("soroswap factory should decompile");
+    assert_in_fn(&src, "pub fn initialize", &["pair_wasm_hash.len() != 32"]);
+    assert!(
+        !src.contains("137438953472"),
+        "raw Val length constant:\n{src}"
+    );
+    assert!(
+        !src.contains(".publish(todo!("),
+        "a never-typed publish must pin its type parameters:\n{src}"
+    );
+    assert!(src.contains(".publish::<(), _>(todo!("));
+}
+
+/// Issue #80: soroswap factory's `Result` exports keep their not-initialized
+/// error path, in all three shapes the SDK lowers it to, and read the keys
+/// the constructor really builds (`TotalPairs`, not its body-order successor
+/// `PairAddressesNIndexed`).
+#[test]
+fn soroswap_factory_keeps_not_initialized_error_paths() {
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/soroswap-CA4HEQTL.wasm");
+    let src = decompile(wasm).expect("soroswap factory should decompile");
+    // Tail value-`if`: `if init { Ok(v) } else { Err(E) }`, value recovered.
+    assert_in_fn(
+        &src,
+        "pub fn all_pairs_length",
+        &[
+            ".has(&DataKey::TotalPairs)",
+            ".get::<_, u32>(&DataKey::TotalPairs)",
+            ".unwrap_or(0)",
+            "Err(FactoryError::NotInitialized)",
+        ],
+    );
+    // Error preset in a local, overwritten on the success path.
+    assert_in_fn(
+        &src,
+        "pub fn set_fees_enabled",
+        &[
+            ".has(&DataKey::TotalPairs)",
+            "return Err(FactoryError::NotInitialized)",
+        ],
+    );
+    // Error carried out of a value block by `br_if`.
+    assert_in_fn(
+        &src,
+        "pub fn all_pairs(",
+        &[
+            "!env.storage().instance().has(&DataKey::TotalPairs)",
+            "return Err(FactoryError::NotInitialized)",
+        ],
+    );
+    assert!(
+        !src.contains("PairAddressesNIndexed\")"),
+        "shifted key:\n{src}"
+    );
+}
+
 #[test]
 fn aquarius_recovers_descriptor_pointer_datakey_storage_keys() {
     // Long-symbol storage keys built via a constant descriptor-pointer chain
@@ -1776,18 +1841,27 @@ fn snapshot_contract_with_constructor() {
 }
 
 /// Issue #38 t22 (#61): fully-static symbol-builder loops are EVALUATED at
-/// lift time — fxdao-oracle's storage keys recover as the real
-/// `Symbol::new(&env, "AssetRecord")` instead of the fabricated tag-only
-/// `vec![&env, 14]` (an empty `SymbolSmall` — the one-iteration artifact
-/// that silently compiled inside a "clean" contract).
+/// lift time, so fxdao-oracle's storage keys are real symbols instead of the
+/// fabricated tag-only `vec![&env, 14]` (an empty `SymbolSmall`).
+///
+/// Issue #80 follow-up: WHICH symbol is decided by executing the key
+/// constructor, not by indexing its variant strings in body order. This
+/// constructor niche-encodes its enum (`AssetRecord`'s payload occupies
+/// discriminants 0/1, so the unit variant `AssetsData` is discriminant 2 and
+/// its arm comes FIRST); the body-order shortcut read these keys as
+/// `AssetRecord`, a payload variant with no payload.
 #[test]
 fn fxdao_oracle_recovers_real_symbol_keys() {
     let wasm = include_bytes!("../../../benchmark-data/mainnet/fxdao-oracle-CB5OTV4G.wasm");
     let source = decompile(wasm).expect("decompile fxdao-oracle");
     assert!(
-        source.contains("Symbol::new(&env, \"AssetRecord\")"),
-        "const-loop evaluation must recover the real AssetRecord key:\n{}",
+        source.contains(".get(&AssetsKeys::AssetsData)"),
+        "the executed constructor yields the AssetsData key:\n{}",
         &source[..source.len().min(4000)]
+    );
+    assert!(
+        !source.contains("Symbol::new(&env, \"AssetRecord\")"),
+        "a payload variant must not appear as a bare unit key"
     );
     assert!(
         !source.contains("vec![&env, 14]"),
