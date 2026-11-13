@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 92.8,
+  "overall_restoration": 93.3,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -125,24 +125,24 @@
     {
       "file": "digicus-CCZLARB4.wasm",
       "entity": "Digicus",
-      "restoration_pct": 87.8,
+      "restoration_pct": 92.3,
       "spec_functions": 12,
-      "fn_clean": 8,
-      "fn_partial": 3,
-      "fn_logic_lost": 1,
-      "artifacts_total": 7,
+      "fn_clean": 6,
+      "fn_partial": 6,
+      "fn_logic_lost": 0,
+      "artifacts_total": 17,
       "wasm_size": 6373,
       "error": null
     },
     {
       "file": "fxdao-liquidity-locking-pool-CDCART6W.wasm",
       "entity": "FxDAO Liquidity locking pool",
-      "restoration_pct": 86.8,
+      "restoration_pct": 94.0,
       "spec_functions": 12,
-      "fn_clean": 0,
-      "fn_partial": 12,
+      "fn_clean": 5,
+      "fn_partial": 7,
       "fn_logic_lost": 0,
-      "artifacts_total": 33,
+      "artifacts_total": 22,
       "wasm_size": 14499,
       "error": null
     },
@@ -197,24 +197,24 @@
     {
       "file": "reflector-CAFJZQWS.wasm",
       "entity": "Reflector",
-      "restoration_pct": 93.9,
+      "restoration_pct": 93.8,
       "spec_functions": 23,
       "fn_clean": 14,
       "fn_partial": 9,
       "fn_logic_lost": 0,
-      "artifacts_total": 60,
+      "artifacts_total": 61,
       "wasm_size": 19418,
       "error": null
     },
     {
       "file": "reflector-CALI2BYU.wasm",
       "entity": "Reflector",
-      "restoration_pct": 93.9,
+      "restoration_pct": 93.8,
       "spec_functions": 23,
       "fn_clean": 14,
       "fn_partial": 9,
       "fn_logic_lost": 0,
-      "artifacts_total": 60,
+      "artifacts_total": 61,
       "wasm_size": 19418,
       "error": null
     },

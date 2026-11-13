@@ -425,7 +425,17 @@ use std::process::Command;
 /// decoded corpus-wide to the u32 length) and never-typed
 /// `publish(todo!(), ..)` (type parameters now pinned). No per-contract
 /// count moved.
-const ERROR_CEILING: u32 = 304;
+/// → 303 (issue #69: string-keyed getters + auth guards by execution, −1).
+/// Protocol mode gained `String::from_str` keys, `require_auth` on a read's
+/// result, and the empty-collection default. fxdao-liquidity 15→10: its
+/// `if todo!() { panic_with_error!(NotStarted) }; todo!().require_auth()`
+/// guards are now `get::<_, Address>(&CoreDataKeys::Manager)
+/// .unwrap_or_else(|| panic_with_error!(..NotStarted)).require_auth()`.
+/// reflector ×2 9→11 each, audited unmask: the admin guard and typed
+/// `u32` reads replace holes that had collapsed whole bodies (a fabricated
+/// `1048681` return becomes `get::<_, u32>(&"cache_size").unwrap_or(2)`),
+/// exposing the still-broken code behind them. digicus stays clean.
+const ERROR_CEILING: u32 = 303;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

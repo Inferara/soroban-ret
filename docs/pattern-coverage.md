@@ -207,7 +207,7 @@ functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
 
-The headline restoration figure this produces — **92.8 %**
+The headline restoration figure this produces — **93.3 %**
 (`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
 mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
 **correctness-blind**: it grades how much of each function lifted to concrete
@@ -254,7 +254,7 @@ every mainnet corpus contract and `cargo check`s the result for
 lifter emitted: output that *looks* like code but does not type-check. The
 metric is "wrong output", not "incomplete output".
 
-Current status: **304 hard errors across 24 contracts** (ceiling 304), with
+Current status: **303 hard errors across 24 contracts** (ceiling 303), with
 **4 contracts compiling cleanly** — `digicus`, `fxdao-oracle`, `soroswap-CA4HEQTL`, `unknown-oracle`.
 Down from 1042 at the start of the v0.0.4 cycle. Every intermediate *rise* in
 this ratchet has been an audited, deliberate unmask (fixing a type error
@@ -277,8 +277,8 @@ decompiler correctness limitation; the gate is a ratchet on the divergence
 count, like the corpus-soundness gate.
 
 Current baseline: **74 functions / 490 cases executed; 63 contracts checked
-(39 fixtures + all 24 mainnet corpus), 0 errored, 99.2 % behavioral match,
-4 divergences** (ceiling 4).
+(39 fixtures + all 24 mainnet corpus), 0 errored, 99.6 % behavioral match,
+2 divergences** (ceiling 2).
 
 **21 of the 63 are reported `not_recompilable`** and are therefore never
 executed: 20 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
@@ -286,18 +286,18 @@ fixture. Only `digicus`, `fxdao-oracle`, `soroswap-CA4HEQTL` and
 `unknown-oracle` recompile from the corpus — the same four the
 corpus-soundness gate reports as clean-compiling.
 
-All 4 divergences are in **`digicus`** (`clear_repos`, `get_repos`,
-`get_repos_and_issues`, `version`). Each is an **honest `todo!()` hole**: the
+Both divergences are in **`digicus`** (`get_repos`,
+`get_repos_and_issues`). Each is an **honest `todo!()` hole**: the
 recompiled function reaches an unrecovered value and traps as
-`Error(Context, InvalidAction)` where the original returns a real value or its
-own `Error(Contract, #1)`. **No divergence is a fabricated wrong value** — the
+`Error(Context, InvalidAction)` where the original returns an empty
+collection. **No divergence is a fabricated wrong value** — the
 distinction that matters for any consumer surfacing these results.
 
 History of this ratchet: 75 / 82.3 % → 60 (the `checked_add`/`checked_sub` →
 `.ok_or(..)` recovery) → 4 (the fallible-storage-get recovery eliminated
 `unknown-oracle`'s 56 empty-storage divergences) → 9 (issue #38 t19 *unmasked*
 `num_list`: the fixture became recompilable for the first time, exposing
-divergences previously hidden behind a compile error) → 8 → 6 → **4** (t21/t23
+divergences previously hidden behind a compile error) → 8 → 6 → 4 → **2** (t21/t23
 recovered the vec accumulator and the populate→push value relay; t24's
 wrapping-exact `<<` render and dead-counter elimination closed the last two
 `test_alloc` overflow cases). `test_alloc` now matches on every generated
@@ -310,7 +310,7 @@ input vectors per function) and no required storage/auth state are executed;
 aggregate/UDT-argument functions, and the renamed `__constructor`/`__check_auth`,
 are skipped, as are contracts whose output does not recompile. It is a
 correctness sanity-check + behavioral-match metric, **not** a full-corpus
-differential test — and the 99.2 % is a match rate over that narrow executed
+differential test — and the 99.6 % is a match rate over that narrow executed
 slice, not a per-contract correctness guarantee.
 
 ### Known gaps

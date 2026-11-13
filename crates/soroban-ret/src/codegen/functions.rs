@@ -393,7 +393,19 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
             let k_never = is_never_rooted(key);
             let v_never = is_never_rooted(value);
             let key = ref_arg(key);
-            let value = ref_arg(value);
+            // A freshly built EMPTY collection stored directly: nothing else
+            // constrains its element types, so the bare `Map::new(&env)` is
+            // always un-inferable (E0283). An empty collection's stored form
+            // does not depend on its element types — pin them to `Val`.
+            let value = match value.as_ref() {
+                SorobanExpr::CollectionNew(c) if c == "Map" => {
+                    quote! { &Map::<soroban_sdk::Val, soroban_sdk::Val>::new(&env) }
+                }
+                SorobanExpr::CollectionNew(c) if c == "Vec" => {
+                    quote! { &Vec::<soroban_sdk::Val>::new(&env) }
+                }
+                _ => ref_arg(value),
+            };
             match (k_never, v_never) {
                 (false, false) => quote! { env.storage().#storage().set(#key, #value) },
                 (false, true) => {

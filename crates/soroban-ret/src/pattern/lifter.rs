@@ -1543,7 +1543,7 @@ impl<'a> LiftContext<'a> {
         args: &[StackVal],
         num_results: usize,
     ) -> Option<bool> {
-        if num_results != 1 {
+        if num_results > 1 {
             return None;
         }
         // Constant arguments only: selectors and static descriptor pointers.
@@ -1598,8 +1598,27 @@ impl<'a> LiftContext<'a> {
             }
         }
         let getter = getter?;
+        // The empty-collection default is PROVEN and classified, but its
+        // recovery is withheld for now (issue #69): binding the stored
+        // collection un-holes the read-modify-write bodies that consume it,
+        // and their element loops do not lift yet (`v.get(0)` one-iteration
+        // residue, functional `.set` chains) — digicus would trade four
+        // honest holes for bodies that no longer compile, and drop out of
+        // the equivalence gate altogether. Enable together with the
+        // collection-mutation loop recovery.
+        if getter.default_empty.is_some() {
+            cov_mark::hit!(proto_defaulting_collection_withheld);
+            return None;
+        }
+        // A value getter returns its value; an auth guard returns nothing.
+        if getter.auth_only != (num_results == 0) {
+            return None;
+        }
         // A fully-constant key (payload-keyed getters are out of scope here).
-        let key = dk_result_to_const_key(&getter.key)?;
+        let key = match &getter.key {
+            DkVal::StrObj(s) => SorobanExpr::StringLiteral(s.clone()),
+            other => dk_result_to_const_key(other)?,
+        };
         let error = match getter.error_val {
             Some(e) => match try_decode_val(e, self.registry) {
                 err @ SorobanExpr::ContractError { .. } => Some(err),
@@ -1636,16 +1655,36 @@ impl<'a> LiftContext<'a> {
             key: Box::new(key),
             // Absent key: the proven `panic_with_error!(E)`, or — when the
             // helper bare-traps — the `.unwrap()` that traps the same way.
-            unwrap: error.is_none() && getter.default_u32.is_none(),
-            // …or the proven constant default (`unwrap_or(d)`).
-            on_missing: match getter.default_u32 {
-                Some(d) => Some(Box::new(SorobanExpr::U32Literal(d))),
-                None => error.map(|e| Box::new(SorobanExpr::PanicWithError(Box::new(e)))),
+            unwrap: error.is_none()
+                && getter.default_u32.is_none()
+                && getter.default_empty.is_none(),
+            // …or the proven default (`unwrap_or(d)` / `unwrap_or(C::new)`).
+            on_missing: match (getter.default_u32, getter.default_empty) {
+                (Some(d), _) => Some(Box::new(SorobanExpr::U32Literal(d))),
+                (_, Some(76)) => Some(Box::new(SorobanExpr::CollectionNew("Map".to_string()))),
+                (_, Some(75)) => Some(Box::new(SorobanExpr::CollectionNew("Vec".to_string()))),
+                (_, Some(_)) => return None,
+                _ => error.map(|e| Box::new(SorobanExpr::PanicWithError(Box::new(e)))),
             },
         };
-        let value = SorobanExpr::CastAs {
-            value: Box::new(get_expr),
-            target_type: target_type.to_string(),
+        // A defaulting collection read is typed by its own default
+        // (`unwrap_or(Map::new(&env))` can only be a `Map`). Its ELEMENT
+        // types come from the contract's own signature when an export
+        // returns this very helper's result verbatim; otherwise they are
+        // left to the consumer, as the tranche-7 arm does.
+        let value = if getter.default_empty.is_some() {
+            match exported_getter_type(self.wasm_module, self.registry, target_idx) {
+                Some(ty) => SorobanExpr::CastAs {
+                    value: Box::new(get_expr),
+                    target_type: ty,
+                },
+                None => get_expr,
+            }
+        } else {
+            SorobanExpr::CastAs {
+                value: Box::new(get_expr),
+                target_type: target_type.to_string(),
+            }
         };
         // Bind ONCE and push the binding — the bytecode reads once; see the
         // tranche-6 arm for why a per-consumer re-read is unsound.
@@ -1666,7 +1705,14 @@ impl<'a> LiftContext<'a> {
             mutable: false,
             value,
         });
-        self.stack.push(StackVal::LetBinding(var_idx));
+        if getter.auth_only {
+            self.stmts
+                .push(SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(
+                    SorobanExpr::Local(var_idx),
+                ))));
+        } else {
+            self.stack.push(StackVal::LetBinding(var_idx));
+        }
         self.found_host_calls = true;
         cov_mark::hit!(proto_fallible_getter_recovered);
         Some(true)
@@ -9185,6 +9231,13 @@ fn lift_function_body(
     let func_type = wasm_module.get_func_type(func_index);
     let num_wasm_params = func_type.map(|ft| ft.params.len()).unwrap_or(0) as u32;
 
+    if let Some(stmts) = eval_constant_export(wasm_module, registry, func, func_type) {
+        return LiftBodyResult {
+            stmts,
+            found_host_calls: false,
+        };
+    }
+
     // Initialize locals: WASM params first, then declared locals
     let mut locals: Vec<StackVal> = Vec::new();
     for i in 0..num_wasm_params {
@@ -10519,6 +10572,167 @@ fn decode_masked_len_compare(a: StackVal, b: StackVal) -> (StackVal, StackVal) {
     (a, b)
 }
 
+/// A zero-parameter export whose body is a pure computation over constants
+/// and static data — digicus's `version()` parses a `"0.1.0"`-style string
+/// literal with nested loops — returns the same value on every invocation.
+/// EXECUTE it and return the literal (issue #69).
+///
+/// Exact, not a heuristic: the function is an invocation ENTRY point, so it
+/// starts from freshly instantiated memory (data segments exactly as
+/// shipped); the evaluator is the concrete one — any host call, non-static
+/// load, store outside its own frame, trap, or unmodeled instruction bails;
+/// and the stack pointer must be restored. Only bodies containing a `loop`
+/// are taken (anything loop-free already lifts as ordinary constants), and
+/// only when the result is a plain integer / bool `Val`.
+fn eval_constant_export(
+    module: &WasmModule,
+    registry: &TypeRegistry,
+    func: &crate::wasm::ir::WasmFunction,
+    func_type: Option<&crate::wasm::FuncType>,
+) -> Option<Vec<SorobanStmt>> {
+    use crate::wasm::ir::{WasmInstr as WI, WasmType};
+    let ft = func_type?;
+    // Soroban contracts only: the fresh-memory argument is the Soroban
+    // invocation model (a new VM instance per call). A spec-less generic
+    // WASM export makes no such promise and keeps its lifted loop.
+    if registry.functions.is_empty() {
+        return None;
+    }
+    if !ft.params.is_empty() || ft.results.as_slice() != [WasmType::I64] {
+        return None;
+    }
+    if !func.body.iter().any(|i| matches!(i, WI::Loop { .. }))
+        || func.body.len() > DK_MAX_BODY
+        || func.body.iter().any(|i| matches!(i, WI::CallIndirect(_)))
+    {
+        return None;
+    }
+    // The concrete evaluator never INTERPRETS a callee it classifies as a
+    // symbol / vec builder — it computes the result from static data. That
+    // is only sound here if such a callee has no effect to skip: a helper
+    // with a builder's signature that also fails or writes storage would
+    // otherwise be folded away with the constant (PR #85 review). Every
+    // function this export can reach that the evaluator might summarize
+    // must be a pure value builder.
+    if !reachable_summaries_are_pure(module, func) {
+        return None;
+    }
+    let mut locals = Vec::new();
+    for ty in &func.locals {
+        locals.push(match ty {
+            WasmType::I32 => DkVal::I32(0),
+            WasmType::I64 => DkVal::I64(0),
+            _ => return None,
+        });
+    }
+    let mut ev = DkEval {
+        module,
+        mem: HashMap::new(),
+        sp: DkVal::StackPtr(0),
+        steps: 0,
+        gap_zero: None,
+        proto: None,
+    };
+    let Some(Some(DkVal::I64(raw))) = ev.run_instrs(&func.body, &mut locals, 1, 0) else {
+        return None;
+    };
+    if ev.sp != DkVal::StackPtr(0) {
+        return None;
+    }
+    let value = try_decode_val(raw, registry);
+    if !matches!(
+        value,
+        SorobanExpr::U32Literal(_)
+            | SorobanExpr::I32Literal(_)
+            | SorobanExpr::U64Literal(_)
+            | SorobanExpr::I64Literal(_)
+            | SorobanExpr::BoolLiteral(_)
+    ) {
+        return None;
+    }
+    cov_mark::hit!(constant_export_evaluated);
+    Some(vec![SorobanStmt::Return(Some(value))])
+}
+
+/// True when every internal function reachable from `root` that carries a
+/// signature [`DkEval::handle_call`] may SUMMARIZE instead of interpreting
+/// (`(i32, i32) -> i64` symbol / vec builders, the `(i32, i32, i32) -> ()`
+/// long-symbol builder) is a pure value builder ([`is_pure_key_ctor`]).
+/// The walk covers the whole static call graph, taken paths or not, and
+/// refuses on an unresolvable callee or `call_indirect`.
+fn reachable_summaries_are_pure(module: &WasmModule, root: &crate::wasm::ir::WasmFunction) -> bool {
+    use crate::wasm::ir::{WasmInstr as WI, WasmType};
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut work: Vec<u32> = Vec::new();
+    let push_calls = |f: &crate::wasm::ir::WasmFunction, work: &mut Vec<u32>| -> bool {
+        for ins in &f.body {
+            match ins {
+                WI::Call(t) => work.push(*t),
+                WI::CallIndirect(_) => return false,
+                _ => {}
+            }
+        }
+        true
+    };
+    if !push_calls(root, &mut work) {
+        return false;
+    }
+    while let Some(f) = work.pop() {
+        if !seen.insert(f) || module.imports.get_by_index(f).is_some() {
+            continue;
+        }
+        let (Some(func), Some(ft)) = (module.get_function(f), module.get_func_type(f)) else {
+            return false;
+        };
+        let summarizable = (ft.params.as_slice() == [WasmType::I32, WasmType::I32]
+            && ft.results.as_slice() == [WasmType::I64])
+            || (ft.params.as_slice() == [WasmType::I32, WasmType::I32, WasmType::I32]
+                && ft.results.is_empty());
+        if summarizable && !is_pure_key_ctor(module, f) {
+            return false;
+        }
+        if !push_calls(func, &mut work) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The declared Rust type of helper `getter`'s result, when the contract
+/// itself states it: some exported function's ENTIRE body is `call getter`,
+/// so that export's spec return type is, by definition, the type of the
+/// value the helper returns (one helper reads one key and returns one stored
+/// value, whoever calls it). Only collection types are reported, and all
+/// such exports must agree.
+fn exported_getter_type(
+    module: &WasmModule,
+    registry: &TypeRegistry,
+    getter: u32,
+) -> Option<String> {
+    use crate::wasm::ir::WasmInstr as WI;
+    let mut found: Option<String> = None;
+    for export in module.exports.contract_functions() {
+        let Some(func) = module.get_function(export.func_index) else {
+            continue;
+        };
+        if !matches!(func.body.as_slice(), [WI::Call(g)] | [WI::Call(g), WI::End] if *g == getter) {
+            continue;
+        }
+        let Some(spec) = registry.get_function(&export.name) else {
+            continue;
+        };
+        let [ty @ (ScSpecTypeDef::Map(_) | ScSpecTypeDef::Vec(_))] = spec.outputs.as_slice() else {
+            continue;
+        };
+        let rendered = crate::codegen::types::generate_type_ident(ty).to_string();
+        match &found {
+            Some(prev) if *prev != rendered => return None,
+            _ => found = Some(rendered),
+        }
+    }
+    found
+}
+
 /// A constant CONTRACT `Error` Val: tag 3, error type (bits 8..32) zero.
 fn is_contract_error_const(v: &StackVal) -> bool {
     matches!(v, StackVal::I64(e)
@@ -10837,6 +11051,10 @@ enum DkVal {
     /// A symbolic runtime value (index into [`ProtoRun::nodes`]) — only ever
     /// produced in protocol mode (issue #67), see [`ProtoRun`].
     Sym(u32),
+    /// A `String` object built by host `string_new_from_linear_memory` from
+    /// static data (`String::from_str(&env, "..")` storage keys) — protocol
+    /// mode only.
+    StrObj(String),
 }
 
 /// A symbolic value in a protocol-mode evaluation. The arena is deliberately
@@ -10859,6 +11077,9 @@ enum ProtoNode {
     Shr32(u32),
     /// `i32.wrap_i64(node)`.
     Wrap(u32),
+    /// A freshly constructed EMPTY collection (`map_new` / `vec_new`),
+    /// carrying its object tag (76 = Map, 75 = Vec).
+    Empty(u8),
 }
 
 /// An observable effect recorded, in execution order, on one evaluated path.
@@ -10870,6 +11091,8 @@ enum ProtoEffect {
     Has(u32),
     /// A `get_contract_data` read (node id).
     Get(u32),
+    /// `require_auth(<node>)` on a read's result (node id).
+    RequireAuth(u32),
 }
 
 /// How one evaluated path ended when it did not return normally.
@@ -11041,6 +11264,14 @@ struct ProtoFallibleGetter {
     /// failing — `get::<_, u32>(&KEY).unwrap_or(d)`. Only for the `u32`
     /// payload getter, where the constant is the Rust-level default itself.
     default_u32: Option<u32>,
+    /// `Some(tag)`: the absent-key path returns a freshly constructed EMPTY
+    /// collection of the same kind the present path asserts —
+    /// `get(&KEY).unwrap_or(Map::new(&env))`. The default is the helper's
+    /// own proven construction, never an assumed one (issue #36).
+    default_empty: Option<u8>,
+    /// The helper returns nothing: its only use of the loaded value is
+    /// `require_auth` on it — `get::<_, Address>(&KEY)…require_auth()`.
+    auth_only: bool,
     value: ProtoGetterValue,
     instance_ttl_bumps: Vec<(u32, u32)>,
 }
@@ -11065,9 +11296,17 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
     if paths.len() != 3 {
         return None;
     }
-    let mut missing: Option<(Option<i64>, Option<u32>, Vec<(u32, u32)>, DkVal, i64)> = None;
+    // What the absent-key path does.
+    #[derive(Clone, Copy)]
+    enum Absent {
+        Fail(i64),
+        Trap,
+        U32(u32),
+        Empty(u8),
+    }
+    let mut missing: Option<(Absent, Vec<(u32, u32)>, DkVal, i64)> = None;
     let mut trap: Option<(Vec<(u32, u32)>, DkVal, i64, i64)> = None;
-    let mut success: Option<(Vec<(u32, u32)>, DkVal, i64, i64, ProtoGetterValue)> = None;
+    let mut success: Option<(Vec<(u32, u32)>, DkVal, i64, i64, ProtoGetterValue, bool)> = None;
     for p in paths {
         // Effects: bumps, then Has, then at most one Get — nothing else.
         let mut bumps = Vec::new();
@@ -11095,6 +11334,12 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
             }
             Some(_) => return None,
         };
+        // …optionally followed by `require_auth` on THAT get's result.
+        let authed = match (it.next(), get) {
+            (None, _) => false,
+            (Some(ProtoEffect::RequireAuth(a)), Some(g)) if *a == g => true,
+            _ => return None,
+        };
         if it.next().is_some() {
             return None;
         }
@@ -11108,20 +11353,31 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
                 // Absent key: a constant contract error, or a bare trap
                 // (the `.unwrap()` form, issue #66).
                 let e = match end {
-                    ProtoEnd::Fail(e) => Some(*e),
-                    ProtoEnd::Trap => None,
+                    ProtoEnd::Fail(e) => Absent::Fail(*e),
+                    ProtoEnd::Trap => Absent::Trap,
                 };
-                if missing
-                    .replace((e, None, bumps, key.clone(), *st))
-                    .is_some()
-                {
+                if missing.replace((e, bumps, key.clone(), *st)).is_some() {
                     return None;
                 }
             }
             // Absent key: the helper returns a constant default.
             ([(ProtoPred::Has(ph), false)], Ok(Some(DkVal::I32(d))), None) if ph == h => {
                 if missing
-                    .replace((None, Some(*d as u32), bumps, key.clone(), *st))
+                    .replace((Absent::U32(*d as u32), bumps, key.clone(), *st))
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            // Absent key: the helper returns a freshly built empty collection.
+            ([(ProtoPred::Has(ph), false)], Ok(Some(DkVal::Sym(r))), None)
+                if ph == h && matches!(p.nodes.get(*r as usize), Some(ProtoNode::Empty(_))) =>
+            {
+                let Some(ProtoNode::Empty(t)) = p.nodes.get(*r as usize) else {
+                    return None;
+                };
+                if missing
+                    .replace((Absent::Empty(*t), bumps, key.clone(), *st))
                     .is_some()
                 {
                     return None;
@@ -11136,11 +11392,29 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
                     return None;
                 }
             }
+            // Present + right tag, value consumed ONLY by `require_auth`.
+            ([(ProtoPred::Has(ph), true), (ProtoPred::TagIs(pg, c), true)], Ok(None), Some(g))
+                if ph == h && *pg == g && authed && *c == 77 =>
+            {
+                if success
+                    .replace((
+                        bumps,
+                        key.clone(),
+                        *st,
+                        *c,
+                        ProtoGetterValue::Object(77),
+                        true,
+                    ))
+                    .is_some()
+                {
+                    return None;
+                }
+            }
             (
                 [(ProtoPred::Has(ph), true), (ProtoPred::TagIs(pg, c), true)],
                 Ok(Some(DkVal::Sym(r))),
                 Some(g),
-            ) if ph == h && *pg == g => {
+            ) if ph == h && *pg == g && !authed => {
                 let value = if *r == g && (64..=77).contains(c) {
                     ProtoGetterValue::Object(*c as u8)
                 } else if *c == TAG_U32 as i64
@@ -11152,7 +11426,7 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
                     return None; // returns something other than the get's value
                 };
                 if success
-                    .replace((bumps, key.clone(), *st, *c, value))
+                    .replace((bumps, key.clone(), *st, *c, value, false))
                     .is_some()
                 {
                     return None;
@@ -11161,11 +11435,21 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
             _ => return None,
         }
     }
-    let (error_val, default_u32, m_bumps, m_key, m_st) = missing?;
+    let (absent, m_bumps, m_key, m_st) = missing?;
     let (t_bumps, t_key, t_st, t_tag) = trap?;
-    let (bumps, key, st, tag, value) = success?;
-    // A constant default is only meaningful for the scalar `u32` getter.
-    if default_u32.is_some() && value != ProtoGetterValue::U32 {
+    let (bumps, key, st, tag, value, auth_only) = success?;
+    let (error_val, default_u32, default_empty) = match absent {
+        Absent::Fail(e) => (Some(e), None, None),
+        Absent::Trap => (None, None, None),
+        // A constant default is only meaningful for the scalar `u32` getter…
+        Absent::U32(d) if value == ProtoGetterValue::U32 => (None, Some(d), None),
+        // …and an empty-collection default only for the SAME collection
+        // kind the present path asserts.
+        Absent::Empty(t) if value == ProtoGetterValue::Object(t) => (None, None, Some(t)),
+        _ => return None,
+    };
+    // An auth guard must fail or trap when the signer is absent.
+    if auth_only && (default_u32.is_some() || default_empty.is_some()) {
         return None;
     }
     // One key, one durability, one bump prefix, one tag across all paths.
@@ -11192,6 +11476,8 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
         storage_type,
         error_val,
         default_u32,
+        default_empty,
+        auth_only,
         value,
         instance_ttl_bumps: bumps,
     })
@@ -11417,7 +11703,7 @@ impl DkEval<'_> {
         // itself a symbolic read result.
         fn is_key(v: &DkVal) -> bool {
             match v {
-                DkVal::I64(_) | DkVal::SymObj(_) | DkVal::Arg(_) => true,
+                DkVal::I64(_) | DkVal::SymObj(_) | DkVal::StrObj(_) | DkVal::Arg(_) => true,
                 DkVal::VecVal(es) => es.iter().all(is_key),
                 _ => false,
             }
@@ -11454,6 +11740,44 @@ impl DkEval<'_> {
                     (threshold >> 32) as u32,
                     (extend_to >> 32) as u32,
                 ));
+                stack.push(DkVal::I64(2)); // Void
+                Some(())
+            }
+            // `String::from_str(&env, "<static>")`: both operands are
+            // constant `U32Val`s and the bytes come from real static data.
+            (HostModule::Buf, "string_new_from_linear_memory") => {
+                let len = dk_i64(&stack.pop()?)? as u64;
+                let ptr = dk_i64(&stack.pop()?)? as u64;
+                if ptr & 0xff != TAG_U32 || len & 0xff != TAG_U32 {
+                    return None;
+                }
+                let s = self
+                    .module
+                    .data_sections
+                    .read_string((ptr >> 32) as u32, (len >> 32) as u32)?;
+                stack.push(DkVal::StrObj(s));
+                Some(())
+            }
+            // An empty collection is a pure construction: no effect, and
+            // its identity is irrelevant — only that it IS empty.
+            (HostModule::Map, "map_new") => {
+                let v = self.proto_node(ProtoNode::Empty(76))?;
+                stack.push(v);
+                Some(())
+            }
+            (HostModule::Vec, "vec_new") => {
+                let v = self.proto_node(ProtoNode::Empty(75))?;
+                stack.push(v);
+                Some(())
+            }
+            (HostModule::Address, "require_auth") => {
+                let DkVal::Sym(n) = stack.pop()? else {
+                    return None;
+                };
+                self.proto
+                    .as_mut()?
+                    .effects
+                    .push(ProtoEffect::RequireAuth(n));
                 stack.push(DkVal::I64(2)); // Void
                 Some(())
             }
@@ -24928,5 +25252,174 @@ mod tests {
             stack_val_to_expr(&masked(), &[], &reg, None),
             stack_val_to_expr(&len(), &[], &reg, None)
         );
+    }
+
+    /// Fixture for the issue-#69 shapes (digicus): string-keyed storage via
+    /// `string_new_from_linear_memory`, an AUTH GUARD (`get admin` →
+    /// `require_auth`, absent → `fail_with_error`), a defaulting MAP getter
+    /// (absent → `map_new()`), and a constant export computed by a loop.
+    /// Imports: 0=has, 1=get, 2=fail, 3=string_new, 4=map_new,
+    /// 5=require_auth, 6=symbol_new. Func 7 = string key builder, 8 = has
+    /// wrapper, 9 = auth guard, 10 = its caller, 11 = defaulting map getter,
+    /// 12 = its caller, 13 = constant export (sums 1..=4 in a loop → 10),
+    /// 14 = a symbol-builder-SHAPED helper that also fails with an error,
+    /// 15 = the same looped constant, but calling 14 first.
+    fn digicus_shapes_module() -> WasmModule {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "l" "0" (func (param i64 i64) (result i64)))
+                (import "l" "1" (func (param i64 i64) (result i64)))
+                (import "x" "5" (func (param i64) (result i64)))
+                (import "b" "i" (func (param i64 i64) (result i64)))
+                (import "m" "_" (func (result i64)))
+                (import "a" "0" (func (param i64) (result i64)))
+                (import "b" "j" (func (param i64 i64) (result i64)))
+                (memory 1)
+                (data (i32.const 2000) "adminrepos")
+                (func (;7;) (param i32 i32) (result i64)
+                    local.get 0 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
+                    local.get 1 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
+                    call 3)
+                (func (;8;) (param i64) (result i32)
+                    local.get 0 i64.const 2 call 0 i64.const 1 i64.eq)
+                (func (;9;) (local i64)
+                    block
+                        i32.const 2000 i32.const 5 call 7 local.tee 0
+                        call 8 i32.eqz br_if 0
+                        local.get 0 i64.const 2 call 1 local.tee 0
+                        i64.const 255 i64.and i64.const 77 i64.ne
+                        if unreachable end
+                        local.get 0 call 5 drop
+                        return
+                    end
+                    i64.const 4294967299 call 2 drop
+                    unreachable)
+                (func (;10;) call 9)
+                (func (;11;) (result i64) (local i64)
+                    block
+                        block
+                            i32.const 2005 i32.const 5 call 7 local.tee 0
+                            call 8 i32.eqz br_if 0
+                            local.get 0 i64.const 2 call 1 local.tee 0
+                            i64.const 255 i64.and i64.const 76 i64.eq br_if 1
+                            unreachable
+                        end
+                        call 4 local.set 0
+                    end
+                    local.get 0)
+                (func (;12;) (result i64) call 11)
+                (func (;13;) (result i64) (local i32 i32)
+                    i32.const 1 local.set 0
+                    block
+                        loop
+                            local.get 0 i32.const 4 i32.gt_u br_if 1
+                            local.get 1 local.get 0 i32.add local.set 1
+                            local.get 0 i32.const 1 i32.add local.set 0
+                            br 0
+                        end
+                    end
+                    local.get 1 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or)
+                (func (;14;) (param i32 i32) (result i64)
+                    i64.const 4294967299 call 2 drop
+                    local.get 0 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
+                    local.get 1 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
+                    call 6)
+                (func (;15;) (result i64) (local i32 i32)
+                    i32.const 2000 i32.const 5 call 14 drop
+                    i32.const 1 local.set 0
+                    block
+                        loop
+                            local.get 0 i32.const 4 i32.gt_u br_if 1
+                            local.get 1 local.get 0 i32.add local.set 1
+                            local.get 0 i32.const 1 i32.add local.set 0
+                            br 0
+                        end
+                    end
+                    local.get 1 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or)
+            )"#,
+        )
+        .expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn proto_auth_guard_with_string_key_recovers_bound_read_and_auth() {
+        cov_mark::check!(proto_fallible_getter_recovered);
+        let m = digicus_shapes_module();
+        let g = proto_enumerate(&m, 9, &[])
+            .as_deref()
+            .and_then(classify_fallible_getter)
+            .expect("the auth guard classifies");
+        assert!(g.auth_only);
+        assert_eq!(g.error_val, Some(4294967299));
+        assert_eq!(g.key, DkVal::StrObj("admin".to_string()));
+        let (stmts, _) = proto_lift(&m, 10).content.expect("effectful");
+        assert!(
+            matches!(
+                stmts.as_slice(),
+                [
+                    SorobanStmt::Let {
+                        value: SorobanExpr::CastAs { target_type, .. },
+                        ..
+                    },
+                    SorobanStmt::Expr(SorobanExpr::RequireAuth(_)),
+                ] if target_type == "Address"
+            ),
+            "one typed read, then require_auth on it: {stmts:?}"
+        );
+    }
+
+    /// The defaulting map getter CLASSIFIES (its empty default is the
+    /// helper's own `map_new()`), but its recovery is withheld — see the
+    /// arm. The call must fall through untouched.
+    #[test]
+    fn proto_defaulting_map_getter_classifies_but_is_withheld() {
+        cov_mark::check!(proto_defaulting_collection_withheld);
+        let m = digicus_shapes_module();
+        let g = proto_enumerate(&m, 11, &[])
+            .as_deref()
+            .and_then(classify_fallible_getter)
+            .expect("the defaulting map getter classifies");
+        assert_eq!(g.default_empty, Some(76));
+        assert_eq!(g.value, ProtoGetterValue::Object(76));
+        assert!(!g.auth_only);
+        let _ = proto_lift(&m, 12);
+    }
+
+    #[test]
+    fn constant_export_with_loop_is_evaluated() {
+        cov_mark::check!(constant_export_evaluated);
+        let m = digicus_shapes_module();
+        // Spec-less (generic WASM) modules are never evaluated.
+        let func = m.get_function(13).expect("func 13");
+        assert!(eval_constant_export(&m, &empty_registry(), func, m.get_func_type(13)).is_none());
+        let mut reg = empty_registry();
+        reg.functions.insert(
+            "version".to_string(),
+            stellar_xdr::ScSpecFunctionV0 {
+                doc: Default::default(),
+                name: "version".try_into().expect("symbol"),
+                inputs: Default::default(),
+                outputs: vec![ScSpecTypeDef::U32].try_into().expect("outputs"),
+            },
+        );
+        let stmts = eval_constant_export(&m, &reg, func, m.get_func_type(13))
+            .expect("a pure looped constant evaluates");
+        assert!(
+            matches!(
+                stmts.as_slice(),
+                [SorobanStmt::Return(Some(SorobanExpr::U32Literal(10)))]
+            ),
+            "1 + 2 + 3 + 4: {stmts:?}"
+        );
+        // A function that reads storage is not a constant.
+        let getter = m.get_function(11).expect("func 11");
+        assert!(eval_constant_export(&m, &reg, getter, m.get_func_type(11)).is_none());
+        // A callee the evaluator would SUMMARIZE as a symbol builder, but
+        // which also fails with an error, must not be skipped: the export
+        // is not a constant (PR #85 review).
+        assert!(!is_pure_key_ctor(&m, 14));
+        let impure = m.get_function(15).expect("func 15");
+        assert!(eval_constant_export(&m, &reg, impure, m.get_func_type(15)).is_none());
     }
 }
