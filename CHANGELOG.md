@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — iterator-protocol proofs, stage 1 of loop recovery (#69)
+
+- The evaluator can summarize a helper with all parameters symbolic (loads
+  and stores through pointer parameters included). Two summaries are
+  classified: the SDK `Vec` iterator `next` and the `Option` unwrap adapter
+  that follows it. No decompiled output changes yet; this is the proof layer
+  the `for`-loop recovery will consume.
+- `DBG_ITER=1` lists the proven helpers and their in-loop call sites.
+
 ### Fixed — two of the four digicus divergences (#69)
 
 - A zero-parameter export that is a pure computation over static data

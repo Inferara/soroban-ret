@@ -200,6 +200,10 @@ pub fn lift_functions(
         resolve_exports_generic(wasm_module)
     };
 
+    if *DBG_ITER {
+        iter_census(wasm_module);
+    }
+
     // Build contract functions
     for resolved_fn in &resolved {
         let func_name = &resolved_fn.export_name;
@@ -604,6 +608,12 @@ static DBG_DKTRACE: std::sync::LazyLock<bool> =
 /// decisions, effects per path) and whether it classified. Measurement-only.
 static DBG_PROTO: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("DBG_PROTO").is_ok());
+/// Issue #69 census probe: list every helper PROVEN to be an SDK
+/// `Vec` iterator `next` / its `Option` unwrap adapter, with the proven
+/// layout and how many of its call sites sit inside a loop.
+/// Measurement-only.
+static DBG_ITER: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("DBG_ITER").is_ok());
 
 /// Issue #34 phase 2: classification of a frame slot whose abstract value was
 /// produced by the then arm of a shared-map `IfElse` join, from the
@@ -11080,6 +11090,25 @@ enum ProtoNode {
     /// A freshly constructed EMPTY collection (`map_new` / `vec_new`),
     /// carrying its object tag (76 = Map, 75 = Vec).
     Empty(u8),
+    /// The helper's `i`-th parameter, held SYMBOLIC (summary mode, see
+    /// [`proto_summarize`]): a value, or a pointer whose pointee fields are
+    /// `ParamField`s.
+    Param(u32),
+    /// `width` bytes at `offset` behind pointer parameter `param`, as they
+    /// were on entry.
+    ParamField { param: u32, off: u32, width: u32 },
+    /// `a <u b` on two symbolic i32s — an i32 boolean.
+    LtU(u32, u32),
+    /// `i64.extend_i32_u(node)`.
+    ExtU(u32),
+    /// `node << 32`.
+    Shl32(u32),
+    /// The `U32Val` encoding of symbolic u32 `node`: `(extend(node) << 32) | 4`.
+    U32Val(u32),
+    /// `node + 1` (i32, wrapping).
+    Add1(u32),
+    /// `vec_get(vec, U32Val(idx))`: `vec` and `idx` are node ids.
+    VecGet { vec: u32, idx: u32 },
 }
 
 /// An observable effect recorded, in execution order, on one evaluated path.
@@ -11093,6 +11122,8 @@ enum ProtoEffect {
     Get(u32),
     /// `require_auth(<node>)` on a read's result (node id).
     RequireAuth(u32),
+    /// A `vec_get` read (node id).
+    VecGet(u32),
 }
 
 /// How one evaluated path ended when it did not return normally.
@@ -11102,6 +11133,11 @@ enum ProtoEnd {
     Fail(i64),
     /// `unreachable`.
     Trap,
+    /// A call that never returns to a live continuation — the instruction
+    /// after it is `unreachable` — into a callee outside the model. The path
+    /// fails; how (which error, a bare trap) is unknown. Whatever the callee
+    /// did first is unobservable: a failed invocation rolls back.
+    Diverge,
 }
 
 /// Base of the binding-index range used for getters recovered by execution
@@ -11131,6 +11167,9 @@ struct ProtoRun {
     /// `(condition node, direction taken)` per symbolic branch, in order.
     decisions: Vec<(u32, bool)>,
     end: Option<ProtoEnd>,
+    /// Writes through pointer PARAMETERS (summary mode): `(param, offset)` →
+    /// `(value, width)`. A later load of the same cell reads it back.
+    param_mem: HashMap<(u32, u32), (DkVal, u32)>,
 }
 
 /// One fully-evaluated path of a helper call. See [`proto_enumerate`].
@@ -11139,6 +11178,8 @@ struct ProtoPath {
     nodes: Vec<ProtoNode>,
     effects: Vec<ProtoEffect>,
     decisions: Vec<(u32, bool)>,
+    /// What the path wrote through its pointer parameters (summary mode).
+    param_mem: HashMap<(u32, u32), (DkVal, u32)>,
     /// `Ok(result)` for a normal return, `Err` for a fail / trap terminal.
     end: Result<Option<DkVal>, ProtoEnd>,
 }
@@ -11148,6 +11189,27 @@ struct ProtoPath {
 /// a write outside the callee's own shadow-stack frame, a stack pointer not
 /// restored on return, too many paths) — a partial path set proves nothing.
 fn proto_enumerate(module: &WasmModule, func_idx: u32, args: &[DkVal]) -> Option<Vec<ProtoPath>> {
+    proto_enumerate_seeded(module, func_idx, args, &[])
+}
+
+/// SUMMARIZE helper `func_idx`: enumerate every path with ALL parameters
+/// symbolic ([`ProtoNode::Param`], node `i` = parameter `i`). Loads and
+/// stores through a parameter used as a pointer become
+/// [`ProtoNode::ParamField`] reads and [`ProtoPath::param_mem`] writes, so
+/// the result describes the helper for every caller, not one call site.
+fn proto_summarize(module: &WasmModule, func_idx: u32) -> Option<Vec<ProtoPath>> {
+    let n = module.get_func_type(func_idx)?.params.len() as u32;
+    let seed: Vec<ProtoNode> = (0..n).map(ProtoNode::Param).collect();
+    let args: Vec<DkVal> = (0..n).map(DkVal::Sym).collect();
+    proto_enumerate_seeded(module, func_idx, &args, &seed)
+}
+
+fn proto_enumerate_seeded(
+    module: &WasmModule,
+    func_idx: u32,
+    args: &[DkVal],
+    seed: &[ProtoNode],
+) -> Option<Vec<ProtoPath>> {
     let mut pending: Vec<Vec<bool>> = vec![Vec::new()];
     let mut out = Vec::new();
     while let Some(script) = pending.pop() {
@@ -11163,6 +11225,7 @@ fn proto_enumerate(module: &WasmModule, func_idx: u32, args: &[DkVal]) -> Option
             gap_zero: None,
             proto: Some(ProtoRun {
                 script,
+                nodes: seed.to_vec(),
                 ..ProtoRun::default()
             }),
         };
@@ -11192,10 +11255,301 @@ fn proto_enumerate(module: &WasmModule, func_idx: u32, args: &[DkVal]) -> Option
             nodes: run.nodes,
             effects: run.effects,
             decisions: run.decisions,
+            param_mem: run.param_mem,
             end,
         });
     }
     Some(out)
+}
+
+/// A helper PROVEN to be the SDK's `Vec` iterator `next` (issue #69):
+/// `(out: *mut [i64; 2], it: *mut Iter) -> ()` over an iterator
+/// `{ vec: i64, idx: u32, len: u32 }` at the proven field offsets.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VecIterNext {
+    vec_off: u32,
+    idx_off: u32,
+    len_off: u32,
+    /// The discriminant written to `out[0]` when the iterator is exhausted.
+    none_disc: i64,
+    /// `Some(T)`: `out[0]` on an element is `(tag(elem) != T) as i64` — the
+    /// element's `TryFromVal` conversion status. `None`: it is the constant 0.
+    conv_tag: Option<u8>,
+}
+
+/// Accept a SUMMARY ([`proto_summarize`]) as the `Vec` iterator `next`
+/// protocol only when it is EXACTLY these three paths:
+///
+/// 1. `it.idx <u it.len` false → `out[0] = NONE`, iterator untouched, no
+///    effect;
+/// 2. true, and `it.idx + 1` wraps to 0 → the path fails (index overflow);
+/// 3. true → one `vec_get(it.vec, U32Val(it.idx))`, `it.idx = it.idx + 1`,
+///    `out[1] =` that element, `out[0] =` 0 or the element's tag-mismatch
+///    flag.
+///
+/// Everything is tied by node identity: the compared, encoded and
+/// incremented index are the SAME entry field; the fetched vector is the
+/// iterator's own field; the stored element is the fetch's result.
+fn classify_vec_iter_next(paths: &[ProtoPath]) -> Option<VecIterNext> {
+    if paths.len() != 3 {
+        return None;
+    }
+    // (param, off, width) of a `ParamField` node.
+    let field = |p: &ProtoPath, n: u32| match p.nodes.get(n as usize)? {
+        ProtoNode::ParamField { param, off, width } => Some((*param, *off, *width)),
+        _ => None,
+    };
+    // `it.idx <u it.len` → (idx_off, len_off).
+    let bound = |p: &ProtoPath, n: u32| -> Option<(u32, u32)> {
+        let ProtoNode::LtU(i, l) = p.nodes.get(n as usize)? else {
+            return None;
+        };
+        match (field(p, *i)?, field(p, *l)?) {
+            ((1, io, 4), (1, lo, 4)) => Some((io, lo)),
+            _ => None,
+        }
+    };
+    let (mut none, mut overflow, mut some) = (None, false, None);
+    for p in paths {
+        match p.decisions.as_slice() {
+            [(c, false)] => {
+                let (io, lo) = bound(p, *c)?;
+                if !p.effects.is_empty() || !matches!(p.end, Ok(None)) {
+                    return None;
+                }
+                // Only the out pair is written; the iterator is untouched.
+                if p.param_mem.len() != 2 || p.param_mem.keys().any(|(q, _)| *q != 0) {
+                    return None;
+                }
+                let (DkVal::I64(d), 8) = p.param_mem.get(&(0, 0))? else {
+                    return None;
+                };
+                if p.param_mem.get(&(0, 8))?.1 != 8 || none.replace((io, lo, *d)).is_some() {
+                    return None;
+                }
+            }
+            [(c, true), (e, taken)] => {
+                let (io, lo) = bound(p, *c)?;
+                // The second decision is `(it.idx + 1) == 0`.
+                let ProtoNode::Eqz(a) = p.nodes.get(*e as usize)? else {
+                    return None;
+                };
+                let ProtoNode::Add1(i) = p.nodes.get(*a as usize)? else {
+                    return None;
+                };
+                if field(p, *i)? != (1, io, 4) {
+                    return None;
+                }
+                let [ProtoEffect::VecGet(g)] = p.effects.as_slice() else {
+                    return None;
+                };
+                let ProtoNode::VecGet { vec, idx } = p.nodes.get(*g as usize)? else {
+                    return None;
+                };
+                let (1, vo, 8) = field(p, *vec)? else {
+                    return None;
+                };
+                if field(p, *idx)? != (1, io, 4) {
+                    return None;
+                }
+                if *taken {
+                    if p.end.is_ok() || overflow {
+                        return None;
+                    }
+                    overflow = true;
+                    continue;
+                }
+                if !matches!(p.end, Ok(None)) || p.param_mem.len() != 3 {
+                    return None;
+                }
+                // it.idx = it.idx + 1
+                if p.param_mem.get(&(1, io))? != &(DkVal::Sym(*a), 4) {
+                    return None;
+                }
+                // out[1] = the fetched element
+                if p.param_mem.get(&(0, 8))? != &(DkVal::Sym(*g), 8) {
+                    return None;
+                }
+                // out[0] = 0, or `(tag(elem) != T) as i64`
+                let conv_tag = match p.param_mem.get(&(0, 0))? {
+                    (DkVal::I64(0), 8) => None,
+                    (DkVal::Sym(x), 8) => {
+                        let ProtoNode::ExtU(c) = p.nodes.get(*x as usize)? else {
+                            return None;
+                        };
+                        let ProtoNode::Cmp {
+                            eq: false,
+                            node,
+                            konst,
+                        } = p.nodes.get(*c as usize)?
+                        else {
+                            return None;
+                        };
+                        if p.nodes.get(*node as usize)? != &ProtoNode::TagOf(*g)
+                            || !(0..=255).contains(konst)
+                        {
+                            return None;
+                        }
+                        Some(*konst as u8)
+                    }
+                    _ => return None,
+                };
+                if some.replace((io, lo, vo, conv_tag)).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (n_io, n_lo, none_disc) = none?;
+    let (io, lo, vo, conv_tag) = some?;
+    if !overflow || (n_io, n_lo) != (io, lo) {
+        return None;
+    }
+    // A conversion flag is 0/1; NONE must be distinguishable from both.
+    if matches!(none_disc, 0 | 1) {
+        return None;
+    }
+    Some(VecIterNext {
+        vec_off: vo,
+        idx_off: io,
+        len_off: lo,
+        none_disc,
+        conv_tag,
+    })
+}
+
+/// A helper PROVEN to be the `Option<Result<T, _>>` → `Option<T>` unwrap
+/// adapter that follows an iterator `next` (issue #69):
+/// `(out: *mut [i64; 2], disc: i64, value: i64) -> ()`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IterUnwrapAdapter {
+    /// The input discriminant meaning "exhausted".
+    none_in: i64,
+    /// `out[0]` when exhausted / when an element is present.
+    none_out: i64,
+    some_out: i64,
+}
+
+/// Accept a SUMMARY as the unwrap adapter only when it is EXACTLY:
+/// `disc == NONE` → `out = [none_out, value]`; otherwise `disc as i32 != 0`
+/// → the path fails (the conversion error is unwrapped); otherwise
+/// `out = [some_out, value]`. `value` is passed through untouched.
+fn classify_iter_unwrap_adapter(paths: &[ProtoPath]) -> Option<IterUnwrapAdapter> {
+    if paths.len() != 3 {
+        return None;
+    }
+    // Parameters are seeded as nodes 0..n: node `i` IS parameter `i`.
+    let is_none_test = |p: &ProtoPath, n: u32| match p.nodes.get(n as usize)? {
+        ProtoNode::Cmp {
+            eq: true,
+            node: 1,
+            konst,
+        } => Some(*konst),
+        _ => None,
+    };
+    let out = |p: &ProtoPath| -> Option<i64> {
+        if !p.effects.is_empty() || !matches!(p.end, Ok(None)) || p.param_mem.len() != 2 {
+            return None;
+        }
+        if p.param_mem.get(&(0, 8))? != &(DkVal::Sym(2), 8) {
+            return None;
+        }
+        match p.param_mem.get(&(0, 0))? {
+            (DkVal::I64(d), 8) => Some(*d),
+            _ => None,
+        }
+    };
+    let (mut none, mut failed, mut some) = (None, false, None);
+    for p in paths {
+        match p.decisions.as_slice() {
+            [(c, true)] => {
+                let k = is_none_test(p, *c)?;
+                if none.replace((k, out(p)?)).is_some() {
+                    return None;
+                }
+            }
+            [(c, false), (w, taken)] => {
+                let k = is_none_test(p, *c)?;
+                if p.nodes.get(*w as usize)? != &ProtoNode::Wrap(1) {
+                    return None;
+                }
+                if *taken {
+                    if p.end.is_ok() || !p.effects.is_empty() || failed {
+                        return None;
+                    }
+                    failed = true;
+                } else if some.replace((k, out(p)?)).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (none_in, none_out) = none?;
+    let (k, some_out) = some?;
+    if !failed || k != none_in || none_out == some_out {
+        return None;
+    }
+    Some(IterUnwrapAdapter {
+        none_in,
+        none_out,
+        some_out,
+    })
+}
+
+/// `DBG_ITER` census (issue #69): summarize every small internal helper
+/// with an iterator-`next` or unwrap-adapter signature, report the proven
+/// ones and how many of their call sites sit inside a WASM `loop`.
+fn iter_census(module: &WasmModule) {
+    use crate::wasm::ir::{WasmInstr as WI, WasmType};
+    let loop_calls = |target: u32| -> usize {
+        let mut n = 0;
+        for f in &module.functions {
+            let mut depth: Vec<bool> = Vec::new();
+            for ins in &f.body {
+                match ins {
+                    WI::Loop { .. } => depth.push(true),
+                    WI::Block { .. } | WI::If { .. } => depth.push(false),
+                    WI::End => {
+                        depth.pop();
+                    }
+                    WI::Call(t) if *t == target && depth.contains(&true) => n += 1,
+                    _ => {}
+                }
+            }
+        }
+        n
+    };
+    for f in &module.functions {
+        let Some(ft) = module.get_func_type(f.index) else {
+            continue;
+        };
+        if !ft.results.is_empty() || f.body.len() > DK_MAX_BODY {
+            continue;
+        }
+        if ft.params.as_slice() == [WasmType::I32, WasmType::I32]
+            && let Some(next) = proto_summarize(module, f.index)
+                .as_deref()
+                .and_then(classify_vec_iter_next)
+        {
+            eprintln!(
+                "[ITER] next func={} {next:?} loop_call_sites={}",
+                f.index,
+                loop_calls(f.index)
+            );
+        } else if ft.params.as_slice() == [WasmType::I32, WasmType::I64, WasmType::I64]
+            && let Some(ad) = proto_summarize(module, f.index)
+                .as_deref()
+                .and_then(classify_iter_unwrap_adapter)
+        {
+            eprintln!(
+                "[ITER] unwrap func={} {ad:?} loop_call_sites={}",
+                f.index,
+                loop_calls(f.index)
+            );
+        }
+    }
 }
 
 /// A branch predicate of the storage-getter protocol, resolved from a
@@ -11355,6 +11709,8 @@ fn classify_fallible_getter(paths: &[ProtoPath]) -> Option<ProtoFallibleGetter> 
                 let e = match end {
                     ProtoEnd::Fail(e) => Absent::Fail(*e),
                     ProtoEnd::Trap => Absent::Trap,
+                    // An unknown failure is neither of the two forms.
+                    ProtoEnd::Diverge => return None,
                 };
                 if missing.replace((e, bumps, key.clone(), *st)).is_some() {
                     return None;
@@ -11770,6 +12126,24 @@ impl DkEval<'_> {
                 stack.push(v);
                 Some(())
             }
+            // `vec_get(vec, U32Val(idx))` with both operands symbolic (summary
+            // mode: the iterator's vector and index fields).
+            (HostModule::Vec, "vec_get") => {
+                let DkVal::Sym(i) = stack.pop()? else {
+                    return None;
+                };
+                let DkVal::Sym(vec) = stack.pop()? else {
+                    return None;
+                };
+                let ProtoNode::U32Val(idx) = *self.proto.as_ref()?.nodes.get(i as usize)? else {
+                    return None;
+                };
+                let v = self.proto_node(ProtoNode::VecGet { vec, idx })?;
+                let DkVal::Sym(id) = v else { return None };
+                self.proto.as_mut()?.effects.push(ProtoEffect::VecGet(id));
+                stack.push(v);
+                Some(())
+            }
             (HostModule::Address, "require_auth") => {
                 let DkVal::Sym(n) = stack.pop()? else {
                     return None;
@@ -11802,10 +12176,22 @@ impl DkEval<'_> {
         use crate::wasm::ir::WasmInstr as WI;
         self.proto.as_ref()?;
         let n = stack.len();
-        let unary = matches!(ins, WI::I32Eqz | WI::I64Eqz | WI::I32WrapI64);
+        let unary = matches!(
+            ins,
+            WI::I32Eqz | WI::I64Eqz | WI::I32WrapI64 | WI::I64ExtendI32U
+        );
         let binary = matches!(
             ins,
-            WI::I64And | WI::I64Eq | WI::I64Ne | WI::I32Eq | WI::I32Ne | WI::I64ShrU
+            WI::I64And
+                | WI::I64Eq
+                | WI::I64Ne
+                | WI::I32Eq
+                | WI::I32Ne
+                | WI::I64ShrU
+                | WI::I32LtU
+                | WI::I64Shl
+                | WI::I64Or
+                | WI::I32Add
         );
         if unary {
             let DkVal::Sym(a) = *stack.last()? else {
@@ -11813,6 +12199,7 @@ impl DkEval<'_> {
             };
             let node = match ins {
                 WI::I32WrapI64 => ProtoNode::Wrap(a),
+                WI::I64ExtendI32U => ProtoNode::ExtU(a),
                 _ => ProtoNode::Eqz(a),
             };
             stack.pop();
@@ -11821,8 +12208,14 @@ impl DkEval<'_> {
         if !binary || n < 2 {
             return None;
         }
+        // The one modeled operation on TWO symbolic operands.
+        if let (WI::I32LtU, DkVal::Sym(a), DkVal::Sym(b)) = (ins, &stack[n - 2], &stack[n - 1]) {
+            let node = ProtoNode::LtU(*a, *b);
+            stack.truncate(n - 2);
+            return Some(self.proto_node(node).map(|v| stack.push(v)));
+        }
         // Exactly one symbolic operand and one constant, either order (all
-        // modeled binary ops except the shift are commutative).
+        // modeled binary ops except the shifts are commutative).
         let (sym, konst, sym_is_lhs) = match (&stack[n - 2], &stack[n - 1]) {
             (DkVal::Sym(a), DkVal::I64(k)) => (*a, *k, true),
             (DkVal::Sym(a), DkVal::I32(k)) => (*a, *k as i64, true),
@@ -11844,6 +12237,19 @@ impl DkEval<'_> {
                 konst,
             },
             WI::I64ShrU if sym_is_lhs && konst == 32 => ProtoNode::Shr32(sym),
+            WI::I64Shl if sym_is_lhs && konst == 32 => ProtoNode::Shl32(sym),
+            WI::I32Add if konst == 1 => ProtoNode::Add1(sym),
+            // `(extend_u(x) << 32) | 4` is exactly the `U32Val` of `x`.
+            WI::I64Or if konst == TAG_U32 as i64 => {
+                let nodes = &self.proto.as_ref()?.nodes;
+                match nodes.get(sym as usize) {
+                    Some(ProtoNode::Shl32(e)) => match nodes.get(*e as usize) {
+                        Some(ProtoNode::ExtU(x)) => ProtoNode::U32Val(*x),
+                        _ => return Some(None),
+                    },
+                    _ => return Some(None),
+                }
+            }
             _ => return Some(None),
         };
         stack.truncate(n - 2);
@@ -11857,7 +12263,67 @@ impl DkEval<'_> {
         self.mem.insert(addr, (val, width));
     }
 
-    fn load(&self, addr: &DkVal, offset: u32, width: u32) -> Option<DkVal> {
+    /// Read `width` bytes at `offset` behind a symbolic pointer PARAMETER
+    /// (summary mode): what this path stored there, else the entry value as
+    /// a (per-path unique) [`ProtoNode::ParamField`]. Only exact-width
+    /// reads of a cell; an overlapping different-width access is out of
+    /// model.
+    fn proto_param_load(&mut self, node: u32, offset: u32, width: u32) -> Option<DkVal> {
+        let run = self.proto.as_mut()?;
+        let ProtoNode::Param(param) = *run.nodes.get(node as usize)? else {
+            return None;
+        };
+        if let Some((v, w)) = run.param_mem.get(&(param, offset)) {
+            return (*w == width).then(|| v.clone());
+        }
+        let overlaps = |o: u32, w: u32| o < offset + width && offset < o + w;
+        if run
+            .param_mem
+            .iter()
+            .any(|((p, o), (_, w))| *p == param && overlaps(*o, *w))
+        {
+            return None;
+        }
+        let field = ProtoNode::ParamField {
+            param,
+            off: offset,
+            width,
+        };
+        if let Some(pos) = run.nodes.iter().position(|x| *x == field) {
+            return Some(DkVal::Sym(pos as u32));
+        }
+        // A field first read at one width must not be re-read at another.
+        if run.nodes.iter().any(|x| {
+            matches!(x, ProtoNode::ParamField { param: p, off, width: w }
+                if *p == param && overlaps(*off, *w))
+        }) {
+            return None;
+        }
+        self.proto_node(field)
+    }
+
+    /// Write through a symbolic pointer PARAMETER (summary mode).
+    fn proto_param_store(&mut self, node: u32, offset: u32, val: DkVal, width: u32) -> Option<()> {
+        let run = self.proto.as_mut()?;
+        let ProtoNode::Param(param) = *run.nodes.get(node as usize)? else {
+            return None;
+        };
+        let overlaps = |o: u32, w: u32| o < offset + width && offset < o + w;
+        if run
+            .param_mem
+            .iter()
+            .any(|((p, o), (_, w))| *p == param && (*o, *w) != (offset, width) && overlaps(*o, *w))
+        {
+            return None;
+        }
+        run.param_mem.insert((param, offset), (val, width));
+        Some(())
+    }
+
+    fn load(&mut self, addr: &DkVal, offset: u32, width: u32) -> Option<DkVal> {
+        if let DkVal::Sym(n) = addr {
+            return self.proto_param_load(*n, offset, width);
+        }
         match addr {
             DkVal::StackPtr(o) => {
                 let a = o.checked_add(offset as i32)?;
@@ -12305,17 +12771,19 @@ impl DkEval<'_> {
                 }
                 WI::I32Store(off) => {
                     let val = stack.pop()?;
-                    let DkVal::StackPtr(o) = stack.pop()? else {
-                        return None;
-                    };
-                    self.store(o.checked_add(*off as i32)?, val, 4);
+                    match stack.pop()? {
+                        DkVal::StackPtr(o) => self.store(o.checked_add(*off as i32)?, val, 4),
+                        DkVal::Sym(n) => self.proto_param_store(n, *off, val, 4)?,
+                        _ => return None,
+                    }
                 }
                 WI::I64Store(off) => {
                     let val = stack.pop()?;
-                    let DkVal::StackPtr(o) = stack.pop()? else {
-                        return None;
-                    };
-                    self.store(o.checked_add(*off as i32)?, val, 8);
+                    match stack.pop()? {
+                        DkVal::StackPtr(o) => self.store(o.checked_add(*off as i32)?, val, 8),
+                        DkVal::Sym(n) => self.proto_param_store(n, *off, val, 8)?,
+                        _ => return None,
+                    }
                 }
 
                 WI::Block { block_type } => {
@@ -12401,7 +12869,22 @@ impl DkEval<'_> {
                     }
                     return None;
                 }
-                WI::Call(t) => self.handle_call(*t, &mut stack, depth)?,
+                WI::Call(t) => {
+                    if self.handle_call(*t, &mut stack, depth).is_none() {
+                        // Protocol mode: a call the model cannot follow,
+                        // whose continuation is `unreachable`, never returns
+                        // to live code — the path diverges (see
+                        // `ProtoEnd::Diverge`).
+                        if let Some(run) = self.proto.as_mut()
+                            && run.end.is_none()
+                            && self.module.imports.get_by_index(*t).is_none()
+                            && matches!(body.get(ip + 1), Some(WI::Unreachable))
+                        {
+                            run.end = Some(ProtoEnd::Diverge);
+                        }
+                        return None;
+                    }
+                }
                 _ => return None,
             }
             ip += 1;
@@ -25421,5 +25904,143 @@ mod tests {
         assert!(!is_pure_key_ctor(&m, 14));
         let impure = m.get_function(15).expect("func 15");
         assert!(eval_constant_export(&m, &reg, impure, m.get_func_type(15)).is_none());
+    }
+
+    /// Fixture for the SDK `Vec` iterator protocol (issue #69). Import 0 =
+    /// vec_get. Func 1 = a diverging panic helper (out of model), 2 = THE
+    /// iterator `next` (digicus shape: tag-73 conversion flag), 3 = the
+    /// unwrap adapter, then NEGATIVE `next` variants: 4 = fetches at
+    /// `idx + 1` instead of `idx`, 5 = never advances the index, 6 = stores
+    /// a constant instead of the fetched element, 7 = bounds the index by a
+    /// field other than the one it advances (compares `len < len`),
+    /// 8 = NEGATIVE adapter that rewrites the value.
+    fn vec_iter_module() -> WasmModule {
+        // (index expression fed to vec_get, the index store, the out[1] store)
+        let next = |idx_expr: &str, advance: &str, elem: &str, bound: &str| {
+            format!(
+                r#"(func (param i32 i32) (local i32 i64 i64)
+                    block
+                        block
+                            {bound}
+                            i32.lt_u br_if 0
+                            i64.const 2 local.set 3
+                            br 1
+                        end
+                        local.get 1 i64.load
+                        {idx_expr} i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
+                        call 0 local.set 4
+                        block
+                            local.get 2 i32.const 1 i32.add local.tee 2
+                            i32.eqz br_if 0
+                            {advance}
+                            local.get 4 i64.const 255 i64.and i64.const 73 i64.ne
+                            i64.extend_i32_u local.set 3
+                            br 1
+                        end
+                        call 1
+                        unreachable
+                    end
+                    local.get 0 {elem} i64.store offset=8
+                    local.get 0 local.get 3 i64.store)"#
+            )
+        };
+        let good_bound = "local.get 1 i32.load offset=8 local.tee 2 local.get 1 i32.load offset=12";
+        let good_adv = "local.get 1 local.get 2 i32.store offset=8";
+        let adapter = |value: &str| {
+            format!(
+                r#"(func (param i32 i64 i64) (local i64)
+                    i64.const 0 local.set 3
+                    block
+                        block
+                            local.get 1 i64.const 2 i64.eq br_if 0
+                            local.get 1 i32.wrap_i64 br_if 1
+                            i64.const 1 local.set 3
+                        end
+                        local.get 0 {value} i64.store offset=8
+                        local.get 0 local.get 3 i64.store
+                        return
+                    end
+                    call 1
+                    unreachable)"#
+            )
+        };
+        let wat = format!(
+            r#"(module
+                (import "v" "1" (func (param i64 i64) (result i64)))
+                (memory 1)
+                (func (;1;) (local i32) loop br 0 end)
+                {}
+                {}
+                {}
+                {}
+                {}
+                {}
+                {}
+            )"#,
+            next("local.get 2", good_adv, "local.get 4", good_bound),
+            adapter("local.get 2"),
+            next(
+                "local.get 2 i32.const 1 i32.add",
+                good_adv,
+                "local.get 4",
+                good_bound
+            ),
+            next("local.get 2", "", "local.get 4", good_bound),
+            next("local.get 2", good_adv, "i64.const 5", good_bound),
+            next(
+                "local.get 2",
+                good_adv,
+                "local.get 4",
+                "local.get 1 i32.load offset=12 local.tee 2 local.get 1 i32.load offset=12"
+            ),
+            adapter("local.get 2 i64.const 1 i64.add"),
+        );
+        let wasm = wat::parse_str(&wat).expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    #[test]
+    fn vec_iterator_next_and_unwrap_adapter_are_proven_by_summary() {
+        let m = vec_iter_module();
+        let classify_next = |f: u32| {
+            proto_summarize(&m, f)
+                .as_deref()
+                .and_then(classify_vec_iter_next)
+        };
+        assert_eq!(
+            classify_next(2),
+            Some(VecIterNext {
+                vec_off: 0,
+                idx_off: 8,
+                len_off: 12,
+                none_disc: 2,
+                conv_tag: Some(73),
+            })
+        );
+        assert_eq!(
+            proto_summarize(&m, 3)
+                .as_deref()
+                .and_then(classify_iter_unwrap_adapter),
+            Some(IterUnwrapAdapter {
+                none_in: 2,
+                none_out: 0,
+                some_out: 1,
+            })
+        );
+        // Every deviation from the protocol refuses.
+        assert_eq!(classify_next(4), None, "fetches idx + 1, not idx");
+        assert_eq!(classify_next(5), None, "never advances the index");
+        assert_eq!(classify_next(6), None, "stores a constant, not the element");
+        assert_eq!(classify_next(7), None, "bound is not on the advanced index");
+        assert_eq!(
+            proto_summarize(&m, 8)
+                .as_deref()
+                .and_then(classify_iter_unwrap_adapter),
+            None,
+            "an adapter must pass the value through untouched"
+        );
+        // A summary is not a call-site evaluation: the adapter is not a
+        // `next`, and the `next` is not an adapter.
+        assert_eq!(classify_next(3), None);
     }
 }
