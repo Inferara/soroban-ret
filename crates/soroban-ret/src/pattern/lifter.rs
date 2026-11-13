@@ -10607,6 +10607,16 @@ fn eval_constant_export(
     {
         return None;
     }
+    // The concrete evaluator never INTERPRETS a callee it classifies as a
+    // symbol / vec builder — it computes the result from static data. That
+    // is only sound here if such a callee has no effect to skip: a helper
+    // with a builder's signature that also fails or writes storage would
+    // otherwise be folded away with the constant (PR #85 review). Every
+    // function this export can reach that the evaluator might summarize
+    // must be a pure value builder.
+    if !reachable_summaries_are_pure(module, func) {
+        return None;
+    }
     let mut locals = Vec::new();
     for ty in &func.locals {
         locals.push(match ty {
@@ -10642,6 +10652,50 @@ fn eval_constant_export(
     }
     cov_mark::hit!(constant_export_evaluated);
     Some(vec![SorobanStmt::Return(Some(value))])
+}
+
+/// True when every internal function reachable from `root` that carries a
+/// signature [`DkEval::handle_call`] may SUMMARIZE instead of interpreting
+/// (`(i32, i32) -> i64` symbol / vec builders, the `(i32, i32, i32) -> ()`
+/// long-symbol builder) is a pure value builder ([`is_pure_key_ctor`]).
+/// The walk covers the whole static call graph, taken paths or not, and
+/// refuses on an unresolvable callee or `call_indirect`.
+fn reachable_summaries_are_pure(module: &WasmModule, root: &crate::wasm::ir::WasmFunction) -> bool {
+    use crate::wasm::ir::{WasmInstr as WI, WasmType};
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut work: Vec<u32> = Vec::new();
+    let push_calls = |f: &crate::wasm::ir::WasmFunction, work: &mut Vec<u32>| -> bool {
+        for ins in &f.body {
+            match ins {
+                WI::Call(t) => work.push(*t),
+                WI::CallIndirect(_) => return false,
+                _ => {}
+            }
+        }
+        true
+    };
+    if !push_calls(root, &mut work) {
+        return false;
+    }
+    while let Some(f) = work.pop() {
+        if !seen.insert(f) || module.imports.get_by_index(f).is_some() {
+            continue;
+        }
+        let (Some(func), Some(ft)) = (module.get_function(f), module.get_func_type(f)) else {
+            return false;
+        };
+        let summarizable = (ft.params.as_slice() == [WasmType::I32, WasmType::I32]
+            && ft.results.as_slice() == [WasmType::I64])
+            || (ft.params.as_slice() == [WasmType::I32, WasmType::I32, WasmType::I32]
+                && ft.results.is_empty());
+        if summarizable && !is_pure_key_ctor(module, f) {
+            return false;
+        }
+        if !push_calls(func, &mut work) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The declared Rust type of helper `getter`'s result, when the contract
@@ -25205,9 +25259,11 @@ mod tests {
     /// `require_auth`, absent → `fail_with_error`), a defaulting MAP getter
     /// (absent → `map_new()`), and a constant export computed by a loop.
     /// Imports: 0=has, 1=get, 2=fail, 3=string_new, 4=map_new,
-    /// 5=require_auth. Func 6 = string key builder, 7 = has wrapper,
-    /// 8 = auth guard, 9 = its caller, 10 = defaulting map getter,
-    /// 11 = its caller, 12 = constant export (sums 1..=4 in a loop → 10).
+    /// 5=require_auth, 6=symbol_new. Func 7 = string key builder, 8 = has
+    /// wrapper, 9 = auth guard, 10 = its caller, 11 = defaulting map getter,
+    /// 12 = its caller, 13 = constant export (sums 1..=4 in a loop → 10),
+    /// 14 = a symbol-builder-SHAPED helper that also fails with an error,
+    /// 15 = the same looped constant, but calling 14 first.
     fn digicus_shapes_module() -> WasmModule {
         let wasm = wat::parse_str(
             r#"(module
@@ -25217,18 +25273,19 @@ mod tests {
                 (import "b" "i" (func (param i64 i64) (result i64)))
                 (import "m" "_" (func (result i64)))
                 (import "a" "0" (func (param i64) (result i64)))
+                (import "b" "j" (func (param i64 i64) (result i64)))
                 (memory 1)
                 (data (i32.const 2000) "adminrepos")
-                (func (;6;) (param i32 i32) (result i64)
+                (func (;7;) (param i32 i32) (result i64)
                     local.get 0 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
                     local.get 1 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
                     call 3)
-                (func (;7;) (param i64) (result i32)
+                (func (;8;) (param i64) (result i32)
                     local.get 0 i64.const 2 call 0 i64.const 1 i64.eq)
-                (func (;8;) (local i64)
+                (func (;9;) (local i64)
                     block
-                        i32.const 2000 i32.const 5 call 6 local.tee 0
-                        call 7 i32.eqz br_if 0
+                        i32.const 2000 i32.const 5 call 7 local.tee 0
+                        call 8 i32.eqz br_if 0
                         local.get 0 i64.const 2 call 1 local.tee 0
                         i64.const 255 i64.and i64.const 77 i64.ne
                         if unreachable end
@@ -25237,12 +25294,12 @@ mod tests {
                     end
                     i64.const 4294967299 call 2 drop
                     unreachable)
-                (func (;9;) call 8)
-                (func (;10;) (result i64) (local i64)
+                (func (;10;) call 9)
+                (func (;11;) (result i64) (local i64)
                     block
                         block
-                            i32.const 2005 i32.const 5 call 6 local.tee 0
-                            call 7 i32.eqz br_if 0
+                            i32.const 2005 i32.const 5 call 7 local.tee 0
+                            call 8 i32.eqz br_if 0
                             local.get 0 i64.const 2 call 1 local.tee 0
                             i64.const 255 i64.and i64.const 76 i64.eq br_if 1
                             unreachable
@@ -25250,8 +25307,25 @@ mod tests {
                         call 4 local.set 0
                     end
                     local.get 0)
-                (func (;11;) (result i64) call 10)
-                (func (;12;) (result i64) (local i32 i32)
+                (func (;12;) (result i64) call 11)
+                (func (;13;) (result i64) (local i32 i32)
+                    i32.const 1 local.set 0
+                    block
+                        loop
+                            local.get 0 i32.const 4 i32.gt_u br_if 1
+                            local.get 1 local.get 0 i32.add local.set 1
+                            local.get 0 i32.const 1 i32.add local.set 0
+                            br 0
+                        end
+                    end
+                    local.get 1 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or)
+                (func (;14;) (param i32 i32) (result i64)
+                    i64.const 4294967299 call 2 drop
+                    local.get 0 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
+                    local.get 1 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
+                    call 6)
+                (func (;15;) (result i64) (local i32 i32)
+                    i32.const 2000 i32.const 5 call 14 drop
                     i32.const 1 local.set 0
                     block
                         loop
@@ -25272,14 +25346,14 @@ mod tests {
     fn proto_auth_guard_with_string_key_recovers_bound_read_and_auth() {
         cov_mark::check!(proto_fallible_getter_recovered);
         let m = digicus_shapes_module();
-        let g = proto_enumerate(&m, 8, &[])
+        let g = proto_enumerate(&m, 9, &[])
             .as_deref()
             .and_then(classify_fallible_getter)
             .expect("the auth guard classifies");
         assert!(g.auth_only);
         assert_eq!(g.error_val, Some(4294967299));
         assert_eq!(g.key, DkVal::StrObj("admin".to_string()));
-        let (stmts, _) = proto_lift(&m, 9).content.expect("effectful");
+        let (stmts, _) = proto_lift(&m, 10).content.expect("effectful");
         assert!(
             matches!(
                 stmts.as_slice(),
@@ -25302,14 +25376,14 @@ mod tests {
     fn proto_defaulting_map_getter_classifies_but_is_withheld() {
         cov_mark::check!(proto_defaulting_collection_withheld);
         let m = digicus_shapes_module();
-        let g = proto_enumerate(&m, 10, &[])
+        let g = proto_enumerate(&m, 11, &[])
             .as_deref()
             .and_then(classify_fallible_getter)
             .expect("the defaulting map getter classifies");
         assert_eq!(g.default_empty, Some(76));
         assert_eq!(g.value, ProtoGetterValue::Object(76));
         assert!(!g.auth_only);
-        let _ = proto_lift(&m, 11);
+        let _ = proto_lift(&m, 12);
     }
 
     #[test]
@@ -25317,8 +25391,8 @@ mod tests {
         cov_mark::check!(constant_export_evaluated);
         let m = digicus_shapes_module();
         // Spec-less (generic WASM) modules are never evaluated.
-        let func = m.get_function(12).expect("func 12");
-        assert!(eval_constant_export(&m, &empty_registry(), func, m.get_func_type(12)).is_none());
+        let func = m.get_function(13).expect("func 13");
+        assert!(eval_constant_export(&m, &empty_registry(), func, m.get_func_type(13)).is_none());
         let mut reg = empty_registry();
         reg.functions.insert(
             "version".to_string(),
@@ -25329,7 +25403,7 @@ mod tests {
                 outputs: vec![ScSpecTypeDef::U32].try_into().expect("outputs"),
             },
         );
-        let stmts = eval_constant_export(&m, &reg, func, m.get_func_type(12))
+        let stmts = eval_constant_export(&m, &reg, func, m.get_func_type(13))
             .expect("a pure looped constant evaluates");
         assert!(
             matches!(
@@ -25339,7 +25413,13 @@ mod tests {
             "1 + 2 + 3 + 4: {stmts:?}"
         );
         // A function that reads storage is not a constant.
-        let getter = m.get_function(10).expect("func 10");
-        assert!(eval_constant_export(&m, &reg, getter, m.get_func_type(10)).is_none());
+        let getter = m.get_function(11).expect("func 11");
+        assert!(eval_constant_export(&m, &reg, getter, m.get_func_type(11)).is_none());
+        // A callee the evaluator would SUMMARIZE as a symbol builder, but
+        // which also fails with an error, must not be skipped: the export
+        // is not a constant (PR #85 review).
+        assert!(!is_pure_key_ctor(&m, 14));
+        let impure = m.get_function(15).expect("func 15");
+        assert!(eval_constant_export(&m, &reg, impure, m.get_func_type(15)).is_none());
     }
 }
