@@ -11262,6 +11262,14 @@ fn proto_enumerate_seeded(
     Some(out)
 }
 
+/// Whether byte ranges `[a, a + aw)` and `[b, b + bw)` intersect. Offsets
+/// are attacker-chosen WASM immediates (up to `u32::MAX`), so the ends are
+/// computed in `u64` — `offset + width` in `u32` would overflow and panic.
+fn byte_ranges_overlap(a: u32, aw: u32, b: u32, bw: u32) -> bool {
+    let (a, aw, b, bw) = (a as u64, aw as u64, b as u64, bw as u64);
+    a < b + bw && b < a + aw
+}
+
 /// A helper PROVEN to be the SDK's `Vec` iterator `next` (issue #69):
 /// `(out: *mut [i64; 2], it: *mut Iter) -> ()` over an iterator
 /// `{ vec: i64, idx: u32, len: u32 }` at the proven field offsets.
@@ -12276,7 +12284,7 @@ impl DkEval<'_> {
         if let Some((v, w)) = run.param_mem.get(&(param, offset)) {
             return (*w == width).then(|| v.clone());
         }
-        let overlaps = |o: u32, w: u32| o < offset + width && offset < o + w;
+        let overlaps = |o: u32, w: u32| byte_ranges_overlap(o, w, offset, width);
         if run
             .param_mem
             .iter()
@@ -12308,7 +12316,7 @@ impl DkEval<'_> {
         let ProtoNode::Param(param) = *run.nodes.get(node as usize)? else {
             return None;
         };
-        let overlaps = |o: u32, w: u32| o < offset + width && offset < o + w;
+        let overlaps = |o: u32, w: u32| byte_ranges_overlap(o, w, offset, width);
         if run
             .param_mem
             .iter()
@@ -26042,5 +26050,25 @@ mod tests {
         // A summary is not a call-site evaluation: the adapter is not a
         // `next`, and the `next` is not an adapter.
         assert_eq!(classify_next(3), None);
+        // Offsets are WASM immediates up to `u32::MAX`: the overlap check
+        // must not overflow (PR #86 review).
+        assert!(byte_ranges_overlap(8, 4, 8, 4));
+        assert!(byte_ranges_overlap(8, 8, 12, 4));
+        assert!(!byte_ranges_overlap(8, 4, 12, 4));
+        assert!(!byte_ranges_overlap(0, 4, u32::MAX, 8));
+        assert!(byte_ranges_overlap(u32::MAX, 8, u32::MAX, 4));
+        // End to end: a helper touching a field at the largest offset is
+        // summarized (or refused) without panicking.
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (func (param i32)
+                    local.get 0 i32.load offset=8 drop
+                    local.get 0 i32.load offset=4294967295 drop
+                    local.get 0 i32.const 1 i32.store offset=4294967295))"#,
+        )
+        .expect("wat parses");
+        let big = WasmModule::parse(&wasm).expect("module parses");
+        let _ = proto_summarize(&big, 0);
     }
 }
