@@ -3325,7 +3325,70 @@ fn hole_mistyped_construct_fields(stmts: &mut [SorobanStmt], registry: &TypeRegi
 ///
 /// Only the value operand of a storage `set` is rewritten, and only for a
 /// plain `var_N` receiver whose `let` is visible in the same list.
+///
+/// The in-place form changes what `m` holds from the store onward, which
+/// the functional original does not. It is used only when the binding has
+/// NO other reader that could tell: no use of `var_N` anywhere in the
+/// function outside the statements between its `let` and this store, no
+/// reassignment, a single declaration, and no mention in the storage key
+/// (evaluated after the hoisted update). Otherwise the update is applied to
+/// a clone in a scope of its own —
+/// `{ let mut m = m.clone(); m.set(k, v); storage.set(&key, &m); }` — which
+/// leaves the original binding untouched; and when the key itself reads
+/// `m`, nothing is rewritten.
 fn hoist_stored_collection_updates(stmts: &mut Vec<SorobanStmt>) {
+    // Whole-function census, taken before any rewrite: uses, reassignments
+    // and declarations per `var_N`.
+    let mut uses: HashMap<u32, usize> = HashMap::new();
+    walk_exprs(stmts, &mut |e| {
+        if let SorobanExpr::Local(n) = e {
+            *uses.entry(*n).or_insert(0) += 1;
+        }
+    });
+    let mut bound: HashMap<String, usize> = HashMap::new();
+    count_bindings(stmts, &mut bound);
+    hoist_stored_collection_updates_in(stmts, &uses, &bound);
+}
+
+/// `let` declarations and assignments per binding name, recursively.
+fn count_bindings(stmts: &[SorobanStmt], out: &mut HashMap<String, usize>) {
+    for s in stmts {
+        match s {
+            SorobanStmt::Let { name, .. } | SorobanStmt::Assign { target: name, .. } => {
+                *out.entry(name.clone()).or_insert(0) += 1;
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                count_bindings(then_body, out);
+                count_bindings(else_body, out);
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => count_bindings(body, out),
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms {
+                    count_bindings(&arm.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn hoist_stored_collection_updates_in(
+    stmts: &mut Vec<SorobanStmt>,
+    uses: &HashMap<u32, usize>,
+    bound: &HashMap<String, usize>,
+) {
+    fn mentions(e: &SorobanExpr, n: u32) -> bool {
+        matches!(e, SorobanExpr::Local(i) if *i == n)
+            || child_exprs(e).iter().any(|c| mentions(c, n))
+    }
+    let hoist_stored_collection_updates =
+        |b: &mut Vec<SorobanStmt>| hoist_stored_collection_updates_in(b, uses, bound);
     for s in stmts.iter_mut() {
         match s {
             SorobanStmt::If {
@@ -3376,16 +3439,57 @@ fn hoist_stored_collection_updates(stmts: &mut Vec<SorobanStmt>) {
             i += 1;
             continue;
         };
-        if let SorobanStmt::Let { mutable, .. } = &mut stmts[decl] {
-            *mutable = true;
+        let SorobanStmt::Expr(SorobanExpr::StorageSet { key, .. }) = &stmts[i] else {
+            unreachable!()
+        };
+        if mentions(key, n) {
+            // The key would be computed from the updated collection.
+            cov_mark::hit!(stored_collection_update_key_reads_receiver);
+            i += 1;
+            continue;
         }
+        // Every use of the binding lies between its `let` and this store
+        // (inclusive), so nothing can observe the in-place update.
+        let mut window_uses = 0usize;
+        walk_exprs(&stmts[decl + 1..=i], &mut |e| {
+            if matches!(e, SorobanExpr::Local(x) if *x == n) {
+                window_uses += 1;
+            }
+        });
+        let unobserved = uses.get(&n).copied().unwrap_or(0) == window_uses
+            && bound.get(&name).copied().unwrap_or(0) == 1;
         let SorobanStmt::Expr(SorobanExpr::StorageSet { value, .. }) = &mut stmts[i] else {
             unreachable!()
         };
         let update = std::mem::replace(value.as_mut(), SorobanExpr::Local(n));
-        stmts.insert(i, SorobanStmt::Expr(update));
-        cov_mark::hit!(stored_collection_update_hoisted);
-        i += 2;
+        if unobserved {
+            if let SorobanStmt::Let { mutable, .. } = &mut stmts[decl] {
+                *mutable = true;
+            }
+            stmts.insert(i, SorobanStmt::Expr(update));
+            cov_mark::hit!(stored_collection_update_hoisted);
+            i += 2;
+        } else {
+            let store = stmts.remove(i);
+            stmts.insert(
+                i,
+                SorobanStmt::Block(vec![
+                    SorobanStmt::Let {
+                        name,
+                        mutable: true,
+                        value: SorobanExpr::MethodCall {
+                            object: Box::new(SorobanExpr::Local(n)),
+                            method: "clone".to_string(),
+                            args: Vec::new(),
+                        },
+                    },
+                    SorobanStmt::Expr(update),
+                    store,
+                ]),
+            );
+            cov_mark::hit!(stored_collection_update_applied_to_clone);
+            i += 1;
+        }
     }
 }
 
@@ -11093,5 +11197,98 @@ mod tests {
         );
         assert!(matches!(fields[1].1, SorobanExpr::NamedLocal(_)));
         assert!(matches!(fields[2].1, SorobanExpr::NamedLocal(_)));
+    }
+
+    fn stored_update(key: SorobanExpr) -> Vec<SorobanStmt> {
+        vec![
+            SorobanStmt::Let {
+                name: "var_1".to_string(),
+                mutable: false,
+                value: SorobanExpr::Param("m".to_string()),
+            },
+            SorobanStmt::Expr(SorobanExpr::StorageSet {
+                storage_type: StorageType::Instance,
+                key: Box::new(key),
+                value: Box::new(SorobanExpr::MethodCall {
+                    object: Box::new(SorobanExpr::Local(1)),
+                    method: "set".to_string(),
+                    args: vec![SorobanExpr::U32Literal(7), SorobanExpr::U32Literal(9)],
+                }),
+            }),
+        ]
+    }
+
+    fn is_update_of_var_1(s: &SorobanStmt) -> bool {
+        matches!(s, SorobanStmt::Expr(SorobanExpr::MethodCall { object, method, .. })
+            if method == "set" && **object == SorobanExpr::Local(1))
+    }
+
+    fn stores_var_1(s: &SorobanStmt) -> bool {
+        matches!(s, SorobanStmt::Expr(SorobanExpr::StorageSet { value, .. })
+            if **value == SorobanExpr::Local(1))
+    }
+
+    /// The binding has no other reader: update it in place, then store it.
+    #[test]
+    fn stored_collection_update_is_hoisted_in_place_when_unobserved() {
+        cov_mark::check!(stored_collection_update_hoisted);
+        let mut stmts = stored_update(SorobanExpr::SymbolLiteral("K".to_string()));
+        hoist_stored_collection_updates(&mut stmts);
+        assert!(
+            matches!(stmts.as_slice(), [SorobanStmt::Let { mutable: true, .. }, u, st]
+                if is_update_of_var_1(u) && stores_var_1(st)),
+            "{stmts:?}"
+        );
+    }
+
+    /// A later reader of the binding must still see the ORIGINAL
+    /// collection — the host update returns a new one. The update goes to
+    /// a clone in its own scope (PR #87 review).
+    #[test]
+    fn stored_collection_update_goes_to_a_clone_when_the_binding_is_read_later() {
+        cov_mark::check!(stored_collection_update_applied_to_clone);
+        cov_mark::check_count!(stored_collection_update_hoisted, 0);
+        let mut stmts = stored_update(SorobanExpr::SymbolLiteral("K".to_string()));
+        stmts.push(SorobanStmt::Return(Some(SorobanExpr::Local(1))));
+        hoist_stored_collection_updates(&mut stmts);
+        let [
+            SorobanStmt::Let { mutable: false, .. },
+            SorobanStmt::Block(inner),
+            SorobanStmt::Return(Some(SorobanExpr::Local(1))),
+        ] = stmts.as_slice()
+        else {
+            panic!("the original binding is untouched: {stmts:?}");
+        };
+        assert!(
+            matches!(inner.as_slice(), [
+                SorobanStmt::Let { name, mutable: true, value: SorobanExpr::MethodCall { object, method, .. } },
+                u,
+                st,
+            ] if name == "var_1"
+                && method == "clone"
+                && **object == SorobanExpr::Local(1)
+                && is_update_of_var_1(u)
+                && stores_var_1(st)),
+            "{inner:?}"
+        );
+    }
+
+    /// A key computed from the collection must see it BEFORE the update;
+    /// hoisting the update would change the key. Left alone (PR #87
+    /// review).
+    #[test]
+    fn stored_collection_update_is_not_hoisted_when_the_key_reads_the_collection() {
+        cov_mark::check!(stored_collection_update_key_reads_receiver);
+        cov_mark::check_count!(stored_collection_update_hoisted, 0);
+        cov_mark::check_count!(stored_collection_update_applied_to_clone, 0);
+        let key = SorobanExpr::MethodCall {
+            object: Box::new(SorobanExpr::Local(1)),
+            method: "len".to_string(),
+            args: Vec::new(),
+        };
+        let before = stored_update(key);
+        let mut stmts = before.clone();
+        hoist_stored_collection_updates(&mut stmts);
+        assert_eq!(format!("{stmts:?}"), format!("{before:?}"));
     }
 }

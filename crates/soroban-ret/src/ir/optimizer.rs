@@ -5306,7 +5306,16 @@ fn remove_redundant_lets(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             }
 
             // Immutable single-use, not inside a loop, and side-effect-free → inline.
-            if !*mutable && uses == 1 && !in_loop && !side_effect {
+            // Not when the value reads a variable that is reassigned before
+            // the use: the binding holds the OLD value, and the inlined
+            // read would land after the assignment (`let t = a; a = b;
+            // b = t;` is a swap; `a = b; b = a;` is not — PR #87 review).
+            if !*mutable
+                && uses == 1
+                && !in_loop
+                && !side_effect
+                && !reads_var_assigned_before_use(value, idx, &stmts[i + 1..])
+            {
                 cov_mark::hit!(redundant_let_inlined);
                 let SorobanStmt::Let { value, .. } = stmts.remove(i) else {
                     unreachable!()
@@ -5585,6 +5594,65 @@ fn remove_dead_assigns_from_body(body: &mut Vec<SorobanStmt>, name: &str) {
 
 /// Count how many times `Local(idx)` appears in `stmts`.
 /// Returns `(count, any_use_inside_loop)`.
+/// True when `value` reads a variable that is assigned between the binding
+/// `var_{idx}` and its use in `rest`: in a statement before the one holding
+/// the use, or anywhere inside that statement when it is a compound one
+/// (the assignment may then run first).
+fn reads_var_assigned_before_use(value: &SorobanExpr, idx: u32, rest: &[SorobanStmt]) -> bool {
+    let Some(j) = (0..rest.len()).find(|j| count_local_uses(&rest[*j..=*j], idx).0 > 0) else {
+        return false;
+    };
+    let compound = matches!(
+        rest[j],
+        SorobanStmt::If { .. }
+            | SorobanStmt::Match { .. }
+            | SorobanStmt::Loop { .. }
+            | SorobanStmt::For { .. }
+            | SorobanStmt::Block(_)
+    );
+    let rest = if compound { &rest[..=j] } else { &rest[..j] };
+    fn targets(stmts: &[SorobanStmt], out: &mut Vec<String>) {
+        for s in stmts {
+            match s {
+                SorobanStmt::Assign { target, .. } => out.push(target.clone()),
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    targets(then_body, out);
+                    targets(else_body, out);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        targets(&arm.body, out);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => targets(body, out),
+                _ => {}
+            }
+        }
+    }
+    fn reads(e: &SorobanExpr, names: &[String]) -> bool {
+        match e {
+            SorobanExpr::Local(i) => names.contains(&format!("var_{i}")),
+            SorobanExpr::NamedLocal(n) => names.contains(n),
+            _ => crate::pipeline::child_exprs(e)
+                .iter()
+                .any(|c| reads(c, names)),
+        }
+    }
+    let mut names = Vec::new();
+    targets(rest, &mut names);
+    if names.is_empty() || !reads(value, &names) {
+        return false;
+    }
+    cov_mark::hit!(let_reading_reassigned_var_not_inlined);
+    true
+}
+
 fn count_local_uses(stmts: &[SorobanStmt], idx: u32) -> (u32, bool) {
     count_local_in_stmts(stmts, idx, false)
 }
@@ -10168,6 +10236,55 @@ mod tests {
                 ]
             ),
             "the read must not move past the storage write: {out:?}"
+        );
+    }
+
+    /// `let t = a; a = b; b = t;` — the binding holds `a`'s OLD value, so
+    /// its read must not be inlined past `a = b` (PR #87 review).
+    #[test]
+    fn let_reading_a_reassigned_variable_is_not_inlined_past_the_assignment() {
+        cov_mark::check!(let_reading_reassigned_var_not_inlined);
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_1".to_string(),
+                mutable: true,
+                value: SorobanExpr::Param("x".to_string()),
+            },
+            SorobanStmt::Let {
+                name: "var_2".to_string(),
+                mutable: true,
+                value: SorobanExpr::Param("y".to_string()),
+            },
+            SorobanStmt::Let {
+                name: "var_3".to_string(),
+                mutable: false,
+                value: SorobanExpr::Local(1),
+            },
+            SorobanStmt::Assign {
+                target: "var_1".to_string(),
+                value: SorobanExpr::Local(2),
+            },
+            SorobanStmt::Assign {
+                target: "var_2".to_string(),
+                value: SorobanExpr::Local(3),
+            },
+            SorobanStmt::Return(Some(SorobanExpr::TupleConstruct(vec![
+                SorobanExpr::Local(1),
+                SorobanExpr::Local(2),
+            ]))),
+        ];
+        let out = remove_redundant_lets_public(stmts);
+        assert!(
+            out.iter()
+                .any(|s| matches!(s, SorobanStmt::Let { name, value, .. }
+                if name == "var_3" && *value == SorobanExpr::Local(1))),
+            "the copy of the old value is kept: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|s| matches!(s, SorobanStmt::Assign { target, value }
+                if target == "var_2" && *value == SorobanExpr::Local(1))),
+            "`var_2` must not read the reassigned `var_1`: {out:?}"
         );
     }
 }

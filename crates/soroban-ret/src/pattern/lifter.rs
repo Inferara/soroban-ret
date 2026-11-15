@@ -988,7 +988,13 @@ impl<'a> LiftContext<'a> {
                 }
                 WI::LocalSet(l) | WI::LocalTee(l) if *l == f => return None,
                 WI::Call(t) if t == next_fn || t == unwrap_fn => return None,
-                WI::GlobalSet(_) | WI::CallIndirect(_) | WI::Return | WI::BrTable { .. } => {
+                // `global.get 0` re-derives the frame pointer: a second
+                // name for the frame that the `f`-only check cannot see.
+                WI::GlobalGet(0)
+                | WI::GlobalSet(_)
+                | WI::CallIndirect(_)
+                | WI::Return
+                | WI::BrTable { .. } => {
                     return None;
                 }
                 _ => {}
@@ -1001,6 +1007,23 @@ impl<'a> LiftContext<'a> {
             return None;
         }
         let fbase = foff.base;
+        // `f` must be the ONLY name for this frame when the loop starts. A
+        // copy of the pointer (another local, an operand, a saved slot)
+        // could read or rewrite the iterator's fields inside the loop —
+        // resetting its index, say — behind the check above, and the loop
+        // would no longer visit each element once.
+        let aliases = |v: &StackVal| stack_val_mentions_frame(v, fid);
+        if self
+            .locals
+            .iter()
+            .enumerate()
+            .any(|(i, v)| i != f as usize && aliases(v))
+            || self.stack.iter().any(aliases)
+            || self.frame_slots.borrow().values().any(aliases)
+        {
+            cov_mark::hit!(vec_iter_loop_declined_frame_alias);
+            return None;
+        }
         let vec_val = self.locals.get(init.vec_local as usize)?.clone();
         let vec_expr = {
             let slots = self.frame_slots.borrow();
@@ -1456,18 +1479,63 @@ impl<'a> LiftContext<'a> {
 
     /// `var_U = <value>` for every carried local whose value on this path
     /// is no longer its variable.
+    ///
+    /// The new values are all computed from the state at the END of the
+    /// iteration, so the writes are one PARALLEL assignment: a value that
+    /// reads another carried variable must see that variable's old value
+    /// (`a, b = b, a`). When any value reads a variable this batch also
+    /// writes, every value is first bound to a temporary.
     fn iter_carried_assigns(&self, st: &IterRegion<'_>) -> Vec<SorobanStmt> {
-        let slots = self.frame_slots.borrow();
-        st.promoted
-            .iter()
-            .filter_map(|(l, u)| {
-                let v = self.locals.get(*l as usize)?;
-                (*v != StackVal::LetBinding(*u)).then(|| SorobanStmt::Assign {
-                    target: format!("var_{u}"),
-                    value: stack_val_to_expr(v, self.params, self.registry, Some(&slots)),
+        let writes: Vec<(u32, SorobanExpr)> = {
+            let slots = self.frame_slots.borrow();
+            st.promoted
+                .iter()
+                .filter_map(|(l, u)| {
+                    let v = self.locals.get(*l as usize)?;
+                    (*v != StackVal::LetBinding(*u)).then(|| {
+                        (
+                            *u,
+                            stack_val_to_expr(v, self.params, self.registry, Some(&slots)),
+                        )
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        };
+        let interferes = writes.iter().any(|(u, value)| {
+            writes
+                .iter()
+                .any(|(w, _)| w != u && expr_references_local_idx(value, *w))
+        });
+        if !interferes {
+            return writes
+                .into_iter()
+                .map(|(u, value)| SorobanStmt::Assign {
+                    target: format!("var_{u}"),
+                    value,
+                })
+                .collect();
+        }
+        cov_mark::hit!(iter_carried_assigns_made_parallel);
+        let mut out = Vec::with_capacity(writes.len() * 2);
+        let mut moves = Vec::with_capacity(writes.len());
+        for (u, value) in writes {
+            let t = {
+                let mut ctr = self.next_frame_id.borrow_mut();
+                *ctr += 1;
+                PROTO_BINDING_BASE + *ctr
+            };
+            out.push(SorobanStmt::Let {
+                name: format!("var_{t}"),
+                mutable: false,
+                value,
+            });
+            moves.push(SorobanStmt::Assign {
+                target: format!("var_{u}"),
+                value: SorobanExpr::Local(t),
+            });
+        }
+        out.extend(moves);
+        out
     }
 
     /// Emit `var_{idx} = <value>` for a loop-carried local and rebind the local
@@ -12071,6 +12139,21 @@ fn iter_init_window(
         frame_local: *f1,
         vec_abs: *vec,
     })
+}
+
+/// Whether `v` is, or is computed from, an address in frame `fid` — or the
+/// raw stack pointer, which may be any frame's.
+fn stack_val_mentions_frame(v: &StackVal, fid: u32) -> bool {
+    match v {
+        StackVal::FrameSlot(id, _) => *id == fid,
+        StackVal::StackPtrRef => true,
+        StackVal::Eqz(a) => stack_val_mentions_frame(a, fid),
+        StackVal::Compare(a, _, b) | StackVal::BinOp(a, _, b) => {
+            stack_val_mentions_frame(a, fid) || stack_val_mentions_frame(b, fid)
+        }
+        StackVal::I128Limb { value, .. } => stack_val_mentions_frame(value, fid),
+        _ => false,
+    }
 }
 
 /// Whether `v` involves the iterator "has element" marker at all.
@@ -26936,6 +27019,18 @@ mod tests {
     /// the iterator over its `Vec` parameter (index initialised to
     /// `idx_init`) and loops `for x in v.iter() { x.require_auth() }`.
     fn vec_iter_loop_module(idx_init: i32) -> WasmModule {
+        vec_iter_loop_module_with(idx_init, "", "", "")
+    }
+
+    /// [`vec_iter_loop_module`] with extra locals of func 6 (first extra
+    /// local = index 3), code before the iterator's construction (`pre`)
+    /// and code at the end of each iteration (`in_loop`).
+    fn vec_iter_loop_module_with(
+        idx_init: i32,
+        extra_locals: &str,
+        pre: &str,
+        in_loop: &str,
+    ) -> WasmModule {
         let wat = format!(
             r#"(module
                 (import "v" "1" (func (param i64 i64) (result i64)))
@@ -26983,8 +27078,9 @@ mod tests {
                     end
                     call 3
                     unreachable)
-                (func (;6;) (param i64) (local i32 i64)
+                (func (;6;) (param i64) (local i32 i64 {extra_locals})
                     global.get 0 i32.const 48 i32.sub local.tee 1 global.set 0
+                    {pre}
                     local.get 0 call 1 local.set 2
                     local.get 1 i32.const {idx_init} i32.store offset=40
                     local.get 1 local.get 0 i64.store offset=32
@@ -27000,6 +27096,7 @@ mod tests {
                             call 5
                             local.get 1 i64.load i32.wrap_i64 i32.eqz br_if 1
                             local.get 1 i64.load offset=8 call 2 drop
+                            {in_loop}
                             br 0
                         end
                     end
@@ -27063,5 +27160,118 @@ mod tests {
     fn vec_iterator_loop_with_other_initial_index_is_not_rebuilt() {
         cov_mark::check_count!(vec_iter_loop_rebuilt, 0);
         let _ = vec_iter_loop_lift(&vec_iter_loop_module(1));
+    }
+
+    /// A second name for the frame can rewrite the iterator behind the
+    /// frame-pointer check — here it resets the index every iteration, so
+    /// the original loops on the first element forever. Not a `for` over
+    /// the vector (PR #87 review).
+    #[test]
+    fn vec_iterator_loop_with_aliased_frame_pointer_is_not_rebuilt() {
+        cov_mark::check_count!(vec_iter_loop_rebuilt, 0);
+        // A copy of the frame pointer taken before the loop.
+        {
+            cov_mark::check!(vec_iter_loop_declined_frame_alias);
+            let _ = vec_iter_loop_lift(&vec_iter_loop_module_with(
+                0,
+                "i32",
+                "local.get 1 local.set 3",
+                "local.get 3 i32.const 0 i32.store offset=40",
+            ));
+        }
+        // The frame pointer re-derived from the stack pointer in the loop.
+        let _ = vec_iter_loop_lift(&vec_iter_loop_module_with(
+            0,
+            "i32",
+            "",
+            "global.get 0 local.tee 3 i32.const 0 i32.store offset=40",
+        ));
+    }
+
+    /// Two carried locals swapped in the loop: the writes are one parallel
+    /// assignment. `a = b; b = a;` would leave both holding the old `b`
+    /// (PR #87 review).
+    #[test]
+    fn vec_iterator_loop_swapping_carried_locals_assigns_in_parallel() {
+        cov_mark::check!(vec_iter_loop_rebuilt);
+        cov_mark::check!(iter_carried_assigns_made_parallel);
+        let stmts = vec_iter_loop_lift(&vec_iter_loop_module_with(
+            0,
+            "i64 i64",
+            "i64.const 1 local.set 3 i64.const 2 local.set 4",
+            "local.get 3 local.get 4 local.set 3 local.set 4",
+        ));
+        let carried: Vec<&String> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                SorobanStmt::Let {
+                    name,
+                    mutable: true,
+                    ..
+                } => Some(name),
+                _ => None,
+            })
+            .collect();
+        let [a, b] = carried.as_slice() else {
+            panic!("two carried variables: {stmts:?}");
+        };
+        let Some(SorobanStmt::For { body, .. }) =
+            stmts.iter().find(|s| matches!(s, SorobanStmt::For { .. }))
+        else {
+            panic!("no `for` emitted: {stmts:?}");
+        };
+        // `let t1 = b; let t2 = a; a = t1; b = t2;`
+        let n = body.len();
+        let [
+            SorobanStmt::Let {
+                name: t1,
+                value: v1,
+                ..
+            },
+            SorobanStmt::Let {
+                name: t2,
+                value: v2,
+                ..
+            },
+            SorobanStmt::Assign {
+                target: w1,
+                value: SorobanExpr::Local(r1),
+            },
+            SorobanStmt::Assign {
+                target: w2,
+                value: SorobanExpr::Local(r2),
+            },
+        ] = &body[n - 4..]
+        else {
+            panic!("temporaries, then the writes: {body:?}");
+        };
+        let var = |e: &SorobanExpr| match e {
+            SorobanExpr::Local(i) => format!("var_{i}"),
+            other => panic!("a variable read: {other:?}"),
+        };
+        assert_eq!((w1, w2), (*a, *b));
+        assert_eq!((&format!("var_{r1}"), &format!("var_{r2}")), (t1, t2));
+        assert_eq!(
+            (&var(v1), &var(v2)),
+            (*b, *a),
+            "each reads the OTHER's old value"
+        );
+        // The optimizer must keep the swap a swap.
+        let out = crate::ir::optimizer::optimize_stmts(stmts.clone());
+        let Some(SorobanStmt::For { body, .. }) =
+            out.iter().find(|s| matches!(s, SorobanStmt::For { .. }))
+        else {
+            panic!("no `for` after optimization: {out:?}");
+        };
+        let reads_after_write = body.windows(2).any(|w| {
+            matches!(w, [
+                SorobanStmt::Assign { target: x, value: xv },
+                SorobanStmt::Assign { target: y, value: yv },
+            ] if var(xv) == *y && var(yv) == *x)
+        });
+        assert!(
+            !reads_after_write,
+            "`a = b; b = a;` is not a swap: {body:?}"
+        );
     }
 }

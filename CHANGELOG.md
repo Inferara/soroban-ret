@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Map` accessors clone a by-value key that is used again.
 - digicus: all four mutation loops recovered with no holes; equivalence
   divergences **2 → 0**. Corpus hard errors unchanged at 303.
+- Review hardening: the loop is not rebuilt when anything but the frame
+  pointer names the iterator's frame; carried locals are written as one
+  parallel assignment (a swap stays a swap); a stored update is hoisted in
+  place only when the binding has no other reader, else applied to a clone,
+  and never when the storage key reads the collection. The optimizer no
+  longer inlines a binding past a reassignment of a variable it reads (two
+  corpus contracts keep such reads in their original order).
 
 ### Added — iterator-protocol proofs, stage 1 of loop recovery (#69)
 
