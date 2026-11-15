@@ -696,6 +696,14 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         }
         log::trace!("Pipeline pass: stage_4m4 fold_option_void_compares");
 
+        // Stage 4m4b: a functional collection update stored directly —
+        // `storage.set(&k, &m.set(a, b))` — is the SDK's in-place mutator
+        // followed by storing the collection (issue #69).
+        for func in &mut contract_module.functions {
+            hoist_stored_collection_updates(&mut func.body);
+        }
+        log::trace!("Pipeline pass: stage_4m4b hoist_stored_collection_updates");
+
         // Stage 4m5: hole surviving PURE-READ raw host-call renders. The
         // handful of marshalling reads the lifter cannot model
         // (`map_key_by_pos`/`map_val_by_pos` — by-position map iteration —
@@ -3306,6 +3314,81 @@ fn hole_mistyped_construct_fields(stmts: &mut [SorobanStmt], registry: &TypeRegi
 /// the `.unwrap()` recovery — and a decoded `u32` index equal to 2 encodes as
 /// 8589934596 raw, never 2) and the literal must be exactly 2. Comparisons
 /// against any other literal are left as-is (still honest hard errors).
+/// Stage 4m4b. The host's `map_put(m, k, v)` RETURNS the updated map; the
+/// SDK's `m.set(k, v)` mutates in place and returns `()`. The lifter models
+/// the host call functionally, so storing the update directly renders
+/// `storage.set(&key, &m.set(k, v))` — `&()` where the map belongs. When `m`
+/// is a binding declared earlier in the SAME statement list, the faithful
+/// form is `m.set(k, v); storage.set(&key, &m);` with `m` made mutable: the
+/// update is evaluated first either way (it is the store's argument), and
+/// the functional result IS `m` after the in-place update.
+///
+/// Only the value operand of a storage `set` is rewritten, and only for a
+/// plain `var_N` receiver whose `let` is visible in the same list.
+fn hoist_stored_collection_updates(stmts: &mut Vec<SorobanStmt>) {
+    for s in stmts.iter_mut() {
+        match s {
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                hoist_stored_collection_updates(then_body);
+                hoist_stored_collection_updates(else_body);
+            }
+            SorobanStmt::Loop { body } | SorobanStmt::For { body, .. } => {
+                hoist_stored_collection_updates(body)
+            }
+            SorobanStmt::Block(body) => hoist_stored_collection_updates(body),
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms {
+                    hoist_stored_collection_updates(&mut arm.body);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut i = 0;
+    while i < stmts.len() {
+        let receiver = match &stmts[i] {
+            SorobanStmt::Expr(SorobanExpr::StorageSet { value, .. }) => match value.as_ref() {
+                SorobanExpr::MethodCall { object, method, .. }
+                    if matches!(method.as_str(), "set" | "remove" | "push_back") =>
+                {
+                    match object.as_ref() {
+                        SorobanExpr::Local(n) => Some(*n),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(n) = receiver else {
+            i += 1;
+            continue;
+        };
+        let name = format!("var_{n}");
+        let Some(decl) = stmts[..i]
+            .iter()
+            .rposition(|s| matches!(s, SorobanStmt::Let { name: x, .. } if *x == name))
+        else {
+            i += 1;
+            continue;
+        };
+        if let SorobanStmt::Let { mutable, .. } = &mut stmts[decl] {
+            *mutable = true;
+        }
+        let SorobanStmt::Expr(SorobanExpr::StorageSet { value, .. }) = &mut stmts[i] else {
+            unreachable!()
+        };
+        let update = std::mem::replace(value.as_mut(), SorobanExpr::Local(n));
+        stmts.insert(i, SorobanStmt::Expr(update));
+        cov_mark::hit!(stored_collection_update_hoisted);
+        i += 2;
+    }
+}
+
 fn fold_option_void_compares(stmts: &mut [SorobanStmt]) {
     // Per-function identifier use counts: `first_index_of(item: impl
     // Borrow<T>)` CONSUMES its argument, so an identifier arg that appears
@@ -3356,8 +3439,15 @@ fn fold_option_void_compares_in(stmts: &mut [SorobanStmt], use_counts: &HashMap<
         // Any bare index-of call (folded below, a discarded duplicate, or
         // otherwise): clone a multi-use identifier arg so the by-value
         // `impl Borrow<T>` parameter doesn't move a value with later uses.
+        // The SDK `Map` accessors take their key (and value) BY VALUE too
+        // (`contains_key(k: K)`, `get(k: K)`, `set(k: K, v: V)`,
+        // `remove(k: K)`), so a key checked and then used again is the same
+        // use-after-move (issue #69).
         if let SorobanExpr::MethodCall { method, args, .. } = e
-            && (method == "first_index_of" || method == "last_index_of")
+            && matches!(
+                method.as_str(),
+                "first_index_of" | "last_index_of" | "contains_key" | "get" | "set" | "remove"
+            )
         {
             for a in args.iter_mut() {
                 let name = match &a {

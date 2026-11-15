@@ -4030,6 +4030,12 @@ fn decode_raw_val_len_compare(expr: SorobanExpr) -> SorobanExpr {
     }
 }
 
+/// Constant/boolean-fold one expression (`bool == 1` → `bool`, …) — for
+/// lifter code that builds a condition outside the statement-level passes.
+pub(crate) fn fold_expr_standalone(expr: SorobanExpr) -> SorobanExpr {
+    fold_expr(expr)
+}
+
 fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
     let expr = decode_raw_val_len_compare(expr);
     match expr {

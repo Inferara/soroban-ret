@@ -223,11 +223,13 @@ fn test_lost_collections_render_honest_holes() {
     // (`Map::new(&env)`), which compiles and reads as an intentional empty
     // collection — silent-wrong output the soundness ratchet cannot see.
     //
-    // digicus `get_repos` is the canonical collapse: the helper is
+    // digicus `get_repos` was the canonical collapse: the helper is
     // `get("repos").unwrap_or_else(|| Map::new(&env))`, and branch-sequential
     // lifting made the default arm the extracted value, fabricating
-    // `Map::new(&env).keys()` (always-empty). The lost value must be an honest
-    // `todo!()` hole instead.
+    // `Map::new(&env).keys()` (always-empty). Issue #36 turned that into an
+    // honest `todo!()`; issue #69 recovers the real expression by executing
+    // the helper. So the empty map may appear ONLY as the read's own default
+    // — never as a stand-alone value.
     let wasm = include_bytes!("../../../benchmark-data/mainnet/digicus-CCZLARB4.wasm");
     let source = decompile(wasm).expect("decompilation failed");
 
@@ -237,13 +239,23 @@ fn test_lost_collections_render_honest_holes() {
             .find("\n    pub fn ")
             .unwrap_or(source.len() - sig);
     let body = &source[sig..end];
-    assert!(
-        !body.contains("Map::new(&env)") && !body.contains("Map::<_, Val>::new(&env)"),
-        "get_repos must not fabricate an empty map for the lost storage value:\n{body}"
+    assert_in_fn(
+        &source,
+        "pub fn get_repos(",
+        &[
+            ".get::<_, Map<String, Map<String, String>>>(&String::from_str(&env, \"repos\"))",
+            ".unwrap_or(Map::new(&env))",
+            ".keys()",
+        ],
+    );
+    assert_eq!(
+        body.matches("Map::new(&env)").count(),
+        1,
+        "the only empty map is the storage read's default:\n{body}"
     );
     assert!(
-        body.contains("todo!("),
-        "get_repos' lost map must surface as an honest todo!() hole:\n{body}"
+        !body.contains("Map::new(&env).keys()") && !body.contains("Map::<_, Val>::new(&env)"),
+        "get_repos must not fabricate an empty map as the value:\n{body}"
     );
 
     // The FAITHFUL counterpart must survive: blend-backstop `reward_zone` is
@@ -1513,6 +1525,75 @@ fn aquarius_recovers_invoke_return_types_and_drops_tag_assert_husks() {
         "ambiguous non-type-tag guards must be preserved (as an if-with-panic \
          whose condition is an honest hole), got:\n{body}"
     );
+}
+
+/// Issue #69: digicus's `for x in vec.iter()` loops are rebuilt from the
+/// proven iterator protocol, with each exit where the bytecode puts it —
+/// the duplicate check fails INSIDE the loop, the size limit is checked
+/// once AFTER it — and the `repos` map read through its proven
+/// `unwrap_or(Map::new(&env))` default.
+#[test]
+fn digicus_rebuilds_vec_iterator_loops() {
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/digicus-CCZLARB4.wasm");
+    let src = decompile(wasm).expect("digicus should decompile");
+    assert_in_fn(
+        &src,
+        "pub fn add_repos",
+        &[
+            ".unwrap_or(Map::new(&env))",
+            "in 0..repos.len()",
+            "repos.get(",
+            ".unwrap()",
+            ".contains_key(",
+            "panic_with_error!(&env, Error::RepoAlreadyExists)",
+            ".set(",
+            "Map::new(&env)",
+            // after the loop
+            ".len() < 256",
+            "panic_with_error!(&env, Error::RepoLimitExceeded)",
+            ".set(&String::from_str(&env, \"repos\")",
+        ],
+    );
+    assert_in_fn(
+        &src,
+        "pub fn remove_repos",
+        &[
+            "in 0..repos.len()",
+            ".contains_key(",
+            ".remove(",
+            "panic_with_error!(&env, Error::RepoMissing)",
+            ".set(&String::from_str(&env, \"repos\")",
+        ],
+    );
+    assert_in_fn(
+        &src,
+        "pub fn get_repos(",
+        &[".unwrap_or(Map::new(&env))", ".keys()"],
+    );
+    assert_in_fn(
+        &src,
+        "pub fn get_issues_for_repo",
+        &[
+            ".contains_key(",
+            "return ",
+            ".unwrap()",
+            "panic_with_error!(&env, Error::RepoMissing)",
+        ],
+    );
+    for f in [
+        "pub fn add_repos",
+        "pub fn add_issues",
+        "pub fn remove_repos",
+        "pub fn remove_issues",
+    ] {
+        let start = src.find(f).unwrap();
+        let end = start + src[start..].find("\n    pub fn ").unwrap();
+        assert!(
+            !src[start..end].contains("todo!("),
+            "{f}:\n{}",
+            &src[start..end]
+        );
+    }
 }
 
 /// Issue #69: digicus `version()` is a looped parse of a static version

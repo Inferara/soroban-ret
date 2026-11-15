@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — equivalence gate at zero divergences (#69)
+
+- SDK `for x in vec.iter()` loops are rebuilt as `for i in 0..v.len()` from
+  the proven iterator protocol. Each exit goes where the bytecode puts it: a
+  failure inside the loop stays inside it, and the code on the exhaustion
+  path (for example a size-limit check) runs once after it. The generic loop
+  lift mapped every exit to `break`, which made in-loop failures
+  unconditional.
+- Loop-carried collections become `let mut` bindings updated in place
+  (`m.set(k, v)`, `m.remove(k)`); a functional update stored directly is
+  hoisted to the mutator followed by the store.
+- The defaulting collection getter (`get(&KEY).unwrap_or(Map::new(&env))`) is
+  enabled, typed from the contract's own signature where an export returns it.
+- A guard whose body is only `return <value>` keeps its guard.
+- `Map` accessors clone a by-value key that is used again.
+- digicus: all four mutation loops recovered with no holes; equivalence
+  divergences **2 → 0**. Corpus hard errors unchanged at 303.
+
 ### Added — iterator-protocol proofs, stage 1 of loop recovery (#69)
 
 - The evaluator can summarize a helper with all parameters symbolic (loads

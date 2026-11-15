@@ -883,6 +883,593 @@ impl<'a> LiftContext<'a> {
         }
     }
 
+    /// Rebuild an SDK `for x in vec.iter() { .. }` loop region (issue #69).
+    ///
+    /// `body` is the body of a `block` whose first element is the loop (or a
+    /// nested `block` that is, recursively); `before` are the instructions
+    /// preceding that block at the same level and `after` the ones following
+    /// it. Returns `None` to decline with NO state change; `Some(skip)` when
+    /// the region was emitted, `skip` meaning the caller must not lift
+    /// `after` (the region's own normal path returned).
+    ///
+    /// Everything the rewrite relies on is proven, not matched by shape:
+    /// - the iterator `next` and its unwrap adapter by symbolic summary
+    ///   ([`classify_vec_iter_next`], [`classify_iter_unwrap_adapter`]);
+    /// - the iterator's initial state `{vec, 0, vec_len(vec) >> 32}` by the
+    ///   contiguous straight-line stores immediately before the region
+    ///   ([`iter_init_window`]) — nothing can run between them and the loop;
+    /// - one `next` + one unwrap per iteration, first thing in the loop,
+    ///   and no other use of the frame holding the iterator and its outputs
+    ///   than loading the adapter's two result words.
+    ///
+    /// Given that, iteration `i` of the loop sees exactly `vec.get(i)`, for
+    /// `i` in `0..vec.len()`, and the path taken when the adapter reports
+    /// "none" runs exactly once, after the last element. The loop body is
+    /// then lifted as a DECISION TREE over its own control flow
+    /// ([`Self::iter_walk`]): every branch is followed to where it really
+    /// goes — the loop head (`continue`), a failing tail outside the loop
+    /// (inlined at the branch), or the single normal continuation. The
+    /// generic loop lift maps every exit to `break`, which turns an
+    /// in-loop failure into an unconditional one after the loop.
+    fn try_lift_iter_region(
+        &mut self,
+        body: &[super::structurize::StructuredBlock],
+        before: &[super::structurize::StructuredBlock],
+        after: &[super::structurize::StructuredBlock],
+    ) -> Option<bool> {
+        use super::structurize::StructuredBlock;
+        use crate::wasm::ir::WasmInstr as WI;
+        let (tails, loop_body) = iter_region_levels(body, 0)?;
+        let init = iter_init_window(before, self.wasm_module)?;
+        // Loop prefix: `next(F + o1, F + vec_abs)`, then
+        // `unwrap(F, load(F + o1), load(F + o1 + 8))`.
+        let flat: Vec<&WI> = loop_body
+            .iter()
+            .take(13)
+            .map(|b| match b {
+                StructuredBlock::Instruction(i) => Some(i),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let &[
+            WI::LocalGet(f1),
+            WI::I32Const(o1),
+            WI::I32Add,
+            WI::LocalGet(f2),
+            WI::I32Const(it_off),
+            WI::I32Add,
+            WI::Call(next_fn),
+            WI::LocalGet(f3),
+            WI::LocalGet(f4),
+            WI::I64Load(d_off),
+            WI::LocalGet(f5),
+            WI::I64Load(v_off),
+            WI::Call(unwrap_fn),
+        ] = flat.as_slice()
+        else {
+            return None;
+        };
+        let f = init.frame_local;
+        if [*f1, *f2, *f3, *f4, *f5].iter().any(|x| *x != f)
+            || *it_off as u32 != init.vec_abs
+            || *o1 < 16
+            || *d_off != *o1 as u32
+            || *v_off != *o1 as u32 + 8
+            // The next-output pair must not overlap the iterator or the
+            // adapter's output pair at `F + 0`.
+            || byte_ranges_overlap(*o1 as u32, 16, init.vec_abs, 16)
+            || byte_ranges_overlap(0, 16, init.vec_abs, 16)
+        {
+            return None;
+        }
+        let next = proto_summarize(self.wasm_module, *next_fn)
+            .as_deref()
+            .and_then(classify_vec_iter_next)?;
+        let adapter = proto_summarize(self.wasm_module, *unwrap_fn)
+            .as_deref()
+            .and_then(classify_iter_unwrap_adapter)?;
+        if (next.vec_off, next.idx_off, next.len_off) != (0, 8, 12)
+            || adapter.none_in != next.none_disc
+            || adapter.none_out != 0
+        {
+            return None;
+        }
+        let rest = &loop_body[13..];
+        // `rest` may use the frame only to load the adapter's result pair,
+        // and never calls the iterator helpers again.
+        let mut instrs: Vec<&WI> = Vec::new();
+        collect_instrs(rest, &mut instrs);
+        for (k, ins) in instrs.iter().enumerate() {
+            match ins {
+                WI::LocalGet(l) if *l == f => {
+                    if !matches!(instrs.get(k + 1), Some(WI::I64Load(0 | 8))) {
+                        return None;
+                    }
+                }
+                WI::LocalSet(l) | WI::LocalTee(l) if *l == f => return None,
+                WI::Call(t) if t == next_fn || t == unwrap_fn => return None,
+                WI::GlobalSet(_) | WI::CallIndirect(_) | WI::Return | WI::BrTable { .. } => {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        let StackVal::FrameSlot(fid, foff) = self.locals.get(f as usize)?.clone() else {
+            return None;
+        };
+        if !foff.is_static() {
+            return None;
+        }
+        let fbase = foff.base;
+        let vec_val = self.locals.get(init.vec_local as usize)?.clone();
+        let vec_expr = {
+            let slots = self.frame_slots.borrow();
+            stack_val_to_expr(&vec_val, self.params, self.registry, Some(&slots))
+        };
+        if vec_expr.is_never_rooted() || matches!(vec_expr, SorobanExpr::Void) {
+            return None;
+        }
+
+        // Locals the loop writes: a local READ before it is written (in the
+        // body's flat order) carries state across iterations and becomes a
+        // `let mut`; any other written local is poisoned for the duration,
+        // so a path that does read it first gets an honest hole.
+        let mut all: Vec<&WI> = Vec::new();
+        collect_instrs(loop_body, &mut all);
+        let mut written: Vec<u32> = Vec::new();
+        let mut live_in: Vec<u32> = Vec::new();
+        let mut seen: Vec<u32> = Vec::new();
+        for ins in &all {
+            match ins {
+                WI::LocalGet(l) => {
+                    if !seen.contains(l) {
+                        seen.push(*l);
+                        live_in.push(*l);
+                    }
+                }
+                WI::LocalSet(l) | WI::LocalTee(l) => {
+                    if !seen.contains(l) {
+                        seen.push(*l);
+                    }
+                    if !written.contains(l) {
+                        written.push(*l);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if written.contains(&f) {
+            return None;
+        }
+
+        // Everything below works on child contexts and shared tables; a
+        // decline must leave no trace.
+        let slots_snap = self.frame_slots.borrow().clone();
+        let taints_snap = self.slot_taints.borrow().clone();
+        let log_len = self.slot_write_log.borrow().len();
+        let restore = |ctx: &Self| {
+            *ctx.frame_slots.borrow_mut() = slots_snap.clone();
+            *ctx.slot_taints.borrow_mut() = taints_snap.clone();
+            ctx.slot_write_log.borrow_mut().truncate(log_len);
+        };
+        let fresh = |ctx: &Self| {
+            let mut ctr = ctx.next_frame_id.borrow_mut();
+            *ctr += 1;
+            PROTO_BINDING_BASE + *ctr
+        };
+
+        let mut work = self.child_context();
+        let mut lets: Vec<SorobanStmt> = Vec::new();
+        let mut promoted: Vec<(u32, u32)> = Vec::new();
+        for l in &written {
+            let Some(cur) = work.locals.get(*l as usize).cloned() else {
+                restore(self);
+                return None;
+            };
+            if live_in.contains(l) {
+                let init_expr = {
+                    let slots = self.frame_slots.borrow();
+                    stack_val_to_expr(&cur, self.params, self.registry, Some(&slots))
+                };
+                if init_expr.is_never_rooted() {
+                    restore(self);
+                    return None;
+                }
+                let init_expr = host_get_unwrapped(init_expr);
+                let u = fresh(self);
+                lets.push(SorobanStmt::Let {
+                    name: format!("var_{u}"),
+                    mutable: true,
+                    value: init_expr,
+                });
+                work.locals[*l as usize] = StackVal::LetBinding(u);
+                promoted.push((*l, u));
+            } else {
+                work.locals[*l as usize] = StackVal::Unknown;
+            }
+        }
+        let idx_var = fresh(self);
+        let elem_var = fresh(self);
+        // The adapter's result pair at `F + 0`: "has element", the element.
+        work.store_frame_slot(fid, fbase, StackVal::IterHasElem, 8);
+        work.store_frame_slot(fid, fbase + 8, StackVal::LetBinding(elem_var), 8);
+
+        let mut st = IterRegion {
+            tails,
+            after,
+            promoted,
+            post: None,
+            normal_k: None,
+            elem_breaks: false,
+            budget: 256,
+        };
+        let walked = work.iter_walk(rest, &[], &mut st, false);
+        restore(self);
+        let mut body_stmts = walked?;
+        let post = st.post.take()?;
+        let normal_k = st.normal_k?;
+        // A `break` from the element path skips the exhaustion path's code
+        // in the original; after a `for` it would run. Only expressible
+        // when that code is empty.
+        if st.elem_breaks && !post.is_empty() {
+            return None;
+        }
+        if matches!(body_stmts.last(), Some(SorobanStmt::Continue)) {
+            body_stmts.pop();
+        }
+
+        // Commit.
+        cov_mark::hit!(vec_iter_loop_rebuilt);
+        let elem = SorobanExpr::MethodCall {
+            object: Box::new(SorobanExpr::MethodCall {
+                object: Box::new(vec_expr.clone()),
+                method: "get".to_string(),
+                args: vec![SorobanExpr::Local(idx_var)],
+            }),
+            method: "unwrap".to_string(),
+            args: Vec::new(),
+        };
+        let mut for_body = vec![SorobanStmt::Let {
+            name: format!("var_{elem_var}"),
+            mutable: false,
+            value: elem,
+        }];
+        for_body.extend(body_stmts);
+        self.stmts.extend(lets);
+        self.stmts.push(SorobanStmt::For {
+            var: format!("var_{idx_var}"),
+            start: SorobanExpr::U32Literal(0),
+            end: SorobanExpr::MethodCall {
+                object: Box::new(vec_expr),
+                method: "len".to_string(),
+                args: Vec::new(),
+            },
+            step: 1,
+            body: for_body,
+        });
+        self.stmts.extend(post);
+        self.found_host_calls = true;
+        for l in &written {
+            self.locals[*l as usize] = StackVal::Unknown;
+        }
+        for (l, u) in &st.promoted {
+            self.locals[*l as usize] = StackVal::LetBinding(*u);
+        }
+        // The iterator, the `next` output pair and the adapter's pair are
+        // dead past the loop.
+        {
+            let mut slots = self.frame_slots.borrow_mut();
+            for off in [
+                0,
+                8,
+                *o1,
+                *o1 + 8,
+                init.vec_abs as i32,
+                init.vec_abs as i32 + 8,
+                init.vec_abs as i32 + 12,
+            ] {
+                slots.remove(&(fid, fbase + off));
+            }
+        }
+        // The normal continuation: region tails from the normal level
+        // outward, then (the caller's job) `after`.
+        if normal_k >= st.tails.len() {
+            return Some(false);
+        }
+        let mut returned = false;
+        for t in &st.tails[normal_k..] {
+            self.lift_structured(t);
+            let mut ti: Vec<&WI> = Vec::new();
+            collect_instrs(t, &mut ti);
+            returned |= ti.iter().any(|i| matches!(i, WI::Return));
+        }
+        if returned && self.inline_depth == 0 {
+            // A top-level `return` emits no statement by itself; make the
+            // exit explicit so nothing lifted after the region can follow.
+            self.stmts.push(SorobanStmt::Return(None));
+        }
+        Some(returned)
+    }
+
+    /// Lift `blocks` as one path-tree of an iterator loop's iteration (see
+    /// [`Self::try_lift_iter_region`]). `frames` are the enclosing labelled
+    /// constructs INSIDE the loop body, outermost first, each as "what runs
+    /// after it". Consumes the context of this path and returns its
+    /// statements, which always end in a transfer (`continue`, `break`, a
+    /// failure) or — on the exhaustion path — fall into the normal
+    /// continuation. `None` declines the whole region.
+    fn iter_walk(
+        mut self,
+        blocks: &[super::structurize::StructuredBlock],
+        frames: &[&[super::structurize::StructuredBlock]],
+        st: &mut IterRegion<'_>,
+        exhausted: bool,
+    ) -> Option<Vec<SorobanStmt>> {
+        use super::structurize::StructuredBlock;
+        use crate::wasm::ir::WasmInstr as WI;
+        st.budget = st.budget.checked_sub(1)?;
+        for (j, b) in blocks.iter().enumerate() {
+            let rest = &blocks[j + 1..];
+            match b {
+                StructuredBlock::Instruction(WI::Br(d)) => {
+                    return self.iter_jump(*d as usize, frames, st, exhausted);
+                }
+                StructuredBlock::Instruction(WI::BrIf(d)) => {
+                    let cond_val = self.stack.pop()?;
+                    if stack_val_mentions_iter_marker(&cond_val) {
+                        let has_elem_when_taken = iter_marker_cond(&cond_val)?;
+                        // The split happens once, before anything else in
+                        // the iteration, on the element path.
+                        if st.post.is_some() || !self.stmts.is_empty() || exhausted {
+                            return None;
+                        }
+                        let snap = self.frame_slots.borrow().clone();
+                        let taken_ctx = self.child_context();
+                        let fall_ctx = self.child_context();
+                        let (elem_side, post) = if has_elem_when_taken {
+                            let post = fall_ctx.iter_walk(rest, frames, st, true)?;
+                            *self.frame_slots.borrow_mut() = snap;
+                            (taken_ctx.iter_jump(*d as usize, frames, st, false)?, post)
+                        } else {
+                            let post = taken_ctx.iter_jump(*d as usize, frames, st, true)?;
+                            *self.frame_slots.borrow_mut() = snap;
+                            (fall_ctx.iter_walk(rest, frames, st, false)?, post)
+                        };
+                        st.post = Some(post);
+                        return Some(elem_side);
+                    }
+                    let condition = crate::ir::optimizer::fold_expr_standalone(stack_val_to_expr(
+                        &cond_val,
+                        self.params,
+                        self.registry,
+                        Some(&self.frame_slots.borrow()),
+                    ));
+                    // Both directions as explicit arms. On the exhaustion
+                    // path the taken arm may END by falling into the normal
+                    // continuation (no statement of its own), so "the rest
+                    // runs only when the branch is not taken" must be
+                    // structural: `if c {} ; rest` would run `rest` — often
+                    // a failure — unconditionally.
+                    let snap = self.frame_slots.borrow().clone();
+                    let taken =
+                        self.child_context()
+                            .iter_jump(*d as usize, frames, st, exhausted)?;
+                    *self.frame_slots.borrow_mut() = snap.clone();
+                    let not_taken = self
+                        .child_context()
+                        .iter_walk(rest, frames, st, exhausted)?;
+                    *self.frame_slots.borrow_mut() = snap;
+                    self.stmts.push(SorobanStmt::If {
+                        condition,
+                        then_body: taken,
+                        else_body: not_taken,
+                    });
+                    return Some(self.stmts);
+                }
+                StructuredBlock::Instruction(WI::Unreachable)
+                | StructuredBlock::SafetyNetUnreachable => {
+                    // Reached only past a failing call; the path is over.
+                    if !self.stmts.last().is_some_and(is_panic_stmt) {
+                        self.stmts.push(SorobanStmt::Expr(SorobanExpr::Panic));
+                    }
+                    return Some(self.stmts);
+                }
+                StructuredBlock::Instruction(ins) => {
+                    self.lift_instruction(ins);
+                    self.iter_tidy_last(st);
+                    if self.stmts.last().is_some_and(is_panic_stmt) {
+                        return Some(self.stmts);
+                    }
+                }
+                StructuredBlock::Block { body, .. } => {
+                    let mut inner = frames.to_vec();
+                    inner.push(rest);
+                    return self.iter_walk(body, &inner, st, exhausted);
+                }
+                StructuredBlock::IfElse {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    let cond_val = self.stack.pop()?;
+                    if stack_val_mentions_iter_marker(&cond_val) {
+                        return None;
+                    }
+                    let condition = crate::ir::optimizer::fold_expr_standalone(stack_val_to_expr(
+                        &cond_val,
+                        self.params,
+                        self.registry,
+                        Some(&self.frame_slots.borrow()),
+                    ));
+                    let mut inner = frames.to_vec();
+                    inner.push(rest);
+                    let snap = self.frame_slots.borrow().clone();
+                    let then_stmts = self
+                        .child_context()
+                        .iter_walk(then_body, &inner, st, exhausted)?;
+                    *self.frame_slots.borrow_mut() = snap.clone();
+                    let else_stmts = self
+                        .child_context()
+                        .iter_walk(else_body, &inner, st, exhausted)?;
+                    *self.frame_slots.borrow_mut() = snap;
+                    self.stmts.push(SorobanStmt::If {
+                        condition,
+                        then_body: then_stmts,
+                        else_body: else_stmts,
+                    });
+                    return Some(self.stmts);
+                }
+                StructuredBlock::Loop { .. } => return None,
+            }
+        }
+        // End of this sequence: resume after the innermost enclosing
+        // construct, or — at the end of the loop body — fall out of the loop.
+        match frames.split_last() {
+            Some((after, outer)) => self.iter_walk(after, outer, st, exhausted),
+            None => self.iter_exit(0, st, exhausted),
+        }
+    }
+
+    /// Follow `br d` from inside an iterator loop iteration.
+    fn iter_jump(
+        mut self,
+        d: usize,
+        frames: &[&[super::structurize::StructuredBlock]],
+        st: &mut IterRegion<'_>,
+        exhausted: bool,
+    ) -> Option<Vec<SorobanStmt>> {
+        if d < frames.len() {
+            let idx = frames.len() - 1 - d;
+            return self.iter_walk(frames[idx], &frames[..idx], st, exhausted);
+        }
+        if d == frames.len() {
+            // The loop label: next iteration. Never from the exhaustion
+            // path (the iterator would be polled again).
+            if exhausted {
+                return None;
+            }
+            let assigns = self.iter_carried_assigns(st);
+            self.stmts.extend(assigns);
+            self.stmts.push(SorobanStmt::Continue);
+            return Some(self.stmts);
+        }
+        self.iter_exit(d - frames.len(), st, exhausted)
+    }
+
+    /// Leave the loop to level `k` of the region: 0 = fell off the end of
+    /// the loop body, `e` = branched past `e` enclosing region blocks.
+    fn iter_exit(
+        mut self,
+        k: usize,
+        st: &mut IterRegion<'_>,
+        exhausted: bool,
+    ) -> Option<Vec<SorobanStmt>> {
+        let levels = st.tails.len();
+        if k > levels {
+            return None; // beyond the code this lift can see
+        }
+        // The first level from `k` outward with code of its own; `levels`
+        // = straight to whatever follows the region.
+        let kc = (k..levels)
+            .find(|j| !st.tails[*j].is_empty())
+            .unwrap_or(levels);
+        let snap = self.frame_slots.borrow().clone();
+        let mut probe = self.child_context();
+        if kc < levels {
+            for t in &st.tails[kc..] {
+                probe.lift_structured(t);
+            }
+        } else {
+            probe.lift_structured(st.after);
+        }
+        *self.frame_slots.borrow_mut() = snap;
+        if probe.stmts.iter().any(is_panic_stmt) {
+            // A failing tail: it belongs at this branch, inside the loop.
+            self.stmts.extend(probe.stmts);
+            return Some(self.stmts);
+        }
+        // The normal continuation — there can be only one.
+        match st.normal_k {
+            None => st.normal_k = Some(kc),
+            Some(x) if x != kc => return None,
+            _ => {}
+        }
+        let assigns = self.iter_carried_assigns(st);
+        self.stmts.extend(assigns);
+        if !exhausted {
+            st.elem_breaks = true;
+            self.stmts.push(SorobanStmt::Break);
+        }
+        Some(self.stmts)
+    }
+
+    /// Post-process what the last lifted instruction emitted, for the
+    /// conventions of an iterator loop body:
+    ///
+    /// - A functional update of a carried collection
+    ///   (`m = map_put(m, k, v)`) is the SDK's in-place mutator: the
+    ///   statement is `m.set(k, v);` (`set`/`remove` return `()` /
+    ///   `Option<()>`, not the collection) and the local IS still the
+    ///   variable.
+    /// - A pure read the call arm emitted as a statement of its own
+    ///   (`m.contains_key(x);`, `Map::new(&env);`) is dropped; its value
+    ///   lives on the abstract stack.
+    fn iter_tidy_last(&mut self, st: &IterRegion<'_>) {
+        fn is_mutator(e: &SorobanExpr, var: u32) -> bool {
+            matches!(e, SorobanExpr::MethodCall { object, method, .. }
+            if **object == SorobanExpr::Local(var)
+                && matches!(
+                    method.as_str(),
+                    "set" | "remove" | "push_back" | "push_front" | "append"
+                ))
+        }
+        for (l, u) in &st.promoted {
+            // `let var_L = m.set(..)` → `m.set(..);`
+            if let Some(SorobanStmt::Let { name, value, .. }) = self.stmts.last()
+                && *name == format!("var_{l}")
+                && is_mutator(value, *u)
+            {
+                let Some(SorobanStmt::Let { value, .. }) = self.stmts.pop() else {
+                    unreachable!()
+                };
+                self.stmts.push(SorobanStmt::Expr(value));
+                self.locals[*l as usize] = StackVal::LetBinding(*u);
+            }
+            if let Some(StackVal::HostCallResult(e)) = self.locals.get(*l as usize)
+                && is_mutator(e, *u)
+            {
+                self.locals[*l as usize] = StackVal::LetBinding(*u);
+            }
+        }
+        let pure_orphan = match self.stmts.last() {
+            Some(SorobanStmt::Expr(SorobanExpr::MethodCall { method, .. })) => matches!(
+                method.as_str(),
+                "contains_key" | "len" | "get" | "keys" | "values" | "is_empty"
+            ),
+            Some(SorobanStmt::Expr(SorobanExpr::CollectionNew(_))) => true,
+            _ => false,
+        };
+        if pure_orphan {
+            self.stmts.pop();
+        }
+    }
+
+    /// `var_U = <value>` for every carried local whose value on this path
+    /// is no longer its variable.
+    fn iter_carried_assigns(&self, st: &IterRegion<'_>) -> Vec<SorobanStmt> {
+        let slots = self.frame_slots.borrow();
+        st.promoted
+            .iter()
+            .filter_map(|(l, u)| {
+                let v = self.locals.get(*l as usize)?;
+                (*v != StackVal::LetBinding(*u)).then(|| SorobanStmt::Assign {
+                    target: format!("var_{u}"),
+                    value: stack_val_to_expr(v, self.params, self.registry, Some(&slots)),
+                })
+            })
+            .collect()
+    }
+
     /// Emit `var_{idx} = <value>` for a loop-carried local and rebind the local
     /// to `var_{idx}` so later reads (in the body and after the loop) reference
     /// the mutable variable the Loop arm declared before the loop. If `value` is
@@ -1608,18 +2195,6 @@ impl<'a> LiftContext<'a> {
             }
         }
         let getter = getter?;
-        // The empty-collection default is PROVEN and classified, but its
-        // recovery is withheld for now (issue #69): binding the stored
-        // collection un-holes the read-modify-write bodies that consume it,
-        // and their element loops do not lift yet (`v.get(0)` one-iteration
-        // residue, functional `.set` chains) — digicus would trade four
-        // honest holes for bodies that no longer compile, and drop out of
-        // the equivalence gate altogether. Enable together with the
-        // collection-mutation loop recovery.
-        if getter.default_empty.is_some() {
-            cov_mark::hit!(proto_defaulting_collection_withheld);
-            return None;
-        }
         // A value getter returns its value; an auth guard returns nothing.
         if getter.auth_only != (num_results == 0) {
             return None;
@@ -5909,6 +6484,17 @@ impl<'a> LiftContext<'a> {
                     self.lift_instruction(instr);
                 }
                 StructuredBlock::Block { body, block_type } => {
+                    // SDK `for x in vec.iter()` region (issue #69): rebuilt
+                    // as a real `for` when the iterator protocol is proven.
+                    if let Some(skip_rest) =
+                        self.try_lift_iter_region(body, &blocks[..i], &blocks[i + 1..])
+                    {
+                        if skip_rest {
+                            break;
+                        }
+                        i += 1;
+                        continue;
+                    }
                     // Try to recognize br_table match pattern first
                     if let Some(match_stmt) = self.try_recognize_match(body) {
                         self.stmts.push(match_stmt);
@@ -6139,6 +6725,34 @@ impl<'a> LiftContext<'a> {
                             // - Has terminators: emit If wrapper as normal, then
                             //   selectively upgrade weak parent locals to child
                             //   values for downstream resolution.
+                            // A body that is ONLY an explicit top-level
+                            // `return <value>` (see the same rule in the
+                            // generic arm below): keep the guard, or the
+                            // failing tail that follows becomes
+                            // unconditional.
+                            let mut then_stmts = then_stmts;
+                            if stmts_are_pure_orphans(&then_stmts)
+                                && self.inline_depth == 0
+                                && matches!(
+                                    post.last(),
+                                    Some(StructuredBlock::Instruction(
+                                        crate::wasm::ir::WasmInstr::Return
+                                    ))
+                                )
+                                && let Some(top) = body_ctx.stack.last()
+                                && !stack_val_contains_unknown(top)
+                            {
+                                let value = host_get_unwrapped(stack_val_to_expr(
+                                    top,
+                                    self.params,
+                                    self.registry,
+                                    Some(&self.frame_slots.borrow()),
+                                ));
+                                if !value.is_never_rooted() && !matches!(value, SorobanExpr::Void) {
+                                    cov_mark::hit!(guarded_return_value_made_explicit);
+                                    then_stmts = vec![SorobanStmt::Return(Some(value))];
+                                }
+                            }
                             let has_terminator = then_stmts.iter().any(is_terminator_stmt);
                             self.memory_stores = body_ctx.memory_stores;
                             if has_terminator {
@@ -6197,6 +6811,39 @@ impl<'a> LiftContext<'a> {
                                     {
                                         self.locals[idx] = body_val.clone();
                                     }
+                                }
+                            }
+                            let mut then_stmts = then_stmts;
+                            // The guarded body is nothing but an explicit
+                            // top-level `return <value>`: at depth 0 that
+                            // emits no statement, so the `if` below would
+                            // be dropped as empty and whatever follows —
+                            // typically the failing tail — would become
+                            // unconditional (issue #69: `if has(k) { return
+                            // get(k) }; fail(E)` rendered as a bare
+                            // `panic_with_error!`). Make the return explicit
+                            // so the guard survives. Only this otherwise-
+                            // vanishing case is touched.
+                            if stmts_are_pure_orphans(&then_stmts)
+                                && self.inline_depth == 0
+                                && matches!(
+                                    post.last(),
+                                    Some(StructuredBlock::Instruction(
+                                        crate::wasm::ir::WasmInstr::Return
+                                    ))
+                                )
+                                && let Some(top) = body_ctx.stack.last()
+                                && !stack_val_contains_unknown(top)
+                            {
+                                let value = host_get_unwrapped(stack_val_to_expr(
+                                    top,
+                                    self.params,
+                                    self.registry,
+                                    Some(&self.frame_slots.borrow()),
+                                ));
+                                if !value.is_never_rooted() && !matches!(value, SorobanExpr::Void) {
+                                    cov_mark::hit!(guarded_return_value_made_explicit);
+                                    then_stmts = vec![SorobanStmt::Return(Some(value))];
                                 }
                             }
                             if !then_stmts.is_empty() {
@@ -11260,6 +11907,202 @@ fn proto_enumerate_seeded(
         });
     }
     Some(out)
+}
+
+/// True when `stmts` do nothing: empty, or only the pure collection reads
+/// the call arm emits as statements of their own (`m.get(k);`,
+/// `m.contains_key(k);`) — residue whose value lives on the abstract stack.
+fn stmts_are_pure_orphans(stmts: &[SorobanStmt]) -> bool {
+    stmts.iter().all(|s| {
+        matches!(s, SorobanStmt::Expr(SorobanExpr::MethodCall { method, .. })
+        if matches!(
+            method.as_str(),
+            "get" | "contains_key" | "len" | "keys" | "values" | "is_empty"
+        ))
+    })
+}
+
+/// The lifter models the host's `map_get` / `vec_get` as the SDK method
+/// `c.get(k)`. The host call TRAPS on a missing entry and yields the value;
+/// the SDK method returns an `Option`. Where the value itself is needed (a
+/// binding's initializer, a returned value) the faithful form is
+/// `c.get(k).unwrap()`.
+fn host_get_unwrapped(e: SorobanExpr) -> SorobanExpr {
+    match e {
+        SorobanExpr::MethodCall {
+            ref method,
+            ref args,
+            ..
+        } if method == "get" && args.len() == 1 => SorobanExpr::MethodCall {
+            object: Box::new(e),
+            method: "unwrap".to_string(),
+            args: Vec::new(),
+        },
+        other => other,
+    }
+}
+
+/// Shared state of one iterator-region rebuild
+/// ([`LiftContext::try_lift_iter_region`]).
+struct IterRegion<'b> {
+    /// What follows the nested element at each region level, innermost
+    /// (the block holding the loop) first.
+    tails: Vec<&'b [super::structurize::StructuredBlock]>,
+    /// What follows the region's root block in the enclosing sequence.
+    after: &'b [super::structurize::StructuredBlock],
+    /// Loop-carried locals: `(wasm local, variable id)`.
+    promoted: Vec<(u32, u32)>,
+    /// The exhaustion path's statements (run once, after the loop).
+    post: Option<Vec<SorobanStmt>>,
+    /// The region level every non-failing exit continues at.
+    normal_k: Option<usize>,
+    /// Whether an element path leaves the loop normally (`break`).
+    elem_breaks: bool,
+    budget: u32,
+}
+
+/// A top-level failure statement.
+fn is_panic_stmt(s: &SorobanStmt) -> bool {
+    matches!(
+        s,
+        SorobanStmt::Expr(SorobanExpr::Panic | SorobanExpr::PanicWithError(_))
+    )
+}
+
+/// `body` = `[<loop or nested region block>, tail..]`: the region's tails,
+/// innermost first, and the loop body. At most three nested blocks.
+#[allow(clippy::type_complexity)]
+fn iter_region_levels(
+    body: &[super::structurize::StructuredBlock],
+    depth: u32,
+) -> Option<(
+    Vec<&[super::structurize::StructuredBlock]>,
+    &[super::structurize::StructuredBlock],
+)> {
+    use super::structurize::StructuredBlock;
+    let (first, tail) = body.split_first()?;
+    match first {
+        StructuredBlock::Loop { body: lb, .. } => Some((vec![tail], lb.as_slice())),
+        StructuredBlock::Block { body: inner, .. } if depth < 2 => {
+            let (mut tails, lb) = iter_region_levels(inner, depth + 1)?;
+            tails.push(tail);
+            Some((tails, lb))
+        }
+        _ => None,
+    }
+}
+
+/// The proven initial state of an SDK `Vec` iterator built in the frame.
+struct IterInit {
+    /// The local holding the vector being iterated.
+    vec_local: u32,
+    /// The local holding the frame pointer.
+    frame_local: u32,
+    /// Frame offset of the iterator struct (`vec` at `+0`, `idx` at `+8`,
+    /// `len` at `+12`).
+    vec_abs: u32,
+}
+
+/// The iterator's construction, as the CONTIGUOUS straight-line suffix of
+/// `before`:
+///
+/// ```text
+/// local.get V; call vec_len; local.set L
+/// local.get F; i32.const 0; i32.store idx
+/// local.get F; local.get V;  i64.store vec
+/// local.get F; local.get L;  i64.const 32; i64.shr_u; i64.store32 len
+/// ```
+///
+/// with `idx = vec + 8`, `len = vec + 12`. Straight-line and contiguous, so
+/// this IS the dataflow: the three fields hold `V`, `0` and
+/// `vec_len(V) >> 32` (the u32 length) when the code after it starts, and
+/// `V` is the same local in both uses.
+fn iter_init_window(
+    before: &[super::structurize::StructuredBlock],
+    module: &WasmModule,
+) -> Option<IterInit> {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr as WI;
+    let n = before.len().checked_sub(14)?;
+    let w: Vec<&WI> = before[n..]
+        .iter()
+        .map(|b| match b {
+            StructuredBlock::Instruction(i) => Some(i),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let &[
+        WI::LocalGet(v1),
+        WI::Call(len_fn),
+        WI::LocalSet(l1),
+        WI::LocalGet(f1),
+        WI::I32Const(0),
+        WI::I32Store(idx),
+        WI::LocalGet(f2),
+        WI::LocalGet(v2),
+        WI::I64Store(vec),
+        WI::LocalGet(f3),
+        WI::LocalGet(l2),
+        WI::I64Const(32),
+        WI::I64ShrU,
+        WI::I64Store32(len),
+    ] = w.as_slice()
+    else {
+        return None;
+    };
+    let is_vec_len = module
+        .imports
+        .get_by_index(*len_fn)
+        .is_some_and(|hf| hf.module == HostModule::Vec && hf.name == "vec_len");
+    if !is_vec_len
+        || v1 != v2
+        || l1 != l2
+        || f1 != f2
+        || f2 != f3
+        || [v1, l1].contains(&f1)
+        || v1 == l1
+        || *idx != vec.checked_add(8)?
+        || *len != vec.checked_add(12)?
+    {
+        return None;
+    }
+    Some(IterInit {
+        vec_local: *v1,
+        frame_local: *f1,
+        vec_abs: *vec,
+    })
+}
+
+/// Whether `v` involves the iterator "has element" marker at all.
+fn stack_val_mentions_iter_marker(v: &StackVal) -> bool {
+    match v {
+        StackVal::IterHasElem => true,
+        StackVal::Eqz(a) => stack_val_mentions_iter_marker(a),
+        StackVal::Compare(a, _, b) | StackVal::BinOp(a, _, b) => {
+            stack_val_mentions_iter_marker(a) || stack_val_mentions_iter_marker(b)
+        }
+        StackVal::I128Limb { value, .. } => stack_val_mentions_iter_marker(value),
+        _ => false,
+    }
+}
+
+/// A branch condition that is exactly a test of the "has element" marker:
+/// `Some(true)` if it is non-zero when an element is present, `Some(false)`
+/// if when exhausted. `None` for any other use of the marker.
+fn iter_marker_cond(v: &StackVal) -> Option<bool> {
+    match v {
+        StackVal::IterHasElem => Some(true),
+        StackVal::Eqz(a) => iter_marker_cond(a).map(|b| !b),
+        StackVal::Compare(a, op, b) => {
+            let inner = iter_marker_cond(a)?;
+            match (op, b.as_ref()) {
+                (CmpOp::Ne, StackVal::I32(0) | StackVal::I64(0)) => Some(inner),
+                (CmpOp::Eq, StackVal::I32(0) | StackVal::I64(0)) => Some(!inner),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Whether byte ranges `[a, a + aw)` and `[b, b + bw)` intersect. Offsets
@@ -18218,6 +19061,13 @@ enum StackVal {
     /// index (`relay_index`); every other consumer degrades to `Unknown` —
     /// the pointer value itself is a lift-time-unknowable heap address.
     RelayBufPtr,
+    /// "The iterator yielded an element" — the discriminant a PROVEN unwrap
+    /// adapter writes after a proven `Vec` iterator `next` (issue #69),
+    /// non-zero exactly when an element is present. Seeded only while an
+    /// iterator loop region is being rebuilt, where the single branch on it
+    /// separates the loop body from the exhaustion path; any other consumer
+    /// degrades to `Unknown`.
+    IterHasElem,
     /// Transitional: `global_get 0` (the WASM stack pointer)
     StackPtrRef,
     /// Transitional: `StackPtrRef - frame_size` before local_tee assigns it.
@@ -20265,7 +21115,7 @@ fn stack_val_to_expr_inner(
         StackVal::FrameBase(_) | StackVal::StackPtrRef => SorobanExpr::UnknownVal,
         // A relay buffer pointer that escapes to expr conversion is a raw
         // heap address — lift-time unknowable (issue #38 t23).
-        StackVal::RelayBufPtr => SorobanExpr::UnknownVal,
+        StackVal::RelayBufPtr | StackVal::IterHasElem => SorobanExpr::UnknownVal,
         StackVal::Unknown => SorobanExpr::UnknownVal,
     }
 }
@@ -25860,12 +26710,10 @@ mod tests {
         );
     }
 
-    /// The defaulting map getter CLASSIFIES (its empty default is the
-    /// helper's own `map_new()`), but its recovery is withheld — see the
-    /// arm. The call must fall through untouched.
+    /// The defaulting map getter (its empty default is the helper's own
+    /// `map_new()`) recovers as one bound `get(..).unwrap_or(Map::new(&env))`.
     #[test]
-    fn proto_defaulting_map_getter_classifies_but_is_withheld() {
-        cov_mark::check!(proto_defaulting_collection_withheld);
+    fn proto_defaulting_map_getter_recovers_unwrap_or_empty() {
         let m = digicus_shapes_module();
         let g = proto_enumerate(&m, 11, &[])
             .as_deref()
@@ -25874,7 +26722,17 @@ mod tests {
         assert_eq!(g.default_empty, Some(76));
         assert_eq!(g.value, ProtoGetterValue::Object(76));
         assert!(!g.auth_only);
-        let _ = proto_lift(&m, 12);
+        let (stmts, _) = proto_lift(&m, 12).content.expect("effectful");
+        assert!(
+            stmts.iter().any(|s| matches!(
+                s,
+                SorobanStmt::Let {
+                    value: SorobanExpr::StorageGet { unwrap: false, on_missing: Some(d), .. },
+                    ..
+                } if matches!(d.as_ref(), SorobanExpr::CollectionNew(c) if c == "Map")
+            )),
+            "the absent-key default is the proven empty map: {stmts:?}"
+        );
     }
 
     #[test]
@@ -26070,5 +26928,140 @@ mod tests {
         .expect("wat parses");
         let big = WasmModule::parse(&wasm).expect("module parses");
         let _ = proto_summarize(&big, 0);
+    }
+
+    /// Fixture for the iterator LOOP region (issue #69). Imports: 0 =
+    /// vec_get, 1 = vec_len, 2 = require_auth. Func 3 = diverging helper,
+    /// 4 = iterator `next`, 5 = unwrap adapter, 6 = a function that builds
+    /// the iterator over its `Vec` parameter (index initialised to
+    /// `idx_init`) and loops `for x in v.iter() { x.require_auth() }`.
+    fn vec_iter_loop_module(idx_init: i32) -> WasmModule {
+        let wat = format!(
+            r#"(module
+                (import "v" "1" (func (param i64 i64) (result i64)))
+                (import "v" "3" (func (param i64) (result i64)))
+                (import "a" "0" (func (param i64) (result i64)))
+                (memory 1)
+                (global (mut i32) (i32.const 65536))
+                (func (;3;) (local i32) loop br 0 end)
+                (func (;4;) (param i32 i32) (local i32 i64 i64)
+                    block
+                        block
+                            local.get 1 i32.load offset=8 local.tee 2
+                            local.get 1 i32.load offset=12
+                            i32.lt_u br_if 0
+                            i64.const 2 local.set 3
+                            br 1
+                        end
+                        local.get 1 i64.load
+                        local.get 2 i64.extend_i32_u i64.const 32 i64.shl i64.const 4 i64.or
+                        call 0 local.set 4
+                        block
+                            local.get 2 i32.const 1 i32.add local.tee 2
+                            i32.eqz br_if 0
+                            local.get 1 local.get 2 i32.store offset=8
+                            local.get 4 i64.const 255 i64.and i64.const 77 i64.ne
+                            i64.extend_i32_u local.set 3
+                            br 1
+                        end
+                        call 3
+                        unreachable
+                    end
+                    local.get 0 local.get 4 i64.store offset=8
+                    local.get 0 local.get 3 i64.store)
+                (func (;5;) (param i32 i64 i64) (local i64)
+                    i64.const 0 local.set 3
+                    block
+                        block
+                            local.get 1 i64.const 2 i64.eq br_if 0
+                            local.get 1 i32.wrap_i64 br_if 1
+                            i64.const 1 local.set 3
+                        end
+                        local.get 0 local.get 2 i64.store offset=8
+                        local.get 0 local.get 3 i64.store
+                        return
+                    end
+                    call 3
+                    unreachable)
+                (func (;6;) (param i64) (local i32 i64)
+                    global.get 0 i32.const 48 i32.sub local.tee 1 global.set 0
+                    local.get 0 call 1 local.set 2
+                    local.get 1 i32.const {idx_init} i32.store offset=40
+                    local.get 1 local.get 0 i64.store offset=32
+                    local.get 1 local.get 2 i64.const 32 i64.shr_u i64.store32 offset=44
+                    block
+                        loop
+                            local.get 1 i32.const 16 i32.add
+                            local.get 1 i32.const 32 i32.add
+                            call 4
+                            local.get 1
+                            local.get 1 i64.load offset=16
+                            local.get 1 i64.load offset=24
+                            call 5
+                            local.get 1 i64.load i32.wrap_i64 i32.eqz br_if 1
+                            local.get 1 i64.load offset=8 call 2 drop
+                            br 0
+                        end
+                    end
+                    local.get 1 i32.const 48 i32.add global.set 0)
+            )"#
+        );
+        let wasm = wat::parse_str(&wat).expect("wat parses");
+        WasmModule::parse(&wasm).expect("module parses")
+    }
+
+    fn vec_iter_loop_lift(m: &WasmModule) -> Vec<SorobanStmt> {
+        lift_inline_call(
+            m,
+            &empty_registry(),
+            6,
+            vec![StackVal::Param("signers".to_string())],
+            0,
+            Rc::new(RefCell::new(HashMap::new())),
+            Rc::new(RefCell::new(0)),
+            Rc::new(RefCell::new(Vec::new())),
+        )
+        .content
+        .map(|c| c.0)
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn vec_iterator_loop_is_rebuilt_as_a_for_over_the_vector() {
+        cov_mark::check!(vec_iter_loop_rebuilt);
+        let stmts = vec_iter_loop_lift(&vec_iter_loop_module(0));
+        let Some(SorobanStmt::For {
+            start, end, body, ..
+        }) = stmts.iter().find(|s| matches!(s, SorobanStmt::For { .. }))
+        else {
+            panic!("no `for` emitted: {stmts:?}");
+        };
+        assert_eq!(*start, SorobanExpr::U32Literal(0));
+        assert!(
+            matches!(end, SorobanExpr::MethodCall { object, method, .. }
+                if method == "len" && **object == SorobanExpr::Param("signers".to_string())),
+            "bound is the vector's length: {end:?}"
+        );
+        // Body: bind the element (`v.get(i).unwrap()`), then use it.
+        assert!(
+            matches!(
+                body.as_slice(),
+                [
+                    SorobanStmt::Let {
+                        value: SorobanExpr::MethodCall { method, .. },
+                        ..
+                    },
+                    SorobanStmt::Expr(SorobanExpr::RequireAuth(_)),
+                ] if method == "unwrap"
+            ),
+            "one element binding and its use: {body:?}"
+        );
+    }
+
+    /// An iterator that does not start at index 0 is not `for i in 0..len`.
+    #[test]
+    fn vec_iterator_loop_with_other_initial_index_is_not_rebuilt() {
+        cov_mark::check_count!(vec_iter_loop_rebuilt, 0);
+        let _ = vec_iter_loop_lift(&vec_iter_loop_module(1));
     }
 }

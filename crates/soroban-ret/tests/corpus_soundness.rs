@@ -435,6 +435,12 @@ use std::process::Command;
 /// `u32` reads replace holes that had collapsed whole bodies (a fabricated
 /// `1048681` return becomes `get::<_, u32>(&"cache_size").unwrap_or(2)`),
 /// exposing the still-broken code behind them. digicus stays clean.
+/// → 303 held (issue #69 stages 2–4: SDK `Vec` iterator loops rebuilt as
+/// `for i in 0..v.len()`, the defaulting collection getter enabled, map
+/// accessors clone a multi-use by-value key). No per-contract count moved:
+/// digicus stays clean with its four mutation loops recovered and no
+/// `todo!()` left in them; aqua-amm / aqua-rewards / comet / reflector only
+/// gain `.clone()`s and typed `Vec` getter reads.
 const ERROR_CEILING: u32 = 303;
 
 #[test]
