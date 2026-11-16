@@ -73,14 +73,15 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
-  # main only: regenerate and commit the trimmed baseline so subsequent PRs diff
-  # against the latest numbers. Skips CI on its own commit to avoid loops.
-  update-baseline:
-    name: Refresh baseline (main)
-    if: github.event_name == 'push'
+  # The committed baseline must match what this commit produces, so the table
+  # above always diffs against real numbers. The baseline is refreshed in the
+  # PR that moves it (`bash scripts/rebuild-benchmark-baseline.sh`): `main` is
+  # protected, so CI cannot commit it after the merge.
+  baseline-current:
+    name: Baseline is current
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -93,14 +94,11 @@ jobs:
       - name: Regenerate baseline
         run: bash scripts/rebuild-benchmark-baseline.sh
 
-      - name: Commit if changed
+      - name: Fail if the committed baseline is stale
         run: |
-          if git diff --quiet -- benchmark-data/baseline.json; then
-            echo "Baseline unchanged."
+          if git diff --exit-code -- benchmark-data/baseline.json; then
+            echo "Baseline is current."
           else
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add benchmark-data/baseline.json
-            git commit -m "chore: refresh benchmark baseline [skip ci]"
-            git push
+            echo "::error::benchmark-data/baseline.json is stale. Run 'bash scripts/rebuild-benchmark-baseline.sh' and commit the result."
+            exit 1
           fi

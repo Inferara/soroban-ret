@@ -221,7 +221,7 @@
     {
       "file": "soroban-domains-CATRNPHY.wasm",
       "entity": "Soroban Domains",
-      "restoration_pct": 91.5,
+      "restoration_pct": 91.7,
       "spec_functions": 15,
       "fn_clean": 4,
       "fn_partial": 11,

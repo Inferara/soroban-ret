@@ -6,8 +6,8 @@
 # The baseline is the trimmed, stable per-contract subset (restoration %, fn
 # buckets, artifact totals) that the per-PR benchmark CI diffs against to mark
 # improved / reduced / no-change. Run this and commit the result whenever a
-# decompiler change legitimately moves restoration numbers; on `main`, CI runs
-# it automatically (see .github/workflows/benchmark.yml).
+# decompiler change moves restoration numbers, in the same PR: CI fails a PR
+# whose committed baseline is stale (see .github/workflows/benchmark.yml).
 #
 # Usage: scripts/rebuild-benchmark-baseline.sh [corpus-dir]
 set -euo pipefail

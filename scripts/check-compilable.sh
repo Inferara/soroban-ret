@@ -10,6 +10,10 @@
 #
 # Usage: scripts/check-compilable.sh [fixture-glob]
 #   default glob: tests/fixtures/test_*.wasm
+#
+# Set SOROBAN_RET_ERRORS_DIR=<dir> to save, for each FAILing fixture, the
+# generated source (<name>.rs) and the compiler's error lines
+# (<name>.errors.txt).
 set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -49,11 +53,17 @@ for wasm in "$REPO_DIR"/$GLOB; do
         continue
     fi
 
-    if (cd "$VERIFY_DIR" && cargo check --target wasm32v1-none 2>/dev/null) >/dev/null 2>&1; then
+    out=$( cd "$VERIFY_DIR" && cargo check --target wasm32v1-none --message-format=short --color never 2>&1 )
+    if [ $? -eq 0 ]; then
         echo "PASS $name"
         PASS=$((PASS + 1))
     else
         echo "FAIL $name"
+        if [ -n "${SOROBAN_RET_ERRORS_DIR:-}" ]; then
+            mkdir -p "$SOROBAN_RET_ERRORS_DIR"
+            cp "$VERIFY_DIR/src/lib.rs" "$SOROBAN_RET_ERRORS_DIR/$name.rs"
+            LC_ALL=C grep -aE 'error' <<<"$out" > "$SOROBAN_RET_ERRORS_DIR/$name.errors.txt" || true
+        fi
         FAILED_NAMES+=("$name")
         FAIL=$((FAIL + 1))
     fi

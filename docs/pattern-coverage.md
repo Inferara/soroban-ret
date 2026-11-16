@@ -301,11 +301,16 @@ wrapping-exact `<<` render and dead-counter elimination closed the last two
 input, including overflow — the earlier claim that `num_list` "loses its
 populate-loop and returns an empty `Vec`" no longer holds.
 
-**Coverage is intrinsically limited** (by design): only functions invocable with
-generated scalar arguments (`bool`/`u32`/`i32`/`u64`/`i64`/`u128`/`i128`, ≤48
-input vectors per function) and no required storage/auth state are executed;
-aggregate/UDT-argument functions, and the renamed `__constructor`/`__check_auth`,
-are skipped, as are contracts whose output does not recompile. It is a
+**Coverage is limited**: only functions invocable with generated scalar
+arguments (`bool`/`u32`/`i32`/`u64`/`i64`/`u128`/`i128`, ≤48 input vectors per
+function) are executed — 74 of the 175 functions in the contracts that
+recompile. Each call runs on a fresh instance with empty storage and no
+authorizations, so a function that needs initialised state or a signer is
+compared only on its failure path. Aggregate/UDT-argument functions and
+`__constructor`/`__check_auth` are skipped, as are contracts whose output does
+not recompile. The gate prints every skipped function with its reason and a
+count of functions blocked per parameter type; `SOROBAN_RET_EQUIV_REPORT=<path>`
+writes the same as JSON. It is a
 correctness sanity-check + behavioral-match metric, **not** a full-corpus
 differential test — and the 100 % is a match rate over that narrow executed
 slice, not a per-contract correctness guarantee.
@@ -334,13 +339,9 @@ slice, not a per-contract correctness guarantee.
     reaching-definitions: values lost across branches, calls and deep helpers
     (the master lever).
   - [#66](https://github.com/Inferara/soroban-ret/issues/66) — lost guard
-    conditions, the 500+ `if todo!("unknown value")` class;
-    [#67](https://github.com/Inferara/soroban-ret/issues/67) is its
-    `ValueNotInitialized` starter bucket.
+    conditions, the `if todo!("unknown value")` class (about 620 sites).
   - [#68](https://github.com/Inferara/soroban-ret/issues/68) — `aqua-rewards`
     checkpoint/derivation math, the deep #34 remainder.
-  - [#69](https://github.com/Inferara/soroban-ret/issues/69) — close the final
-    4 equivalence divergences (the `digicus` todo-panics).
 
 - **No published per-contract accuracy signal.** The benchmark HTML/JSON report
   is a per-commit GitHub Actions artifact (`.github/workflows/benchmark.yml`),

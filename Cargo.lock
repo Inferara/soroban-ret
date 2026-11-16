@@ -2004,6 +2004,7 @@ dependencies = [
 name = "soroban-ret-equiv"
 version = "0.0.4"
 dependencies = [
+ "serde_json",
  "soroban-ret",
  "soroban-sdk",
  "stellar-xdr",

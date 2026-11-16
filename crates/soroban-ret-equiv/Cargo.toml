@@ -27,3 +27,7 @@ stellar-xdr = { workspace = true }
 # shelling out to a separate verify crate (see src/lib.rs), mirroring
 # scripts/check-compilable.sh.
 soroban-sdk = { version = "=26.0.1", features = ["testutils"] }
+
+[dev-dependencies]
+# The opt-in JSON report of the equivalence gate (`SOROBAN_RET_EQUIV_REPORT`).
+serde_json = { workspace = true }

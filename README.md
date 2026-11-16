@@ -263,13 +263,10 @@ instead of a guess. The frontier is tracked as open issues:
 - [#34](https://github.com/Inferara/soroban-ret/issues/34) — no memory-SSA /
   reaching-definitions: values lost across branches, calls and deep helpers
   (the master lever).
-- [#66](https://github.com/Inferara/soroban-ret/issues/66) /
-  [#67](https://github.com/Inferara/soroban-ret/issues/67) — lost guard
-  conditions, the 500+ `if todo!("unknown value")` class.
+- [#66](https://github.com/Inferara/soroban-ret/issues/66) — lost guard
+  conditions, the `if todo!("unknown value")` class (about 620 sites).
 - [#68](https://github.com/Inferara/soroban-ret/issues/68) — `aqua-rewards`
   checkpoint/derivation math.
-- [#69](https://github.com/Inferara/soroban-ret/issues/69) — the final 4
-  equivalence divergences.
 
 Allowance / balance helper recovery is shipped but **not yet validated** — no
 fixture exercises it. Trait-based contracts are recovered as a flat
