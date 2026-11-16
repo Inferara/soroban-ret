@@ -22,7 +22,8 @@
 //! (`bool`/`u32`/`i32`/`u64`/`i64`/`u128`/`i128`) and no required storage/auth
 //! state are executed. Functions taking aggregate/custom args (`Vec`/`Map`/UDTs/
 //! `Address`/`Bytes`/`String`) are skipped, as are `__constructor`/`__check_auth`
-//! (the decompiler renames them, so their exports no longer match the original).
+//! (not callable as ordinary functions). Every skip is reported with its reason
+//! ([`SkipReason`]), naming the parameter types that blocked it.
 //! Contracts whose decompiled output does not recompile are skipped wholesale.
 //! This is a correctness sanity-check + behavioral-match metric, **not** a
 //! full-corpus differential test.
@@ -81,8 +82,8 @@ pub struct Divergence {
 pub struct EquivReport {
     /// Functions that were invoked on both contracts.
     pub executed_fns: usize,
-    /// (function, reason) for each function that could not be executed.
-    pub skipped_fns: Vec<(String, String)>,
+    /// Each function that could not be executed, and why.
+    pub skipped_fns: Vec<SkippedFn>,
     /// Total (function, input-vector) cases invoked.
     pub executed_cases: usize,
     /// Cases where original and recompiled produced the same outcome.
@@ -101,9 +102,109 @@ impl EquivReport {
         }
     }
 
-    fn skip(&mut self, name: &str, reason: &str) {
-        self.skipped_fns
-            .push((name.to_string(), reason.to_string()));
+    fn skip(&mut self, name: &str, reason: SkipReason) {
+        self.skipped_fns.push(SkippedFn {
+            function: name.to_string(),
+            reason,
+        });
+    }
+}
+
+/// A function the harness did not execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFn {
+    pub function: String,
+    pub reason: SkipReason,
+}
+
+/// Why a function was not executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// `__constructor` / `__check_auth`: not callable as an ordinary function.
+    NotDirectlyCallable,
+    /// At least one parameter has a type the harness cannot generate values
+    /// for. Carries the distinct unsupported parameter types, in signature
+    /// order (`Address`, `Vec<String>`, `MyStruct`, …).
+    UnsupportedParamTypes(Vec<String>),
+    /// The contract cannot be registered without constructor arguments.
+    NotRegistrable,
+}
+
+impl SkipReason {
+    /// A short machine-readable tag for reports.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SkipReason::NotDirectlyCallable => "not_directly_callable",
+            SkipReason::UnsupportedParamTypes(_) => "unsupported_param_types",
+            SkipReason::NotRegistrable => "not_registrable",
+        }
+    }
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::NotDirectlyCallable => {
+                write!(f, "constructor/check_auth: not directly callable")
+            }
+            SkipReason::UnsupportedParamTypes(t) => {
+                write!(f, "unsupported parameter type(s): {}", t.join(", "))
+            }
+            SkipReason::NotRegistrable => {
+                write!(f, "contract not registrable (constructor needs args?)")
+            }
+        }
+    }
+}
+
+/// A readable name for a spec type, for skip reasons and reports.
+pub fn type_label(td: &ScSpecTypeDef) -> String {
+    use ScSpecTypeDef as T;
+    match td {
+        T::Val => "Val".into(),
+        T::Bool => "bool".into(),
+        T::Void => "()".into(),
+        T::Error => "Error".into(),
+        T::U32 => "u32".into(),
+        T::I32 => "i32".into(),
+        T::U64 => "u64".into(),
+        T::I64 => "i64".into(),
+        T::Timepoint => "Timepoint".into(),
+        T::Duration => "Duration".into(),
+        T::U128 => "u128".into(),
+        T::I128 => "i128".into(),
+        T::U256 => "U256".into(),
+        T::I256 => "I256".into(),
+        T::Bytes => "Bytes".into(),
+        T::String => "String".into(),
+        T::Symbol => "Symbol".into(),
+        T::Address => "Address".into(),
+        T::MuxedAddress => "MuxedAddress".into(),
+        T::Option(o) => format!("Option<{}>", type_label(&o.value_type)),
+        T::Result(r) => format!(
+            "Result<{}, {}>",
+            type_label(&r.ok_type),
+            type_label(&r.error_type)
+        ),
+        T::Vec(v) => format!("Vec<{}>", type_label(&v.element_type)),
+        T::Map(m) => format!(
+            "Map<{}, {}>",
+            type_label(&m.key_type),
+            type_label(&m.value_type)
+        ),
+        T::Tuple(t) => format!(
+            "({})",
+            t.value_types
+                .iter()
+                .map(type_label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        T::BytesN(b) => format!("BytesN<{}>", b.n),
+        T::Udt(u) => u
+            .name
+            .to_utf8_string()
+            .unwrap_or_else(|_| "<udt>".to_string()),
     }
 }
 
@@ -385,17 +486,26 @@ pub fn check_equivalence(original_wasm: &[u8]) -> Result<EquivReport, EquivError
 
     for (name, spec_fn) in &ir.registry.functions {
         if name.starts_with("__") {
-            report.skip(name, "constructor/check_auth: export renamed by decompiler");
+            report.skip(name, SkipReason::NotDirectlyCallable);
             continue;
         }
         let kinds: Option<Vec<ParamKind>> =
             spec_fn.inputs.iter().map(|i| classify(&i.type_)).collect();
         let Some(kinds) = kinds else {
-            report.skip(name, "non-scalar parameter(s)");
+            let mut unsupported: Vec<String> = Vec::new();
+            for input in spec_fn.inputs.iter() {
+                if classify(&input.type_).is_none() {
+                    let label = type_label(&input.type_);
+                    if !unsupported.contains(&label) {
+                        unsupported.push(label);
+                    }
+                }
+            }
+            report.skip(name, SkipReason::UnsupportedParamTypes(unsupported));
             continue;
         };
         if !registrable {
-            report.skip(name, "contract not registrable (constructor needs args?)");
+            report.skip(name, SkipReason::NotRegistrable);
             continue;
         }
 
@@ -422,4 +532,53 @@ pub fn check_equivalence(original_wasm: &[u8]) -> Result<EquivReport, EquivError
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        ScSpecTypeBytesN, ScSpecTypeMap, ScSpecTypeOption, ScSpecTypeTuple, ScSpecTypeUdt,
+        ScSpecTypeVec,
+    };
+
+    #[test]
+    fn type_labels_name_nested_and_user_types() {
+        let vec_of_string = ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+            element_type: Box::new(ScSpecTypeDef::String),
+        }));
+        assert_eq!(type_label(&vec_of_string), "Vec<String>");
+        assert_eq!(
+            type_label(&ScSpecTypeDef::BytesN(ScSpecTypeBytesN { n: 32 })),
+            "BytesN<32>"
+        );
+        let map = ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+            key_type: Box::new(ScSpecTypeDef::Address),
+            value_type: Box::new(ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+                value_type: Box::new(ScSpecTypeDef::I128),
+            }))),
+        }));
+        assert_eq!(type_label(&map), "Map<Address, Option<i128>>");
+        let tuple = ScSpecTypeDef::Tuple(Box::new(ScSpecTypeTuple {
+            value_types: vec![ScSpecTypeDef::U32, ScSpecTypeDef::Symbol]
+                .try_into()
+                .unwrap(),
+        }));
+        assert_eq!(type_label(&tuple), "(u32, Symbol)");
+        let udt = ScSpecTypeDef::Udt(ScSpecTypeUdt {
+            name: "ConfigData".try_into().unwrap(),
+        });
+        assert_eq!(type_label(&udt), "ConfigData");
+    }
+
+    #[test]
+    fn skip_reason_names_the_blocking_types() {
+        let r = SkipReason::UnsupportedParamTypes(vec!["Address".into(), "Vec<String>".into()]);
+        assert_eq!(
+            r.to_string(),
+            "unsupported parameter type(s): Address, Vec<String>"
+        );
+        assert_eq!(r.kind(), "unsupported_param_types");
+        assert_eq!(SkipReason::NotRegistrable.kind(), "not_registrable");
+    }
 }

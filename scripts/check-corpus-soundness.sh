@@ -20,6 +20,11 @@
 #
 # Usage: scripts/check-corpus-soundness.sh [corpus-glob]
 #   default glob: benchmark-data/mainnet/*.wasm
+#
+# Set SOROBAN_RET_ERRORS_DIR=<dir> to also save, per contract, the generated
+# source (<name>.rs) and its hard errors (<name>.errors.txt, one
+# `src/lib.rs:LINE:COL: error[E…]: …` line each) — the census of WHAT is wrong,
+# which the counts alone do not give.
 set -u
 set -o pipefail
 
@@ -75,6 +80,13 @@ for wasm in "$REPO_DIR"/$GLOB; do
     # also matches bytes, not characters, so non-UTF-8 bytes in the decompiled
     # source can't make GNU grep (CI's UTF-8 locale) miss present lines.
     errs=$( LC_ALL=C grep -acE 'src/lib\.rs.*error\[E[0-9]+\]' <<<"$out" )
+    if [ -n "${SOROBAN_RET_ERRORS_DIR:-}" ]; then
+        mkdir -p "$SOROBAN_RET_ERRORS_DIR"
+        cp "$VERIFY_DIR/src/lib.rs" "$SOROBAN_RET_ERRORS_DIR/$name.rs"
+        # `|| true`: no match is the clean case, not a failure.
+        LC_ALL=C grep -aE 'src/lib\.rs.*error\[E[0-9]+\]' <<<"$out" \
+            > "$SOROBAN_RET_ERRORS_DIR/$name.errors.txt" || true
+    fi
     COUNT=$((COUNT + 1))
     if [ "$status" -eq 0 ]; then
         CLEAN=$((CLEAN + 1))

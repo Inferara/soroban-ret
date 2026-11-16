@@ -30,7 +30,7 @@ use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 
-use soroban_ret_equiv::{EquivError, check_equivalence};
+use soroban_ret_equiv::{EquivError, SkipReason, check_equivalence};
 
 /// Max tolerated behavioral divergences (input cases where the original and
 /// recompiled contracts differ). A ratchet: drive DOWN as the decompiler
@@ -67,8 +67,8 @@ const DIVERGENCE_CEILING: usize = 0;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).
-/// Measured 63; floored with headroom.
-const EXECUTED_FN_FLOOR: usize = 60;
+/// Measured 74; floored with headroom.
+const EXECUTED_FN_FLOOR: usize = 70;
 
 /// Max contracts that may hard-panic the harness (should be zero).
 const ERRORED_MAX: usize = 0;
@@ -100,6 +100,12 @@ fn equivalence_within_ceiling() {
     let mut divergences = Vec::new();
     let mut not_recompilable = Vec::new();
     let mut errored = Vec::new();
+    let mut skipped_total = 0usize;
+    // Unsupported parameter type → functions it blocks (in recompilable
+    // contracts): what a new argument generator would un-skip.
+    let mut blocked_by_type: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut skipped_by_kind: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut json_contracts: Vec<serde_json::Value> = Vec::new();
 
     for (name, path) in &targets {
         let wasm = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -118,6 +124,38 @@ fn equivalence_within_ceiling() {
                     rep.skipped_fns.len(),
                     rep.divergences.len(),
                 );
+                skipped_total += rep.skipped_fns.len();
+                for s in &rep.skipped_fns {
+                    eprintln!("    SKIP {name}::{} — {}", s.function, s.reason);
+                    *skipped_by_kind.entry(s.reason.kind()).or_insert(0) += 1;
+                    if let SkipReason::UnsupportedParamTypes(types) = &s.reason {
+                        for t in types {
+                            *blocked_by_type.entry(t.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                json_contracts.push(serde_json::json!({
+                    "contract": name,
+                    "status": "executed",
+                    "executed_fns": rep.executed_fns,
+                    "executed_cases": rep.executed_cases,
+                    "matched_cases": rep.matched_cases,
+                    "skipped": rep.skipped_fns.iter().map(|s| serde_json::json!({
+                        "function": s.function,
+                        "kind": s.reason.kind(),
+                        "reason": s.reason.to_string(),
+                        "unsupported_types": match &s.reason {
+                            SkipReason::UnsupportedParamTypes(t) => t.clone(),
+                            _ => Vec::new(),
+                        },
+                    })).collect::<Vec<_>>(),
+                    "divergences": rep.divergences.iter().map(|d| serde_json::json!({
+                        "function": d.function,
+                        "inputs": d.inputs,
+                        "original": d.original,
+                        "recompiled": d.recompiled,
+                    })).collect::<Vec<_>>(),
+                }));
                 for d in &rep.divergences {
                     eprintln!(
                         "    DIVERGE {name}::{} inputs={} orig={} recomp={}",
@@ -127,15 +165,26 @@ fn equivalence_within_ceiling() {
                 }
             }
             Ok(Err(EquivError::NotRecompilable(reason))) => {
+                json_contracts.push(serde_json::json!({
+                    "contract": name, "status": "not_recompilable", "reason": reason,
+                }));
                 not_recompilable.push((name.clone(), reason));
             }
-            Ok(Err(e)) => errored.push((name.clone(), format!("{e}"))),
+            Ok(Err(e)) => {
+                json_contracts.push(serde_json::json!({
+                    "contract": name, "status": "errored", "reason": format!("{e}"),
+                }));
+                errored.push((name.clone(), format!("{e}")))
+            }
             Err(p) => {
                 let msg = p
                     .downcast_ref::<&str>()
                     .map(|s| s.to_string())
                     .or_else(|| p.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "<non-string panic>".to_string());
+                json_contracts.push(serde_json::json!({
+                    "contract": name, "status": "errored", "reason": format!("panic: {msg}"),
+                }));
                 errored.push((name.clone(), format!("panic: {msg}")));
             }
         }
@@ -159,13 +208,48 @@ fn equivalence_within_ceiling() {
     for (n, r) in &errored {
         eprintln!("    - {n}: {r}");
     }
-    eprintln!("functions executed:  {exec_fns}");
+    eprintln!(
+        "functions executed:  {exec_fns} of {} in recompilable contracts",
+        exec_fns + skipped_total
+    );
+    eprintln!("functions skipped:   {skipped_total}");
+    for (kind, n) in &skipped_by_kind {
+        eprintln!("    - {kind}: {n}");
+    }
+    // Most-blocking types first: the order in which new argument generators
+    // pay off. A function with several unsupported types counts under each.
+    let mut blockers: Vec<(&String, &usize)> = blocked_by_type.iter().collect();
+    blockers.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    eprintln!("blocked by parameter type (functions):");
+    for (t, n) in &blockers {
+        eprintln!("    - {t}: {n}");
+    }
     eprintln!("cases executed:      {exec_cases}");
     eprintln!("behavioral match:    {match_pct:.1}%");
     eprintln!(
         "divergences:         {} (ceiling {DIVERGENCE_CEILING})",
         divergences.len()
     );
+
+    // Opt-in machine-readable report of everything above.
+    if let Ok(path) = std::env::var("SOROBAN_RET_EQUIV_REPORT") {
+        let report = serde_json::json!({
+            "contracts_checked": targets.len(),
+            "not_recompilable": not_recompilable.len(),
+            "errored": errored.len(),
+            "functions_executed": exec_fns,
+            "functions_skipped": skipped_total,
+            "cases_executed": exec_cases,
+            "cases_matched": matched,
+            "divergences": divergences.len(),
+            "skipped_by_kind": skipped_by_kind,
+            "blocked_by_param_type": blocked_by_type,
+            "contracts": json_contracts,
+        });
+        let text = serde_json::to_string_pretty(&report).expect("report serializes");
+        fs::write(&path, text).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        eprintln!("report written:      {path}");
+    }
 
     assert!(
         errored.len() <= ERRORED_MAX,

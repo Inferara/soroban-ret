@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — gate tooling and CI housekeeping
+
+- The equivalence gate prints every skipped function with its reason, naming
+  the parameter types that blocked it, and a count of functions blocked per
+  type; `SOROBAN_RET_EQUIV_REPORT=<path>` writes the run as JSON. No change to
+  what is executed (74 of 175 functions in the contracts that recompile).
+- `SOROBAN_RET_ERRORS_DIR=<dir>` makes the corpus-soundness and compile-back
+  scripts save each contract's generated source and compiler errors.
+- CI: the macOS job moves to `macos-15` (the `macos-14` label is no longer
+  accepted and the job never started); the job that pushed a refreshed
+  baseline to protected `main` is replaced by a check that fails a PR whose
+  committed `benchmark-data/baseline.json` is stale. The PR benchmark table
+  now compares against the base commit's baseline, so a PR that refreshes the
+  file still shows what it changed.
+- Baseline refreshed: soroban-domains restoration 91.5 → 91.7 %, left behind
+  by the #87 review fixes.
+
 ### Fixed — equivalence gate at zero divergences (#69)
 
 - SDK `for x in vec.iter()` loops are rebuilt as `for i in 0..v.len()` from

@@ -76,9 +76,10 @@ cargo run -p soroban-ret-bench -- \
 ```
 
 `baseline.json` (one directory up) is the committed snapshot every PR is diffed
-against to mark **improved / reduced / no-change**; the `Benchmark` GitHub
-Action posts that table on each PR and refreshes the baseline on merge to
-`main`. Regenerate it manually with `scripts/rebuild-benchmark-baseline.sh`.
+against to mark **improved / reduced / no-change**. The `Benchmark` GitHub
+Action posts that table on each PR, comparing against the copy on the PR's
+base commit, and fails the PR if the copy it commits is stale. Regenerate it with `scripts/rebuild-benchmark-baseline.sh` in the PR
+that moves the numbers.
 
 The headline % is deliberately graded per function, so a large body with a few
 `todo!()`s still scores high — watch the **Artifacts** column for the sharper,
