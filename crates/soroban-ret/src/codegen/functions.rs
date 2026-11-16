@@ -455,8 +455,24 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
 
         // Auth
         SorobanExpr::RequireAuth(addr) => {
-            let addr = generate_expr(addr);
-            quote! { #addr.require_auth() }
+            // An address that lifted to a non-address constant (the helper's
+            // result slot still holding its `Void` placeholder) or to nothing
+            // is unknown: who must authorize is a hole, never `().require_auth()`.
+            if is_never_rooted(addr)
+                || matches!(
+                    **addr,
+                    SorobanExpr::Void
+                        | SorobanExpr::I32Literal(_)
+                        | SorobanExpr::U32Literal(_)
+                        | SorobanExpr::I64Literal(_)
+                        | SorobanExpr::U64Literal(_)
+                )
+            {
+                quote! { todo!("unknown value") }
+            } else {
+                let addr = generate_expr(addr);
+                quote! { #addr.require_auth() }
+            }
         }
         SorobanExpr::RequireAuthForArgs { address, args } => {
             let addr = generate_expr(address);
@@ -578,19 +594,26 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                 .collect();
             let type_param = invoke_type_param(return_type);
             // v26 `try_invoke_contract::<T, E>` returns
-            // `Result<Result<T, T::Error>, Result<E, InvokeError>>`; flatten it to the
-            // function's declared `Result<T, E>`. `E` is left to inference so it matches
-            // whatever error type the signature declares (contract enum or `soroban_sdk::Error`).
+            // `Result<Result<T, T::Error>, Result<E, InvokeError>>`. Rendered
+            // as the bare call: how the original mapped that result is not
+            // recovered (`hole_try_invoke_results` holes a value use), and a
+            // fixed `.unwrap()` mapping would panic where the original did not.
             quote! {
-                env.try_invoke_contract::<#type_param, _>(#addr, #func, vec![&env, #(#arg_exprs),*])
-                    .map(|r| r.unwrap())
-                    .map_err(|e| e.unwrap())
+                env.try_invoke_contract::<#type_param, soroban_sdk::Error>(#addr, #func, vec![&env, #(#arg_exprs),*])
             }
         }
 
         // Type construction
         SorobanExpr::StructConstruct { type_name, fields } => {
             let ty = safe_ident(type_name);
+            // A tuple struct (`struct S(A, B)`) has positional fields named
+            // "0", "1", …: construct it positionally, in index order.
+            if !fields.is_empty() && fields.iter().all(|(n, _)| n.parse::<u32>().is_ok()) {
+                let mut ordered: Vec<&(String, SorobanExpr)> = fields.iter().collect();
+                ordered.sort_by_key(|(n, _)| n.parse::<u32>().unwrap_or(u32::MAX));
+                let values: Vec<_> = ordered.iter().map(|(_, e)| generate_expr(e)).collect();
+                return quote! { #ty(#(#values),*) };
+            }
             let field_assigns: Vec<_> = fields
                 .iter()
                 .map(|(name, expr)| {
@@ -846,7 +869,12 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
                     && s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
                     && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             };
-            if is_valid_ident(&module.to_lowercase()) && is_valid_ident(function) {
+            // `*_linear_memory` host functions (`map_new_from_linear_memory`,
+            // `vec_unpack_to_linear_memory`, …) take guest pointers and have
+            // no SDK method: an unlowered one is a hole, not a call.
+            let has_sdk_method = !function.contains("linear_memory");
+            if has_sdk_method && is_valid_ident(&module.to_lowercase()) && is_valid_ident(function)
+            {
                 let arg_exprs: Vec<_> = args.iter().map(generate_expr).collect();
                 let mod_ident = format_ident!("{}", module.to_lowercase());
                 let fn_ident = format_ident!("{}", function);
@@ -2563,6 +2591,45 @@ mod generate_expr_tests {
     }
 
     #[test]
+    fn tuple_struct_is_constructed_positionally() {
+        let e = SorobanExpr::StructConstruct {
+            type_name: "Admin".into(),
+            fields: vec![
+                ("1".into(), SorobanExpr::Param("b".into())),
+                ("0".into(), SorobanExpr::Param("a".into())),
+            ],
+        };
+        assert_eq!(collapse(&s(generate_expr(&e))), "Admin (a , b)");
+    }
+
+    #[test]
+    fn require_auth_on_a_non_address_is_a_hole() {
+        for addr in [SorobanExpr::Void, SorobanExpr::UnknownVal] {
+            let out = collapse(&s(generate_expr(&SorobanExpr::RequireAuth(boxed(addr)))));
+            assert_eq!(out, "todo ! (\"unknown value\")");
+        }
+        let real = SorobanExpr::RequireAuth(boxed(SorobanExpr::Param("admin".into())));
+        assert_eq!(
+            collapse(&s(generate_expr(&real))),
+            "admin . require_auth ()"
+        );
+    }
+
+    #[test]
+    fn unlowered_linear_memory_host_call_is_a_hole() {
+        let e = SorobanExpr::RawHostCall {
+            module: "Map".into(),
+            function: "map_new_from_linear_memory".into(),
+            args: vec![SorobanExpr::U32Literal(1048664)],
+        };
+        assert!(e.is_never_rooted());
+        assert_eq!(
+            collapse(&s(generate_expr(&e))),
+            "todo ! (\"host call: Map.map_new_from_linear_memory\")"
+        );
+    }
+
+    #[test]
     fn try_invoke_contract_emits_try_variant() {
         let e = SorobanExpr::TryInvokeContract {
             address: boxed(SorobanExpr::Param("addr".into())),
@@ -2571,14 +2638,15 @@ mod generate_expr_tests {
             return_type: Some("i32".into()),
         };
         let out = collapse(&s(generate_expr(&e)));
-        // v26: two generic params (`E` inferred) + flatten of the nested Result.
+        // v26: two generic params; the bare call, with no fabricated mapping
+        // of its nested `Result`.
         assert!(
-            out.contains("env . try_invoke_contract :: < i32 , _ >"),
+            out.contains("env . try_invoke_contract :: < i32 , soroban_sdk :: Error >"),
             "got: {out}"
         );
         assert!(
-            out.contains(". map_err"),
-            "expected nested-Result flatten: {out}"
+            !out.contains("unwrap") && !out.contains("map_err"),
+            "the result mapping is not recovered and must not be invented: {out}"
         );
     }
 

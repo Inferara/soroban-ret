@@ -740,16 +740,15 @@ fn test_decompile_import_contract() {
     assert!(source.contains("y: u64"), "missing y parameter");
     // Regression guards for #15 (SDK v26.0.1 invoke_contract codegen):
     // - infallible call carries the return-type generic `::<u64>`
-    // - fallible call uses the two-generic `::<u64, _>` form with the inner
-    //   Result unwrapped via `.map(|r| r.unwrap()).map_err(|e| e.unwrap())`.
+    // - fallible call uses the two-generic form, rendered bare: the mapping
+    //   of its nested Result is not recovered, so the value is a hole.
     assert_in_fn(&source, "fn add_with", &["env.invoke_contract::<u64>("]);
     assert_in_fn(
         &source,
         "fn safe_add_with",
         &[
-            "env.try_invoke_contract::<u64, _>(",
-            ".map(|r| r.unwrap())",
-            ".map_err(|e| e.unwrap())",
+            "env.try_invoke_contract::<u64, soroban_sdk::Error>(",
+            "todo!(\"unknown value\")",
         ],
     );
 }
@@ -1257,9 +1256,15 @@ fn test_all_fixtures_decompile() {
 // truncation artifact. test_liquidity_pool's i128 share-math is now reconstructed
 // (the soft-arith multiply/divide helpers are classified and lowered to clean
 // `Mul`/`Div`, operands rebuilt from their limb pairs, and the carry/borrow-flag
-// leaks dropped), so it no longer needs an exemption — the list is empty and every
-// fixture is held to the full no-artifact bar.
-const KNOWN_I128_TODO_FIXTURES: &[&str] = &[];
+// leaks dropped), so it no longer needs an exemption.
+//
+// `import_contract`: `safe_add_with` / `safe_add_with_two` map a `try_call`
+// result by hand (callee error 1 → `Err(Overflow)`, anything else →
+// `Err(Abort)`). That mapping is not recovered, and the former fixed
+// `.unwrap()` rendering diverged from the original under execution, so the
+// result is an honest hole (`hole_try_invoke_results`) until the mapping is
+// lifted.
+const KNOWN_I128_TODO_FIXTURES: &[&str] = &["test_import_contract"];
 
 #[test]
 fn test_all_fixtures_no_artifacts() {
@@ -2265,5 +2270,107 @@ fn spec_only_yields_no_recovery_report() {
     assert!(
         spec.recovery.is_none(),
         "spec_only must not produce a recovery report"
+    );
+}
+
+/// `errors::hello` dispatches on a five-variant enum with a `br_table`; the
+/// `Flag::B` target is *outside* the switch (it falls through to the shared
+/// `return Err(AnError)`), while the default target is a case body. Dropping
+/// the escaping arm sent `Flag::B` to the default's code (`panic_with_error!`
+/// with code 9) — found by the equivalence gate once it generated enum
+/// arguments. The arm must stay, empty, so `B` reaches the fall-through.
+#[test]
+fn switch_arm_that_leaves_the_switch_is_not_folded_into_the_default() {
+    cov_mark::check!(switch_escape_arm_kept_out_of_default);
+    let wasm = include_bytes!("../../../tests/fixtures/test_errors.wasm");
+    let src = soroban_ret::decompile(wasm).expect("decompile");
+    let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("else if flag == Flag::B { } else {"),
+        "Flag::B must have its own (empty) arm ahead of the default:\n{src}"
+    );
+    assert!(
+        flat.contains("} Err(Error::AnError) }"),
+        "the fall-through after the switch returns Err(AnError):\n{src}"
+    );
+}
+
+/// `import_contract::safe_add_with` maps a `try_call` result by hand (callee
+/// error 1 → `Err(Overflow)`, any other failure → `Err(Abort)`). That mapping
+/// is not recovered, so the call is rendered bare and its result is an honest
+/// hole — not a fixed `.unwrap()` mapping, which panicked on the failures the
+/// original turned into an error value.
+#[test]
+fn try_invoke_result_mapping_is_a_hole_not_an_unwrap() {
+    cov_mark::check!(try_invoke_result_mapping_holed);
+    let wasm = include_bytes!("../../../tests/fixtures/test_import_contract.wasm");
+    let src = soroban_ret::decompile(wasm).expect("decompile");
+    assert!(
+        src.contains("env.try_invoke_contract::<u64, soroban_sdk::Error>("),
+        "the call itself is kept:\n{src}"
+    );
+    assert!(
+        !src.contains(".unwrap()"),
+        "no fabricated unwrap of the try result:\n{src}"
+    );
+    assert_eq!(
+        src.matches("todo!(\"unknown value\")").count(),
+        2,
+        "one hole per try-invoking function:\n{src}"
+    );
+}
+
+/// unknown-oracle `set_admin` is `check_admin()?; storage.set(Admin, new);
+/// Ok(())`, where the check is a helper returning a status code (401 = ok).
+/// Three faults used to reduce it to an unconditional `Ok(())`, found by the
+/// equivalence gate once it generated `Address` arguments:
+///
+/// - the helper's status came out of a two-exit value block as ONE exit's
+///   constant, so `if status == 401 { write }` folded away;
+/// - the inlined getter's `return` read as the caller returning, cutting off
+///   everything after the call;
+/// - `set_price` / `initialize` were replaced wholesale by a storage read,
+///   because they call the same fallible getter a real getter does.
+///
+/// The status is not recovered, so the write now sits behind an honest hole.
+#[test]
+fn status_helper_caller_keeps_its_write_behind_a_hole() {
+    cov_mark::check!(value_block_join_constant_not_guessed);
+    cov_mark::check!(inlined_return_before_effects_dropped);
+    cov_mark::check!(fallible_get_rebuild_declined_for_effectful_function);
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/unknown-oracle-CAWGFKEL.wasm");
+    let src = decompile(wasm).expect("decompile unknown-oracle");
+    let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    let body = |name: &str| -> String {
+        let start = flat
+            .find(&format!("pub fn {name}("))
+            .expect("function present");
+        let end = flat[start + 1..]
+            .find("pub fn ")
+            .map_or(flat.len(), |e| start + 1 + e);
+        flat[start..end].to_string()
+    };
+    for f in ["set_admin", "initialize"] {
+        let b = body(f);
+        assert!(
+            b.contains("if todo!(\"unknown value\") { env.storage() .instance() .set(&symbol_short!(\"Admin\"), &Admin("),
+            "{f}: the admin write is kept, behind the unrecovered status:\n{b}"
+        );
+    }
+    let set_price = body("set_price");
+    assert!(
+        set_price.contains(".temporary()") && set_price.contains(".set::<"),
+        "set_price keeps its write:\n{set_price}"
+    );
+    assert!(
+        !set_price.contains(".ok_or(Error::Uninitialized); Ok(())"),
+        "set_price is not a discarded read:\n{set_price}"
+    );
+    // A real getter through the same helper is still rebuilt as a read.
+    let get_admin = body("get_admin");
+    assert!(
+        get_admin
+            .contains(".get::<_, Address>(&symbol_short!(\"Admin\")) .ok_or(Error::Uninitialized)"),
+        "get_admin stays a fallible read:\n{get_admin}"
     );
 }

@@ -18,12 +18,15 @@
 //!
 //! ## Intrinsic coverage limits (by design, documented)
 //!
-//! Only functions invocable with generated **scalar** arguments
-//! (`bool`/`u32`/`i32`/`u64`/`i64`/`u128`/`i128`) and no required storage/auth
-//! state are executed. Functions taking aggregate/custom args (`Vec`/`Map`/UDTs/
-//! `Address`/`Bytes`/`String`) are skipped, as are `__constructor`/`__check_auth`
-//! (not callable as ordinary functions). Every skip is reported with its reason
-//! ([`SkipReason`]), naming the parameter types that blocked it.
+//! Arguments of every spec type are generated (see `args`), and each case runs
+//! under both [`AuthMode`]s. What is NOT covered: every invocation runs on a
+//! fresh instance with **empty storage** and no other contract registered, so a
+//! function that needs initialised state is compared only up to its first
+//! storage read or cross-contract call; and only the **return outcome** is
+//! compared, not events or storage. `__constructor`/`__check_auth` are skipped
+//! (not callable as ordinary functions); every skip is reported with its
+//! reason ([`SkipReason`]). A case that reaches a `todo!()` hole in the
+//! recompiled contract is counted as unverified, not as a match (`mark_holes`).
 //! Contracts whose decompiled output does not recompile are skipped wholesale.
 //! This is a correctness sanity-check + behavioral-match metric, **not** a
 //! full-corpus differential test.
@@ -32,9 +35,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use soroban_sdk::testutils::EnvTestConfig;
-use soroban_sdk::xdr::{Int128Parts, ScVal, UInt128Parts};
-use soroban_sdk::{Env, Symbol, TryFromVal, Val, Vec as SVec};
-use stellar_xdr::curr::ScSpecTypeDef;
+use soroban_sdk::xdr::ScVal;
+use soroban_sdk::{Address, Env, Symbol, TryFromVal, Val, Vec as SVec};
+use stellar_xdr::curr::{ContractId, Hash, ScAddress, ScSpecTypeDef};
+
+mod args;
+
+use args::{Generator, SELF_CONTRACT_ID, select_cases};
 
 /// A test [`Env`] that does NOT write a snapshot JSON on drop (the harness
 /// creates many envs; the default would litter `test_snapshots/`).
@@ -84,10 +91,22 @@ pub struct EquivReport {
     pub executed_fns: usize,
     /// Each function that could not be executed, and why.
     pub skipped_fns: Vec<SkippedFn>,
-    /// Total (function, input-vector) cases invoked.
+    /// Total (function, input-vector, [`AuthMode`]) cases invoked.
     pub executed_cases: usize,
     /// Cases where original and recompiled produced the same outcome.
     pub matched_cases: usize,
+    /// Matched cases where both sides returned a value (not an error or a
+    /// trap). The rest of the matches agree only on *failing*: without
+    /// initialised state most calls stop at the first storage read.
+    pub value_cases: usize,
+    /// Executed functions with at least one value-returning matched case.
+    pub value_fns: usize,
+    /// Cases where the recompiled contract reached a `todo!()` hole: the
+    /// decompiler declared the value unrecovered, so there is nothing to
+    /// compare. Neither a match nor a divergence.
+    pub hole_cases: usize,
+    /// Executed functions with at least one case that reached a hole.
+    pub hole_fns: Vec<String>,
     /// Every observed divergence (an empty vec is the pass condition).
     pub divergences: Vec<Divergence>,
 }
@@ -223,124 +242,72 @@ enum Outcome {
     Panic,
 }
 
-/// Scalar parameter kinds the harness can synthesize inputs for.
-#[derive(Clone, Copy)]
-enum ParamKind {
-    Bool,
-    U32,
-    I32,
-    U64,
-    I64,
-    U128,
-    I128,
-}
-
-fn classify(td: &ScSpecTypeDef) -> Option<ParamKind> {
-    match td {
-        ScSpecTypeDef::Bool => Some(ParamKind::Bool),
-        ScSpecTypeDef::U32 => Some(ParamKind::U32),
-        ScSpecTypeDef::I32 => Some(ParamKind::I32),
-        ScSpecTypeDef::U64 => Some(ParamKind::U64),
-        ScSpecTypeDef::I64 => Some(ParamKind::I64),
-        ScSpecTypeDef::U128 => Some(ParamKind::U128),
-        ScSpecTypeDef::I128 => Some(ParamKind::I128),
-        _ => None,
+impl Outcome {
+    /// Did the (recompiled) contract stop at a `todo!()` hole? See [`mark_holes`].
+    fn is_hole(&self) -> bool {
+        matches!(self, Outcome::ContractError(e) if *e == format!("Error(Contract, #{HOLE_ERROR_CODE})"))
     }
 }
 
-fn u128_scval(v: u128) -> ScVal {
-    ScVal::U128(UInt128Parts {
-        hi: (v >> 64) as u64,
-        lo: v as u64,
-    })
+/// Contract error code a reached hole fails with in the recompiled contract
+/// (see [`mark_holes`]). Far outside any code a real contract declares, and
+/// below `i32::MAX` because the host prints contract codes as signed.
+const HOLE_ERROR_CODE: u32 = 2_000_000_001;
+
+/// Make every `todo!()` in decompiled source observable at run time.
+///
+/// A hole is the decompiler saying "this value was not recovered". Compiled
+/// as is, reaching one traps exactly like a `panic!()`, so the harness could
+/// not tell an honest hole from wrong recovered code. This shadows `todo!`
+/// with a macro that fails with [`HOLE_ERROR_CODE`] instead, so a case that
+/// reaches a hole is counted as *unverified* ([`EquivReport::hole_cases`])
+/// rather than as a match or a divergence.
+fn mark_holes(source: &str) -> String {
+    let shadow = format!(
+        "#[allow(unused_macros)]\nmacro_rules! todo {{ ($($t:tt)*) => {{ \
+         soroban_sdk::panic_with_error!(&soroban_sdk::Env::default(), \
+         soroban_sdk::Error::from_contract_error({HOLE_ERROR_CODE})) }}; }}\n"
+    );
+    // Inner attributes (`#![no_std]`) must stay first; the macro must precede
+    // its first use, so it goes right after the last of them.
+    let mut insert_at = 0;
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim_start().starts_with("#![") {
+            insert_at = offset;
+        }
+    }
+    format!("{}{shadow}{}", &source[..insert_at], &source[insert_at..])
 }
 
-fn i128_scval(v: i128) -> ScVal {
-    ScVal::I128(Int128Parts {
-        hi: (v >> 64) as i64,
-        lo: v as u64,
-    })
+/// How authorization is handled for one invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    /// No authorization is provided: every `require_auth` fails.
+    Enforced,
+    /// Every `require_auth` succeeds (`mock_all_auths_allowing_non_root_auth`),
+    /// so the code behind an auth check runs.
+    Mocked,
 }
 
-/// Tiny deterministic LCG so fuzz inputs are reproducible without `rand`.
-fn lcg(state: &mut u64) -> u64 {
-    *state = state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    *state
-}
+impl AuthMode {
+    const ALL: [AuthMode; 2] = [AuthMode::Enforced, AuthMode::Mocked];
 
-/// Candidate inputs for one parameter: boundary values plus a few seeded-random.
-fn candidates(kind: ParamKind, seed: &mut u64) -> Vec<ScVal> {
-    let r = |s: &mut u64| lcg(s);
-    match kind {
-        ParamKind::Bool => vec![ScVal::Bool(false), ScVal::Bool(true)],
-        ParamKind::U32 => {
-            let mut v = vec![0u32, 1, 2, u32::MAX];
-            v.push(r(seed) as u32);
-            v.into_iter().map(ScVal::U32).collect()
-        }
-        ParamKind::I32 => {
-            let mut v = vec![i32::MIN, -1, 0, 1, i32::MAX];
-            v.push(r(seed) as i32);
-            v.into_iter().map(ScVal::I32).collect()
-        }
-        ParamKind::U64 => {
-            let mut v = vec![0u64, 1, 2, u64::MAX];
-            v.push(r(seed));
-            v.into_iter().map(ScVal::U64).collect()
-        }
-        ParamKind::I64 => {
-            let mut v = vec![i64::MIN, -1, 0, 1, i64::MAX];
-            v.push(r(seed) as i64);
-            v.into_iter().map(ScVal::I64).collect()
-        }
-        ParamKind::U128 => {
-            let mut v = vec![0u128, 1, u128::MAX];
-            v.push(((r(seed) as u128) << 64) | r(seed) as u128);
-            v.into_iter().map(u128_scval).collect()
-        }
-        ParamKind::I128 => {
-            let mut v = vec![i128::MIN, -1, 0, 1, i128::MAX];
-            v.push((((r(seed) as u128) << 64) | r(seed) as u128) as i128);
-            v.into_iter().map(i128_scval).collect()
+    /// A short tag for reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            AuthMode::Enforced => "auth enforced",
+            AuthMode::Mocked => "auth mocked",
         }
     }
 }
 
-/// Build input vectors (cartesian of per-param candidates, capped + sampled).
-fn gen_cases(fn_name: &str, kinds: &[ParamKind]) -> Vec<Vec<ScVal>> {
-    // Seed from the function name so cases are stable per function across runs.
-    let mut seed = fn_name.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+/// Seed for a function's inputs: stable per function name across runs.
+fn fn_seed(fn_name: &str) -> u64 {
+    fn_name.bytes().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ b as u64).wrapping_mul(0x100000001b3)
-    });
-    let per_param: Vec<Vec<ScVal>> = kinds.iter().map(|k| candidates(*k, &mut seed)).collect();
-
-    let mut out: Vec<Vec<ScVal>> = vec![vec![]];
-    for cand in &per_param {
-        let mut next = Vec::new();
-        for prefix in &out {
-            for v in cand {
-                let mut p = prefix.clone();
-                p.push(v.clone());
-                next.push(p);
-            }
-        }
-        out = next;
-        // Keep the intermediate product bounded.
-        if out.len() > MAX_CASES_PER_FN * 8 {
-            out.truncate(MAX_CASES_PER_FN * 8);
-        }
-    }
-    if out.len() > MAX_CASES_PER_FN {
-        let step = (out.len() / MAX_CASES_PER_FN).max(1);
-        out = out
-            .into_iter()
-            .step_by(step)
-            .take(MAX_CASES_PER_FN)
-            .collect();
-    }
-    out
+    })
 }
 
 /// Recompile decompiled Rust source to a contract `.wasm`.
@@ -423,10 +390,13 @@ fn cache_dir() -> PathBuf {
 /// poisoned-env drop panic becomes [`Outcome::Panic`] rather than escaping and
 /// aborting the whole run. Because the comparison is on env-independent
 /// `ScVal`, separate envs per side are correct.
-fn run_side(wasm: &[u8], func: &str, inputs: &[ScVal]) -> Outcome {
+fn run_side(wasm: &[u8], func: &str, inputs: &[ScVal], auth: AuthMode) -> Outcome {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let env = fresh_env();
-        let addr = env.register(wasm, ());
+        let addr = register(&env, wasm);
+        if auth == AuthMode::Mocked {
+            env.mock_all_auths_allowing_non_root_auth();
+        }
         let mut args = SVec::new(&env);
         for sc in inputs {
             match Val::try_from_val(&env, sc) {
@@ -466,17 +436,26 @@ fn run_side(wasm: &[u8], func: &str, inputs: &[ScVal]) -> Outcome {
 fn can_register(wasm: &[u8]) -> bool {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let env = fresh_env();
-        let _ = env.register(wasm, ());
+        let _ = register(&env, wasm);
     }))
     .is_ok()
 }
 
+/// Register `wasm` at the fixed harness address ([`SELF_CONTRACT_ID`]), so the
+/// contract's own address is the same on both sides and can be passed as an
+/// argument.
+fn register(env: &Env, wasm: &[u8]) -> Address {
+    let sc = ScVal::Address(ScAddress::Contract(ContractId(Hash(SELF_CONTRACT_ID))));
+    let addr = Address::try_from_val(env, &sc).expect("fixed contract address converts");
+    env.register_at(&addr, wasm, ())
+}
+
 /// Decompile `original_wasm`, recompile it, then differentially execute every
-/// scalar-invocable exported function on both contracts.
+/// exported function on both contracts.
 pub fn check_equivalence(original_wasm: &[u8]) -> Result<EquivReport, EquivError> {
     let ir = soroban_ret::decompile_to_ir(original_wasm)
         .map_err(|e| EquivError::Decompile(format!("{e:?}")))?;
-    let recompiled = recompile_to_wasm(&ir.source)?;
+    let recompiled = recompile_to_wasm(&mark_holes(&ir.source))?;
 
     let mut report = EquivReport::default();
 
@@ -489,45 +468,66 @@ pub fn check_equivalence(original_wasm: &[u8]) -> Result<EquivReport, EquivError
             report.skip(name, SkipReason::NotDirectlyCallable);
             continue;
         }
-        let kinds: Option<Vec<ParamKind>> =
-            spec_fn.inputs.iter().map(|i| classify(&i.type_)).collect();
-        let Some(kinds) = kinds else {
-            let mut unsupported: Vec<String> = Vec::new();
-            for input in spec_fn.inputs.iter() {
-                if classify(&input.type_).is_none() {
+        let mut generator = Generator::new(&ir.registry, fn_seed(name));
+        let mut per_param: Vec<Vec<ScVal>> = Vec::new();
+        let mut unsupported: Vec<String> = Vec::new();
+        for input in spec_fn.inputs.iter() {
+            match generator.values(&input.type_) {
+                Some(values) if !values.is_empty() => per_param.push(values),
+                _ => {
                     let label = type_label(&input.type_);
                     if !unsupported.contains(&label) {
                         unsupported.push(label);
                     }
                 }
             }
+        }
+        if !unsupported.is_empty() {
             report.skip(name, SkipReason::UnsupportedParamTypes(unsupported));
             continue;
-        };
+        }
         if !registrable {
             report.skip(name, SkipReason::NotRegistrable);
             continue;
         }
 
-        let cases = gen_cases(name, &kinds);
+        let mut seed = fn_seed(name) ^ 0x9e3779b97f4a7c15;
+        let cases = select_cases(&per_param, MAX_CASES_PER_FN, &mut seed);
         report.executed_fns += 1;
+        let mut returned_a_value = false;
+        let mut reached_a_hole = false;
 
         for inputs in &cases {
-            // Each side runs in its own fully-isolated env (see `run_side`).
-            let out_orig = run_side(original_wasm, name, inputs);
-            let out_recomp = run_side(&recompiled, name, inputs);
+            for auth in AuthMode::ALL {
+                // Each side runs in its own fully-isolated env (see `run_side`).
+                let out_orig = run_side(original_wasm, name, inputs, auth);
+                let out_recomp = run_side(&recompiled, name, inputs, auth);
 
-            report.executed_cases += 1;
-            if out_orig == out_recomp {
-                report.matched_cases += 1;
-            } else {
-                report.divergences.push(Divergence {
-                    function: name.clone(),
-                    inputs: format!("{inputs:?}"),
-                    original: format!("{out_orig:?}"),
-                    recompiled: format!("{out_recomp:?}"),
-                });
+                report.executed_cases += 1;
+                if out_recomp.is_hole() {
+                    report.hole_cases += 1;
+                    reached_a_hole = true;
+                } else if out_orig == out_recomp {
+                    report.matched_cases += 1;
+                    if matches!(out_orig, Outcome::Value(_)) {
+                        report.value_cases += 1;
+                        returned_a_value = true;
+                    }
+                } else {
+                    report.divergences.push(Divergence {
+                        function: name.clone(),
+                        inputs: format!("{inputs:?} [{}]", auth.label()),
+                        original: format!("{out_orig:?}"),
+                        recompiled: format!("{out_recomp:?}"),
+                    });
+                }
             }
+        }
+        if returned_a_value {
+            report.value_fns += 1;
+        }
+        if reached_a_hole {
+            report.hole_fns.push(name.clone());
         }
     }
 

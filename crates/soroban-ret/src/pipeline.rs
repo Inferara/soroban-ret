@@ -908,6 +908,9 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // `!`-rooted → honest `UnknownVal`. Runs first so every later pass sees
         // the husked shapes.
         let body = husk_unbound_local_uses(body, &func.params);
+        // A `try_invoke_contract` used as a value: keep the call, hole the
+        // unrecovered mapping of its result.
+        let body = crate::ir::correctness::hole_try_invoke_results(body, returns_value);
         // Issue #36: a bare empty-collection tail alongside a discarded storage
         // load is the collapsed default arm of `get(&k).unwrap_or_else(|| …)` —
         // the loaded value was lost, so the "always empty" tail is silent-wrong.

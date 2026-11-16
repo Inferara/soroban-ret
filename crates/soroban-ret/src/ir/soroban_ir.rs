@@ -279,6 +279,9 @@ impl SorobanExpr {
     pub(crate) fn is_never_rooted(&self) -> bool {
         match self {
             SorobanExpr::UnknownVal | SorobanExpr::Panic | SorobanExpr::PanicWithError(_) => true,
+            // An unlowered `*_linear_memory` host call has no SDK method and
+            // renders as `todo!("host call: …")`.
+            SorobanExpr::RawHostCall { function, .. } if function.contains("linear_memory") => true,
             SorobanExpr::MethodCall { object, .. } | SorobanExpr::FieldAccess { object, .. } => {
                 object.is_never_rooted()
             }

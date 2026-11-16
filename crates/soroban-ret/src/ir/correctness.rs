@@ -1377,6 +1377,66 @@ pub fn husk_type_mismatched_ok_literal(
     stmts
 }
 
+/// A `try_invoke_contract` result in value position → the call, then an
+/// honest hole for the value.
+///
+/// `try_call` hands the contract a raw result; what the original did with it
+/// (which callee error became which value, what a failed conversion turned
+/// into) is user code the lifter does not recover. Rendering the call as the
+/// function's result needs *some* mapping, and any fixed one is a guess: the
+/// former `.map(|r| r.unwrap()).map_err(|e| e.unwrap())` panicked on the very
+/// failures the original mapped to an error value (`import_contract`'s
+/// `safe_add_with`). So the call stays — it is real — and the value it was
+/// turned into becomes `todo!()`.
+///
+/// `returns_value`: also treat a `try_invoke_contract` that is the body's last
+/// statement as the returned value.
+pub fn hole_try_invoke_results(
+    mut stmts: Vec<SorobanStmt>,
+    returns_value: bool,
+) -> Vec<SorobanStmt> {
+    fn is_try(e: &SorobanExpr) -> bool {
+        matches!(e, SorobanExpr::TryInvokeContract { .. })
+    }
+    fn walk(stmts: &mut Vec<SorobanStmt>) {
+        let mut out: Vec<SorobanStmt> = Vec::with_capacity(stmts.len());
+        for mut stmt in std::mem::take(stmts) {
+            match &mut stmt {
+                SorobanStmt::Return(Some(e)) if is_try(e) => {
+                    cov_mark::hit!(try_invoke_result_mapping_holed);
+                    let call = std::mem::replace(e, SorobanExpr::UnknownVal);
+                    out.push(SorobanStmt::Expr(call));
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body);
+                    walk(else_body);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        walk(&mut arm.body);
+                    }
+                }
+                SorobanStmt::Loop { body, .. }
+                | SorobanStmt::For { body, .. }
+                | SorobanStmt::Block(body) => walk(body),
+                _ => {}
+            }
+            out.push(stmt);
+        }
+        *stmts = out;
+    }
+    walk(&mut stmts);
+    if returns_value && matches!(stmts.last(), Some(SorobanStmt::Expr(e)) if is_try(e)) {
+        cov_mark::hit!(try_invoke_result_mapping_holed);
+        stmts.push(SorobanStmt::Return(Some(SorobanExpr::UnknownVal)));
+    }
+    stmts
+}
+
 /// Issue #36: husk a fabricated empty-collection function tail.
 ///
 /// Shape: the function's tail value is a bare `Map::new`/`Vec::new`
