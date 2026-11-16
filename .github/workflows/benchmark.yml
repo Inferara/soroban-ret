@@ -32,11 +32,28 @@ jobs:
       - name: Build benchmark
         run: cargo build --release -p soroban-ret-bench --locked
 
+      # Compare against the baseline of the commit this change lands on (the
+      # PR's base, or the previous tip of `main` on a push), not the one in the
+      # checkout: a PR that moves the numbers must also commit the refreshed
+      # baseline ("Baseline is current" below), so the checkout's own baseline
+      # always equals this run and would report no change.
+      - name: Fetch the base commit's baseline
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if git fetch --no-tags --depth=1 origin "$BASE_SHA" \
+            && git show "$BASE_SHA:benchmark-data/baseline.json" > base-baseline.json; then
+            echo "Comparing against the baseline at $BASE_SHA."
+          else
+            echo "::warning::No baseline at base commit '$BASE_SHA'; comparing against the checkout's own baseline, so the table will show no change."
+            cp benchmark-data/baseline.json base-baseline.json
+          fi
+
       - name: Run benchmark
         run: |
           ./target/release/bench \
             --corpus benchmark-data/mainnet \
-            --against benchmark-data/baseline.json \
+            --against base-baseline.json \
             --json benchmark-results.json \
             --html benchmark-report.html \
             --markdown > benchmark-summary.md
@@ -73,8 +90,9 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
-  # The committed baseline must match what this commit produces, so the table
-  # above always diffs against real numbers. The baseline is refreshed in the
+  # The committed baseline must match what this commit produces, so the next
+  # change is compared against real numbers (the table above reads the base
+  # commit's copy). The baseline is refreshed in the
   # PR that moves it (`bash scripts/rebuild-benchmark-baseline.sh`): `main` is
   # protected, so CI cannot commit it after the merge.
   baseline-current:

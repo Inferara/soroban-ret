@@ -346,8 +346,8 @@ slice, not a per-contract correctness guarantee.
 - **No published per-contract accuracy signal.** The benchmark HTML/JSON report
   is a per-commit GitHub Actions artifact (`.github/workflows/benchmark.yml`),
   not a hosted page; the only stable, linkable artifact is
-  `benchmark-data/baseline.json`, which CI rewrites on every push to `main`
-  (cite it at a tag, not at `main`). Consumers wanting a per-contract hole
+  `benchmark-data/baseline.json`, which each PR that moves the numbers
+  refreshes (cite it at a tag, not at `main`). Consumers wanting a per-contract hole
   count today should count the marker strings in the emitted source
   (`todo!("unknown value")`, `todo!("host call`, `todo!("decompiled function
   body")`, `var_N` — matching `count_artifacts` in
