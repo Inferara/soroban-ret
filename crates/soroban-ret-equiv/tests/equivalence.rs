@@ -36,16 +36,15 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// recompiled contracts differ). A ratchet: drive DOWN as the decompiler
 /// recovers more behavior; never raise without understanding the new divergence.
 ///
-/// Measured baseline = 2 (74 fns / 490 cases executed; 63 contracts checked —
-/// 39 fixtures + 24 corpus — 99.6% match). Both are `digicus`:
-/// `get_repos` / `get_repos_and_issues` — honest todo-panics (the recompiled
-/// function hits a `todo!()` hole and traps as `Error(Context,
-/// InvalidAction)` where the original returns an empty collection). No
-/// entry is a fabricated wrong value. Their getter IS proven
-/// (`get(&"repos").unwrap_or(Map::new(&env))`) but its recovery is withheld
-/// until the collection-mutation loops that consume the same value lift
-/// (see `proto_defaulting_collection_withheld`).
+/// Measured baseline = 0 (74 fns / 490 cases executed; 63 contracts checked —
+/// 39 fixtures + 24 corpus — 100% match): every function the harness can
+/// execute behaves like the original on every generated case.
 ///
+/// Previously 2 (issue #69 stages 2–4: digicus `get_repos` /
+/// `get_repos_and_issues` read the `repos` map through its proven
+/// `unwrap_or(Map::new(&env))` default; that became possible once the
+/// `for x in vec.iter()` loops consuming the same map were rebuilt from the
+/// proven iterator protocol, so digicus keeps compiling).
 /// Previously 4 (issue #69: `version` — a looped parse of a static string —
 /// is evaluated as the constant it is; `clear_repos`'s admin check renders
 /// its real `panic_with_error!(Error::Unauthorized)` instead of `.unwrap()`).
@@ -64,7 +63,7 @@ use soroban_ret_equiv::{EquivError, check_equivalence};
 /// (`detect_fallible_storage_get_helper`) eliminating `unknown-oracle`'s 56
 /// empty-storage divergences; 75 → 60 from the `checked_add`/`checked_sub`
 /// recovery (`recover_checked_arith_from_body`).
-const DIVERGENCE_CEILING: usize = 2;
+const DIVERGENCE_CEILING: usize = 0;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).
