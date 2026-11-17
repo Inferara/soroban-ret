@@ -85,6 +85,19 @@ const DIVERGENCE_CEILING: usize = 0;
 /// a constructor that needs arguments); floored with headroom.
 const EXECUTED_FN_FLOOR: usize = 140;
 
+/// Maximum cases that may reach a `todo!()` hole. A case that reaches a hole
+/// is not compared, so without this limit a change that turns working bodies
+/// into holes would remove their checks while every other number stayed
+/// green. Measured 262 (in 6 functions) at campaign stage 1b; lower it when
+/// holes are filled, and raise it only with the reason recorded here.
+const HOLE_CASE_CEILING: usize = 262;
+
+/// Minimum executed functions with at least one case where both sides
+/// returned the same value (not the same error). The second guard against
+/// the same loss: a body that degrades to "always fails" on both sides still
+/// "matches". Measured 118 of 146 at campaign stage 1b.
+const VALUE_FN_FLOOR: usize = 118;
+
 /// Max contracts that may hard-panic the harness (should be zero).
 const ERRORED_MAX: usize = 0;
 
@@ -256,12 +269,12 @@ fn equivalence_within_ceiling() {
     // How much of the match is real work: the rest agree only on failing
     // (no state is initialised, so most calls stop at the first storage read).
     eprintln!(
-        "matched on a value:  {value_cases} cases, in {value_fns} of {exec_fns} executed functions"
+        "matched on a value:  {value_cases} cases, in {value_fns} of {exec_fns} executed functions (floor {VALUE_FN_FLOOR})"
     );
     // Cases that stopped at a `todo!()` in the recompiled contract: declared
     // unrecovered by the decompiler, so not comparable.
     eprintln!(
-        "reached a hole:      {hole_cases} cases, in {} functions",
+        "reached a hole:      {hole_cases} cases (ceiling {HOLE_CASE_CEILING}), in {} functions",
         hole_fns.len()
     );
     for f in &hole_fns {
@@ -310,6 +323,16 @@ fn equivalence_within_ceiling() {
     assert!(
         exec_fns >= EXECUTED_FN_FLOOR,
         "differential coverage collapsed: only {exec_fns} functions executed (floor {EXECUTED_FN_FLOOR})"
+    );
+    assert!(
+        hole_cases <= HOLE_CASE_CEILING,
+        "{hole_cases} cases reach a `todo!()` hole (ceiling {HOLE_CASE_CEILING}): a decompiler \
+         change replaced compared behaviour with holes"
+    );
+    assert!(
+        value_fns >= VALUE_FN_FLOOR,
+        "only {value_fns} functions match on a returned value (floor {VALUE_FN_FLOOR}): \
+         compared behaviour was lost"
     );
 }
 

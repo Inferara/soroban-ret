@@ -10098,7 +10098,30 @@ fn lift_function_body(
     if !only_reads && fallible_rec.is_some() {
         cov_mark::hit!(fallible_get_rebuild_declined_for_effectful_function);
     }
+    // A getter that also extends the lifetime of what it reads keeps doing
+    // so: the extension goes in front of the rebuilt read. A value-returning
+    // rebuild that cannot account for every extension in the body is
+    // declined, so no extension is dropped silently. (The computed form ends
+    // in a `todo!()`, which already says the rest of the body is missing.)
+    let extension = fallible_rec.as_ref().and_then(|rec| {
+        crate::ir::correctness::lifetime_extensions_under_has(
+            &ctx.stmts,
+            &rec.storage_type,
+            &rec.key,
+        )
+    });
+    let computed_get = multiple_gets || function_calls_math_helper(wasm_module, func_index, 3);
+    let extensions_kept = extension.as_ref().map_or(0, |(_, n)| *n);
+    let extensions_lost = fallible_rec.is_some()
+        && only_reads
+        && !computed_get
+        && (crate::ir::correctness::count_lifetime_extensions(&ctx.stmts) != extensions_kept
+            || (extensions_kept == 0 && function_extends_a_lifetime(wasm_module, func_index)));
+    if extensions_lost {
+        cov_mark::hit!(fallible_get_rebuild_declined_for_unplaced_lifetime_extension);
+    }
     if only_reads
+        && !extensions_lost
         && let Some(rec) = fallible_rec
         && let Some(ScSpecTypeDef::Result(r)) = return_type
     {
@@ -10114,7 +10137,7 @@ fn lift_function_body(
         // computed even without arithmetic: the value-returning tail would return
         // the FIRST key's value/error and drop the later reads, so emit only the
         // always-faithful leading early-return guard.
-        let computed = multiple_gets || function_calls_math_helper(wasm_module, func_index, 3);
+        let computed = computed_get;
         let value_ty = if computed {
             Some("soroban_sdk::Val".to_string())
         } else {
@@ -10139,11 +10162,16 @@ fn lift_function_body(
             // `needs_todo_value_tail` appends the honest `todo!()` value tail
             // (`Try` in tail position counts as the `()`-typed `?;` statement).
             // Direct: the `get(..).ok_or(err)` IS the value tail.
-            let stmts = vec![SorobanStmt::Expr(if computed {
+            let mut stmts = Vec::new();
+            if let Some((guarded, _)) = extension {
+                cov_mark::hit!(fallible_get_rebuild_keeps_lifetime_extension);
+                stmts.push(guarded);
+            }
+            stmts.push(SorobanStmt::Expr(if computed {
                 SorobanExpr::Try(Box::new(get))
             } else {
                 get
-            })];
+            }));
             return LiftBodyResult {
                 stmts,
                 found_host_calls: true,
@@ -11626,9 +11654,9 @@ fn value_block_has_carried_exit(body: &[super::structurize::StructuredBlock]) ->
 /// Does `func_idx` (transitively) do anything a pure read does not: write or
 /// delete storage, require or grant authorization, call another contract,
 /// publish an event, deploy or upgrade code? An indirect call counts, since
-/// its target is unknown.
+/// its target is unknown. Lifetime extensions are checked separately
+/// ([`function_extends_a_lifetime`]): a getter may keep those.
 fn function_has_effect_beyond_reads(module: &WasmModule, func_idx: u32) -> bool {
-    use crate::wasm::ir::WasmInstr;
     const EFFECTS: &[(HostModule, &str)] = &[
         (HostModule::Ledger, "put_contract_data"),
         (HostModule::Ledger, "del_contract_data"),
@@ -11644,6 +11672,34 @@ fn function_has_effect_beyond_reads(module: &WasmModule, func_idx: u32) -> bool 
         (HostModule::Address, "authorize_as_curr_contract"),
         (HostModule::Context, "contract_event"),
     ];
+    function_reaches_host_call(module, func_idx, EFFECTS)
+}
+
+/// Does `func_idx` (transitively) extend the lifetime of a storage entry, of
+/// the instance or of contract code? That changes ledger state: an entry a
+/// getter bumps on every read stays alive, and one it does not bump expires.
+fn function_extends_a_lifetime(module: &WasmModule, func_idx: u32) -> bool {
+    const EXTENSIONS: &[(HostModule, &str)] = &[
+        (HostModule::Ledger, "extend_contract_data_ttl"),
+        (
+            HostModule::Ledger,
+            "extend_current_contract_instance_and_code_ttl",
+        ),
+        (HostModule::Ledger, "extend_contract_instance_and_code_ttl"),
+        (HostModule::Ledger, "extend_contract_instance_ttl"),
+        (HostModule::Ledger, "extend_contract_code_ttl"),
+    ];
+    function_reaches_host_call(module, func_idx, EXTENSIONS)
+}
+
+/// True when `func_idx` can reach one of `calls` through direct calls, or
+/// makes an indirect call (whose target is unknown).
+fn function_reaches_host_call(
+    module: &WasmModule,
+    func_idx: u32,
+    calls: &[(HostModule, &str)],
+) -> bool {
+    use crate::wasm::ir::WasmInstr;
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut work = vec![func_idx];
     while let Some(idx) = work.pop() {
@@ -11651,10 +11707,7 @@ fn function_has_effect_beyond_reads(module: &WasmModule, func_idx: u32) -> bool 
             continue;
         }
         if let Some(hf) = module.imports.get_by_index(idx) {
-            if EFFECTS
-                .iter()
-                .any(|(m, n)| hf.module == *m && hf.name == *n)
-            {
+            if calls.iter().any(|(m, n)| hf.module == *m && hf.name == *n) {
                 return true;
             }
             continue;

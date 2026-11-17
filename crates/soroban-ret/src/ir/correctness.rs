@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use stellar_xdr::curr::ScSpecTypeDef;
 
 use super::high_level_ir::FnParam;
-use super::soroban_ir::{MatchArm, SorobanExpr, SorobanStmt};
+use super::soroban_ir::{MatchArm, SorobanExpr, SorobanStmt, StorageType};
 
 /// Guard a single function body. Order is irrelevant — the detectors target
 /// disjoint shapes — but expression husking runs first so a later statement
@@ -1070,6 +1070,113 @@ fn for_each_expr_in_stmts(stmts: &[SorobanStmt], f: &mut dyn FnMut(&SorobanExpr)
     }
 }
 
+/// Number of storage, instance and code lifetime extensions anywhere in
+/// `stmts`.
+pub fn count_lifetime_extensions(stmts: &[SorobanStmt]) -> usize {
+    fn count(e: &SorobanExpr, n: &mut usize) {
+        if matches!(
+            e,
+            SorobanExpr::StorageExtendTtl { .. } | SorobanExpr::ExtendInstanceAndCodeTtl { .. }
+        ) {
+            *n += 1;
+        }
+        for_each_subexpr(e, &mut |c| count(c, n));
+    }
+    let mut n = 0;
+    for_each_expr_in_stmts(stmts, &mut |e| count(e, &mut n));
+    n
+}
+
+/// The lifetime extensions a getter performs for the entry it reads, as the
+/// lifted body shows them: the first `if <storage>.has(&key) { .. }` for the
+/// same storage and key (at any depth, the raw body nests it under argument
+/// checks), and inside it every `extend_ttl` of that entry, or of the
+/// instance for an instance read. Returns the guarded statement to put in
+/// front of a rebuilt read, with the number of extensions it holds.
+pub fn lifetime_extensions_under_has(
+    stmts: &[SorobanStmt],
+    storage_type: &StorageType,
+    key: &SorobanExpr,
+) -> Option<(SorobanStmt, usize)> {
+    fn is_has(e: &SorobanExpr, st: &StorageType, key: &SorobanExpr) -> bool {
+        match e {
+            SorobanExpr::StorageHas {
+                storage_type,
+                key: k,
+            } => storage_type == st && **k == *key,
+            // The raw form compares the host's boolean with `1`.
+            SorobanExpr::Eq(a, b) => {
+                matches!(**b, SorobanExpr::I64Literal(1) | SorobanExpr::I32Literal(1))
+                    && is_has(a, st, key)
+            }
+            _ => false,
+        }
+    }
+    fn find<'a>(
+        stmts: &'a [SorobanStmt],
+        st: &StorageType,
+        key: &SorobanExpr,
+    ) -> Option<&'a [SorobanStmt]> {
+        for s in stmts {
+            let found = match s {
+                SorobanStmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    if is_has(condition, st, key) {
+                        return Some(then_body);
+                    }
+                    find(then_body, st, key).or_else(|| find(else_body, st, key))
+                }
+                SorobanStmt::Match { arms, .. } => arms.iter().find_map(|a| find(&a.body, st, key)),
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => find(body, st, key),
+                _ => None,
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+    fn collect(e: &SorobanExpr, st: &StorageType, key: &SorobanExpr, out: &mut Vec<SorobanStmt>) {
+        let ours = match e {
+            SorobanExpr::StorageExtendTtl {
+                storage_type,
+                key: k,
+                ..
+            } => storage_type == st && **k == *key,
+            SorobanExpr::ExtendInstanceAndCodeTtl { .. } => matches!(st, StorageType::Instance),
+            _ => false,
+        };
+        if ours {
+            out.push(SorobanStmt::Expr(e.clone()));
+            return;
+        }
+        for_each_subexpr(e, &mut |c| collect(c, st, key, out));
+    }
+    let guarded = find(stmts, storage_type, key)?;
+    let mut kept = Vec::new();
+    for_each_expr_in_stmts(guarded, &mut |e| collect(e, storage_type, key, &mut kept));
+    if kept.is_empty() {
+        return None;
+    }
+    let n = kept.len();
+    Some((
+        SorobanStmt::If {
+            condition: SorobanExpr::StorageHas {
+                storage_type: *storage_type,
+                key: Box::new(key.clone()),
+            },
+            then_body: kept,
+            else_body: Vec::new(),
+        },
+        n,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Minimal generic walkers (the IR has no shared visitor; these stay local).
 // ---------------------------------------------------------------------------
@@ -1996,6 +2103,55 @@ fn subst_never_uses_stmt(stmt: &mut SorobanStmt, never: &HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifetime_extensions_are_found_under_the_matching_has_only() {
+        let key = SorobanExpr::Param("k".into());
+        let other = SorobanExpr::Param("other".into());
+        let has = |k: &SorobanExpr| SorobanExpr::StorageHas {
+            storage_type: StorageType::Temporary,
+            key: Box::new(k.clone()),
+        };
+        let extend = |k: &SorobanExpr| {
+            SorobanStmt::Expr(SorobanExpr::StorageExtendTtl {
+                storage_type: StorageType::Temporary,
+                key: Box::new(k.clone()),
+                threshold: Box::new(SorobanExpr::U32Literal(10)),
+                extend_to: Box::new(SorobanExpr::U32Literal(20)),
+            })
+        };
+        // Raw shape: nested under an argument check, `has == 1`, the
+        // extension below other statements, plus one for a different key.
+        let body = vec![SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![SorobanStmt::If {
+                condition: SorobanExpr::Eq(
+                    Box::new(has(&key)),
+                    Box::new(SorobanExpr::I64Literal(1)),
+                ),
+                then_body: vec![SorobanStmt::Block(vec![extend(&key)]), extend(&other)],
+                else_body: vec![],
+            }],
+            else_body: vec![],
+        }];
+        assert_eq!(count_lifetime_extensions(&body), 2);
+        let (guarded, n) =
+            lifetime_extensions_under_has(&body, &StorageType::Temporary, &key).expect("found");
+        assert_eq!(n, 1, "the other key's extension is not this getter's");
+        let SorobanStmt::If {
+            condition,
+            then_body,
+            else_body,
+        } = guarded
+        else {
+            panic!("guarded statement is an if");
+        };
+        assert_eq!(condition, has(&key));
+        assert_eq!(then_body.len(), 1);
+        assert!(else_body.is_empty());
+        // No `has` for the key: nothing to place.
+        assert!(lifetime_extensions_under_has(&body, &StorageType::Persistent, &key).is_none());
+    }
     use crate::ir::soroban_ir::StorageType;
 
     fn remove(key: &str) -> SorobanStmt {

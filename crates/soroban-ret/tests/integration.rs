@@ -2320,6 +2320,38 @@ fn try_invoke_result_mapping_is_a_hole_not_an_unwrap() {
     );
 }
 
+/// A fallible getter that also extends the lifetime of the entry it reads
+/// keeps doing so when its read is rebuilt. unknown-oracle's getters bump the
+/// entry (or the instance) on every successful read; dropping that would let
+/// the data expire.
+#[test]
+fn rebuilt_fallible_getter_keeps_its_lifetime_extension() {
+    cov_mark::check!(fallible_get_rebuild_keeps_lifetime_extension);
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/unknown-oracle-CAWGFKEL.wasm");
+    let src = decompile(wasm).expect("decompile unknown-oracle");
+    let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "pub fn get_price(env: Env, chain_id: u32) -> Result<u128, Error> { \
+             if env.storage().temporary().has(&chain_id) { \
+             env.storage() .temporary() .extend_ttl(&chain_id, 34560, 34560); } \
+             env.storage() .temporary() .get::<_, u128>(&chain_id) \
+             .ok_or(Error::NoGasDataForChain) }"
+        ),
+        "get_price extends the entry, then reads it:\n{src}"
+    );
+    assert!(
+        flat.contains(
+            "pub fn get_admin(env: Env) -> Result<Address, Error> { \
+             if env.storage().instance().has(&symbol_short!(\"Admin\")) { \
+             env.storage().instance().extend_ttl(103680, 120960); } \
+             env.storage() .instance() .get::<_, Address>(&symbol_short!(\"Admin\")) \
+             .ok_or(Error::Uninitialized) }"
+        ),
+        "get_admin extends the instance, then reads the admin:\n{src}"
+    );
+}
+
 /// unknown-oracle `set_admin` is `check_admin()?; storage.set(Admin, new);
 /// Ok(())`, where the check is a helper returning a status code (401 = ok).
 /// Three faults used to reduce it to an unconditional `Ok(())`, found by the

@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as unverified ("reached a hole": 262 cases in 6 functions), neither a match
   nor a divergence. The gate also reports how many matches returned a value
   (1287) as opposed to failing identically.
+  Both numbers are gated: at most 262 cases may reach a hole, and at least
+  118 functions must match on a returned value, so a change that replaces
+  working bodies with holes fails the gate.
+- **Getters keep their lifetime extension.** A rebuilt fallible getter
+  dropped the `extend_ttl` the original performs on a successful read. The
+  extension now goes in front of the rebuilt read
+  (`if has(&key) { extend_ttl(..) }`), and a value-returning rebuild that
+  cannot account for every extension in the body is declined.
 - **What it found.** The first run had 404 diverging cases in 11 functions
   the integer-only gate had reported as matching. Divergences are back to 0,
   by fixing the cause or leaving an honest hole:
