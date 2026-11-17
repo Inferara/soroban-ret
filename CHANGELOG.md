@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — the equivalence gate executes every function, and what it found
+
+- **Gate.** The equivalence harness generates arguments of every spec type
+  (addresses, wide integers, bytes, strings, symbols, collections, tuples,
+  options, and the contract's own structs and enums built from its spec) and
+  runs each case with authorization enforced and mocked. Functions executed:
+  74 → 146 of the 149 in contracts that recompile. Case selection now covers
+  every candidate of every parameter instead of truncating the product.
+- **Holes are visible at run time.** A `todo!()` in the recompiled contract
+  fails with a reserved error code, so a case that reaches a hole is counted
+  as unverified ("reached a hole": 262 cases in 6 functions), neither a match
+  nor a divergence. The gate also reports how many matches returned a value
+  (1287) as opposed to failing identically.
+  Both numbers are gated: at most 262 cases may reach a hole, and at least
+  118 functions must match on a returned value, so a change that replaces
+  working bodies with holes fails the gate.
+- **Getters keep their lifetime extension.** A rebuilt fallible getter
+  dropped the `extend_ttl` the original performs on a successful read. The
+  extension now goes in front of the rebuilt read
+  (`if has(&key) { extend_ttl(..) }`), and a value-returning rebuild that
+  cannot account for every extension in the body is declined.
+- **What it found.** The first run had 404 diverging cases in 11 functions
+  the integer-only gate had reported as matching. Divergences are back to 0,
+  by fixing the cause or leaving an honest hole:
+  - A `br_table` arm that leaves the switch was dropped when the default
+    target was a case body, sending its discriminant to the default's code
+    (`errors::hello`; role checks in the aqua contracts were unconditional
+    panics).
+  - An inlined helper's `return` was read as the caller returning, deleting
+    whatever followed the call. It is now removed when state-changing code
+    follows it.
+  - A value block with two exits kept one exit's constant, folding real
+    conditions away. That constant is now an unknown.
+  - The whole-body fallible-getter rebuild also fired on setters; it is now
+    limited to functions that only read.
+  - A `try_invoke_contract` result used as a value is a hole instead of a
+    fixed `.unwrap()` mapping, which panicked where the original returned an
+    error. `import_contract` therefore carries two holes.
+  - Unlowered `*_linear_memory` host calls and `require_auth` on a
+    non-address render as holes; tuple structs are constructed positionally.
+- **Honest numbers.** Corpus hard errors 303 → 433 and clean contracts 4 → 2:
+  `fxdao-oracle` and `soroswap-CA4HEQTL` compiled cleanly only because their
+  bodies had been truncated. The deleted code is back, partly unrecovered.
+  `unknown-oracle` stays clean with holes in its four admin-gated setters
+  where it used to return `Ok(())`.
+
 ### Changed — gate tooling and CI housekeeping
 
 - The equivalence gate prints every skipped function with its reason, naming

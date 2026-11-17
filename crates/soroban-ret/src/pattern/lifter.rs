@@ -6493,7 +6493,19 @@ impl<'a> LiftContext<'a> {
     fn lift_structured(&mut self, blocks: &[super::structurize::StructuredBlock]) {
         use super::structurize::StructuredBlock;
         let mut i = 0;
+        // Stack depth before a value block that has more than one exit (see
+        // `settle_value_block_join`).
+        let mut pending_join: Option<usize> = None;
         while i < blocks.len() {
+            self.settle_value_block_join(&mut pending_join);
+            if let StructuredBlock::Block {
+                body,
+                block_type: crate::wasm::ir::BlockType::Value(_),
+            } = &blocks[i]
+                && value_block_has_carried_exit(body)
+            {
+                pending_join = Some(self.stack.len());
+            }
             match &blocks[i] {
                 // Flat BrIf(0) at the instruction level: these appear when a Block
                 // body has multiple BrIf(0) instructions and the Block handler only
@@ -7738,6 +7750,29 @@ impl<'a> LiftContext<'a> {
             }
             i += 1;
         }
+        self.settle_value_block_join(&mut pending_join);
+    }
+
+    /// A value block (`block (result T) … end`) that is also left by a branch
+    /// has a path-dependent result: each exit carries its own value. The
+    /// sequential lift walks every path in order and keeps only the last value
+    /// it saw — for a status helper (`if ok { …; 401; br } else { err }`) that
+    /// is a *constant from one path*, which then folds the caller's
+    /// `if status == 401 { … }` away and deletes real code (unknown-oracle
+    /// `set_admin`: the admin write vanished and the function returned
+    /// `Ok(())` unconditionally). A constant left by such a block is therefore
+    /// replaced by an unknown; a non-constant result is left as lifted.
+    fn settle_value_block_join(&mut self, pending: &mut Option<usize>) {
+        let Some(base) = pending.take() else {
+            return;
+        };
+        if self.stack.len() == base + 1
+            && let Some(top) = self.stack.last_mut()
+            && matches!(top, StackVal::I32(_) | StackVal::I64(_))
+        {
+            cov_mark::hit!(value_block_join_constant_not_guessed);
+            *top = StackVal::Unknown;
+        }
     }
 
     /// Join the two arm values of a value-producing `if (result T)` when they are
@@ -8092,11 +8127,58 @@ impl<'a> LiftContext<'a> {
 
         let _pre_match_locals = self.locals.clone();
         let mut _arm_locals_data: Vec<(u32, Vec<usize>, Vec<StackVal>, bool)> = Vec::new();
+        // Discriminants that branch past the switch while a default arm exists.
+        let mut escape_discriminants: Vec<usize> = Vec::new();
+
+        let make_pattern = |disc: usize| -> MatchPattern {
+            if let Some((ref type_name, ref variants, ref has_data)) = enum_info {
+                if disc < variants.len() {
+                    let bindings = if *has_data.get(disc).unwrap_or(&false) {
+                        vec!["_".to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    MatchPattern::EnumVariant {
+                        type_name: type_name.clone(),
+                        variant: variants[disc].clone(),
+                        bindings,
+                    }
+                } else {
+                    MatchPattern::Wildcard
+                }
+            } else if let Some((ref type_name, ref variants, ref has_data)) = int_enum_info {
+                if disc < variants.len() {
+                    let bindings = if *has_data.get(disc).unwrap_or(&false) {
+                        vec!["_".to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    MatchPattern::EnumVariant {
+                        type_name: type_name.clone(),
+                        variant: variants[disc].clone(),
+                        bindings,
+                    }
+                } else {
+                    MatchPattern::Wildcard
+                }
+            } else {
+                MatchPattern::Literal(SorobanExpr::U32Literal(disc as u32))
+            }
+        };
 
         for (target, discriminants) in &sorted_groups {
             let target_idx = *target as usize;
             if target_idx >= num_blocks {
                 _arm_locals_data.push((*target, discriminants.clone(), self.locals.clone(), true));
+                // This discriminant leaves the switch for the code after it.
+                // When the default target is a case body, that body becomes a
+                // wildcard arm below, which would swallow this discriminant
+                // and run the default's code instead: give it an explicit
+                // empty arm so it falls through to the continuation.
+                if *target != default_target && (default_target as usize) < num_blocks {
+                    cov_mark::hit!(switch_escape_arm_kept_out_of_default);
+                    escape_discriminants.extend(discriminants.iter().copied());
+                }
                 continue;
             }
 
@@ -8197,42 +8279,8 @@ impl<'a> LiftContext<'a> {
 
             // Create pattern for each discriminant
             for &disc in discriminants {
-                let pattern = if let Some((ref type_name, ref variants, ref has_data)) = enum_info {
-                    if disc < variants.len() {
-                        let bindings = if *has_data.get(disc).unwrap_or(&false) {
-                            vec!["_".to_string()]
-                        } else {
-                            Vec::new()
-                        };
-                        MatchPattern::EnumVariant {
-                            type_name: type_name.clone(),
-                            variant: variants[disc].clone(),
-                            bindings,
-                        }
-                    } else {
-                        MatchPattern::Wildcard
-                    }
-                } else if let Some((ref type_name, ref variants, ref has_data)) = int_enum_info {
-                    if disc < variants.len() {
-                        let bindings = if *has_data.get(disc).unwrap_or(&false) {
-                            vec!["_".to_string()]
-                        } else {
-                            Vec::new()
-                        };
-                        MatchPattern::EnumVariant {
-                            type_name: type_name.clone(),
-                            variant: variants[disc].clone(),
-                            bindings,
-                        }
-                    } else {
-                        MatchPattern::Wildcard
-                    }
-                } else {
-                    MatchPattern::Literal(SorobanExpr::U32Literal(disc as u32))
-                };
-
                 arms.push(MatchArm {
-                    pattern,
+                    pattern: make_pattern(disc),
                     body: case_stmts.clone(),
                 });
             }
@@ -8244,6 +8292,18 @@ impl<'a> LiftContext<'a> {
             matches!(a.pattern, MatchPattern::Wildcard)
                 && matches!(b.pattern, MatchPattern::Wildcard)
         });
+
+        // Escaping discriminants: an empty arm each, ahead of the wildcard. A
+        // discriminant the type does not name stays with the wildcard.
+        for &disc in &escape_discriminants {
+            let pattern = make_pattern(disc);
+            if !matches!(pattern, MatchPattern::Wildcard) {
+                arms.push(MatchArm {
+                    pattern,
+                    body: Vec::new(),
+                });
+            }
+        }
 
         // Handle the default target as a wildcard arm
         let default_idx = default_target as usize;
@@ -8553,8 +8613,16 @@ impl<'a> LiftContext<'a> {
         // dispatch always keeps both Ok/Err arms even if one body is empty, so the
         // reconstructed dispatch (and its return path) is never dropped.
         let scrutinee_is_sret = matches!(scrutinee, SorobanExpr::SretResult(_));
+        // An escaping discriminant's empty arm is real control flow (it skips
+        // the wildcard's code), not an unrecovered body: always keep it.
+        let escape_patterns: Vec<String> = escape_discriminants
+            .iter()
+            .map(|&d| format!("{:?}", make_pattern(d)))
+            .collect();
         arms.retain(|arm| {
             !arm.body.is_empty()
+                || (!matches!(arm.pattern, MatchPattern::Wildcard)
+                    && escape_patterns.contains(&format!("{:?}", arm.pattern)))
                 || (phi_local.is_some() && matches!(arm.pattern, MatchPattern::EnumVariant { .. }))
                 || (scrutinee_is_sret && matches!(arm.pattern, MatchPattern::EnumVariant { .. }))
         });
@@ -10001,6 +10069,10 @@ fn lift_function_body(
     }
     ctx.lift_structured(&structured);
 
+    // An inlined helper's `return` is spliced in as a bare `return`. Where
+    // state-changing code follows it, it cannot be this function's exit.
+    drop_inlined_returns_before_effects(&mut ctx.stmts);
+
     // Re-attribute enum-payload loads hoisted before a `match` dispatch into the
     // arms (udt::add). Runs over the whole body now that every load is resolved.
     rebind_hoisted_enum_payload_body(&mut ctx.stmts);
@@ -10018,7 +10090,39 @@ fn lift_function_body(
     // double-wrap to `Ok(get(..).ok_or(..))`).
     let multiple_gets = *ctx.fallible_get_count.borrow() > 1;
     let fallible_rec = ctx.fallible_get_recovery.borrow_mut().take();
-    if let Some(rec) = fallible_rec
+    // The rebuild replaces the WHOLE body with the read. That is only the
+    // function when reading is all it does: a setter that first checks an
+    // admin key through the same helper (`set_price`, `initialize`) would
+    // lose its writes, its auth and its events, and return `Ok(())`.
+    let only_reads = !function_has_effect_beyond_reads(wasm_module, func_index);
+    if !only_reads && fallible_rec.is_some() {
+        cov_mark::hit!(fallible_get_rebuild_declined_for_effectful_function);
+    }
+    // A getter that also extends the lifetime of what it reads keeps doing
+    // so: the extension goes in front of the rebuilt read. A value-returning
+    // rebuild that cannot account for every extension in the body is
+    // declined, so no extension is dropped silently. (The computed form ends
+    // in a `todo!()`, which already says the rest of the body is missing.)
+    let extension = fallible_rec.as_ref().and_then(|rec| {
+        crate::ir::correctness::lifetime_extensions_under_has(
+            &ctx.stmts,
+            &rec.storage_type,
+            &rec.key,
+        )
+    });
+    let computed_get = multiple_gets || function_calls_math_helper(wasm_module, func_index, 3);
+    let extensions_kept = extension.as_ref().map_or(0, |(_, n)| *n);
+    let extensions_lost = fallible_rec.is_some()
+        && only_reads
+        && !computed_get
+        && (crate::ir::correctness::count_lifetime_extensions(&ctx.stmts) != extensions_kept
+            || (extensions_kept == 0 && function_extends_a_lifetime(wasm_module, func_index)));
+    if extensions_lost {
+        cov_mark::hit!(fallible_get_rebuild_declined_for_unplaced_lifetime_extension);
+    }
+    if only_reads
+        && !extensions_lost
+        && let Some(rec) = fallible_rec
         && let Some(ScSpecTypeDef::Result(r)) = return_type
     {
         // A "computed" getter feeds the storage value through now-lost arithmetic,
@@ -10033,7 +10137,7 @@ fn lift_function_body(
         // computed even without arithmetic: the value-returning tail would return
         // the FIRST key's value/error and drop the later reads, so emit only the
         // always-faithful leading early-return guard.
-        let computed = multiple_gets || function_calls_math_helper(wasm_module, func_index, 3);
+        let computed = computed_get;
         let value_ty = if computed {
             Some("soroban_sdk::Val".to_string())
         } else {
@@ -10058,11 +10162,16 @@ fn lift_function_body(
             // `needs_todo_value_tail` appends the honest `todo!()` value tail
             // (`Try` in tail position counts as the `()`-typed `?;` statement).
             // Direct: the `get(..).ok_or(err)` IS the value tail.
-            let stmts = vec![SorobanStmt::Expr(if computed {
+            let mut stmts = Vec::new();
+            if let Some((guarded, _)) = extension {
+                cov_mark::hit!(fallible_get_rebuild_keeps_lifetime_extension);
+                stmts.push(guarded);
+            }
+            stmts.push(SorobanStmt::Expr(if computed {
                 SorobanExpr::Try(Box::new(get))
             } else {
                 get
-            })];
+            }));
             return LiftBodyResult {
                 stmts,
                 found_host_calls: true,
@@ -11513,6 +11622,108 @@ fn epilogue_returns_stack(rest: &[super::structurize::StructuredBlock]) -> bool 
         }
     }
     depth == 0
+}
+
+/// True if a branch inside `body` targets the block that `body` belongs to
+/// (so the block has an exit besides falling off its end). `body` is the
+/// block's own body: a branch at nesting depth `n` inside it targets the
+/// block when its label is `n`.
+fn value_block_has_carried_exit(body: &[super::structurize::StructuredBlock]) -> bool {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr as WI;
+    fn scan(blocks: &[StructuredBlock], depth: u32) -> bool {
+        blocks.iter().any(|b| match b {
+            StructuredBlock::Instruction(WI::Br(d) | WI::BrIf(d)) => *d == depth,
+            StructuredBlock::Instruction(WI::BrTable { targets, default }) => {
+                *default == depth || targets.contains(&depth)
+            }
+            StructuredBlock::Instruction(_) | StructuredBlock::SafetyNetUnreachable => false,
+            StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+                scan(body, depth + 1)
+            }
+            StructuredBlock::IfElse {
+                then_body,
+                else_body,
+                ..
+            } => scan(then_body, depth + 1) || scan(else_body, depth + 1),
+        })
+    }
+    scan(body, 0)
+}
+
+/// Does `func_idx` (transitively) do anything a pure read does not: write or
+/// delete storage, require or grant authorization, call another contract,
+/// publish an event, deploy or upgrade code? An indirect call counts, since
+/// its target is unknown. Lifetime extensions are checked separately
+/// ([`function_extends_a_lifetime`]): a getter may keep those.
+fn function_has_effect_beyond_reads(module: &WasmModule, func_idx: u32) -> bool {
+    const EFFECTS: &[(HostModule, &str)] = &[
+        (HostModule::Ledger, "put_contract_data"),
+        (HostModule::Ledger, "del_contract_data"),
+        (HostModule::Ledger, "create_contract"),
+        (HostModule::Ledger, "create_asset_contract"),
+        (HostModule::Ledger, "create_contract_with_constructor"),
+        (HostModule::Ledger, "upload_wasm"),
+        (HostModule::Ledger, "update_current_contract_wasm"),
+        (HostModule::Call, "call"),
+        (HostModule::Call, "try_call"),
+        (HostModule::Address, "require_auth"),
+        (HostModule::Address, "require_auth_for_args"),
+        (HostModule::Address, "authorize_as_curr_contract"),
+        (HostModule::Context, "contract_event"),
+    ];
+    function_reaches_host_call(module, func_idx, EFFECTS)
+}
+
+/// Does `func_idx` (transitively) extend the lifetime of a storage entry, of
+/// the instance or of contract code? That changes ledger state: an entry a
+/// getter bumps on every read stays alive, and one it does not bump expires.
+fn function_extends_a_lifetime(module: &WasmModule, func_idx: u32) -> bool {
+    const EXTENSIONS: &[(HostModule, &str)] = &[
+        (HostModule::Ledger, "extend_contract_data_ttl"),
+        (
+            HostModule::Ledger,
+            "extend_current_contract_instance_and_code_ttl",
+        ),
+        (HostModule::Ledger, "extend_contract_instance_and_code_ttl"),
+        (HostModule::Ledger, "extend_contract_instance_ttl"),
+        (HostModule::Ledger, "extend_contract_code_ttl"),
+    ];
+    function_reaches_host_call(module, func_idx, EXTENSIONS)
+}
+
+/// True when `func_idx` can reach one of `calls` through direct calls, or
+/// makes an indirect call (whose target is unknown).
+fn function_reaches_host_call(
+    module: &WasmModule,
+    func_idx: u32,
+    calls: &[(HostModule, &str)],
+) -> bool {
+    use crate::wasm::ir::WasmInstr;
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut work = vec![func_idx];
+    while let Some(idx) = work.pop() {
+        if !seen.insert(idx) {
+            continue;
+        }
+        if let Some(hf) = module.imports.get_by_index(idx) {
+            if calls.iter().any(|(m, n)| hf.module == *m && hf.name == *n) {
+                return true;
+            }
+            continue;
+        }
+        let Some(func) = module.get_function(idx) else {
+            continue;
+        };
+        for ins in &func.body {
+            match ins {
+                WasmInstr::Call(t) => work.push(*t),
+                WasmInstr::CallIndirect(_) => return true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// True if any block in the tree branches (`br`, `br_if`, `br_table`).
@@ -20716,6 +20927,53 @@ fn stmt_is_pure_arith_husk(stmt: &SorobanStmt) -> bool {
         SorobanStmt::For {
             start, end, body, ..
         } => !expr_has_effect(start) && !expr_has_effect(end) && stmts_are_pure_arith_husks(body),
+    }
+}
+
+/// Remove a bare `return` that is followed, in the same statement list, by
+/// state-changing code.
+///
+/// A top-level wasm `return` emits no statement, so every bare `return` in a
+/// lifted body is the `return` of an *inlined helper* — the end of the callee,
+/// not of this function. Left in place it reads as the caller returning, and
+/// dead-code removal then deletes whatever the caller does next
+/// (unknown-oracle `set_admin`: the admin check helper's `return` cut off the
+/// write that follows the call, leaving `Ok(())`). The compiler never emits
+/// unreachable effects, so a storage write, an auth requirement, a call or an
+/// event after the `return` proves it is not the exit. Where only pure code
+/// follows (a guard, a value computation) the `return` is left as it was.
+fn drop_inlined_returns_before_effects(stmts: &mut Vec<SorobanStmt>) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                drop_inlined_returns_before_effects(then_body);
+                drop_inlined_returns_before_effects(else_body);
+            }
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms {
+                    drop_inlined_returns_before_effects(&mut arm.body);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::For { body, .. }
+            | SorobanStmt::Block(body) => drop_inlined_returns_before_effects(body),
+            _ => {}
+        }
+    }
+    let mut i = 0;
+    while i < stmts.len() {
+        if matches!(stmts[i], SorobanStmt::Return(None))
+            && !stmts_are_pure_arith_husks(&stmts[i + 1..])
+        {
+            cov_mark::hit!(inlined_return_before_effects_dropped);
+            stmts.remove(i);
+        } else {
+            i += 1;
+        }
     }
 }
 

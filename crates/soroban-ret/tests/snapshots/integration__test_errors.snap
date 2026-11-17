@@ -30,13 +30,15 @@ impl Contract {
             .persistent()
             .set(&symbol_short!("persisted"), &1);
         if flag == Flag::A {
-            Ok(symbol_short!("hello"))
+            return Ok(symbol_short!("hello"));
         } else if flag == Flag::C {
-            Err(Error::AnError)
+            return Err(Error::AnError);
         } else if flag == Flag::D {
-            panic!()
+            panic!();
+        } else if flag == Flag::B {
         } else {
-            panic_with_error!(&env, soroban_sdk::Error::from_contract_error(9))
+            panic_with_error!(&env, soroban_sdk::Error::from_contract_error(9));
         }
+        Err(Error::AnError)
     }
 }

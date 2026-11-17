@@ -3,8 +3,9 @@
 //!
 //! For every fixture (and the clean mainnet corpus contracts), decompiles →
 //! recompiles → registers both the original and recompiled contract in a
-//! `soroban-sdk` test host → invokes each scalar-invocable exported function
-//! with boundary + seeded-random inputs → compares the two contracts' outcomes.
+//! `soroban-sdk` test host → invokes each exported function with generated
+//! inputs of every spec type, with auth enforced and with auth mocked →
+//! compares the two contracts' outcomes.
 //!
 //! A divergence (same inputs → different result/error/trap) is a decompiler
 //! correctness limitation. Some are known and expected (e.g. the decompiler
@@ -63,12 +64,39 @@ use soroban_ret_equiv::{EquivError, SkipReason, check_equivalence};
 /// (`detect_fallible_storage_get_helper`) eliminating `unknown-oracle`'s 56
 /// empty-storage divergences; 75 → 60 from the `checked_add`/`checked_sub`
 /// recovery (`recover_checked_arith_from_body`).
+///
+/// Still 0 after campaign stage 1b, under a much stronger gate: every argument
+/// type is generated and each case runs with auth enforced and mocked. The
+/// first such run had 404 diverging cases in 11 functions that the
+/// integer-only gate had reported as matching (`errors::hello`,
+/// `import_contract::safe_add_with*`, unknown-oracle `set_admin` /
+/// `set_price` / `upgrade`, fxdao-oracle `init` / `price` / `prices` /
+/// `lastprice`, soroswap factory `initialize`). Each was fixed or turned into
+/// an honest hole; a case that reaches a `todo!()` is now counted separately
+/// ("reached a hole"), neither a match nor a divergence. fxdao-oracle and the
+/// soroswap factory no longer recompile (their truncated bodies came back,
+/// partly unrecovered), so they are not executed until they compile again.
 const DIVERGENCE_CEILING: usize = 0;
 
 /// Minimum functions differentially executed. Guards against silent coverage
 /// collapse (a change that stops recompilation or scalar-signature recovery).
-/// Measured 74; floored with headroom.
-const EXECUTED_FN_FLOOR: usize = 70;
+/// Measured 146 of the 149 functions in the contracts that recompile (the
+/// three others are `__constructor`, `__check_auth` and one function behind
+/// a constructor that needs arguments); floored with headroom.
+const EXECUTED_FN_FLOOR: usize = 140;
+
+/// Maximum cases that may reach a `todo!()` hole. A case that reaches a hole
+/// is not compared, so without this limit a change that turns working bodies
+/// into holes would remove their checks while every other number stayed
+/// green. Measured 262 (in 6 functions) at campaign stage 1b; lower it when
+/// holes are filled, and raise it only with the reason recorded here.
+const HOLE_CASE_CEILING: usize = 262;
+
+/// Minimum executed functions with at least one case where both sides
+/// returned the same value (not the same error). The second guard against
+/// the same loss: a body that degrades to "always fails" on both sides still
+/// "matches". Measured 118 of 146 at campaign stage 1b.
+const VALUE_FN_FLOOR: usize = 118;
 
 /// Max contracts that may hard-panic the harness (should be zero).
 const ERRORED_MAX: usize = 0;
@@ -97,6 +125,10 @@ fn equivalence_within_ceiling() {
     let mut exec_fns = 0usize;
     let mut exec_cases = 0usize;
     let mut matched = 0usize;
+    let mut value_cases = 0usize;
+    let mut value_fns = 0usize;
+    let mut hole_cases = 0usize;
+    let mut hole_fns: Vec<String> = Vec::new();
     let mut divergences = Vec::new();
     let mut not_recompilable = Vec::new();
     let mut errored = Vec::new();
@@ -116,6 +148,10 @@ fn equivalence_within_ceiling() {
                 exec_fns += rep.executed_fns;
                 exec_cases += rep.executed_cases;
                 matched += rep.matched_cases;
+                value_cases += rep.value_cases;
+                value_fns += rep.value_fns;
+                hole_cases += rep.hole_cases;
+                hole_fns.extend(rep.hole_fns.iter().map(|f| format!("{name}::{f}")));
                 eprintln!(
                     "{name}: {} fns / {} cases, {:.1}% match, {} skipped, {} divergences",
                     rep.executed_fns,
@@ -140,6 +176,10 @@ fn equivalence_within_ceiling() {
                     "executed_fns": rep.executed_fns,
                     "executed_cases": rep.executed_cases,
                     "matched_cases": rep.matched_cases,
+                    "value_cases": rep.value_cases,
+                    "value_fns": rep.value_fns,
+                    "hole_cases": rep.hole_cases,
+                    "hole_fns": rep.hole_fns,
                     "skipped": rep.skipped_fns.iter().map(|s| serde_json::json!({
                         "function": s.function,
                         "kind": s.reason.kind(),
@@ -226,6 +266,20 @@ fn equivalence_within_ceiling() {
     }
     eprintln!("cases executed:      {exec_cases}");
     eprintln!("behavioral match:    {match_pct:.1}%");
+    // How much of the match is real work: the rest agree only on failing
+    // (no state is initialised, so most calls stop at the first storage read).
+    eprintln!(
+        "matched on a value:  {value_cases} cases, in {value_fns} of {exec_fns} executed functions (floor {VALUE_FN_FLOOR})"
+    );
+    // Cases that stopped at a `todo!()` in the recompiled contract: declared
+    // unrecovered by the decompiler, so not comparable.
+    eprintln!(
+        "reached a hole:      {hole_cases} cases (ceiling {HOLE_CASE_CEILING}), in {} functions",
+        hole_fns.len()
+    );
+    for f in &hole_fns {
+        eprintln!("    - {f}");
+    }
     eprintln!(
         "divergences:         {} (ceiling {DIVERGENCE_CEILING})",
         divergences.len()
@@ -241,6 +295,10 @@ fn equivalence_within_ceiling() {
             "functions_skipped": skipped_total,
             "cases_executed": exec_cases,
             "cases_matched": matched,
+            "cases_matched_on_value": value_cases,
+            "functions_with_a_value_case": value_fns,
+            "cases_reaching_a_hole": hole_cases,
+            "functions_reaching_a_hole": hole_fns,
             "divergences": divergences.len(),
             "skipped_by_kind": skipped_by_kind,
             "blocked_by_param_type": blocked_by_type,
@@ -265,6 +323,16 @@ fn equivalence_within_ceiling() {
     assert!(
         exec_fns >= EXECUTED_FN_FLOOR,
         "differential coverage collapsed: only {exec_fns} functions executed (floor {EXECUTED_FN_FLOOR})"
+    );
+    assert!(
+        hole_cases <= HOLE_CASE_CEILING,
+        "{hole_cases} cases reach a `todo!()` hole (ceiling {HOLE_CASE_CEILING}): a decompiler \
+         change replaced compared behaviour with holes"
+    );
+    assert!(
+        value_fns >= VALUE_FN_FLOOR,
+        "only {value_fns} functions match on a returned value (floor {VALUE_FN_FLOOR}): \
+         compared behaviour was lost"
     );
 }
 

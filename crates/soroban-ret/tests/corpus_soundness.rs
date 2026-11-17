@@ -441,7 +441,35 @@ use std::process::Command;
 /// digicus stays clean with its four mutation loops recovered and no
 /// `todo!()` left in them; aqua-amm / aqua-rewards / comet / reflector only
 /// gain `.clone()`s and typed `Vec` getter reads.
-const ERROR_CEILING: u32 = 303;
+/// → 433 (+130, user-approved; campaign stage 1b). The equivalence gate began
+/// generating every argument type and found functions in the "clean"
+/// contracts that returned `Ok(())` with their writes, auth and error paths
+/// deleted. Four lifter faults did the deleting, and fixing them brings the
+/// deleted code back, partly unrecovered — an honest unmask, audited per
+/// contract:
+/// (1) a `br_table` arm that leaves the switch was dropped whenever the
+/// default target was a case body, so its discriminant ran the default's
+/// code; in the aqua contracts that had turned role checks into
+/// unconditional panics (aqua-amm 46→73, aqua-rewards 25→31).
+/// (2) an inlined helper's `return` read as the caller returning; it is now
+/// removed when state-changing code follows it. (3) a two-exit value block
+/// kept one exit's constant, folding real `if`s away; the constant is now an
+/// unknown. (4) the whole-body fallible-getter rebuild also fired on setters;
+/// it is now limited to functions that only read.
+/// Per contract: blend-backstop 4→9, blend-emitter 9→28, blend-fixed-pool /
+/// yieldblox 23→30 each, fxdao-liquidity 10→14, phoenix 6→8,
+/// soroban-domains 50→56, soroswap-CAG5 19→49, blend-pool-factory 2→1,
+/// reflector ×2 11→10. **fxdao-oracle 0→12 and soroswap-CA4HEQTL 0→8 are no
+/// longer clean**: their clean status rested on truncated bodies (fxdao
+/// `init` was a single storage read; the factory's `create_pair` had lost
+/// its deploy-and-initialize sequence). Clean contracts 4 → 2 (digicus,
+/// unknown-oracle; the latter now carries holes in its four admin-gated
+/// setters instead of a silent `Ok(())`). Also in this step: a
+/// `try_invoke_contract` result used as a value is a hole, not a fixed
+/// `.unwrap()` mapping; unlowered `*_linear_memory` host calls and
+/// `require_auth` on a non-address render as holes; tuple structs are
+/// constructed positionally.
+const ERROR_CEILING: u32 = 433;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

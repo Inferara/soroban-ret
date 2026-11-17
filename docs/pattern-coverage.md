@@ -207,7 +207,7 @@ functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
 
-The headline restoration figure this produces — **93.7 %**
+The headline restoration figure this produces — **92.8 %**
 (`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
 mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
 **correctness-blind**: it grades how much of each function lifted to concrete
@@ -254,9 +254,12 @@ every mainnet corpus contract and `cargo check`s the result for
 lifter emitted: output that *looks* like code but does not type-check. The
 metric is "wrong output", not "incomplete output".
 
-Current status: **303 hard errors across 24 contracts** (ceiling 303), with
-**4 contracts compiling cleanly** — `digicus`, `fxdao-oracle`, `soroswap-CA4HEQTL`, `unknown-oracle`.
-Down from 1042 at the start of the v0.0.4 cycle. Every intermediate *rise* in
+Current status: **433 hard errors across 24 contracts** (ceiling 433), with
+**2 contracts compiling cleanly** — `digicus` and `unknown-oracle`.
+Down from 1042 at the start of the v0.0.4 cycle, and up from 303: the
+equivalence gate showed that `fxdao-oracle` and `soroswap-CA4HEQTL` compiled
+cleanly only because function bodies had been silently truncated; with the
+truncation fixed the missing code is back, partly unrecovered. Every intermediate *rise* in
 this ratchet has been an audited, deliberate unmask (fixing a type error
 un-suppresses pre-existing brokenness rustc's error recovery was hiding); see
 the running commentary in the `ERROR_CEILING` docstring, which is the
@@ -271,24 +274,29 @@ SOROBAN_RET_CORPUS_SOUNDNESS=1 cargo test -p soroban-ret --test corpus_soundness
 The strongest check: it **recompiles** decompiled output to a real `.wasm`
 (`cargo build --target wasm32v1-none`), registers BOTH the original and
 recompiled contract in a `soroban-sdk` test host (`soroban-env-host`), invokes
-each scalar-invocable exported function with boundary + seeded-random inputs,
-and compares the outcomes (lowered to canonical `ScVal`). A divergence is a
+each exported function with generated inputs of every spec type (boundary and
+seeded values for scalars; addresses, bytes, strings, collections and the
+contract's own structs and enums built from its spec), once with
+authorization enforced and once with it mocked, and compares the outcomes (lowered to canonical `ScVal`). A divergence is a
 decompiler correctness limitation; the gate is a ratchet on the divergence
 count, like the corpus-soundness gate.
 
-Current baseline: **74 functions / 490 cases executed; 63 contracts checked
-(39 fixtures + all 24 mainnet corpus), 0 errored, 100 % behavioral match,
-0 divergences** (ceiling 0).
+Current baseline: **146 of 149 functions / 2652 cases executed; 63 contracts
+checked (39 fixtures + all 24 mainnet corpus), 0 errored, 0 divergences**
+(ceiling 0). Of those cases, 2390 match (90.1 %), 1287 of them on a returned
+value; **262 cases in 6 functions reach a `todo!()` hole** and are counted as
+unverified, neither a match nor a divergence (the recompiled contract fails
+with a reserved error code at a hole, so a hole is told apart from wrong code).
 
-**21 of the 63 are reported `not_recompilable`** and are therefore never
-executed: 20 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
-fixture. Only `digicus`, `fxdao-oracle`, `soroswap-CA4HEQTL` and
-`unknown-oracle` recompile from the corpus — the same four the
-corpus-soundness gate reports as clean-compiling.
+**23 of the 63 are reported `not_recompilable`** and are therefore never
+executed: 22 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
+fixture. Only `digicus` and `unknown-oracle` recompile from the corpus — the
+same two the corpus-soundness gate reports as clean-compiling.
 
-There are **no divergences**: the last four (`digicus`) were closed by issue
-#69. A divergence, when one appears, is either an honest `todo!()` hole that
-traps or a wrong recovery; only the first kind was ever present here.
+Limits that remain: every call runs on a fresh instance with **empty
+storage** and no other contract registered, so most matches agree on the
+failure at the first storage read or cross-contract call; and only the
+**return outcome** is compared, not events or storage.
 
 History of this ratchet: 75 / 82.3 % → 60 (the `checked_add`/`checked_sub` →
 `.ok_or(..)` recovery) → 4 (the fallible-storage-get recovery eliminated
@@ -301,14 +309,12 @@ wrapping-exact `<<` render and dead-counter elimination closed the last two
 input, including overflow — the earlier claim that `num_list` "loses its
 populate-loop and returns an empty `Vec`" no longer holds.
 
-**Coverage is limited**: only functions invocable with generated scalar
-arguments (`bool`/`u32`/`i32`/`u64`/`i64`/`u128`/`i128`, ≤48 input vectors per
-function) are executed — 74 of the 175 functions in the contracts that
-recompile. Each call runs on a fresh instance with empty storage and no
-authorizations, so a function that needs initialised state or a signer is
-compared only on its failure path. Aggregate/UDT-argument functions and
-`__constructor`/`__check_auth` are skipped, as are contracts whose output does
-not recompile. The gate prints every skipped function with its reason and a
+**Coverage is limited**: every function in a contract that recompiles is
+executed (≤48 input vectors per function, each under both auth modes) except
+`__constructor`/`__check_auth` — 146 of 149 today. Each call runs on a fresh
+instance with empty storage, so a function that needs initialised state is
+compared only up to its first storage read. Contracts whose output does not
+recompile are skipped. The gate prints every skipped function with its reason and a
 count of functions blocked per parameter type; `SOROBAN_RET_EQUIV_REPORT=<path>`
 writes the same as JSON. It is a
 correctness sanity-check + behavioral-match metric, **not** a full-corpus
