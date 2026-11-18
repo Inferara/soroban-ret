@@ -20497,19 +20497,22 @@ fn rewrite_branch_seq(
 /// The flat lifter keeps the fall-through `fail_with_error` as an
 /// unconditional statement and loses the branch, and the stray panic is then
 /// dropped downstream, so the guard vanishes (digicus `config` lost its
-/// "already initialised" check). Rewritten here, exactly, to
+/// "already initialised" check). Rewritten here to
 ///
 /// ```text
-///   <ok>; i32.eqz; if { <fail tail> }; br k
+///   <ok>; i32.eqz; if { <fail tail> } else { br k+1 }
 /// ```
 ///
-/// Exact because `fail_with_error` diverges: when `<ok>` is false the tail
-/// traps, otherwise control leaves through the same `br k`.
+/// This is the same control flow whatever the tail does: when `<ok>` holds,
+/// control leaves through the same branch (one level deeper inside the
+/// `if`); otherwise the tail runs and, should the error helper ever return,
+/// falls off the end exactly as before. Nothing is assumed about the helper
+/// diverging.
 ///
-/// Gated: not inside a loop; everything after the `br_if` to the end of the body is plain
-/// instructions (no nested control flow), at most a few: the operands of the
-/// error call, the call that reaches `fail_with_error`, then at most
-/// `unreachable`.
+/// Gated: not inside a loop; everything after the `br_if` to the end of the
+/// body is plain instructions (no nested control flow), at most a few: the
+/// operands of the error call, the call that reaches `fail_with_error`, then
+/// at most `unreachable`.
 fn recover_skipped_fail_with_error(
     blocks: &mut Vec<super::structurize::StructuredBlock>,
     module: &WasmModule,
@@ -20581,12 +20584,12 @@ fn recover_skipped_fail_with_error(
     let tail: Vec<StructuredBlock> = blocks.drain(pos + 1..).collect();
     blocks.truncate(pos);
     blocks.push(StructuredBlock::Instruction(WasmInstr::I32Eqz));
+    // The skipping branch moves into the `else`, one level deeper.
     blocks.push(StructuredBlock::IfElse {
         block_type: BlockType::Empty,
         then_body: tail,
-        else_body: Vec::new(),
+        else_body: vec![StructuredBlock::Instruction(WasmInstr::Br(depth + 1))],
     });
-    blocks.push(StructuredBlock::Instruction(WasmInstr::Br(depth)));
 }
 
 fn is_guard_error_path(remaining: &[super::structurize::StructuredBlock]) -> bool {

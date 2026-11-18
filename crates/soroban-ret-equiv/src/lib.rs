@@ -453,12 +453,13 @@ fn cases_for(
 
 /// Register the original contract: with no constructor arguments if that
 /// works, otherwise with the first generated argument vector its constructor
-/// accepts. Returns the world and the arguments used.
+/// accepts. Returns the world, the arguments used, and whether the callee
+/// was registered next to it.
 fn register_original(
     wasm: &[u8],
     reg: &soroban_ret::TypeRegistry,
     callee: &[u8],
-) -> Option<(World, Vec<ScVal>)> {
+) -> Option<(World, Vec<ScVal>, bool)> {
     let with_callee = [Callee {
         id: CALLEE_CONTRACT_ID,
         wasm: callee,
@@ -482,7 +483,7 @@ fn register_original(
     for callees in callee_sets {
         for args in &arg_sets {
             if let Some(world) = World::new(wasm, args, callees) {
-                return Some((world, args.clone()));
+                return Some((world, args.clone(), !callees.is_empty()));
             }
         }
     }
@@ -585,7 +586,7 @@ pub fn check_equivalence_with(
     let registered = register_original(original_wasm, reg, callee);
     let mut preferred = Preferred::new();
     let states = match registered {
-        Some((world, ctor_args)) => {
+        Some((world, ctor_args, with_callee)) => {
             if let Some((_, ctor)) = reg
                 .functions
                 .iter()
@@ -596,9 +597,15 @@ pub fn check_equivalence_with(
                 }
             }
             // The recompiled contract must register with the same arguments
-            // (its own constructor runs here; everything else starts from the
+            // in the same surroundings (its own constructor runs here, and
+            // may call the callee; everything else starts from the
             // original's state).
-            if !ctor_args.is_empty() && World::new(&recompiled, &ctor_args, &[]).is_none() {
+            let callees = [Callee {
+                id: CALLEE_CONTRACT_ID,
+                wasm: callee,
+            }];
+            let callees: &[Callee<'_>] = if with_callee { &callees } else { &[] };
+            if !ctor_args.is_empty() && World::new(&recompiled, &ctor_args, callees).is_none() {
                 report.divergences.push(Divergence {
                     function: "__constructor".to_string(),
                     inputs: format!("{ctor_args:?}"),
@@ -744,7 +751,7 @@ mod tests {
 
     fn labels(wasm: &[u8]) -> (Vec<String>, Preferred) {
         let reg = soroban_ret::TypeRegistry::from_wasm(wasm).expect("spec");
-        let (world, _) = register_original(wasm, &reg, wasm).expect("registers");
+        let (world, _, _) = register_original(wasm, &reg, wasm).expect("registers");
         let mut preferred = Preferred::new();
         let states = discover_states(world, &reg, &mut preferred);
         (states.into_iter().map(|s| s.label).collect(), preferred)

@@ -400,14 +400,6 @@ fn equivalence_within_ceiling() {
          introduced new semantic differences between original and recompiled contracts",
         divergences.len()
     );
-    if only.is_some() {
-        eprintln!("partial run (SOROBAN_RET_EQUIV_ONLY): coverage floors not checked");
-        return;
-    }
-    assert!(
-        exec_fns >= EXECUTED_FN_FLOOR,
-        "differential coverage collapsed: only {exec_fns} functions executed (floor {EXECUTED_FN_FLOOR})"
-    );
     assert!(
         hole_cases <= HOLE_CASE_CEILING,
         "{hole_cases} cases reach a `todo!()` hole (ceiling {HOLE_CASE_CEILING}): a decompiler \
@@ -417,6 +409,14 @@ fn equivalence_within_ceiling() {
         hole_fns.len() <= HOLE_FN_CEILING,
         "{} functions reach a `todo!()` hole (ceiling {HOLE_FN_CEILING})",
         hole_fns.len()
+    );
+    if only.is_some() {
+        eprintln!("partial run (SOROBAN_RET_EQUIV_ONLY): coverage floors not checked");
+        return;
+    }
+    assert!(
+        exec_fns >= EXECUTED_FN_FLOOR,
+        "differential coverage collapsed: only {exec_fns} functions executed (floor {EXECUTED_FN_FLOOR})"
     );
     assert!(
         stateful_value_fns >= STATEFUL_VALUE_FN_FLOOR,
