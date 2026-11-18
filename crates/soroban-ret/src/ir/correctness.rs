@@ -1070,6 +1070,22 @@ fn for_each_expr_in_stmts(stmts: &[SorobanStmt], f: &mut dyn FnMut(&SorobanExpr)
     }
 }
 
+/// Does `stmts` unpack a struct or tuple value into its fields
+/// (`map_unpack_to_linear_memory` / `vec_unpack_to_linear_memory`)?
+pub fn unpacks_an_aggregate(stmts: &[SorobanStmt]) -> bool {
+    fn visit(e: &SorobanExpr, found: &mut bool) {
+        if let SorobanExpr::RawHostCall { function, .. } = e
+            && function.contains("unpack_to_linear_memory")
+        {
+            *found = true;
+        }
+        for_each_subexpr(e, &mut |c| visit(c, found));
+    }
+    let mut found = false;
+    for_each_expr_in_stmts(stmts, &mut |e| visit(e, &mut found));
+    found
+}
+
 /// Number of storage, instance and code lifetime extensions anywhere in
 /// `stmts`.
 pub fn count_lifetime_extensions(stmts: &[SorobanStmt]) -> usize {

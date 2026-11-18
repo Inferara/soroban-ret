@@ -2332,23 +2332,82 @@ fn rebuilt_fallible_getter_keeps_its_lifetime_extension() {
     let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         flat.contains(
-            "pub fn get_price(env: Env, chain_id: u32) -> Result<u128, Error> { \
+            "pub fn get_gas_price(env: Env, chain_id: u32) -> Result<ChainData, Error> { \
              if env.storage().temporary().has(&chain_id) { \
              env.storage() .temporary() .extend_ttl(&chain_id, 34560, 34560); } \
-             env.storage() .temporary() .get::<_, u128>(&chain_id) \
+             env.storage() .temporary() .get::<_, ChainData>(&chain_id) \
              .ok_or(Error::NoGasDataForChain) }"
         ),
-        "get_price extends the entry, then reads it:\n{src}"
+        "get_gas_price extends the entry, then reads it:\n{src}"
     );
     assert!(
         flat.contains(
             "pub fn get_admin(env: Env) -> Result<Address, Error> { \
              if env.storage().instance().has(&symbol_short!(\"Admin\")) { \
-             env.storage().instance().extend_ttl(103680, 120960); } \
-             env.storage() .instance() .get::<_, Address>(&symbol_short!(\"Admin\")) \
-             .ok_or(Error::Uninitialized) }"
+             env.storage().instance().extend_ttl(103680, 120960); }"
         ),
-        "get_admin extends the instance, then reads the admin:\n{src}"
+        "get_admin extends the instance before reading the admin:\n{src}"
+    );
+}
+
+/// A getter that unpacks the stored struct and returns one of its fields is
+/// not a direct read of that field's type. unknown-oracle stores `ChainData`
+/// per chain and `Admin(Address)`: `get_price` returns `ChainData.price` and
+/// `get_admin` the `Admin` payload. Rebuilt as `get::<_, u128>` /
+/// `get::<_, Address>` they failed on every stored value (found by the
+/// equivalence gate once it ran getters against real state). Only the
+/// missing-key check is recovered; the value is an honest hole.
+#[test]
+fn getter_returning_a_field_of_a_stored_struct_is_not_a_direct_read() {
+    cov_mark::check!(fallible_get_of_a_struct_field_is_not_direct);
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/unknown-oracle-CAWGFKEL.wasm");
+    let src = decompile(wasm).expect("decompile unknown-oracle");
+    let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            ".get::<_, soroban_sdk::Val>(&chain_id) .ok_or(Error::NoGasDataForChain)?; \
+             todo!(\"decompiled return value\") } pub fn get_gas_cost_in_native_token("
+        ),
+        "get_price keeps the missing-key error and holes the value:\n{src}"
+    );
+    assert!(
+        flat.contains(
+            ".get::<_, soroban_sdk::Val>(&symbol_short!(\"Admin\")) \
+             .ok_or(Error::Uninitialized)?; todo!(\"decompiled return value\") }"
+        ),
+        "get_admin keeps the missing-key error and holes the value:\n{src}"
+    );
+    assert!(
+        !flat.contains(".get::<_, u128>(&chain_id)")
+            && !flat.contains(".get::<_, Address>(&symbol_short!(\"Admin\"))"),
+        "no scalar read of a stored struct:\n{src}"
+    );
+}
+
+/// `if cond { panic_with_error!(..) }` lowered with the error path as the
+/// fall-through and a `br_if` skipping it. The branch used to be lost and the
+/// stray panic dropped, so the guard vanished: digicus `config` could be
+/// called twice (the original fails with `AlreadyInitialized`). Found by the
+/// equivalence gate once it called `config` in an initialised state.
+#[test]
+fn guard_whose_error_path_is_skipped_by_a_branch_is_kept() {
+    cov_mark::check!(skipped_fail_with_error_guard_recovered);
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/digicus-CCZLARB4.wasm");
+    let src = decompile(wasm).expect("decompile digicus");
+    let flat: String = src.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "config.admin.require_auth(); if env .storage() .instance() \
+             .has(&String::from_str(&env, \"admin\")) { \
+             panic_with_error!(&env, Error::AlreadyInitialized); }"
+        ),
+        "config refuses a second initialisation:\n{src}"
+    );
+    // Inside the loop the same shape is the loop's exit and is left to the
+    // loop recognizer: the repo limit keeps its polarity.
+    assert!(
+        flat.contains("if var_1048580.len() < 256 { } else { panic_with_error!(&env, Error::RepoLimitExceeded); }"),
+        "repo limit check is unchanged:\n{src}"
     );
 }
 
@@ -2401,8 +2460,9 @@ fn status_helper_caller_keeps_its_write_behind_a_hole() {
     // A real getter through the same helper is still rebuilt as a read.
     let get_admin = body("get_admin");
     assert!(
-        get_admin
-            .contains(".get::<_, Address>(&symbol_short!(\"Admin\")) .ok_or(Error::Uninitialized)"),
+        get_admin.contains(
+            ".get::<_, soroban_sdk::Val>(&symbol_short!(\"Admin\")) .ok_or(Error::Uninitialized)?;"
+        ),
         "get_admin stays a fallible read:\n{get_admin}"
     );
 }

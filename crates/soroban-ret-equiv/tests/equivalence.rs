@@ -31,7 +31,7 @@ use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 
-use soroban_ret_equiv::{EquivError, SkipReason, check_equivalence};
+use soroban_ret_equiv::{EquivError, Options, SkipReason, check_equivalence_with};
 
 /// Max tolerated behavioral divergences (input cases where the original and
 /// recompiled contracts differ). A ratchet: drive DOWN as the decompiler
@@ -76,27 +76,63 @@ use soroban_ret_equiv::{EquivError, SkipReason, check_equivalence};
 /// ("reached a hole"), neither a match nor a divergence. fxdao-oracle and the
 /// soroswap factory no longer recompile (their truncated bodies came back,
 /// partly unrecovered), so they are not executed until they compile again.
+///
+/// Still 0 after campaign stage 1c, where every function also runs in states
+/// the original contract reaches (and callees exist behind an address). The
+/// first such run had 17 diverging cases in 3 functions: digicus `config`
+/// accepted a second initialisation (a guard whose error path a branch skips
+/// was dropped; fixed in the lifter, which also restored guards in eleven
+/// other outputs), and unknown-oracle `get_admin` / `get_price` read a stored
+/// struct as a bare scalar (now honest holes).
 const DIVERGENCE_CEILING: usize = 0;
 
 /// Minimum functions differentially executed. Guards against silent coverage
-/// collapse (a change that stops recompilation or scalar-signature recovery).
-/// Measured 146 of the 149 functions in the contracts that recompile (the
-/// three others are `__constructor`, `__check_auth` and one function behind
-/// a constructor that needs arguments); floored with headroom.
+/// collapse (a change that stops recompilation or signature recovery).
+/// Measured 147 of the 149 functions in the contracts that recompile (the
+/// two others are `__constructor` and `__check_auth`); floored with headroom.
 const EXECUTED_FN_FLOOR: usize = 140;
 
 /// Maximum cases that may reach a `todo!()` hole. A case that reaches a hole
 /// is not compared, so without this limit a change that turns working bodies
 /// into holes would remove their checks while every other number stayed
-/// green. Measured 262 (in 6 functions) at campaign stage 1b; lower it when
-/// holes are filled, and raise it only with the reason recorded here.
-const HOLE_CASE_CEILING: usize = 262;
+/// green. Lower it when holes are filled, and raise it only with the reason
+/// recorded here.
+///
+/// 630 at campaign stage 1c, up from 262: each case now also runs in up to
+/// three built states, which multiplies the cases of the functions that
+/// already reached a hole (unknown-oracle's four admin-gated setters, 488 of
+/// the 630), and three unknown-oracle getters reach their hole only now that
+/// the key exists (see [`HOLE_FN_CEILING`]).
+const HOLE_CASE_CEILING: usize = 630;
+
+/// Maximum functions with at least one case reaching a hole. Unlike the case
+/// count this does not grow with the number of states.
+///
+/// 9 at campaign stage 1c, up from 6: unknown-oracle `get_price` and
+/// `get_admin` were rebuilt as a scalar read of a stored struct and failed on
+/// every stored value, so their value is now an honest hole; and
+/// `get_transaction_gas_cost_in_usd` always had one, hidden while every call
+/// stopped at "no data for chain".
+const HOLE_FN_CEILING: usize = 9;
 
 /// Minimum executed functions with at least one case where both sides
 /// returned the same value (not the same error). The second guard against
 /// the same loss: a body that degrades to "always fails" on both sides still
-/// "matches". Measured 118 of 146 at campaign stage 1b.
-const VALUE_FN_FLOOR: usize = 118;
+/// "matches". 129 of 147 at campaign stage 1c (118 of 146 at stage 1b, before
+/// functions ran against built state and reachable callees).
+const VALUE_FN_FLOOR: usize = 129;
+
+/// Minimum functions that match on a returned value in a BUILT state (not
+/// the freshly registered one). Guards the state machinery itself: if state
+/// discovery or the code swap stops working, every such case silently falls
+/// back to comparing "not initialised". Measured 15 (digicus 10,
+/// `test_contract_data` 3, unknown-oracle 1, `test_errors` 1).
+const STATEFUL_VALUE_FN_FLOOR: usize = 15;
+
+/// Contracts whose cross-contract calls expect a specific callee. The harness
+/// registers it behind the first `Address` candidate; every other contract
+/// gets a second copy of itself there.
+const CALLEES: &[(&str, &str)] = &[("test_import_contract", "test_add_u64")];
 
 /// Max contracts that may hard-panic the harness (should be zero).
 const ERRORED_MAX: usize = 0;
@@ -122,6 +158,14 @@ fn equivalence_within_ceiling() {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
 
+    // Development aid: `SOROBAN_RET_EQUIV_ONLY=digicus,test_udt` runs only the
+    // contracts whose name contains one of the parts. The coverage floors are
+    // not checked on such a partial run; the ceilings still are.
+    let only = std::env::var("SOROBAN_RET_EQUIV_ONLY").ok();
+    let mut stateful_cases = 0usize;
+    let mut stateful_value_cases = 0usize;
+    let mut stateful_value_fns = 0usize;
+    let mut contracts_with_state = 0usize;
     let mut exec_fns = 0usize;
     let mut exec_cases = 0usize;
     let mut matched = 0usize;
@@ -140,9 +184,23 @@ fn equivalence_within_ceiling() {
     let mut json_contracts: Vec<serde_json::Value> = Vec::new();
 
     for (name, path) in &targets {
+        if only
+            .as_ref()
+            .is_some_and(|o| !o.split(',').any(|part| name.contains(part)))
+        {
+            continue;
+        }
         let wasm = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         // Isolate each contract: a hard panic in one must not abort the gate.
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| check_equivalence(&wasm)));
+        let callee = CALLEES.iter().find(|(c, _)| c == name).map(|(_, callee)| {
+            let p = root.join("tests/fixtures").join(format!("{callee}.wasm"));
+            fs::read(&p).unwrap_or_else(|e| panic!("read callee {}: {e}", p.display()))
+        });
+        let options = Options {
+            callee: callee.as_deref(),
+        };
+        let result =
+            std::panic::catch_unwind(AssertUnwindSafe(|| check_equivalence_with(&wasm, &options)));
         match result {
             Ok(Ok(rep)) => {
                 exec_fns += rep.executed_fns;
@@ -152,6 +210,12 @@ fn equivalence_within_ceiling() {
                 value_fns += rep.value_fns;
                 hole_cases += rep.hole_cases;
                 hole_fns.extend(rep.hole_fns.iter().map(|f| format!("{name}::{f}")));
+                stateful_cases += rep.stateful_cases;
+                stateful_value_cases += rep.stateful_value_cases;
+                stateful_value_fns += rep.stateful_value_fns;
+                if !rep.states.is_empty() {
+                    contracts_with_state += 1;
+                }
                 eprintln!(
                     "{name}: {} fns / {} cases, {:.1}% match, {} skipped, {} divergences",
                     rep.executed_fns,
@@ -160,6 +224,10 @@ fn equivalence_within_ceiling() {
                     rep.skipped_fns.len(),
                     rep.divergences.len(),
                 );
+                for (i, st) in rep.states.iter().enumerate() {
+                    let shown: String = st.chars().take(300).collect();
+                    eprintln!("    STATE {} {name}: {shown}", i + 1);
+                }
                 skipped_total += rep.skipped_fns.len();
                 for s in &rep.skipped_fns {
                     eprintln!("    SKIP {name}::{} — {}", s.function, s.reason);
@@ -180,6 +248,10 @@ fn equivalence_within_ceiling() {
                     "value_fns": rep.value_fns,
                     "hole_cases": rep.hole_cases,
                     "hole_fns": rep.hole_fns,
+                    "states": rep.states,
+                    "stateful_cases": rep.stateful_cases,
+                    "stateful_value_cases": rep.stateful_value_cases,
+                    "stateful_value_fns": rep.stateful_value_fns,
                     "skipped": rep.skipped_fns.iter().map(|s| serde_json::json!({
                         "function": s.function,
                         "kind": s.reason.kind(),
@@ -252,6 +324,10 @@ fn equivalence_within_ceiling() {
         "functions executed:  {exec_fns} of {} in recompilable contracts",
         exec_fns + skipped_total
     );
+    eprintln!(
+        "in a built state:    {stateful_cases} cases in {contracts_with_state} contracts; \
+         {stateful_value_cases} matched on a value, in {stateful_value_fns} functions"
+    );
     eprintln!("functions skipped:   {skipped_total}");
     for (kind, n) in &skipped_by_kind {
         eprintln!("    - {kind}: {n}");
@@ -298,6 +374,10 @@ fn equivalence_within_ceiling() {
             "cases_matched_on_value": value_cases,
             "functions_with_a_value_case": value_fns,
             "cases_reaching_a_hole": hole_cases,
+            "cases_in_a_built_state": stateful_cases,
+            "cases_matched_on_value_in_a_built_state": stateful_value_cases,
+            "functions_with_a_value_case_in_a_built_state": stateful_value_fns,
+            "contracts_with_a_built_state": contracts_with_state,
             "functions_reaching_a_hole": hole_fns,
             "divergences": divergences.len(),
             "skipped_by_kind": skipped_by_kind,
@@ -320,6 +400,10 @@ fn equivalence_within_ceiling() {
          introduced new semantic differences between original and recompiled contracts",
         divergences.len()
     );
+    if only.is_some() {
+        eprintln!("partial run (SOROBAN_RET_EQUIV_ONLY): coverage floors not checked");
+        return;
+    }
     assert!(
         exec_fns >= EXECUTED_FN_FLOOR,
         "differential coverage collapsed: only {exec_fns} functions executed (floor {EXECUTED_FN_FLOOR})"
@@ -328,6 +412,16 @@ fn equivalence_within_ceiling() {
         hole_cases <= HOLE_CASE_CEILING,
         "{hole_cases} cases reach a `todo!()` hole (ceiling {HOLE_CASE_CEILING}): a decompiler \
          change replaced compared behaviour with holes"
+    );
+    assert!(
+        hole_fns.len() <= HOLE_FN_CEILING,
+        "{} functions reach a `todo!()` hole (ceiling {HOLE_FN_CEILING})",
+        hole_fns.len()
+    );
+    assert!(
+        stateful_value_fns >= STATEFUL_VALUE_FN_FLOOR,
+        "only {stateful_value_fns} functions match on a value in a built state \
+         (floor {STATEFUL_VALUE_FN_FLOOR}): state discovery or the code swap regressed"
     );
     assert!(
         value_fns >= VALUE_FN_FLOOR,

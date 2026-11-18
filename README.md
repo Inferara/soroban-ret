@@ -210,7 +210,7 @@ Note the CLI binary is built from `soroban-ret-cli`, not `soroban-ret` —
 
 - **Accuracy** — interface similarity vs the SDK reference sources: **98.3 %** over 37 scored contracts (2 skipped for lacking a reference source).
 - **Spec-consistency** — generated signatures/types vs each contract's own `contractspecv0`, across all 63 contracts including the mainnet corpus, which has no reference source: **0** dropped/extra functions, **0** arity mismatches, mean signature similarity **98.9 %**.
-- **Structural plausibility** — a ratchet on per-contract recovery vs `benchmark-data/baseline.json` (corpus mean restoration **92.8 %**).
+- **Structural plausibility** — a ratchet on per-contract recovery vs `benchmark-data/baseline.json` (corpus mean restoration **92.7 %**).
 
 Three heavier gates compile decompiled output back for `wasm32v1-none` and are opt-in via env var (also run in CI):
 
@@ -231,7 +231,7 @@ These three are **error-count ratchets pinned to rustc 1.95.0**
 (`RUSTUP_TOOLCHAIN`, as in CI): rustc diagnostics drift across floating
 `stable` releases, so numbers measured on another toolchain are not comparable.
 
-> **These are corpus metrics, not per-contract guarantees.** 92.8 % is an
+> **These are corpus metrics, not per-contract guarantees.** 92.7 % is an
 > equal-weight mean across 24 mainnet contracts, and it is *correctness-blind* —
 > it grades how much lifted to concrete Rust, not whether the result is right.
 > 100 % is a match rate over the narrow slice the equivalence harness can

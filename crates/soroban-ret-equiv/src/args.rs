@@ -20,6 +20,13 @@ use stellar_xdr::curr::{
 /// is a valid argument and identical for the original and the recompiled side.
 pub(crate) const SELF_CONTRACT_ID: [u8; 32] = [0xC0; 32];
 
+/// Contract id of the first `Address` candidate. The harness registers a
+/// callee contract there, so a cross-contract call has something to reach.
+pub(crate) const CALLEE_CONTRACT_ID: [u8; 32] = [0xA1; 32];
+
+/// Key of the account `Address` candidate.
+pub(crate) const ACCOUNT_KEY: [u8; 32] = [0x11; 32];
+
 /// User types nest at most this deep before the generator picks the smallest
 /// terminating shape (`None`, an empty collection, a unit case).
 const SHALLOW_DEPTH: usize = 2;
@@ -78,15 +85,68 @@ fn sc_map(mut entries: Vec<(ScVal, ScVal)>) -> ScVal {
     ScVal::Map(Some(ScMap(entries.try_into().expect("map fits"))))
 }
 
+/// Values that earlier calls stored, by type label. Offered first for later
+/// parameters of the same type, so a getter is asked about a key that exists.
+pub(crate) type Preferred = std::collections::BTreeMap<String, Vec<ScVal>>;
+
+/// At most this many remembered values per type (keeps the case count flat).
+const MAX_PREFERRED: usize = 3;
+
+/// Record `value` (of spec type `td`) and the values nested in it: a stored
+/// `Vec<String>` makes each of its strings a candidate for a later `String`
+/// parameter.
+pub(crate) fn remember(preferred: &mut Preferred, td: &ScSpecTypeDef, value: &ScVal) {
+    use ScSpecTypeDef as T;
+    let slot = preferred.entry(crate::type_label(td)).or_default();
+    if slot.len() < MAX_PREFERRED && !slot.contains(value) {
+        slot.push(value.clone());
+    }
+    match (td, value) {
+        (T::Vec(v), ScVal::Vec(Some(items))) => {
+            for item in items.iter() {
+                remember(preferred, &v.element_type, item);
+            }
+        }
+        (T::Tuple(t), ScVal::Vec(Some(items))) => {
+            for (ty, item) in t.value_types.iter().zip(items.iter()) {
+                remember(preferred, ty, item);
+            }
+        }
+        (T::Map(m), ScVal::Map(Some(entries))) => {
+            for e in entries.iter() {
+                remember(preferred, &m.key_type, &e.key);
+                remember(preferred, &m.value_type, &e.val);
+            }
+        }
+        (T::Option(o), v) if *v != ScVal::Void => remember(preferred, &o.value_type, v),
+        _ => {}
+    }
+}
+
 /// Candidate values for spec types, seeded per function.
 pub(crate) struct Generator<'a> {
     reg: &'a TypeRegistry,
     seed: u64,
+    preferred: Preferred,
+    extra_addresses: Vec<ScVal>,
 }
 
 impl<'a> Generator<'a> {
     pub(crate) fn new(reg: &'a TypeRegistry, seed: u64) -> Self {
-        Generator { reg, seed }
+        Generator {
+            reg,
+            seed,
+            preferred: Preferred::new(),
+            extra_addresses: Vec::new(),
+        }
+    }
+
+    /// Offer `preferred` values first, and `extra_addresses` as additional
+    /// `Address` candidates (contracts registered next to the one under test).
+    pub(crate) fn with_context(mut self, preferred: &Preferred, extra_addresses: &[ScVal]) -> Self {
+        self.preferred = preferred.clone();
+        self.extra_addresses = extra_addresses.to_vec();
+        self
     }
 
     fn next(&mut self) -> u64 {
@@ -101,7 +161,17 @@ impl<'a> Generator<'a> {
     /// type cannot be built (an unknown user type, a `Result`, a user type
     /// with no finite value).
     pub(crate) fn values(&mut self, td: &ScSpecTypeDef) -> Option<Vec<ScVal>> {
-        self.values_at(td, 0)
+        let generated = self.values_at(td, 0)?;
+        let Some(first) = self.preferred.get(&crate::type_label(td)) else {
+            return Some(generated);
+        };
+        let mut out = first.clone();
+        for v in generated {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+        Some(out)
     }
 
     fn values_at(&mut self, td: &ScSpecTypeDef, depth: usize) -> Option<Vec<ScVal>> {
@@ -191,12 +261,19 @@ impl<'a> Generator<'a> {
                     i(self.next() as i64, self.next(), self.next(), self.next()),
                 ]
             }
-            T::Address => vec![
-                contract_address([0xA1; 32]),
-                contract_address([0xB2; 32]),
-                account_address([0x11; 32]),
-                contract_address(SELF_CONTRACT_ID),
-            ],
+            T::Address => {
+                // The account comes first: it is the candidate most likely to
+                // end up as a stored admin, and mocked auth works for it. (A
+                // contract address with code behind it cannot authorize.)
+                let mut v = vec![
+                    account_address(ACCOUNT_KEY),
+                    contract_address(CALLEE_CONTRACT_ID),
+                    contract_address([0xB2; 32]),
+                    contract_address(SELF_CONTRACT_ID),
+                ];
+                v.extend(self.extra_addresses.iter().cloned());
+                v
+            }
             T::MuxedAddress => vec![
                 account_address([0x11; 32]),
                 ScVal::Address(ScAddress::MuxedAccount(MuxedEd25519Account {
@@ -537,6 +614,29 @@ mod tests {
         assert!(
             unbuildable.is_empty(),
             "parameter types with no generated value: {unbuildable:#?}"
+        );
+    }
+
+    /// A remembered value, and the values nested in it, come first for a
+    /// later parameter of the same type.
+    #[test]
+    fn remembered_values_are_offered_first() {
+        let reg = plain_registry();
+        let strings = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+            element_type: Box::new(ScSpecTypeDef::String),
+        }));
+        let stored = ScVal::String(ScString("stored-repo".try_into().unwrap()));
+        let mut preferred = Preferred::new();
+        remember(&mut preferred, &strings, &sc_vec(vec![stored.clone()]));
+        let values = Generator::new(&reg, 1)
+            .with_context(&preferred, &[])
+            .values(&ScSpecTypeDef::String)
+            .expect("strings generate");
+        assert_eq!(values[0], stored);
+        assert_eq!(
+            values.iter().filter(|v| **v == stored).count(),
+            1,
+            "offered once"
         );
     }
 
