@@ -10062,6 +10062,7 @@ fn lift_function_body(
     // tail into a nested `if cond { panic_with_error!(…) }` (see
     // `recover_fail_with_error_branches`).
     recover_fail_with_error_branches(&mut structured, wasm_module);
+    recover_skipped_fail_with_error(&mut structured, wasm_module);
     if let Ok(want) = std::env::var("DBG_STRUCT")
         && (want.is_empty() || want == func_index.to_string())
     {
@@ -10110,7 +10111,28 @@ fn lift_function_body(
             &rec.key,
         )
     });
-    let computed_get = multiple_gets || function_calls_math_helper(wasm_module, func_index, 3);
+    // "Direct" means the stored value is returned as it is. A getter that
+    // unpacks the stored value into fields but returns a scalar hands back one
+    // FIELD of a stored struct (unknown-oracle `get_price` returns
+    // `ChainData.price`, `get_admin` the payload of `Admin(Address)`); reading
+    // the entry as that scalar fails on real data. Only the leading
+    // missing-key check is faithful there, like any other computed getter.
+    let returns_a_field = matches!(
+        return_type,
+        Some(ScSpecTypeDef::Result(r))
+            if !matches!(
+                *r.ok_type,
+                ScSpecTypeDef::Udt(_)
+                    | ScSpecTypeDef::Tuple(_)
+                    | ScSpecTypeDef::Vec(_)
+                    | ScSpecTypeDef::Map(_)
+            )
+    ) && crate::ir::correctness::unpacks_an_aggregate(&ctx.stmts);
+    if returns_a_field && fallible_rec.is_some() && only_reads {
+        cov_mark::hit!(fallible_get_of_a_struct_field_is_not_direct);
+    }
+    let computed_get =
+        multiple_gets || returns_a_field || function_calls_math_helper(wasm_module, func_index, 3);
     let extensions_kept = extension.as_ref().map_or(0, |(_, n)| *n);
     let extensions_lost = fallible_rec.is_some()
         && only_reads
@@ -10623,6 +10645,7 @@ fn lift_inline_call(
     // inlining instead of leaking as a stray (see
     // `recover_fail_with_error_branches`).
     recover_fail_with_error_branches(&mut structured, wasm_module);
+    recover_skipped_fail_with_error(&mut structured, wasm_module);
     // Debug affordance: dump the structured body of an *inlined* (non-exported)
     // function by index. `DBG_STRUCT` only reaches lifted entrypoints; the big
     // contracts degrade values inside 3-4 levels of inlined helpers, so tracing
@@ -20458,6 +20481,115 @@ fn rewrite_branch_seq(
             _ => {}
         }
     }
+}
+
+/// The other lowering of `if cond { panic_with_error!(..) }`: the error path
+/// is the fall-through and a `br_if k` SKIPS it.
+///
+/// ```text
+///   <ok>            ;; e.g. `has(key) == 0`
+///   br_if k         ;; fine: carry on at the exit of depth k
+///   i64.const <err>
+///   call $fail_with_error   ;; never returns
+/// end
+/// ```
+///
+/// The flat lifter keeps the fall-through `fail_with_error` as an
+/// unconditional statement and loses the branch, and the stray panic is then
+/// dropped downstream, so the guard vanishes (digicus `config` lost its
+/// "already initialised" check). Rewritten here to
+///
+/// ```text
+///   <ok>; i32.eqz; if { <fail tail> } else { br k+1 }
+/// ```
+///
+/// This is the same control flow whatever the tail does: when `<ok>` holds,
+/// control leaves through the same branch (one level deeper inside the
+/// `if`); otherwise the tail runs and, should the error helper ever return,
+/// falls off the end exactly as before. Nothing is assumed about the helper
+/// diverging.
+///
+/// Gated: not inside a loop; everything after the `br_if` to the end of the
+/// body is plain instructions (no nested control flow), at most a few: the
+/// operands of the error call, the call that reaches `fail_with_error`, then
+/// at most `unreachable`.
+fn recover_skipped_fail_with_error(
+    blocks: &mut Vec<super::structurize::StructuredBlock>,
+    module: &WasmModule,
+) {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::{BlockType, WasmInstr};
+
+    for b in blocks.iter_mut() {
+        match b {
+            StructuredBlock::Block { body, .. } => recover_skipped_fail_with_error(body, module),
+            // Not inside a loop: there the skipping branch is usually the
+            // loop's own exit, which the loop recognizers read in this exact
+            // shape (digicus `add_repos`: `len < 256; br_if <after loop>`).
+            StructuredBlock::Loop { .. } => {}
+            StructuredBlock::IfElse {
+                then_body,
+                else_body,
+                ..
+            } => {
+                recover_skipped_fail_with_error(then_body, module);
+                recover_skipped_fail_with_error(else_body, module);
+            }
+            _ => {}
+        }
+    }
+
+    const MAX_TAIL_LEN: usize = 6;
+    let Some(pos) = blocks
+        .iter()
+        .rposition(|b| matches!(b, StructuredBlock::Instruction(WasmInstr::BrIf(_))))
+    else {
+        return;
+    };
+    let StructuredBlock::Instruction(WasmInstr::BrIf(depth)) = blocks[pos] else {
+        return;
+    };
+    let tail = &blocks[pos + 1..];
+    if tail.is_empty() || tail.len() > MAX_TAIL_LEN {
+        return;
+    }
+    let mut fails = false;
+    for sb in tail {
+        match sb {
+            StructuredBlock::SafetyNetUnreachable
+            | StructuredBlock::Instruction(WasmInstr::Unreachable)
+                if fails => {}
+            StructuredBlock::Instruction(WasmInstr::Call(idx))
+                if !fails
+                    && function_calls_host(
+                        module,
+                        *idx,
+                        HostModule::Context,
+                        "fail_with_error",
+                    ) =>
+            {
+                fails = true;
+            }
+            // Operands of the error call.
+            StructuredBlock::Instruction(
+                WasmInstr::I64Const(_) | WasmInstr::I32Const(_) | WasmInstr::LocalGet(_),
+            ) if !fails => {}
+            _ => return,
+        }
+    }
+    if !fails {
+        return;
+    }
+    cov_mark::hit!(skipped_fail_with_error_guard_recovered);
+    let tail: Vec<StructuredBlock> = blocks.drain(pos + 1..).collect();
+    blocks.truncate(pos);
+    blocks.push(StructuredBlock::Instruction(WasmInstr::I32Eqz));
+    // The skipping branch moves into the `else`, one level deeper.
+    blocks.push(StructuredBlock::IfElse {
+        block_type: BlockType::Empty,
+        then_body: tail,
+        else_body: vec![StructuredBlock::Instruction(WasmInstr::Br(depth + 1))],
+    });
 }
 
 fn is_guard_error_path(remaining: &[super::structurize::StructuredBlock]) -> bool {

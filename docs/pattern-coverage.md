@@ -207,7 +207,7 @@ functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
 
-The headline restoration figure this produces — **92.8 %**
+The headline restoration figure this produces — **92.7 %**
 (`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
 mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
 **correctness-blind**: it grades how much of each function lifted to concrete
@@ -281,12 +281,21 @@ authorization enforced and once with it mocked, and compares the outcomes (lower
 decompiler correctness limitation; the gate is a ratchet on the divergence
 count, like the corpus-soundness gate.
 
-Current baseline: **146 of 149 functions / 2652 cases executed; 63 contracts
+Current baseline: **147 of 149 functions / 3724 cases executed; 63 contracts
 checked (39 fixtures + all 24 mainnet corpus), 0 errored, 0 divergences**
-(ceiling 0). Of those cases, 2390 match (90.1 %), 1287 of them on a returned
-value; **262 cases in 6 functions reach a `todo!()` hole** and are counted as
+(ceiling 0). Of those cases, 3094 match (83.1 %), 1490 of them on a returned
+value; **630 cases in 9 functions reach a `todo!()` hole** and are counted as
 unverified, neither a match nor a divergence (the recompiled contract fails
 with a reserved error code at a hole, so a hole is told apart from wrong code).
+The match rate fell from 90.1 % because functions that already reached a hole
+now do so in every built state; no case diverges.
+
+Each function runs as registered and in up to three further **states** that
+the original contract reaches (a call that returns a value and changes the
+ledger builds the next one; the recompiled contract is then put in the
+original's place in that ledger). 1060 cases run in a built state, in the 4
+contracts that have one; **15 functions match on a returned value there**
+(digicus 10, `test_contract_data` 3, unknown-oracle 1, `test_errors` 1).
 
 **23 of the 63 are reported `not_recompilable`** and are therefore never
 executed: 22 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
@@ -311,10 +320,10 @@ populate-loop and returns an empty `Vec`" no longer holds.
 
 **Coverage is limited**: every function in a contract that recompiles is
 executed (≤48 input vectors per function, each under both auth modes) except
-`__constructor`/`__check_auth` — 146 of 149 today. Each call runs on a fresh
-instance with empty storage, so a function that needs initialised state is
-compared only up to its first storage read. Contracts whose output does not
-recompile are skipped. The gate prints every skipped function with its reason and a
+`__constructor`/`__check_auth` — 147 of 149 today. The built states are the
+ones a short greedy search reaches, not every reachable state, and only the
+return outcome is compared, not events or the resulting storage. Contracts
+whose output does not recompile are skipped. The gate prints every skipped function with its reason and a
 count of functions blocked per parameter type; `SOROBAN_RET_EQUIV_REPORT=<path>`
 writes the same as JSON. It is a
 correctness sanity-check + behavioral-match metric, **not** a full-corpus

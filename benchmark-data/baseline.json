@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 92.8,
+  "overall_restoration": 92.7,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -10,7 +10,7 @@
       "fn_clean": 18,
       "fn_partial": 57,
       "fn_logic_lost": 0,
-      "artifacts_total": 269,
+      "artifacts_total": 270,
       "wasm_size": 44514,
       "error": null
     },
@@ -22,7 +22,7 @@
       "fn_clean": 23,
       "fn_partial": 53,
       "fn_logic_lost": 0,
-      "artifacts_total": 343,
+      "artifacts_total": 346,
       "wasm_size": 54833,
       "error": null
     },
@@ -53,12 +53,12 @@
     {
       "file": "blend-backstop-CAQQR5SW.wasm",
       "entity": "Blend Backstop",
-      "restoration_pct": 91.3,
+      "restoration_pct": 91.2,
       "spec_functions": 17,
       "fn_clean": 9,
       "fn_partial": 8,
       "fn_logic_lost": 0,
-      "artifacts_total": 93,
+      "artifacts_total": 101,
       "wasm_size": 30772,
       "error": null
     },
@@ -77,12 +77,12 @@
     {
       "file": "blend-fixed-pool-CAJJZSGM.wasm",
       "entity": "Blend Fixed Pool",
-      "restoration_pct": 89.4,
+      "restoration_pct": 89.2,
       "spec_functions": 27,
-      "fn_clean": 7,
-      "fn_partial": 20,
+      "fn_clean": 6,
+      "fn_partial": 21,
       "fn_logic_lost": 0,
-      "artifacts_total": 165,
+      "artifacts_total": 168,
       "wasm_size": 57328,
       "error": null
     },
@@ -101,12 +101,12 @@
     {
       "file": "blend-yieldblox-pool-CCCCIQSD.wasm",
       "entity": "Blend Yieldblox Pool",
-      "restoration_pct": 89.4,
+      "restoration_pct": 89.2,
       "spec_functions": 27,
-      "fn_clean": 7,
-      "fn_partial": 20,
+      "fn_clean": 6,
+      "fn_partial": 21,
       "fn_logic_lost": 0,
-      "artifacts_total": 165,
+      "artifacts_total": 168,
       "wasm_size": 57328,
       "error": null
     },
@@ -221,12 +221,12 @@
     {
       "file": "soroban-domains-CATRNPHY.wasm",
       "entity": "Soroban Domains",
-      "restoration_pct": 88.9,
+      "restoration_pct": 88.7,
       "spec_functions": 15,
-      "fn_clean": 2,
-      "fn_partial": 13,
+      "fn_clean": 1,
+      "fn_partial": 14,
       "fn_logic_lost": 0,
-      "artifacts_total": 191,
+      "artifacts_total": 194,
       "wasm_size": 20215,
       "error": null
     },

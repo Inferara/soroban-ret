@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — the equivalence gate runs functions against real state
+
+- **States.** Every function now also runs in up to three states the original
+  contract reaches, not only on a freshly registered instance. A state is
+  found by calling the original: a call that returns a value and changes the
+  ledger builds the next one (digicus: `config` → `add_repos` → `add_issues`).
+  The recompiled contract is then put in the original's place in that same
+  ledger, so a hole in a recompiled setter does not stop its getters from
+  being compared against real data. Values stored by those calls are offered
+  first as later arguments.
+- **Callees and constructors.** A contract is registered behind the first
+  `Address` candidate (a second copy of the original, or the fixture named
+  in the gate's `CALLEES` table), so cross-contract calls complete. A
+  constructor that needs arguments gets generated ones (`test_constructor`
+  is executed for the first time).
+- **Numbers.** 147 of 149 functions, 3724 cases, 0 divergences. Functions
+  that match on a returned value: 118 → 129; 15 of them in a built state.
+  Cases reaching a hole: 262 → 630 (the same functions, now in every state)
+  in 9 functions (was 6). New limits: at most 9 functions may reach a hole,
+  and at least 15 must match on a value in a built state.
+- **What it found** (17 diverging cases in 3 functions, all fixed or holed):
+  - *A guard whose error path is skipped by a branch was dropped.* digicus
+    `config` accepted a second initialisation; the original fails with
+    `AlreadyInitialized`. Fixed in the lifter. The same fix restores guards
+    in eleven other outputs, where the panic was unconditional or missing
+    (for example aqua `if em_pause_admins.first_index_of(admin).is_none()
+    { panic_with_error!(Unauthorized) }`, reflector `AlreadyInitialized`).
+  - *A getter returning one field of a stored struct was rebuilt as a read
+    of that field's type.* unknown-oracle `get_price` and `get_admin` failed
+    on every stored value. They keep the missing-key error; the value is an
+    honest hole.
+- Corpus errors stay at 433 (no per-contract change). Mean restoration
+  92.8 % → 92.7 %: recovered guards whose condition is not recovered add
+  `todo!()` conditions.
+- Not done: comparing events and resulting storage (stage 1d); a token
+  contract behind an address (no contract in the gate takes one yet).
+
 ### Changed — the equivalence gate executes every function, and what it found
 
 - **Gate.** The equivalence harness generates arguments of every spec type
