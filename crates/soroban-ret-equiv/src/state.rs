@@ -17,8 +17,9 @@
 
 use soroban_sdk::testutils::{EnvTestConfig, Snapshot};
 use soroban_sdk::xdr::{
-    ContractEvent, ContractEventType, ContractExecutable, ContractId, Hash, LedgerEntry,
-    LedgerEntryData, LedgerKey, ScAddress, ScVal, SorobanAuthorizedInvocation,
+    ContractCodeEntry, ContractCodeEntryExt, ContractEvent, ContractEventType, ContractExecutable,
+    ContractId, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode, ScAddress,
+    ScVal, SorobanAuthorizedInvocation,
 };
 use soroban_sdk::{Address, Env, Symbol, TryFromVal, Val, Vec as SVec};
 
@@ -62,6 +63,8 @@ pub(crate) struct Effects {
     /// Contract events published by the call and its sub-calls, in order.
     pub events: Vec<ContractEvent>,
     /// The ledger after the call (see [`World::ledger`]), sorted by key.
+    /// A code entry is listed only if the call changed it (in practice: its
+    /// lifetime), because the two sides start with different code installed.
     pub ledger: Vec<Entry>,
     /// Who authorized what (recorded under mocked auth; empty otherwise).
     pub auths: Vec<(ScAddress, SorobanAuthorizedInvocation)>,
@@ -168,7 +171,11 @@ impl World {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let env = fresh_env();
             for c in callees {
-                env.register_at(&address(&env, c.id), c.wasm, ());
+                if c.wasm == wasm {
+                    env.register_at(&address(&env, c.id), &distinct_copy(wasm)[..], ());
+                } else {
+                    env.register_at(&address(&env, c.id), c.wasm, ());
+                }
             }
             let mut args: SVec<Val> = SVec::new(&env);
             for sc in ctor_args {
@@ -209,6 +216,18 @@ impl World {
         };
         let new_hash = code.hash.clone();
 
+        // The new code entry starts with the lifetime of the one it replaces,
+        // so a later `extend_ttl` moves both sides' code by the same amount.
+        let old_hash = self.code()?;
+        let lifetime = self
+            .snapshot
+            .ledger
+            .ledger_entries
+            .iter()
+            .find(|(k, _)| matches!(&**k, LedgerKey::ContractCode(c) if c.hash == old_hash))
+            .map(|(_, (_, live_until))| *live_until)?;
+        let code_entry = (code_entry.0, lifetime);
+
         let mut out = self.clone();
         let entries = &mut out.snapshot.ledger.ledger_entries;
         let mut repointed = false;
@@ -226,8 +245,9 @@ impl World {
         if !repointed {
             return None;
         }
-        if !entries.iter().any(|(k, _)| **k == *code_key) {
-            entries.push((code_key, code_entry));
+        match entries.iter_mut().find(|(k, _)| **k == *code_key) {
+            Some((_, existing)) => existing.1 = lifetime,
+            None => entries.push((code_key, code_entry)),
         }
         Some(out)
     }
@@ -316,6 +336,13 @@ impl World {
                         };
                         let wrote = contents(&before) != contents(&ledger);
                         let extended = !wrote && before != ledger;
+                        // The two sides carry different code entries (the
+                        // recompiled side has both codes installed), so of
+                        // those only what this call changed is an effect.
+                        let mut ledger = ledger;
+                        ledger.retain(|e| {
+                            !matches!(e.0, LedgerKey::ContractCode(_)) || !before.contains(e)
+                        });
                         Run {
                             outcome: Outcome::Value(sc),
                             effects: Some(Effects {
@@ -361,20 +388,34 @@ impl World {
             })
     }
 
-    /// The ledger as an effect, lifetimes included, in a form that is equal
-    /// for two worlds that differ only in which code is under test: code
-    /// entries are left out, and where the contract under test still runs
-    /// `code` its executable is replaced by a fixed marker. Anything the
-    /// contract itself changed, its own executable included, is kept.
+    /// The ledger as an effect, lifetimes included, in a form where the code
+    /// under test (`code`) is anonymous: its code entry is replaced by a
+    /// fixed marker that keeps only the lifetime, and where the contract
+    /// under test still runs `code` its executable is replaced by the same
+    /// marker. Anything the contract itself changed, its own executable
+    /// included, is kept, and so is every other contract's code entry.
     fn ledger(&self, code: Option<&Hash>) -> Vec<Entry> {
+        let marker = Hash([0; 32]);
         let mut v: Vec<Entry> = self
             .snapshot
             .ledger
             .ledger_entries
             .iter()
-            .filter(|(k, _)| !matches!(**k, LedgerKey::ContractCode(_)))
             .map(|(k, (e, live_until))| {
                 let mut entry = (**e).clone();
+                if let LedgerKey::ContractCode(c) = &**k
+                    && Some(&c.hash) == code
+                {
+                    entry.data = LedgerEntryData::ContractCode(ContractCodeEntry {
+                        ext: ContractCodeEntryExt::V0,
+                        hash: marker.clone(),
+                        code: Default::default(),
+                    });
+                    let key = LedgerKey::ContractCode(LedgerKeyContractCode {
+                        hash: marker.clone(),
+                    });
+                    return (key, entry, *live_until);
+                }
                 if is_self_instance_key(k)
                     && let LedgerEntryData::ContractData(data) = &mut entry.data
                     && let ScVal::ContractInstance(instance) = &mut data.val
@@ -414,6 +455,20 @@ impl World {
         let only_b = b.iter().filter(|e| !a.contains(e)).count();
         only_a.max(only_b)
     }
+}
+
+/// The same contract under a different code hash: `wasm` with an empty-bodied
+/// custom section appended. A callee that is a copy of the contract under
+/// test must not share its code entry, or extending one contract's code
+/// lifetime would extend the other's on the original side only.
+fn distinct_copy(wasm: &[u8]) -> Vec<u8> {
+    let name = b"equiv-callee";
+    let mut out = wasm.to_vec();
+    out.push(0); // custom section id
+    out.push(name.len() as u8 + 1); // section size: name length byte + name
+    out.push(name.len() as u8);
+    out.extend_from_slice(name);
+    out
 }
 
 fn is_self_instance_key(key: &LedgerKey) -> bool {
@@ -627,6 +682,81 @@ mod tests {
             .expect("an entry with a lifetime");
         entry.2 = entry.2.map(|l| l + 1);
         assert_eq!(a.difference(&b).expect("differs").part, "lifetime");
+    }
+
+    fn mainnet(name: &str) -> Vec<u8> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmark-data/mainnet")
+            .join(name);
+        std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    }
+
+    fn code_entries(e: &Effects) -> Vec<&Entry> {
+        e.ledger
+            .iter()
+            .filter(|(k, _, _)| matches!(k, LedgerKey::ContractCode(_)))
+            .collect()
+    }
+
+    /// Extending the instance extends the code entry too. That lifetime is
+    /// compared, under a name that does not depend on which code is under
+    /// test, and a call that leaves the code alone lists no code entry.
+    #[test]
+    fn a_code_lifetime_is_an_effect() {
+        let wasm = mainnet("unknown-oracle-CAWGFKEL.wasm");
+        let empty = World::new(&wasm, &[], &[]).expect("registers");
+        let init = empty.run("initialize", &[account()], AuthMode::Mocked);
+        let a = init.effects.expect("initialize returns");
+        let code = code_entries(&a);
+        assert_eq!(code.len(), 1, "the extended code entry: {code:?}");
+        let position = a.ledger.iter().position(|e| e == code[0]).unwrap();
+
+        // Only the code entry's lifetime differs.
+        let mut b = a.clone();
+        b.ledger[position].2 = b.ledger[position].2.map(|l| l - 1);
+        assert_eq!(a.difference(&b).expect("differs").part, "lifetime");
+        // The other side did not extend the code at all.
+        let mut c = a.clone();
+        c.ledger.remove(position);
+        assert!(a.difference(&c).is_some());
+
+        // The same behaviour under another code hash is not a difference,
+        // from the empty state and from one whose code is already extended.
+        let copy = distinct_copy(&wasm);
+        let swapped = empty.with_code(&copy).expect("repoints");
+        let b = effects(&swapped, "initialize", &[account()], AuthMode::Mocked);
+        assert_eq!(a.difference(&b), None);
+        let after = init.after.expect("a world after initialize");
+        let after_swapped = after.with_code(&copy).expect("repoints");
+        let a = effects(&after, "get_admin", &[], AuthMode::Enforced);
+        let b = effects(&after_swapped, "get_admin", &[], AuthMode::Enforced);
+        assert_eq!(a.difference(&b), None);
+
+        // A call that does not touch the code lists no code entry.
+        let data = fixture("test_contract_data.wasm");
+        let world = World::new(&data, &[], &[]).expect("registers");
+        let put = effects(&world, "put", &[sym("k"), sym("v")], AuthMode::Enforced);
+        assert!(code_entries(&put).is_empty());
+    }
+
+    /// A callee that is a copy of the contract under test gets its own code
+    /// entry, so the two lifetimes move independently on both sides.
+    #[test]
+    fn a_callee_copy_does_not_share_the_code_entry() {
+        let wasm = fixture("test_contract_data.wasm");
+        let callee = Callee {
+            id: [7; 32],
+            wasm: &wasm,
+        };
+        let world = World::new(&wasm, &[], &[callee]).expect("registers");
+        let codes = world
+            .snapshot
+            .ledger
+            .ledger_entries
+            .iter()
+            .filter(|(k, _)| matches!(**k, LedgerKey::ContractCode(_)))
+            .count();
+        assert_eq!(codes, 2);
     }
 
     #[test]

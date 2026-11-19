@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sides return a value; a failed call is rolled back by the host. A
   divergence names the part that differs (`events`, `storage`, `lifetime`,
   `auth`) and shows the first differing item from each side.
+  Code entries count too: the lifetime of the code under test is compared
+  under a name that does not depend on which code is installed, and a callee
+  that is a copy of the contract under test gets its own code entry, so that
+  extending one contract's code cannot extend the other's on one side only.
 - **What the comparison covered** is reported and floored, so "effects are
   compared" cannot quietly mean "two empty lists were equal": a ledger write
   in 9 functions (85 matching cases), an authorization in 8 (30 cases). No
