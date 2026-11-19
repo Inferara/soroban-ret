@@ -31,14 +31,24 @@
 //! ([`Options::callee`]), and a constructor that needs arguments is given
 //! generated ones.
 //!
+//! ## What is compared
+//!
+//! The outcome of the call (value, contract error, host error or trap) and,
+//! when both sides return a value, what the call did (`state::Effects`): the
+//! contract events published, the ledger afterwards (every entry of every
+//! contract, so a wrong, missing or extra write is a divergence), the
+//! lifetime of every entry (a dropped or wrong `extend_ttl`), and under
+//! mocked auth the recorded authorizations (who had to authorize which call
+//! with which arguments). A failed call is rolled back by the host, so there
+//! the error is all there is to compare. Not compared: cost / budget (it
+//! differs with code generation by design) and diagnostic events.
+//!
 //! ## Intrinsic coverage limits (by design, documented)
 //!
 //! Arguments of every spec type are generated (see `args`), and each case runs
 //! under both [`AuthMode`]s. What is NOT covered: the states are the ones a
-//! short greedy search reaches, not every reachable state; and only the
-//! **return outcome** is compared, not events or the resulting storage (a
-//! wrong write is seen only if a later-compared read returns it, and the
-//! state for that read is built by the original). `__constructor` /
+//! short greedy search reaches, not every reachable state; effects are
+//! compared only for calls that return (see below). `__constructor` /
 //! `__check_auth` are not called as ordinary functions; every skip is reported
 //! with its reason ([`SkipReason`]). A case that reaches a `todo!()` hole in
 //! the recompiled contract is counted as unverified, not as a match
@@ -56,7 +66,7 @@ mod args;
 mod state;
 
 use args::{CALLEE_CONTRACT_ID, Generator, Preferred, remember, select_cases};
-use state::{Callee, World};
+use state::{Callee, EffectDifference, World};
 
 /// Maximum input vectors generated per function (caps cartesian blow-up).
 const MAX_CASES_PER_FN: usize = 48;
@@ -124,8 +134,50 @@ pub struct EquivReport {
     /// Executed functions with a value-returning match in one of
     /// [`Self::states`].
     pub stateful_value_fns: usize,
+    /// What the compared effects of the value-returning matched cases
+    /// contained. Without these numbers "effects are compared" could mean
+    /// that two empty lists were found equal.
+    pub effects: EffectCoverage,
     /// Every observed divergence (an empty vec is the pass condition).
     pub divergences: Vec<Divergence>,
+}
+
+/// One kind of effect: how many matched cases had it, in how many functions.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Covered {
+    pub cases: usize,
+    pub fns: usize,
+}
+
+impl Covered {
+    /// Add another contract's counts.
+    pub fn add(&mut self, other: Covered) {
+        self.cases += other.cases;
+        self.fns += other.fns;
+    }
+}
+
+/// Matched value-returning cases by the effect that was compared.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EffectCoverage {
+    /// Published at least one contract event.
+    pub events: Covered,
+    /// Added, removed or changed a ledger entry.
+    pub writes: Covered,
+    /// Changed only the lifetime of an entry.
+    pub lifetimes: Covered,
+    /// Recorded at least one authorization (mocked auth only).
+    pub auths: Covered,
+}
+
+impl EffectCoverage {
+    /// Add another contract's counts.
+    pub fn add(&mut self, other: EffectCoverage) {
+        self.events.add(other.events);
+        self.writes.add(other.writes);
+        self.lifetimes.add(other.lifetimes);
+        self.auths.add(other.auths);
+    }
 }
 
 impl EquivReport {
@@ -646,6 +698,8 @@ pub fn check_equivalence_with(
         let mut returned_a_value = false;
         let mut returned_a_value_with_state = false;
         let mut reached_a_hole = false;
+        // [events, writes, lifetimes, auths] seen in a matched case.
+        let mut seen = [false; 4];
 
         for (state_no, state) in states.iter().enumerate() {
             let Some(recompiled_world) = state.world.with_code(&recompiled) else {
@@ -655,8 +709,13 @@ pub fn check_equivalence_with(
                 for auth in AuthMode::ALL {
                     // Both sides start from the same ledger, built by the
                     // original contract; each call runs in its own env.
-                    let (out_orig, _) = state.world.call(name, inputs, auth);
-                    let (out_recomp, _) = recompiled_world.call(name, inputs, auth);
+                    let run_orig = state.world.run(name, inputs, auth);
+                    let run_recomp = recompiled_world.run(name, inputs, auth);
+                    let (out_orig, out_recomp) = (run_orig.outcome, run_recomp.outcome);
+                    let effect_difference = match (&run_orig.effects, &run_recomp.effects) {
+                        (Some(a), Some(b)) => a.difference(b),
+                        _ => None,
+                    };
 
                     report.executed_cases += 1;
                     if state_no > 0 {
@@ -665,11 +724,26 @@ pub fn check_equivalence_with(
                     if out_recomp.is_hole() {
                         report.hole_cases += 1;
                         reached_a_hole = true;
-                    } else if out_orig == out_recomp {
+                    } else if out_orig == out_recomp && effect_difference.is_none() {
                         report.matched_cases += 1;
                         if matches!(out_orig, Outcome::Value(_)) {
                             report.value_cases += 1;
                             returned_a_value = true;
+                            if let Some(e) = &run_orig.effects {
+                                let cov = &mut report.effects;
+                                let had = [
+                                    (!e.events.is_empty(), &mut cov.events),
+                                    (e.wrote, &mut cov.writes),
+                                    (e.extended, &mut cov.lifetimes),
+                                    (!e.auths.is_empty(), &mut cov.auths),
+                                ];
+                                for (i, (had, covered)) in had.into_iter().enumerate() {
+                                    if had {
+                                        covered.cases += 1;
+                                        seen[i] = true;
+                                    }
+                                }
+                            }
                             if state_no > 0 {
                                 report.stateful_value_cases += 1;
                                 returned_a_value_with_state = true;
@@ -684,11 +758,22 @@ pub fn check_equivalence_with(
                         report.divergences.push(Divergence {
                             function: name.clone(),
                             inputs: format!("{inputs:?} [{}] [{state_label}]", auth.label()),
-                            original: format!("{out_orig:?}"),
-                            recompiled: format!("{out_recomp:?}"),
+                            original: describe(&out_orig, effect_difference.as_ref(), true),
+                            recompiled: describe(&out_recomp, effect_difference.as_ref(), false),
                         });
                     }
                 }
+            }
+        }
+        let cov = &mut report.effects;
+        for (seen, covered) in seen.into_iter().zip([
+            &mut cov.events,
+            &mut cov.writes,
+            &mut cov.lifetimes,
+            &mut cov.auths,
+        ]) {
+            if seen {
+                covered.fns += 1;
             }
         }
         if returned_a_value {
@@ -703,6 +788,18 @@ pub fn check_equivalence_with(
     }
 
     Ok(report)
+}
+
+/// One side of a divergence: the outcome and, when the outcomes agree but
+/// the effects do not, the first effect that differs.
+fn describe(outcome: &Outcome, difference: Option<&EffectDifference>, original: bool) -> String {
+    match difference {
+        Some(d) => {
+            let item = if original { &d.left } else { &d.right };
+            format!("{outcome:?}; {}: {item}", d.part)
+        }
+        None => format!("{outcome:?}"),
+    }
 }
 
 #[cfg(test)]

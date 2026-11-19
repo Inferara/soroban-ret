@@ -234,9 +234,11 @@ These three are **error-count ratchets pinned to rustc 1.95.0**
 > **These are corpus metrics, not per-contract guarantees.** 92.7 % is an
 > equal-weight mean across 24 mainnet contracts, and it is *correctness-blind* —
 > it grades how much lifted to concrete Rust, not whether the result is right.
-> 100 % is a match rate over the narrow slice the equivalence harness can
-> actually execute (single calls on a fresh instance with empty storage, on
-> contracts whose output recompiles — 2 of the 24 corpus contracts today). Neither figure transfers to
+> "0 divergences" covers the slice the equivalence harness can actually
+> execute (return value, events, ledger and authorizations of single calls, as
+> registered and in a few states the original reaches, on contracts whose
+> output recompiles — 2 of the 24 corpus contracts today), and cases that
+> reach a `todo!()` are not compared. Neither figure transfers to
 > an arbitrary contract; for a per-contract signal use
 > [`DecompileResult::recovery`](#per-contract-recovery-signals), which is
 > computed from that contract alone.

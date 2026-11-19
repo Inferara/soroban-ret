@@ -6257,7 +6257,7 @@ fn void_to_none_expr(
                 .into_iter()
                 .map(|(name, value)| {
                     let value = void_to_none_expr(value, registry);
-                    if is_void_or_unknown(&value) && is_option_field(registry, &type_name, &name) {
+                    if is_void(&value) && is_option_field(registry, &type_name, &name) {
                         return (name, SorobanExpr::None);
                     }
                     (name, value)
@@ -6310,10 +6310,13 @@ fn void_to_none_expr(
 }
 
 /// Check if an expression is Void, UnknownVal, or a ValConvert wrapping one of those.
-fn is_void_or_unknown(expr: &SorobanExpr) -> bool {
+/// A `Void` in an `Option` slot IS `None` (that is how the SDK encodes it).
+/// An unknown value is not: it stays a hole, since reading it as `None`
+/// would publish or store `None` where the original has a value.
+fn is_void(expr: &SorobanExpr) -> bool {
     match expr {
-        SorobanExpr::Void | SorobanExpr::UnknownVal => true,
-        SorobanExpr::ValConvert { value, .. } => is_void_or_unknown(value),
+        SorobanExpr::Void => true,
+        SorobanExpr::ValConvert { value, .. } => is_void(value),
         _ => false,
     }
 }

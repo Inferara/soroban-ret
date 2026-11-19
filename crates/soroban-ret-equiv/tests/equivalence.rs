@@ -84,6 +84,13 @@ use soroban_ret_equiv::{EquivError, Options, SkipReason, check_equivalence_with}
 /// was dropped; fixed in the lifter, which also restored guards in eleven
 /// other outputs), and unknown-oracle `get_admin` / `get_price` read a stored
 /// struct as a bare scalar (now honest holes).
+///
+/// Campaign stage 1d (a case matches only if the call's effects match too:
+/// events, ledger, lifetimes, authorizations) found 100 diverging cases in 3
+/// functions that all matched on the return value: `test_errors::hello`
+/// stored the integer `1` where the original stores `true` (fixed, with six
+/// corpus outputs), and `transfer` in both events fixtures published
+/// `to_muxed_id: None` for a muxed address (now an honest hole).
 const DIVERGENCE_CEILING: usize = 0;
 
 /// Minimum functions differentially executed. Guards against silent coverage
@@ -103,7 +110,10 @@ const EXECUTED_FN_FLOOR: usize = 140;
 /// already reached a hole (unknown-oracle's four admin-gated setters, 488 of
 /// the 630), and three unknown-oracle getters reach their hole only now that
 /// the key exists (see [`HOLE_FN_CEILING`]).
-const HOLE_CASE_CEILING: usize = 630;
+///
+/// 918 at campaign stage 1d, up from 630: the three events functions below
+/// (96 cases each).
+const HOLE_CASE_CEILING: usize = 918;
 
 /// Maximum functions with at least one case reaching a hole. Unlike the case
 /// count this does not grow with the number of states.
@@ -113,14 +123,21 @@ const HOLE_CASE_CEILING: usize = 630;
 /// every stored value, so their value is now an honest hole; and
 /// `get_transaction_gas_cost_in_usd` always had one, hidden while every call
 /// stopped at "no data for chain".
-const HOLE_FN_CEILING: usize = 9;
+///
+/// 12 at campaign stage 1d, up from 9: `test_events::transfer` and
+/// `test_events_ref::transfer` published a constant `None` as the muxed id
+/// (wrong for every muxed address; seen once events were compared), and
+/// `test_events_ref::failed_transfer` got its correct `None` from the same
+/// "an unknown value in an `Option` slot is `None`" guess, which is gone.
+const HOLE_FN_CEILING: usize = 12;
 
 /// Minimum executed functions with at least one case where both sides
 /// returned the same value (not the same error). The second guard against
 /// the same loss: a body that degrades to "always fails" on both sides still
 /// "matches". 129 of 147 at campaign stage 1c (118 of 146 at stage 1b, before
-/// functions ran against built state and reachable callees).
-const VALUE_FN_FLOOR: usize = 129;
+/// functions ran against built state and reachable callees). 127 at stage
+/// 1d: the two `transfer` functions above now stop at a hole.
+const VALUE_FN_FLOOR: usize = 127;
 
 /// Minimum functions that match on a returned value in a BUILT state (not
 /// the freshly registered one). Guards the state machinery itself: if state
@@ -128,6 +145,25 @@ const VALUE_FN_FLOOR: usize = 129;
 /// back to comparing "not initialised". Measured 15 (digicus 10,
 /// `test_contract_data` 3, unknown-oracle 1, `test_errors` 1).
 const STATEFUL_VALUE_FN_FLOOR: usize = 15;
+
+/// Minimum functions with a matched case whose compared effects contained
+/// the named effect (campaign stage 1d). "Effects are compared" is only a
+/// claim about the cases that had one: these floors keep the comparison from
+/// silently shrinking to "two empty lists are equal".
+///
+/// Measured: writes 9 (digicus 6, `test_contract_data` 2, `test_errors` 1),
+/// authorizations 8 (digicus 6, `test_auth` 2).
+///
+/// Events and lifetime-only changes are at 0, and that is a real gap, not a
+/// formality: the only functions in recompilable contracts that publish an
+/// event and return are the two `transfer`s, which now stop at a hole (the
+/// comparison did run on them: it is what found the wrong muxed id), and
+/// every function that extends a lifetime is either a hole or also writes.
+/// Raise these as soon as a publishing function compares again.
+const EVENT_FN_FLOOR: usize = 0;
+const WRITE_FN_FLOOR: usize = 9;
+const LIFETIME_FN_FLOOR: usize = 0;
+const AUTH_FN_FLOOR: usize = 8;
 
 /// Contracts whose cross-contract calls expect a specific callee. The harness
 /// registers it behind the first `Address` candidate; every other contract
@@ -165,6 +201,7 @@ fn equivalence_within_ceiling() {
     let mut stateful_cases = 0usize;
     let mut stateful_value_cases = 0usize;
     let mut stateful_value_fns = 0usize;
+    let mut effects = soroban_ret_equiv::EffectCoverage::default();
     let mut contracts_with_state = 0usize;
     let mut exec_fns = 0usize;
     let mut exec_cases = 0usize;
@@ -213,6 +250,7 @@ fn equivalence_within_ceiling() {
                 stateful_cases += rep.stateful_cases;
                 stateful_value_cases += rep.stateful_value_cases;
                 stateful_value_fns += rep.stateful_value_fns;
+                effects.add(rep.effects);
                 if !rep.states.is_empty() {
                     contracts_with_state += 1;
                 }
@@ -252,6 +290,7 @@ fn equivalence_within_ceiling() {
                     "stateful_cases": rep.stateful_cases,
                     "stateful_value_cases": rep.stateful_value_cases,
                     "stateful_value_fns": rep.stateful_value_fns,
+                    "effects": effects_json(&rep.effects),
                     "skipped": rep.skipped_fns.iter().map(|s| serde_json::json!({
                         "function": s.function,
                         "kind": s.reason.kind(),
@@ -347,6 +386,23 @@ fn equivalence_within_ceiling() {
     eprintln!(
         "matched on a value:  {value_cases} cases, in {value_fns} of {exec_fns} executed functions (floor {VALUE_FN_FLOOR})"
     );
+    // What the compared effects of those cases contained.
+    eprintln!("effects compared (matched cases / functions that had one):");
+    for (label, c, floor) in [
+        ("published an event", effects.events, EVENT_FN_FLOOR),
+        ("wrote to the ledger", effects.writes, WRITE_FN_FLOOR),
+        (
+            "extended a lifetime only",
+            effects.lifetimes,
+            LIFETIME_FN_FLOOR,
+        ),
+        ("recorded an authorization", effects.auths, AUTH_FN_FLOOR),
+    ] {
+        eprintln!(
+            "  {label:<26} {} cases, {} functions (floor {floor})",
+            c.cases, c.fns
+        );
+    }
     // Cases that stopped at a `todo!()` in the recompiled contract: declared
     // unrecovered by the decompiler, so not comparable.
     eprintln!(
@@ -378,6 +434,7 @@ fn equivalence_within_ceiling() {
             "cases_matched_on_value_in_a_built_state": stateful_value_cases,
             "functions_with_a_value_case_in_a_built_state": stateful_value_fns,
             "contracts_with_a_built_state": contracts_with_state,
+            "effects": effects_json(&effects),
             "functions_reaching_a_hole": hole_fns,
             "divergences": divergences.len(),
             "skipped_by_kind": skipped_by_kind,
@@ -428,6 +485,34 @@ fn equivalence_within_ceiling() {
         "only {value_fns} functions match on a returned value (floor {VALUE_FN_FLOOR}): \
          compared behaviour was lost"
     );
+    for (label, c, floor) in [
+        ("publish an event", effects.events, EVENT_FN_FLOOR),
+        ("write to the ledger", effects.writes, WRITE_FN_FLOOR),
+        (
+            "only extend a lifetime",
+            effects.lifetimes,
+            LIFETIME_FN_FLOOR,
+        ),
+        ("record an authorization", effects.auths, AUTH_FN_FLOOR),
+    ] {
+        assert!(
+            c.fns >= floor,
+            "only {} functions match on a case that does {label} (floor {floor}): \
+             compared effects were lost",
+            c.fns
+        );
+    }
+}
+
+fn effects_json(e: &soroban_ret_equiv::EffectCoverage) -> serde_json::Value {
+    let one =
+        |c: soroban_ret_equiv::Covered| serde_json::json!({"cases": c.cases, "functions": c.fns});
+    serde_json::json!({
+        "published_an_event": one(e.events),
+        "wrote_to_the_ledger": one(e.writes),
+        "extended_a_lifetime_only": one(e.lifetimes),
+        "recorded_an_authorization": one(e.auths),
+    })
 }
 
 /// Fixtures (`tests/fixtures/test_*.wasm`) plus every mainnet corpus contract.
