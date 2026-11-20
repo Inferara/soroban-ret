@@ -207,7 +207,7 @@ functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
 
-The headline restoration figure this produces — **92.7 %**
+The headline restoration figure this produces — **90.1 %**
 (`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
 mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
 **correctness-blind**: it grades how much of each function lifted to concrete
@@ -219,6 +219,13 @@ quoted as one.
 > below). No decompiler output changed — `artifacts_total` is identical for all
 > 24 contracts — only the grading of two functions whose empty bodies render as
 > `todo!()` stubs. The lower number is the more honest one.
+>
+> Was 92.7 % before the grader learned to see three more shapes (#81): a body
+> ending in `todo!("decompiled return value")`, a parameter that is never read,
+> and a `Result` whose every exit is an error. Again no output changed. 38
+> corpus functions left "fully recovered" (189 → 151 of 481), 18 are now
+> `LogicLost`, and the 89 lost-return-value markers are counted as holes
+> (1994 → 2083).
 
 #### Per-contract recovery signals (`soroban_ret::recovery`)
 
@@ -243,6 +250,23 @@ harness as diverging (original returns `U32(0)`, recompiled traps). Both are now
 `LogicLost`. A "fully recovered" badge on a function that traps is the
 deceptively-clean bug class this project treats as a defect, so the baseline was
 refreshed rather than the grading kept.
+
+**A function with every node lifted can still be incomplete.** Three signs
+are checked, and each is reported in `FnRecovery::incomplete`:
+
+- the body ends in `todo!("decompiled return value")`, which codegen appends
+  when the statements lifted and the returned value did not. The function is
+  `Partial`, or `LogicLost` when it also writes, authorizes, publishes, calls
+  and returns nothing;
+- a parameter is never read (unless its name starts with `_`);
+- the function returns `Result<T, E>` and every exit is an error.
+
+The markers counted as holes are `todo!("unknown value")`, `todo!("host call …")`,
+`todo!("decompiled function body")`, `todo!("decompiled return value")` and
+`var_N` names. A test checks on every corpus contract and fixture that no
+function graded fully recovered has a `todo!` in its emitted body. What the
+grader still cannot see is a body that reads every parameter and returns a
+value, but the wrong one; only the equivalence gate speaks to that.
 
 ### Corpus soundness (`crates/soroban-ret/tests/corpus_soundness.rs`, `SOROBAN_RET_CORPUS_SOUNDNESS=1`)
 

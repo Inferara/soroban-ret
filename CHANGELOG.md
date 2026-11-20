@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — the recovery report stops calling incomplete functions recovered (#81)
+
+No decompiler output changes; only how it is graded and counted.
+
+- **`todo!("decompiled return value")` is counted.** `ArtifactCounts` has a
+  new `return_value` field, included in `total` and in `--report` under
+  `holes`. The corpus has 89 of these markers, uncounted until now.
+- **A function ending in that marker is not recovered.** The grader uses the
+  same condition codegen uses to append it, so the two cannot drift. The lost
+  value counts as one unknown node. If the function also writes, authorizes,
+  publishes, calls and returns nothing, it is `LogicLost`: it does nothing
+  and then traps.
+- **Two signs of a truncated body with no marker at all** make a function
+  `Partial`, each counted as one unknown node: a parameter that is never read
+  (names starting with `_` are exempt), and a `Result<T, E>` whose every exit
+  is an error.
+- **The report says why.** `FnRecovery::incomplete` (and `incomplete` per
+  function in `--report`) lists the signs in plain words, for example
+  ``"parameter `amount` is never read"``.
+- **Effect on the corpus numbers** (24 contracts, 481 functions):
+
+  | | Before | After |
+  |---|---:|---:|
+  | Functions graded fully recovered | 189 | 151 |
+  | Functions graded logic lost | 0 | 18 |
+  | Holes counted | 1994 | 2083 |
+  | Mean restoration | 92.7 % | 90.1 % |
+
+  Of the 38 functions no longer graded fully recovered, 19 never read a
+  parameter, 12 end in the lost-return-value marker, 6 show both, and 1
+  (`phoenix-amm::accept_admin`) can only return an error. 8 of them are now
+  `LogicLost`, as are 10 functions that were already `Partial`. The largest
+  per-contract moves are unknown-oracle (6 → 1 fully recovered), lightecho
+  (18 → 12) and blend-backstop (9 → 4). `benchmark-data/baseline.json` is
+  refreshed; the lower number is the accurate one.
+- A new test checks, on every corpus contract and fixture, that no function
+  graded fully recovered has a `todo!` in its emitted body.
+
 ### Changed — the equivalence gate compares what a call does, not only what it returns
 
 - **Effects.** A case now matches only if the return outcome and the call's

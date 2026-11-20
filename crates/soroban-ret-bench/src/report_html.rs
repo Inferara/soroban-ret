@@ -351,6 +351,11 @@ fn render_detail(o: &mut String, c: &ContractBench) {
     );
     let _ = write!(o, "<span class=\"chip\">host call: {}</span>", a.host_call);
     let _ = write!(o, "<span class=\"chip\">stub body: {}</span>", a.stub);
+    let _ = write!(
+        o,
+        "<span class=\"chip\">lost return value: {}</span>",
+        a.return_value
+    );
     let _ = write!(o, "<span class=\"chip\">var_N: {}</span></div>", a.var_n);
 
     // Aggregated missing host calls.
@@ -396,7 +401,7 @@ fn render_detail(o: &mut String, c: &ContractBench) {
     let _ = write!(
         o,
         "<div class=\"sec\">Functions ({})</div><table class=\"ftable\"><thead><tr>\
-         <th>Function</th><th>Status</th><th>Recovery</th><th>Nodes</th><th>Missing host calls</th>\
+         <th>Function</th><th>Status</th><th>Recovery</th><th>Nodes</th><th>What is missing</th>\
          </tr></thead><tbody>",
         c.functions.len()
     );
@@ -406,6 +411,12 @@ fn render_detail(o: &mut String, c: &ContractBench) {
         } else {
             format!("{}/{}", f.total_nodes - f.unknown_nodes, f.total_nodes)
         };
+        let missing: Vec<&str> = f
+            .missing_host_calls
+            .iter()
+            .chain(&f.incomplete)
+            .map(String::as_str)
+            .collect();
         let _ = write!(
             o,
             "<tr><td class=\"mono\">{}</td><td>{}</td><td>{:.0}%</td><td>{}</td><td class=\"mono\">{}</td></tr>",
@@ -413,7 +424,7 @@ fn render_detail(o: &mut String, c: &ContractBench) {
             status_badge(f.status),
             f.score * 100.0,
             nodes,
-            esc(&f.missing_host_calls.join(", "))
+            esc(&missing.join(", "))
         );
     }
     let _ = write!(o, "</tbody></table></details>");

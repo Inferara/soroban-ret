@@ -112,6 +112,7 @@ fn corpus_run_invariants() {
             c.artifacts.unknown_value
                 + c.artifacts.host_call
                 + c.artifacts.stub
+                + c.artifacts.return_value
                 + c.artifacts.var_n,
             "{}",
             c.file
