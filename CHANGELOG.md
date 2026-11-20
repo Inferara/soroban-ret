@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — the equivalence gate compares what a call does, not only what it returns
+
+- **Effects.** A case now matches only if the return outcome and the call's
+  effects are equal: the contract events published, the ledger afterwards
+  (every entry of every contract), the lifetime of every entry, and under
+  mocked auth the recorded authorizations. Effects are compared when both
+  sides return a value; a failed call is rolled back by the host. A
+  divergence names the part that differs (`events`, `storage`, `lifetime`,
+  `auth`) and shows the first differing item from each side.
+  Code entries count too: the lifetime of the code under test is compared
+  under a name that does not depend on which code is installed, and a callee
+  that is a copy of the contract under test gets its own code entry, so that
+  extending one contract's code cannot extend the other's on one side only.
+- **What the comparison covered** is reported and floored, so "effects are
+  compared" cannot quietly mean "two empty lists were equal": a ledger write
+  in 9 functions (85 matching cases), an authorization in 8 (30 cases). No
+  matching case publishes an event or changes only a lifetime; see below.
+- **What it found** (100 diverging cases in 3 functions, every one of which
+  matched on its return value):
+  - *A stored `true` / `false` was written as the integer `1` / `0`.*
+    `test_errors::hello` stored an `i32` where the original stores a `bool`.
+    A pipeline pass turned every stored bool constant into an integer; that
+    is only right where the constant reaches the write through a wrapper
+    that takes the value before encoding it (one fixture). A constant handed
+    to `put_contract_data` is a `Val`, where 0 and 1 are `false` and `true`
+    and nothing else. Fixed; six corpus outputs now store the bool the
+    original stores (aqua-rewards kill switches, blend `Backfill` and
+    `IsInit`, phoenix `MULTIHOP`, ybx `Final`).
+  - *`transfer` published `to_muxed_id: None` for a muxed address.* The
+    original publishes `to.id()`. In `test_events` the SDK's two-way
+    argument switch (plain or muxed address) was walked as straight-line
+    code and the plain-address result kept; in `test_events_ref` the value
+    was simply unknown, and an unknown value in an `Option` field was
+    rendered as `None`. Both are now an honest `todo!()`. Along the way an
+    unknown event field is no longer filled with a parameter that already
+    fills another field (`to_muxed_id: amount`).
+- **Numbers.** 147 of 149 functions, 3724 cases, 0 divergences. Matching
+  cases 3094 → 2806, on a returned value 1490 → 1298; functions matching on a
+  value 129 → 127. Cases reaching a hole 630 → 918, in 12 functions (was 9):
+  the two `transfer`s, and `test_events_ref::failed_transfer`, whose correct
+  `None` came from the same guess. Both events fixtures leave the list of
+  fixtures without a `todo!()`.
+- **Open.** Recovering the muxed id (a value assigned under one arm of a
+  switch) would bring the event comparison back onto matching cases.
+
 ### Changed — the equivalence gate runs functions against real state
 
 - **States.** Every function now also runs in up to three states the original

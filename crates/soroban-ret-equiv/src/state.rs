@@ -17,7 +17,9 @@
 
 use soroban_sdk::testutils::{EnvTestConfig, Snapshot};
 use soroban_sdk::xdr::{
-    ContractExecutable, ContractId, Hash, LedgerEntry, LedgerEntryData, LedgerKey, ScAddress, ScVal,
+    ContractCodeEntry, ContractCodeEntryExt, ContractEvent, ContractEventType, ContractExecutable,
+    ContractId, Hash, LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyContractCode, ScAddress,
+    ScVal, SorobanAuthorizedInvocation,
 };
 use soroban_sdk::{Address, Env, Symbol, TryFromVal, Val, Vec as SVec};
 
@@ -50,6 +52,117 @@ pub(crate) struct World {
     snapshot: Snapshot,
 }
 
+/// One ledger entry as an effect: key, entry, and the ledger its lifetime
+/// runs to.
+type Entry = (LedgerKey, LedgerEntry, Option<u32>);
+
+/// Everything a call that returned did besides returning: what the two sides
+/// must agree on for a case to match.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Effects {
+    /// Contract events published by the call and its sub-calls, in order.
+    pub events: Vec<ContractEvent>,
+    /// The ledger after the call (see [`World::ledger`]), sorted by key.
+    /// A code entry is listed only if the call changed it (in practice: its
+    /// lifetime), because the two sides start with different code installed.
+    pub ledger: Vec<Entry>,
+    /// Who authorized what (recorded under mocked auth; empty otherwise).
+    pub auths: Vec<(ScAddress, SorobanAuthorizedInvocation)>,
+    /// The call added, removed or changed a ledger entry.
+    pub wrote: bool,
+    /// The call changed the lifetime of an entry it did not otherwise change.
+    pub extended: bool,
+}
+
+/// Which part of two [`Effects`] differs, with the first differing item
+/// from each side.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EffectDifference {
+    /// `events`, `storage`, `lifetime` or `auth`.
+    pub part: &'static str,
+    pub left: String,
+    pub right: String,
+}
+
+fn shown<T: std::fmt::Debug>(item: Option<&T>) -> String {
+    match item {
+        Some(v) => format!("{v:?}"),
+        None => "nothing".to_string(),
+    }
+}
+
+/// First position where two lists differ, shown from both sides.
+fn first_difference<T: PartialEq + std::fmt::Debug>(a: &[T], b: &[T]) -> Option<(String, String)> {
+    let n = a.len().max(b.len());
+    (0..n)
+        .find(|&i| a.get(i) != b.get(i))
+        .map(|i| (shown(a.get(i)), shown(b.get(i))))
+}
+
+impl Effects {
+    /// `None` when the two calls did the same thing.
+    pub(crate) fn difference(&self, other: &Effects) -> Option<EffectDifference> {
+        if let Some((left, right)) = first_difference(&self.events, &other.events) {
+            return Some(EffectDifference {
+                part: "events",
+                left,
+                right,
+            });
+        }
+        // Contents first: a wrong value is reported as `storage` even when
+        // its lifetime differs too.
+        let contents = |e: &[Entry]| -> Vec<(LedgerKey, LedgerEntry)> {
+            e.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect()
+        };
+        if let Some((left, right)) =
+            first_difference(&contents(&self.ledger), &contents(&other.ledger))
+        {
+            return Some(EffectDifference {
+                part: "storage",
+                left,
+                right,
+            });
+        }
+        let lifetimes = |e: &[Entry]| -> Vec<(LedgerKey, Option<u32>)> {
+            e.iter().map(|(k, _, l)| (k.clone(), *l)).collect()
+        };
+        if let Some((left, right)) =
+            first_difference(&lifetimes(&self.ledger), &lifetimes(&other.ledger))
+        {
+            return Some(EffectDifference {
+                part: "lifetime",
+                left,
+                right,
+            });
+        }
+        first_difference(&self.auths, &other.auths).map(|(left, right)| EffectDifference {
+            part: "auth",
+            left,
+            right,
+        })
+    }
+}
+
+/// The result of [`World::run`].
+pub(crate) struct Run {
+    pub outcome: Outcome,
+    /// What the call did, when it returned a value. A failed call is rolled
+    /// back by the host, so it has no effects to compare.
+    pub effects: Option<Effects>,
+    /// The world after the call, when it returned a value.
+    pub after: Option<World>,
+}
+
+impl Run {
+    fn failed(outcome: Outcome) -> Run {
+        Run {
+            outcome,
+            effects: None,
+            after: None,
+        }
+    }
+}
+
 impl World {
     /// Register `wasm` (with `ctor_args`) and the `callees` in an empty
     /// ledger. `None` when registration fails: a constructor that rejects the
@@ -58,7 +171,11 @@ impl World {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let env = fresh_env();
             for c in callees {
-                env.register_at(&address(&env, c.id), c.wasm, ());
+                if c.wasm == wasm {
+                    env.register_at(&address(&env, c.id), &distinct_copy(wasm)[..], ());
+                } else {
+                    env.register_at(&address(&env, c.id), c.wasm, ());
+                }
             }
             let mut args: SVec<Val> = SVec::new(&env);
             for sc in ctor_args {
@@ -99,6 +216,18 @@ impl World {
         };
         let new_hash = code.hash.clone();
 
+        // The new code entry starts with the lifetime of the one it replaces,
+        // so a later `extend_ttl` moves both sides' code by the same amount.
+        let old_hash = self.code()?;
+        let lifetime = self
+            .snapshot
+            .ledger
+            .ledger_entries
+            .iter()
+            .find(|(k, _)| matches!(&**k, LedgerKey::ContractCode(c) if c.hash == old_hash))
+            .map(|(_, (_, live_until))| *live_until)?;
+        let code_entry = (code_entry.0, lifetime);
+
         let mut out = self.clone();
         let entries = &mut out.snapshot.ledger.ledger_entries;
         let mut repointed = false;
@@ -116,8 +245,9 @@ impl World {
         if !repointed {
             return None;
         }
-        if !entries.iter().any(|(k, _)| **k == *code_key) {
-            entries.push((code_key, code_entry));
+        match entries.iter_mut().find(|(k, _)| **k == *code_key) {
+            Some((_, existing)) => existing.1 = lifetime,
+            None => entries.push((code_key, code_entry)),
         }
         Some(out)
     }
@@ -135,18 +265,24 @@ impl World {
         .ok()
     }
 
-    /// Invoke `func` in this world. Returns the outcome and, when the call
+    /// [`World::run`] without the effects: the outcome and, when the call
     /// returned normally, the world after it.
-    ///
-    /// Everything runs inside one `catch_unwind`, env drop included, so a
-    /// host panic (budget exceeded, trap escalation) becomes
-    /// [`Outcome::Panic`] instead of aborting the run.
     pub(crate) fn call(
         &self,
         func: &str,
         inputs: &[ScVal],
         auth: AuthMode,
     ) -> (Outcome, Option<World>) {
+        let run = self.run(func, inputs, auth);
+        (run.outcome, run.after)
+    }
+
+    /// Invoke `func` in this world.
+    ///
+    /// Everything runs inside one `catch_unwind`, env drop included, so a
+    /// host panic (budget exceeded, trap escalation) becomes
+    /// [`Outcome::Panic`] instead of aborting the run.
+    pub(crate) fn run(&self, func: &str, inputs: &[ScVal], auth: AuthMode) -> Run {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let env = self.env();
             let addr = address(&env, SELF_CONTRACT_ID);
@@ -157,7 +293,7 @@ impl World {
             for sc in inputs {
                 match Val::try_from_val(&env, sc) {
                     Ok(v) => args.push_back(v),
-                    Err(_) => return (Outcome::Unconvertible, None),
+                    Err(_) => return Run::failed(Outcome::Unconvertible),
                 }
             }
             let sym = Symbol::new(&env, func);
@@ -178,20 +314,121 @@ impl World {
                             !matches!(&**key, LedgerKey::ContractData(d)
                                 if matches!(d.key, ScVal::LedgerKeyNonce(_)))
                         });
-                        (Outcome::Value(sc), Some(World { snapshot }))
+                        let events = snapshot
+                            .events
+                            .0
+                            .iter()
+                            .filter(|e| {
+                                !e.failed_call && e.event.type_ == ContractEventType::Contract
+                            })
+                            .map(|e| e.event.clone())
+                            .collect();
+                        let auths = snapshot.auth.0.last().cloned().unwrap_or_default();
+                        // The next call in this world starts its own record.
+                        snapshot.events.0.clear();
+                        snapshot.auth.0.clear();
+                        let after = World { snapshot };
+                        let code = self.code();
+                        let before = self.ledger(code.as_ref());
+                        let ledger = after.ledger(code.as_ref());
+                        let contents = |e: &[Entry]| -> Vec<(LedgerKey, LedgerEntry)> {
+                            e.iter().map(|(k, v, _)| (k.clone(), v.clone())).collect()
+                        };
+                        let wrote = contents(&before) != contents(&ledger);
+                        let extended = !wrote && before != ledger;
+                        // The two sides carry different code entries (the
+                        // recompiled side has both codes installed), so of
+                        // those only what this call changed is an effect.
+                        let mut ledger = ledger;
+                        ledger.retain(|e| {
+                            !matches!(e.0, LedgerKey::ContractCode(_)) || !before.contains(e)
+                        });
+                        Run {
+                            outcome: Outcome::Value(sc),
+                            effects: Some(Effects {
+                                events,
+                                ledger,
+                                auths,
+                                wrote,
+                                extended,
+                            }),
+                            after: Some(after),
+                        }
                     }
-                    Err(_) => (Outcome::Unconvertible, None),
+                    Err(_) => Run::failed(Outcome::Unconvertible),
                 },
                 // Unreachable for `T = Val` (the conversion is infallible);
                 // kept for exhaustiveness. NOT a contract-error path.
-                Ok(Err(_conv)) => (Outcome::Unconvertible, None),
+                Ok(Err(_conv)) => Run::failed(Outcome::Unconvertible),
                 // The error value is kept in the string, so two *different*
                 // contract errors compare unequal.
-                Err(Ok(e)) => (Outcome::ContractError(format!("{e:?}")), None),
-                Err(Err(ie)) => (Outcome::InvokeError(format!("{ie:?}")), None),
+                Err(Ok(e)) => Run::failed(Outcome::ContractError(format!("{e:?}"))),
+                Err(Err(ie)) => Run::failed(Outcome::InvokeError(format!("{ie:?}"))),
             }
         }))
-        .unwrap_or((Outcome::Panic, None))
+        .unwrap_or_else(|_| Run::failed(Outcome::Panic))
+    }
+
+    /// The code the contract under test runs in this world.
+    fn code(&self) -> Option<Hash> {
+        self.snapshot
+            .ledger
+            .ledger_entries
+            .iter()
+            .find(|(k, _)| is_self_instance_key(k))
+            .and_then(|(_, (entry, _))| match &entry.data {
+                LedgerEntryData::ContractData(data) => match &data.val {
+                    ScVal::ContractInstance(instance) => match &instance.executable {
+                        ContractExecutable::Wasm(hash) => Some(hash.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            })
+    }
+
+    /// The ledger as an effect, lifetimes included, in a form where the code
+    /// under test (`code`) is anonymous: its code entry is replaced by a
+    /// fixed marker that keeps only the lifetime, and where the contract
+    /// under test still runs `code` its executable is replaced by the same
+    /// marker. Anything the contract itself changed, its own executable
+    /// included, is kept, and so is every other contract's code entry.
+    fn ledger(&self, code: Option<&Hash>) -> Vec<Entry> {
+        let marker = Hash([0; 32]);
+        let mut v: Vec<Entry> = self
+            .snapshot
+            .ledger
+            .ledger_entries
+            .iter()
+            .map(|(k, (e, live_until))| {
+                let mut entry = (**e).clone();
+                if let LedgerKey::ContractCode(c) = &**k
+                    && Some(&c.hash) == code
+                {
+                    entry.data = LedgerEntryData::ContractCode(ContractCodeEntry {
+                        ext: ContractCodeEntryExt::V0,
+                        hash: marker.clone(),
+                        code: Default::default(),
+                    });
+                    let key = LedgerKey::ContractCode(LedgerKeyContractCode {
+                        hash: marker.clone(),
+                    });
+                    return (key, entry, *live_until);
+                }
+                if is_self_instance_key(k)
+                    && let LedgerEntryData::ContractData(data) = &mut entry.data
+                    && let ScVal::ContractInstance(instance) = &mut data.val
+                    && let ContractExecutable::Wasm(hash) = &instance.executable
+                    && Some(hash) == code
+                {
+                    instance.executable = ContractExecutable::Wasm(Hash([0; 32]));
+                }
+                ((**k).clone(), entry, *live_until)
+            })
+            .collect();
+        v.sort();
+        v
     }
 
     /// The ledger entries, for telling whether a call changed anything.
@@ -218,6 +455,20 @@ impl World {
         let only_b = b.iter().filter(|e| !a.contains(e)).count();
         only_a.max(only_b)
     }
+}
+
+/// The same contract under a different code hash: `wasm` with an empty-bodied
+/// custom section appended. A callee that is a copy of the contract under
+/// test must not share its code entry, or extending one contract's code
+/// lifetime would extend the other's on the original side only.
+fn distinct_copy(wasm: &[u8]) -> Vec<u8> {
+    let name = b"equiv-callee";
+    let mut out = wasm.to_vec();
+    out.push(0); // custom section id
+    out.push(name.len() as u8 + 1); // section size: name length byte + name
+    out.push(name.len() as u8);
+    out.extend_from_slice(name);
+    out
 }
 
 fn is_self_instance_key(key: &LedgerKey) -> bool {
@@ -312,6 +563,200 @@ mod tests {
             Outcome::Value(ScVal::Void),
             "admin auth is mocked again"
         );
+    }
+
+    fn account() -> ScVal {
+        ScVal::Address(ScAddress::Account(soroban_sdk::xdr::AccountId(
+            soroban_sdk::xdr::PublicKey::PublicKeyTypeEd25519(soroban_sdk::xdr::Uint256(
+                crate::args::ACCOUNT_KEY,
+            )),
+        )))
+    }
+
+    fn effects(world: &World, func: &str, inputs: &[ScVal], auth: AuthMode) -> Effects {
+        let run = world.run(func, inputs, auth);
+        assert!(
+            matches!(run.outcome, Outcome::Value(_)),
+            "{func} returns: {:?}",
+            run.outcome
+        );
+        run.effects.expect("a returning call has effects")
+    }
+
+    /// A write is an effect, a different written value is a `storage`
+    /// difference, and a read has no effect.
+    #[test]
+    fn a_write_is_an_effect_and_a_read_is_not() {
+        let wasm = fixture("test_contract_data.wasm");
+        let empty = World::new(&wasm, &[], &[]).expect("registers");
+        let v1 = effects(&empty, "put", &[sym("k"), sym("v")], AuthMode::Enforced);
+        let v2 = effects(&empty, "put", &[sym("k"), sym("w")], AuthMode::Enforced);
+        assert!(v1.wrote && !v1.extended);
+        assert_eq!(v1.difference(&v1.clone()), None);
+        let diff = v1.difference(&v2).expect("different values differ");
+        assert_eq!(diff.part, "storage");
+        assert!(
+            diff.left.contains("StringM(v)") && diff.right.contains("StringM(w)"),
+            "{diff:?}"
+        );
+
+        let read = effects(&empty, "get", &[sym("k")], AuthMode::Enforced);
+        assert!(!read.wrote && !read.extended);
+        assert!(read.events.is_empty() && read.auths.is_empty());
+        // A missing write is a difference too.
+        assert_eq!(v1.difference(&read).expect("differs").part, "storage");
+    }
+
+    /// Putting a second copy of the same code in place changes nothing a
+    /// comparison can see: the normalisation hides the swap and only that.
+    #[test]
+    fn a_code_swap_is_not_an_effect() {
+        let wasm = fixture("test_contract_data.wasm");
+        let other = fixture("test_add_u64.wasm");
+        let empty = World::new(&wasm, &[], &[]).expect("registers");
+        // Through another contract's code and back: the ledger now carries an
+        // extra code entry, as the recompiled side's does.
+        let swapped = empty
+            .with_code(&other)
+            .and_then(|w| w.with_code(&wasm))
+            .expect("repoints");
+        for (func, inputs) in [("put", vec![sym("k"), sym("v")]), ("get", vec![sym("k")])] {
+            let a = effects(&empty, func, &inputs, AuthMode::Enforced);
+            let b = effects(&swapped, func, &inputs, AuthMode::Enforced);
+            assert_eq!(a.difference(&b), None, "{func}");
+            assert_eq!(a.wrote, b.wrote, "{func}");
+        }
+    }
+
+    #[test]
+    fn a_published_event_is_an_effect() {
+        let wasm = fixture("test_events.wasm");
+        let world = World::new(&wasm, &[], &[]).expect("registers");
+        let transfer = |amount: i128| {
+            let amount = ScVal::I128(soroban_sdk::xdr::Int128Parts {
+                hi: 0,
+                lo: amount as u64,
+            });
+            effects(
+                &world,
+                "transfer",
+                &[account(), account(), amount],
+                AuthMode::Enforced,
+            )
+        };
+        let a = transfer(5);
+        assert_eq!(a.events.len(), 1, "{:?}", a.events);
+        assert!(!a.wrote);
+        assert_eq!(a.difference(&transfer(5)), None, "deterministic");
+        assert_eq!(a.difference(&transfer(6)).expect("differs").part, "events");
+    }
+
+    #[test]
+    fn a_recorded_authorization_is_an_effect() {
+        let wasm = fixture("test_auth.wasm");
+        let world = World::new(&wasm, &[], &[]).expect("registers");
+        let a = effects(&world, "fn1", &[account()], AuthMode::Mocked);
+        assert_eq!(a.auths.len(), 1, "{:?}", a.auths);
+        assert_eq!(ScVal::Address(a.auths[0].0.clone()), account());
+        assert!(!a.wrote, "a consumed nonce is not a write");
+        let again = effects(&world, "fn1", &[account()], AuthMode::Mocked);
+        assert_eq!(a.difference(&again), None, "deterministic");
+
+        let mut other = again;
+        other.auths.clear();
+        assert_eq!(a.difference(&other).expect("differs").part, "auth");
+    }
+
+    /// The same contents with a different lifetime are a `lifetime`
+    /// difference, not a `storage` one.
+    #[test]
+    fn a_lifetime_is_compared_separately_from_contents() {
+        let wasm = fixture("test_contract_data.wasm");
+        let empty = World::new(&wasm, &[], &[]).expect("registers");
+        let a = effects(&empty, "put", &[sym("k"), sym("v")], AuthMode::Enforced);
+        let mut b = a.clone();
+        let entry = b
+            .ledger
+            .iter_mut()
+            .find(|(_, _, live_until)| live_until.is_some())
+            .expect("an entry with a lifetime");
+        entry.2 = entry.2.map(|l| l + 1);
+        assert_eq!(a.difference(&b).expect("differs").part, "lifetime");
+    }
+
+    fn mainnet(name: &str) -> Vec<u8> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmark-data/mainnet")
+            .join(name);
+        std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    }
+
+    fn code_entries(e: &Effects) -> Vec<&Entry> {
+        e.ledger
+            .iter()
+            .filter(|(k, _, _)| matches!(k, LedgerKey::ContractCode(_)))
+            .collect()
+    }
+
+    /// Extending the instance extends the code entry too. That lifetime is
+    /// compared, under a name that does not depend on which code is under
+    /// test, and a call that leaves the code alone lists no code entry.
+    #[test]
+    fn a_code_lifetime_is_an_effect() {
+        let wasm = mainnet("unknown-oracle-CAWGFKEL.wasm");
+        let empty = World::new(&wasm, &[], &[]).expect("registers");
+        let init = empty.run("initialize", &[account()], AuthMode::Mocked);
+        let a = init.effects.expect("initialize returns");
+        let code = code_entries(&a);
+        assert_eq!(code.len(), 1, "the extended code entry: {code:?}");
+        let position = a.ledger.iter().position(|e| e == code[0]).unwrap();
+
+        // Only the code entry's lifetime differs.
+        let mut b = a.clone();
+        b.ledger[position].2 = b.ledger[position].2.map(|l| l - 1);
+        assert_eq!(a.difference(&b).expect("differs").part, "lifetime");
+        // The other side did not extend the code at all.
+        let mut c = a.clone();
+        c.ledger.remove(position);
+        assert!(a.difference(&c).is_some());
+
+        // The same behaviour under another code hash is not a difference,
+        // from the empty state and from one whose code is already extended.
+        let copy = distinct_copy(&wasm);
+        let swapped = empty.with_code(&copy).expect("repoints");
+        let b = effects(&swapped, "initialize", &[account()], AuthMode::Mocked);
+        assert_eq!(a.difference(&b), None);
+        let after = init.after.expect("a world after initialize");
+        let after_swapped = after.with_code(&copy).expect("repoints");
+        let a = effects(&after, "get_admin", &[], AuthMode::Enforced);
+        let b = effects(&after_swapped, "get_admin", &[], AuthMode::Enforced);
+        assert_eq!(a.difference(&b), None);
+
+        // A call that does not touch the code lists no code entry.
+        let data = fixture("test_contract_data.wasm");
+        let world = World::new(&data, &[], &[]).expect("registers");
+        let put = effects(&world, "put", &[sym("k"), sym("v")], AuthMode::Enforced);
+        assert!(code_entries(&put).is_empty());
+    }
+
+    /// A callee that is a copy of the contract under test gets its own code
+    /// entry, so the two lifetimes move independently on both sides.
+    #[test]
+    fn a_callee_copy_does_not_share_the_code_entry() {
+        let wasm = fixture("test_contract_data.wasm");
+        let callee = Callee {
+            id: [7; 32],
+            wasm: &wasm,
+        };
+        let world = World::new(&wasm, &[], &[callee]).expect("registers");
+        let codes = world
+            .snapshot
+            .ledger
+            .ledger_entries
+            .iter()
+            .filter(|(k, _)| matches!(**k, LedgerKey::ContractCode(_)))
+            .count();
+        assert_eq!(codes, 2);
     }
 
     #[test]

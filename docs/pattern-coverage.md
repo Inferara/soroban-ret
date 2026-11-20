@@ -283,12 +283,24 @@ count, like the corpus-soundness gate.
 
 Current baseline: **147 of 149 functions / 3724 cases executed; 63 contracts
 checked (39 fixtures + all 24 mainnet corpus), 0 errored, 0 divergences**
-(ceiling 0). Of those cases, 3094 match (83.1 %), 1490 of them on a returned
-value; **630 cases in 9 functions reach a `todo!()` hole** and are counted as
+(ceiling 0). Of those cases, 2806 match (75.3 %), 1298 of them on a returned
+value; **918 cases in 12 functions reach a `todo!()` hole** and are counted as
 unverified, neither a match nor a divergence (the recompiled contract fails
 with a reserved error code at a hole, so a hole is told apart from wrong code).
-The match rate fell from 90.1 % because functions that already reached a hole
-now do so in every built state; no case diverges.
+The match rate fell from 83.1 % because three event-publishing functions
+became holes (see below); no case diverges.
+
+A case matches only if the return outcome **and the call's effects** are
+equal: the contract events published, the ledger afterwards (every entry of
+every contract), the lifetime of every entry, and under mocked auth the
+recorded authorizations. Effects are compared when both sides return a value
+(a failed call is rolled back). What that comparison actually covered among
+the matching cases: **a ledger write in 9 functions** (85 cases), **an
+authorization in 8 functions** (30 cases), and **no published event and no
+lifetime-only change**. The last two are a gap: the only functions in
+recompilable contracts that publish an event and return are the two
+`transfer` fixtures, and the event comparison is what showed their
+`to_muxed_id` to be wrong, so they are holes until the id is recovered.
 
 Each function runs as registered and in up to three further **states** that
 the original contract reaches (a call that returns a value and changes the
@@ -302,10 +314,9 @@ executed: 22 of the 24 mainnet corpus contracts, plus the `test_liquidity_pool`
 fixture. Only `digicus` and `unknown-oracle` recompile from the corpus — the
 same two the corpus-soundness gate reports as clean-compiling.
 
-Limits that remain: every call runs on a fresh instance with **empty
-storage** and no other contract registered, so most matches agree on the
-failure at the first storage read or cross-contract call; and only the
-**return outcome** is compared, not events or storage.
+Limits that remain: the states are the ones a short greedy search reaches;
+effects are compared only for calls that return a value; cost / budget and
+diagnostic events are not compared.
 
 History of this ratchet: 75 / 82.3 % → 60 (the `checked_add`/`checked_sub` →
 `.ok_or(..)` recovery) → 4 (the fallible-storage-get recovery eliminated
@@ -321,8 +332,8 @@ populate-loop and returns an empty `Vec`" no longer holds.
 **Coverage is limited**: every function in a contract that recompiles is
 executed (≤48 input vectors per function, each under both auth modes) except
 `__constructor`/`__check_auth` — 147 of 149 today. The built states are the
-ones a short greedy search reaches, not every reachable state, and only the
-return outcome is compared, not events or the resulting storage. Contracts
+ones a short greedy search reaches, not every reachable state, and no
+matching case publishes an event yet (see above). Contracts
 whose output does not recompile are skipped. The gate prints every skipped function with its reason and a
 count of functions blocked per parameter type; `SOROBAN_RET_EQUIV_REPORT=<path>`
 writes the same as JSON. It is a

@@ -547,6 +547,7 @@ fn test_decompile_errors() {
 
 #[test]
 fn test_decompile_events() {
+    cov_mark::check!(lost_muxed_id_is_a_hole);
     let wasm = include_bytes!("../../../tests/fixtures/test_events.wasm");
     let source = decompile(wasm).expect("decompilation failed");
     // Event struct + field order matters: `from` and `to` are topics; `amount`
@@ -580,13 +581,22 @@ fn test_decompile_events() {
             "panic!()",
         ],
     );
-    // transfer extracts the MuxedAddress before constructing the event.
+    // transfer extracts the MuxedAddress before constructing the event. The
+    // original publishes `to_muxed_id: to.id()`; which field the id reaches
+    // is not tracked, and the former constant `None` was wrong for every
+    // muxed address (found by comparing published events, campaign stage
+    // 1d). An honest hole until the id is threaded through.
     assert_in_fn(
         &source,
         "pub fn transfer",
-        &["Transfer {", "to: to.address()", ".publish(&env)"],
+        &[
+            "Transfer {",
+            "to: to.address()",
+            "to_muxed_id: todo!(\"unknown value\")",
+            ".publish(&env)",
+        ],
     );
-    assert!(!source.contains("todo!("), "unexpected todo! artifact");
+    assert_eq!(source.matches("todo!(").count(), 1, "{source}");
 }
 
 #[test]
@@ -598,7 +608,20 @@ fn test_decompile_events_ref() {
     assert!(source.contains("contractevent"));
     assert!(source.contains("#[topic]"));
     assert!(source.contains(".publish(&env)"));
-    assert!(!source.contains("todo!("), "unexpected todo! artifact");
+    // The by-reference variant passes the optional id as a nullable pointer,
+    // which is not followed: the field's value is unknown in both functions.
+    // It used to be rendered `None` (an unknown value in an `Option` slot was
+    // read as `None`; right for `failed_transfer` by luck, wrong for
+    // `transfer`), and must not be filled with the only spare parameter.
+    assert_eq!(
+        source
+            .matches("to_muxed_id: todo!(\"unknown value\")")
+            .count(),
+        2,
+        "{source}"
+    );
+    assert!(!source.contains("to_muxed_id: amount"), "{source}");
+    assert_eq!(source.matches("todo!(").count(), 2, "{source}");
 }
 
 #[test]
@@ -1264,7 +1287,12 @@ fn test_all_fixtures_decompile() {
 // `.unwrap()` rendering diverged from the original under execution, so the
 // result is an honest hole (`hole_try_invoke_results`) until the mapping is
 // lifted.
-const KNOWN_I128_TODO_FIXTURES: &[&str] = &["test_import_contract"];
+//
+// `events` / `events_ref`: the muxed id published by `transfer` (and, in the
+// by-reference variant, the optional id in both functions) is not recovered;
+// see `test_decompile_events` / `test_decompile_events_ref`.
+const KNOWN_I128_TODO_FIXTURES: &[&str] =
+    &["test_import_contract", "test_events", "test_events_ref"];
 
 #[test]
 fn test_all_fixtures_no_artifacts() {
@@ -2464,5 +2492,38 @@ fn status_helper_caller_keeps_its_write_behind_a_hole() {
             ".get::<_, soroban_sdk::Val>(&symbol_short!(\"Admin\")) .ok_or(Error::Uninitialized)?;"
         ),
         "get_admin stays a fallible read:\n{get_admin}"
+    );
+}
+
+/// A constant handed straight to `put_contract_data` is a `Val`, where 0 and 1
+/// are `false` and `true`. It used to be rendered as the integer `1`, which
+/// stores an `i32` where the original stores a `bool` (found by comparing the
+/// ledger after the call, campaign stage 1d).
+#[test]
+fn stored_val_constant_keeps_its_bool_type() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_errors.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    assert!(
+        source
+            .split_whitespace()
+            .collect::<String>()
+            .contains(".set(&symbol_short!(\"persisted\"),&true)"),
+        "{source}"
+    );
+}
+
+/// The other side of the same question: a wrapper that takes the value before
+/// encoding it (here the two halves of an `i128`) is given an integer.
+#[test]
+fn unencoded_wrapper_constant_stays_an_integer() {
+    cov_mark::check!(unencoded_wrapper_constant_is_an_integer);
+    let wasm = include_bytes!("../../../tests/fixtures/test_liquidity_pool.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    assert!(
+        source
+            .split_whitespace()
+            .collect::<String>()
+            .contains(".set(&DataKey::TotalShares,&0)"),
+        "{source}"
     );
 }

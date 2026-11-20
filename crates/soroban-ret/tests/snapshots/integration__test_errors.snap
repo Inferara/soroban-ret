@@ -28,7 +28,7 @@ impl Contract {
     pub fn hello(env: Env, flag: Flag) -> Result<Symbol, Error> {
         env.storage()
             .persistent()
-            .set(&symbol_short!("persisted"), &1);
+            .set(&symbol_short!("persisted"), &true);
         if flag == Flag::A {
             return Ok(symbol_short!("hello"));
         } else if flag == Flag::C {

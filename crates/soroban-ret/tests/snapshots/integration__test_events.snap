@@ -1,6 +1,5 @@
 ---
 source: crates/soroban-ret/tests/integration.rs
-assertion_line: 1027
 expression: source
 ---
 #![no_std]
@@ -34,7 +33,7 @@ impl Contract {
             from,
             to: to.address(),
             amount,
-            to_muxed_id: None,
+            to_muxed_id: todo!("unknown value"),
         }
         .publish(&env);
     }

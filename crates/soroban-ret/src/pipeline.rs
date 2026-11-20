@@ -175,6 +175,13 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
 
     // Stage 4: Optimize IR
     log::info!("Stage 4: Optimizing IR");
+    // Taken before optimisation: a discarded read is removed there.
+    let reads_muxed_id: std::collections::HashSet<String> = contract_module
+        .functions
+        .iter()
+        .filter(|f| reads_a_muxed_id(f))
+        .map(|f| f.name.clone())
+        .collect();
     for func in &mut contract_module.functions {
         let pre_opt_body = if func.had_host_calls {
             Some(func.body.clone())
@@ -656,6 +663,13 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         }
         log::trace!("Pipeline pass: stage_4l recover_event_publish");
 
+        // Stage 4l2: a muxed id that was read but whose use was lost.
+        for func in &mut contract_module.functions {
+            if reads_muxed_id.contains(&func.name) {
+                hole_lost_muxed_id(func, &registry);
+            }
+        }
+
         // Stage 4m: Recover enum key construction from tuple patterns.
         for func in &mut contract_module.functions {
             cov_mark::hit!(stage_4m_enum_key_constructed);
@@ -756,11 +770,12 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         }
         log::trace!("Pipeline pass: stage_4n fix_bool_literal_returns");
 
-        // Stage 4n2: Fix BoolLiteral in StorageSet values.
-        for func in &mut contract_module.functions {
-            fix_bool_in_storage_set(&mut func.body);
-        }
-        log::trace!("Pipeline pass: stage_4n2 fix_bool_in_storage_set");
+        // (Stage 4n2 used to turn every stored `true`/`false` into `1`/`0`.
+        // A value handed to `put_contract_data` is a `Val`, where 0 and 1 can
+        // only be `false` and `true`, so that changed the stored type. The
+        // one case where the constant really is an integer, a wrapper that
+        // takes the value before encoding it, is decided where the wrapper
+        // is recognised, in the lifter.)
 
         // Stage 4o: Strip return values from void functions.
         for func in &mut contract_module.functions {
@@ -6810,6 +6825,97 @@ fn recover_event_publish(
     }
 }
 
+/// `<param>.id()` on a `MuxedAddress` parameter.
+fn is_muxed_id_read(e: &SorobanExpr, params: &[crate::ir::high_level_ir::FnParam]) -> bool {
+    matches!(e, SorobanExpr::MethodCall { object, method, args }
+        if method == "id" && args.is_empty()
+            && matches!(object.as_ref(), SorobanExpr::Param(p)
+                if params.iter().any(|fp| fp.name == *p
+                    && matches!(fp.type_def, stellar_xdr::curr::ScSpecTypeDef::MuxedAddress))))
+}
+
+/// Does the function read the id of a `MuxedAddress` parameter?
+fn reads_a_muxed_id(func: &crate::ir::high_level_ir::ContractFn) -> bool {
+    let mut found = false;
+    walk_exprs(&func.body, &mut |e| {
+        found |= is_muxed_id_read(e, &func.params)
+    });
+    found
+}
+
+/// `to: MuxedAddress` is decoded by a two-way tag switch (plain address or
+/// muxed), and on the muxed arm the SDK reads `to.id()` into an
+/// `Option<u64>`. The lifter walks that switch as straight-line code and
+/// keeps the plain-address arm's result, so the event field the id was
+/// headed for is published as a constant `None`: wrong for every muxed
+/// address. Which field the id reaches is not tracked, so this does not
+/// rebuild `to.id()`; it stops claiming `None`. The evidence required: the
+/// function does read the id of a `MuxedAddress` parameter (the caller
+/// checks that on the unoptimised body, see `reads_a_muxed_id`), no
+/// published field uses it, and an `Option<u64>` event field holds a bare
+/// `None`.
+fn hole_lost_muxed_id(func: &mut crate::ir::high_level_ir::ContractFn, registry: &TypeRegistry) {
+    let mut id_published = false;
+    walk_exprs(&func.body, &mut |e| {
+        if let SorobanExpr::PublishEvent { .. } = e {
+            let event = [SorobanStmt::Expr(e.clone())];
+            walk_exprs(&event, &mut |inner| {
+                id_published |= is_muxed_id_read(inner, &func.params)
+            });
+        }
+    });
+    if id_published {
+        return;
+    }
+    fn hole(stmts: &mut [SorobanStmt], registry: &TypeRegistry) {
+        use stellar_xdr::curr::ScSpecTypeDef;
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                SorobanStmt::Expr(SorobanExpr::PublishEvent {
+                    event_name: Some(name),
+                    data,
+                    ..
+                }) => {
+                    let Some(spec) = registry.get_event(name) else {
+                        continue;
+                    };
+                    let SorobanExpr::StructConstruct { fields, .. } = data.as_mut() else {
+                        continue;
+                    };
+                    for (field, value) in fields.iter_mut() {
+                        let is_optional_u64 = spec.params.iter().any(|p| {
+                            p.name.to_utf8_string().ok().as_deref() == Some(field.as_str())
+                                && matches!(&p.type_, ScSpecTypeDef::Option(o)
+                                    if matches!(*o.value_type, ScSpecTypeDef::U64))
+                        });
+                        if is_optional_u64 && matches!(value, SorobanExpr::Void | SorobanExpr::None)
+                        {
+                            cov_mark::hit!(lost_muxed_id_is_a_hole);
+                            *value = SorobanExpr::UnknownVal;
+                        }
+                    }
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    hole(then_body, registry);
+                    hole(else_body, registry);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms.iter_mut() {
+                        hole(&mut arm.body, registry);
+                    }
+                }
+                SorobanStmt::Loop { body } | SorobanStmt::Block(body) => hole(body, registry),
+                _ => {}
+            }
+        }
+    }
+    hole(&mut func.body, registry);
+}
+
 fn try_recover_event_expr(
     expr: &mut SorobanExpr,
     registry: &TypeRegistry,
@@ -8741,48 +8847,6 @@ fn fix_named_local_in_expr(expr: &mut SorobanExpr, pairs: &[(String, String)]) {
     }
 }
 
-/// Fix BoolLiteral(false/true) in StorageSet value positions and StructConstruct
-/// field values. Val-decoded 0x00/0x01 should be numeric 0/1 in storage contexts.
-fn fix_bool_in_storage_set(stmts: &mut [SorobanStmt]) {
-    for stmt in stmts.iter_mut() {
-        match stmt {
-            SorobanStmt::Expr(SorobanExpr::StorageSet { value, .. }) => {
-                fix_bool_to_int(value);
-            }
-            SorobanStmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                fix_bool_in_storage_set(then_body);
-                fix_bool_in_storage_set(else_body);
-            }
-            SorobanStmt::Match { arms, .. } => {
-                for arm in arms.iter_mut() {
-                    fix_bool_in_storage_set(&mut arm.body);
-                }
-            }
-            SorobanStmt::Loop { body } | SorobanStmt::Block(body) => {
-                fix_bool_in_storage_set(body);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn fix_bool_to_int(expr: &mut SorobanExpr) {
-    match expr {
-        SorobanExpr::BoolLiteral(false) => *expr = SorobanExpr::I64Literal(0),
-        SorobanExpr::BoolLiteral(true) => *expr = SorobanExpr::I64Literal(1),
-        SorobanExpr::StructConstruct { fields, .. } => {
-            for (_, v) in fields.iter_mut() {
-                fix_bool_to_int(v);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Resolve unbound `NamedLocal("var_N")` and `Local(N)` in event publish data
 /// to matching function parameters. When the event data references an unresolved
 /// body local, check if any unused function parameter could provide the value.
@@ -8962,6 +9026,18 @@ fn resolve_var_to_param(
             *expr = SorobanExpr::Param(data_candidates[0].name.clone());
         }
         SorobanExpr::StructConstruct { fields, .. } => {
+            // A parameter that already fills one field is not a candidate
+            // for an unresolved sibling: `Transfer { amount, to_muxed_id: ? }`
+            // must not become `to_muxed_id: amount` just because `amount` is
+            // the only non-topic parameter.
+            let mut with_siblings: Vec<SorobanExpr> = topics.to_vec();
+            with_siblings.extend(
+                fields
+                    .iter()
+                    .filter(|(_, v)| !is_unresolved_event_value(v))
+                    .map(|(_, v)| v.clone()),
+            );
+            let topics = with_siblings.as_slice();
             for (field_name, value) in fields.iter_mut() {
                 if allow_candidate_fallback
                     && is_unresolved_event_value(value)

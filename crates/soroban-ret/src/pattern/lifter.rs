@@ -4808,6 +4808,21 @@ impl<'a> LiftContext<'a> {
                                     Some(&self.frame_slots.borrow()),
                                 );
 
+                                // A fixed-key wrapper takes the value BEFORE it is
+                                // encoded (e.g. the two halves of an `i128`), so a
+                                // constant 0/1 there is an integer; `stack_val_to_expr`
+                                // read it as a `Val`, where 0/1 are `false`/`true`.
+                                // The direct form passes a `Val` straight to the host
+                                // call, and there the bool reading is the right one.
+                                let value_expr = match value_expr {
+                                    SorobanExpr::BoolLiteral(b)
+                                        if keyed_set_info.hardcoded_variant_idx.is_some() =>
+                                    {
+                                        cov_mark::hit!(unencoded_wrapper_constant_is_an_integer);
+                                        SorobanExpr::I64Literal(b as i64)
+                                    }
+                                    other => other,
+                                };
                                 let key_fields = if has_data {
                                     vec![value_expr.clone()]
                                 } else {
