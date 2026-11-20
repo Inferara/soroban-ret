@@ -9,7 +9,8 @@
 //! # What this measures, and what it does not
 //!
 //! These counts grade **completeness**, not correctness. A function reported
-//! [`FnStatus::Clean`] contains no unrecovered nodes — it does *not* follow that
+//! [`FnStatus::Clean`] contains no unrecovered nodes, returns its value, reads
+//! every parameter and has a non-error exit — it does *not* follow that
 //! the recovered logic is right. Nothing short of the functional-equivalence
 //! harness (recompile + differential execution against the original under
 //! `soroban-env-host`) speaks to correctness, and that harness can only run on
@@ -44,6 +45,7 @@ use std::collections::BTreeMap;
 
 use stellar_xdr::curr::ScSpecTypeDef;
 
+use crate::codegen::module::needs_todo_value_tail_for;
 use crate::ir::high_level_ir::{ContractFn, ContractModule};
 use crate::ir::soroban_ir::{MatchPattern, SorobanExpr, SorobanStmt};
 use crate::spec::registry::TypeRegistry;
@@ -68,6 +70,10 @@ pub struct ArtifactCounts {
     pub host_call: usize,
     /// `todo!("decompiled function body")` — a whole body that did not lift.
     pub stub: usize,
+    /// `todo!("decompiled return value")` — the statements lifted, the value
+    /// the function returns did not. The function traps where it should return.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub return_value: usize,
     /// `var_N` — a local the namer could not give a meaningful name.
     pub var_n: usize,
     /// Sum of the above.
@@ -87,6 +93,10 @@ pub fn count_artifacts(src: &str) -> ArtifactCounts {
         "todo!(\"decompiled function body\")",
         "todo !(\"decompiled function body\")",
     );
+    let return_value = count_both(
+        "todo!(\"decompiled return value\")",
+        "todo !(\"decompiled return value\")",
+    );
 
     let mut var_n = 0;
     for word in src.split(|c: char| !c.is_alphanumeric() && c != '_') {
@@ -102,8 +112,9 @@ pub fn count_artifacts(src: &str) -> ArtifactCounts {
         unknown_value,
         host_call,
         stub,
+        return_value,
         var_n,
-        total: unknown_value + host_call + stub + var_n,
+        total: unknown_value + host_call + stub + return_value + var_n,
     }
 }
 
@@ -124,7 +135,8 @@ pub fn count_artifacts(src: &str) -> ArtifactCounts {
 )]
 #[non_exhaustive]
 pub enum FnStatus {
-    /// Body lifted with zero unrecovered nodes.
+    /// Body lifted with zero unrecovered nodes and no sign of being
+    /// incomplete (see [`score_fn`]).
     Clean,
     /// Body present, but some nodes did not lift.
     Partial,
@@ -188,6 +200,12 @@ pub struct FnRecovery {
     pub unknown_nodes: usize,
     /// Distinct `module::function` host calls the lifter left unrecovered.
     pub missing_host_calls: Vec<String>,
+    /// Signs that the body is incomplete although every node in it lifted
+    /// (see [`score_fn`]), in plain words: a return value that was not
+    /// recovered, a parameter that is never read, and so on. Each one counts
+    /// as one unknown node. Empty for a function with nothing visibly lost.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub incomplete: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +313,7 @@ pub fn report(module: &ContractModule, registry: &TypeRegistry, source: &str) ->
                 total_nodes: 0,
                 unknown_nodes: 0,
                 missing_host_calls: Vec::new(),
+                incomplete: Vec::new(),
             },
         })
         .collect();
@@ -328,6 +347,17 @@ fn returns_a_value(f: &ContractFn) -> bool {
 ///   (the body renders as a `todo!()` stub and traps — see [`returns_a_value`])
 /// - empty body, otherwise         → [`FnStatus::Trivial`], score `1.0`
 /// - non-empty body                → `clean_nodes / total_nodes`
+///
+/// A body in which every node lifted can still be visibly incomplete. Three
+/// signs are checked; each is listed in [`FnRecovery::incomplete`] and counts
+/// as one unknown node, so the function is [`FnStatus::Partial`] at best:
+///
+/// - codegen will append `todo!("decompiled return value")` (the statements
+///   lifted, the returned value did not). When the body also does nothing a
+///   caller can observe and has no other way out, the function does nothing
+///   and then traps: [`FnStatus::LogicLost`];
+/// - a parameter is never read (names starting with `_` are exempt);
+/// - the function returns `Result<T, E>` and every exit is an error.
 pub fn score_fn(name: &str, f: &ContractFn) -> FnRecovery {
     if f.body.is_empty() {
         let (status, score) = if f.had_host_calls || returns_a_value(f) {
@@ -342,18 +372,43 @@ pub fn score_fn(name: &str, f: &ContractFn) -> FnRecovery {
             total_nodes: 0,
             unknown_nodes: 0,
             missing_host_calls: Vec::new(),
+            incomplete: Vec::new(),
         };
     }
 
     let mut s = NodeStats::default();
     walk_body(&f.body, &mut s);
+
+    // Losses the node walk cannot see, because nothing in the IR marks them.
+    let mut incomplete = Vec::new();
+    let lost_return = needs_todo_value_tail_for(&f.return_type, &f.body);
+    if lost_return {
+        incomplete.push("return value not recovered".to_string());
+    } else if never_produces_its_value(f) {
+        incomplete.push("no path returns a value, only errors".to_string());
+    }
+    if f.wasm_signature.is_none() {
+        for p in &f.params {
+            if !p.name.starts_with('_') && !s.names.contains(&p.name) {
+                incomplete.push(format!("parameter `{}` is never read", p.name));
+            }
+        }
+    }
+    s.total += incomplete.len();
+    s.unknown += incomplete.len();
+
     let score = if s.total == 0 {
         // Control flow / comments only — no expression nodes, nothing lost.
         1.0
     } else {
         (s.total - s.unknown) as f64 / s.total as f64
     };
-    let status = if s.unknown == 0 {
+    let status = if lost_return && !s.can_return && !s.acts {
+        // Nothing is written, authorized, published or called, and the only
+        // way out is the `todo!()` codegen appends: the function does nothing
+        // and then traps. Same reasoning as the empty-body rule above.
+        FnStatus::LogicLost
+    } else if s.unknown == 0 {
         FnStatus::Clean
     } else {
         FnStatus::Partial
@@ -367,6 +422,86 @@ pub fn score_fn(name: &str, f: &ContractFn) -> FnRecovery {
         total_nodes: s.total,
         unknown_nodes: s.unknown,
         missing_host_calls: s.host_calls,
+        incomplete,
+    }
+}
+
+/// Whether a function declared `Result<T, E>` with a real `T` has no exit that
+/// produces one: every `return` and every tail is an error or diverges. The
+/// success path was lost; what is left reads as complete and is not.
+fn never_produces_its_value(f: &ContractFn) -> bool {
+    let Some(ScSpecTypeDef::Result(r)) = &f.return_type else {
+        return false;
+    };
+    let unit = match &*r.ok_type {
+        ScSpecTypeDef::Void => true,
+        ScSpecTypeDef::Tuple(t) => t.value_types.is_empty(),
+        _ => false,
+    };
+    if unit {
+        return false;
+    }
+    let mut exits = Vec::new();
+    returned_exprs(&f.body, &mut exits);
+    tail_exprs(&f.body, &mut exits);
+    !exits.is_empty() && exits.iter().all(|e| is_error_or_diverges(e))
+}
+
+fn is_error_or_diverges(e: &SorobanExpr) -> bool {
+    matches!(
+        e,
+        SorobanExpr::ContractError { .. }
+            | SorobanExpr::ErrorFromCode(_)
+            | SorobanExpr::Panic
+            | SorobanExpr::PanicWithError(_)
+    )
+}
+
+/// The operand of every `return` in `body`, at any depth.
+fn returned_exprs<'a>(body: &'a [SorobanStmt], out: &mut Vec<&'a SorobanExpr>) {
+    for st in body {
+        match st {
+            SorobanStmt::Return(Some(e)) => out.push(e),
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                returned_exprs(then_body, out);
+                returned_exprs(else_body, out);
+            }
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms {
+                    returned_exprs(&arm.body, out);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::For { body, .. }
+            | SorobanStmt::Block(body) => returned_exprs(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// The expressions in tail position of `body` (the value it evaluates to).
+fn tail_exprs<'a>(body: &'a [SorobanStmt], out: &mut Vec<&'a SorobanExpr>) {
+    match body.last() {
+        Some(SorobanStmt::Expr(e)) => out.push(e),
+        Some(SorobanStmt::If {
+            then_body,
+            else_body,
+            ..
+        }) => {
+            tail_exprs(then_body, out);
+            tail_exprs(else_body, out);
+        }
+        Some(SorobanStmt::Match { arms, .. }) => {
+            for arm in arms {
+                tail_exprs(&arm.body, out);
+            }
+        }
+        Some(SorobanStmt::Block(b)) => tail_exprs(b, out),
+        _ => {}
     }
 }
 
@@ -384,6 +519,14 @@ struct NodeStats {
     unknown: usize,
     /// `module::function` of each unrecovered `RawHostCall`.
     host_calls: Vec<String>,
+    /// Every parameter and named local the body mentions.
+    names: std::collections::BTreeSet<String>,
+    /// The body has a way out other than falling off its end: a `return` or
+    /// a `?`.
+    can_return: bool,
+    /// The body does something a caller can observe besides returning: a
+    /// write, an authorization, an event, a call, a deliberate failure.
+    acts: bool,
 }
 
 fn walk_body(body: &[SorobanStmt], s: &mut NodeStats) {
@@ -397,8 +540,11 @@ fn walk_stmt(st: &SorobanStmt, s: &mut NodeStats) {
         SorobanStmt::Expr(e) => walk_expr(e, s),
         SorobanStmt::Let { value, .. } => walk_expr(value, s),
         SorobanStmt::Assign { value, .. } => walk_expr(value, s),
-        SorobanStmt::Return(Some(e)) => walk_expr(e, s),
-        SorobanStmt::Return(None) => {}
+        SorobanStmt::Return(Some(e)) => {
+            s.can_return = true;
+            walk_expr(e, s)
+        }
+        SorobanStmt::Return(None) => s.can_return = true,
         SorobanStmt::If {
             condition,
             then_body,
@@ -436,6 +582,25 @@ fn walk_stmt(st: &SorobanStmt, s: &mut NodeStats) {
 /// fails to compile and forces the metric to account for it.
 fn walk_expr(e: &SorobanExpr, s: &mut NodeStats) {
     s.total += 1;
+    if matches!(
+        e,
+        SorobanExpr::StorageSet { .. }
+            | SorobanExpr::StorageRemove { .. }
+            | SorobanExpr::PublishEvent { .. }
+            | SorobanExpr::InvokeContract { .. }
+            | SorobanExpr::TryInvokeContract { .. }
+            | SorobanExpr::RequireAuth(_)
+            | SorobanExpr::RequireAuthForArgs { .. }
+            | SorobanExpr::AuthorizeAsCurrContract(_)
+            | SorobanExpr::RawHostCall { .. }
+            | SorobanExpr::ContractError { .. }
+            | SorobanExpr::ErrorFromCode(_)
+            | SorobanExpr::Panic
+            | SorobanExpr::PanicWithError(_)
+            | SorobanExpr::Log(_)
+    ) {
+        s.acts = true;
+    }
     match e {
         // Unrecovered markers (each renders as a `todo!()`).
         SorobanExpr::UnknownVal | SorobanExpr::CyclicSlot { .. } => s.unknown += 1,
@@ -464,9 +629,7 @@ fn walk_expr(e: &SorobanExpr, s: &mut NodeStats) {
         | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::Void
         | SorobanExpr::None
-        | SorobanExpr::Param(_)
         | SorobanExpr::Local(_)
-        | SorobanExpr::NamedLocal(_)
         | SorobanExpr::Env
         | SorobanExpr::ContractError { .. }
         | SorobanExpr::Panic
@@ -477,6 +640,14 @@ fn walk_expr(e: &SorobanExpr, s: &mut NodeStats) {
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::ValTagName(_) => {}
+
+        SorobanExpr::Param(name) | SorobanExpr::NamedLocal(name) => {
+            s.names.insert(name.clone());
+        }
+        SorobanExpr::Try(b) => {
+            s.can_return = true;
+            walk_expr(b, s)
+        }
 
         // Single child.
         SorobanExpr::Some(b)
@@ -495,8 +666,7 @@ fn walk_expr(e: &SorobanExpr, s: &mut NodeStats) {
         | SorobanExpr::SretResult(b)
         | SorobanExpr::ValTag(b)
         | SorobanExpr::ValConvert { value: b, .. }
-        | SorobanExpr::CastAs { value: b, .. }
-        | SorobanExpr::Try(b) => walk_expr(b, s),
+        | SorobanExpr::CastAs { value: b, .. } => walk_expr(b, s),
 
         // Two children.
         SorobanExpr::Add(a, b)
@@ -713,6 +883,131 @@ mod tests {
         assert_eq!(r.status, FnStatus::LogicLost);
     }
 
+    fn func(
+        params: &[&str],
+        return_type: Option<ScSpecTypeDef>,
+        body: Vec<SorobanStmt>,
+    ) -> ContractFn {
+        ContractFn {
+            params: params
+                .iter()
+                .map(|n| crate::ir::high_level_ir::FnParam {
+                    name: n.to_string(),
+                    type_def: ScSpecTypeDef::Address,
+                })
+                .collect(),
+            body,
+            ..empty_fn(return_type, true)
+        }
+    }
+
+    fn auth(param: &str) -> SorobanStmt {
+        SorobanStmt::Expr(SorobanExpr::RequireAuth(Box::new(SorobanExpr::Param(
+            param.into(),
+        ))))
+    }
+
+    /// `if c { .. }` with no else: a `()` tail, so a value-returning function
+    /// ending in it gets the `todo!("decompiled return value")` tail.
+    fn unit_tail(then_body: Vec<SorobanStmt>) -> SorobanStmt {
+        SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body,
+            else_body: Vec::new(),
+        }
+    }
+
+    fn result_u32() -> Option<ScSpecTypeDef> {
+        Some(ScSpecTypeDef::Result(Box::new(
+            stellar_xdr::curr::ScSpecTypeResult {
+                ok_type: Box::new(ScSpecTypeDef::U32),
+                error_type: Box::new(ScSpecTypeDef::Error),
+            },
+        )))
+    }
+
+    fn error() -> SorobanExpr {
+        SorobanExpr::ContractError {
+            error_code: 1,
+            error_type: None,
+            variant_name: None,
+        }
+    }
+
+    #[test]
+    fn the_lost_return_value_marker_is_counted() {
+        let c = count_artifacts(
+            r#"fn f() -> u32 { todo!("decompiled return value") }
+               fn g() -> u32 { todo !("decompiled return value") }"#,
+        );
+        assert_eq!(c.return_value, 2);
+        assert_eq!(c.total, 2);
+    }
+
+    /// The statements lifted, the returned value did not: codegen appends a
+    /// `todo!()`, so the function is not recovered however clean its nodes.
+    #[test]
+    fn a_lost_return_value_is_partial() {
+        let f = func(
+            &["a"],
+            Some(ScSpecTypeDef::U32),
+            vec![auth("a"), unit_tail(vec![auth("a")])],
+        );
+        let r = score_fn("f", &f);
+        assert_eq!(r.status, FnStatus::Partial);
+        assert_eq!(r.incomplete, vec!["return value not recovered"]);
+        assert_eq!(r.unknown_nodes, 1);
+        assert!(r.score < 1.0);
+    }
+
+    /// Nothing observable happens and the only way out is the `todo!()`:
+    /// the function does nothing and then traps.
+    #[test]
+    fn a_lost_return_value_after_nothing_is_logic_lost() {
+        let idle = SorobanStmt::Expr(SorobanExpr::LedgerSequence);
+        let f = func(&[], Some(ScSpecTypeDef::U32), vec![unit_tail(vec![idle])]);
+        assert_eq!(score_fn("f", &f).status, FnStatus::LogicLost);
+
+        // With another way out it is incomplete, not lost.
+        let ret = SorobanStmt::Return(Some(SorobanExpr::U32Literal(1)));
+        let f = func(&[], Some(ScSpecTypeDef::U32), vec![unit_tail(vec![ret])]);
+        assert_eq!(score_fn("f", &f).status, FnStatus::Partial);
+    }
+
+    #[test]
+    fn a_parameter_never_read_is_partial() {
+        let f = func(&["a", "_ignored", "amount"], None, vec![auth("a")]);
+        let r = score_fn("f", &f);
+        assert_eq!(r.status, FnStatus::Partial);
+        assert_eq!(r.incomplete, vec!["parameter `amount` is never read"]);
+
+        let f = func(&["a", "_ignored"], None, vec![auth("a")]);
+        let r = score_fn("f", &f);
+        assert_eq!(r.status, FnStatus::Clean);
+        assert!(r.incomplete.is_empty());
+        assert_eq!(r.score, 1.0);
+    }
+
+    #[test]
+    fn a_result_with_only_error_exits_is_partial() {
+        let fail = SorobanStmt::Return(Some(error()));
+        let f = func(&[], result_u32(), vec![fail.clone()]);
+        let r = score_fn("f", &f);
+        assert_eq!(r.status, FnStatus::Partial);
+        assert_eq!(r.incomplete, vec!["no path returns a value, only errors"]);
+
+        // One exit that produces the value is enough.
+        let f = func(
+            &[],
+            result_u32(),
+            vec![
+                unit_tail(vec![fail]),
+                SorobanStmt::Expr(SorobanExpr::U32Literal(7)),
+            ],
+        );
+        assert_eq!(score_fn("f", &f).status, FnStatus::Clean);
+    }
+
     #[test]
     fn status_classification() {
         assert!(FnStatus::Clean.is_fully_recovered());
@@ -734,6 +1029,7 @@ mod tests {
                     total_nodes: 3,
                     unknown_nodes: 0,
                     missing_host_calls: vec![],
+                    incomplete: vec![],
                 },
                 FnRecovery {
                     name: "b".into(),
@@ -742,6 +1038,7 @@ mod tests {
                     total_nodes: 0,
                     unknown_nodes: 0,
                     missing_host_calls: vec![],
+                    incomplete: vec![],
                 },
             ],
             artifacts: ArtifactCounts {

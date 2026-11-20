@@ -2301,6 +2301,115 @@ fn spec_only_yields_no_recovery_report() {
     );
 }
 
+/// Issue #81: a function whose last line is `todo!("decompiled return value")`
+/// traps where it should return, and a function that never reads one of its
+/// parameters has lost the logic that used it. Neither is "recovered", and
+/// the report says which sign it saw.
+#[test]
+fn incomplete_functions_are_not_graded_recovered() {
+    let grade = |wasm: &[u8], name: &str| {
+        let result =
+            soroban_ret::decompile_with_options(wasm, &soroban_ret::DecompileOptions::default())
+                .expect("decompile");
+        let report = result.recovery.expect("recovery report");
+        let f = report
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("{name} in report"))
+            .clone();
+        (f, report.artifacts)
+    };
+
+    let emitter = include_bytes!("../../../benchmark-data/mainnet/blend-emitter-CCOQM6S7.wasm");
+    let (f, artifacts) = grade(emitter, "get_queued_swap");
+    assert!(!f.status.is_fully_recovered(), "{f:?}");
+    assert!(
+        f.incomplete.iter().any(|s| s.contains("return value")),
+        "{f:?}"
+    );
+    assert!(artifacts.return_value > 0, "the marker is counted");
+
+    let factory = include_bytes!("../../../benchmark-data/mainnet/soroswap-CA4HEQTL.wasm");
+    let (f, _) = grade(factory, "create_pair");
+    assert!(!f.status.is_fully_recovered(), "{f:?}");
+    assert!(!f.incomplete.is_empty(), "{f:?}");
+
+    let xycloans = include_bytes!("../../../benchmark-data/mainnet/xycloans-CBV4OSTR.wasm");
+    let (f, _) = grade(xycloans, "withdraw");
+    assert!(!f.status.is_fully_recovered(), "{f:?}");
+    assert_eq!(f.incomplete, vec!["parameter `amount` is never read"]);
+}
+
+/// No function graded fully recovered has a `todo!` in its emitted body, in
+/// any corpus contract or fixture. The grader walks the IR and codegen can
+/// add holes of its own; this ties the two together.
+#[test]
+fn no_fully_recovered_function_contains_a_hole() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut paths: Vec<std::path::PathBuf> = ["benchmark-data/mainnet", "tests/fixtures"]
+        .iter()
+        .flat_map(|dir| std::fs::read_dir(root.join(dir)).expect("read dir"))
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "wasm"))
+        .collect();
+    paths.sort();
+
+    // (functions checked, offenders) for one contract.
+    let check = |path: &std::path::PathBuf| -> (usize, Vec<String>) {
+        let wasm = std::fs::read(path).expect("read wasm");
+        let Ok(result) =
+            soroban_ret::decompile_with_options(&wasm, &soroban_ret::DecompileOptions::default())
+        else {
+            return (0, Vec::new());
+        };
+        let Some(report) = result.recovery else {
+            return (0, Vec::new());
+        };
+        let mut checked = 0;
+        let mut offenders = Vec::new();
+        for f in report
+            .functions
+            .iter()
+            .filter(|f| f.status.is_fully_recovered())
+        {
+            let Some(start) = result.source.find(&format!("pub fn {}(", f.name)) else {
+                continue;
+            };
+            let rest = &result.source[start + 1..];
+            let end = rest.find("\n    pub fn ").unwrap_or(rest.len());
+            checked += 1;
+            if rest[..end].contains("todo!") {
+                offenders.push(format!(
+                    "{}::{}",
+                    path.file_stem().unwrap().to_string_lossy(),
+                    f.name
+                ));
+            }
+        }
+        (checked, offenders)
+    };
+
+    // The large contracts dominate; decompile them side by side.
+    let results: Vec<(usize, Vec<String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = paths
+            .iter()
+            .map(|path| scope.spawn(|| check(path)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("decompile thread"))
+            .collect()
+    });
+    let checked: usize = results.iter().map(|r| r.0).sum();
+    let offenders: Vec<&String> = results.iter().flat_map(|r| &r.1).collect();
+    assert!(checked > 200, "only {checked} functions checked");
+    assert!(
+        offenders.is_empty(),
+        "graded fully recovered but the body has a hole: {offenders:?}"
+    );
+}
+
 /// `errors::hello` dispatches on a five-variant enum with a `br_table`; the
 /// `Flag::B` target is *outside* the switch (it falls through to the shared
 /// `return Err(AnError)`), while the default target is a case body. Dropping

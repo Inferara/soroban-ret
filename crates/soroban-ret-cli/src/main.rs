@@ -93,6 +93,7 @@ fn render_report(wasm: &[u8], result: &soroban_ret::DecompileResult) -> Option<S
                 "unknown_nodes": f.unknown_nodes,
                 "total_nodes": f.total_nodes,
                 "missing_host_calls": f.missing_host_calls,
+                "incomplete": f.incomplete,
             })
         })
         .collect();
@@ -114,6 +115,7 @@ fn render_report(wasm: &[u8], result: &soroban_ret::DecompileResult) -> Option<S
             "unknown_value": r.artifacts.unknown_value,
             "host_call": r.artifacts.host_call,
             "stub": r.artifacts.stub,
+            "return_value": r.artifacts.return_value,
             "var_n": r.artifacts.var_n,
         },
         "functions": functions,
