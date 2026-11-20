@@ -2355,17 +2355,38 @@ fn no_fully_recovered_function_contains_a_hole() {
         .collect();
     paths.sort();
 
-    // (functions checked, offenders) for one contract.
+    // The name a spec function is emitted under (codegen's `safe_ident`).
+    let emitted_name = |name: &str| -> String {
+        let mut out: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            out.insert(0, '_');
+        }
+        out
+    };
+    // Both spellings: `prettyplease` writes `todo !(` in some positions.
+    let has_hole = |body: &str| body.contains("todo!") || body.contains("todo !");
+
+    // (functions checked, offenders) for one contract. Nothing is skipped:
+    // a contract that does not decompile, has no report, or a function that
+    // cannot be found in the source fails the test by name.
     let check = |path: &std::path::PathBuf| -> (usize, Vec<String>) {
+        let contract = path.file_stem().unwrap().to_string_lossy().to_string();
         let wasm = std::fs::read(path).expect("read wasm");
-        let Ok(result) =
+        let result =
             soroban_ret::decompile_with_options(&wasm, &soroban_ret::DecompileOptions::default())
-        else {
-            return (0, Vec::new());
-        };
-        let Some(report) = result.recovery else {
-            return (0, Vec::new());
-        };
+                .unwrap_or_else(|e| panic!("{contract} does not decompile: {e:?}"));
+        let report = result
+            .recovery
+            .unwrap_or_else(|| panic!("{contract} has no recovery report"));
         let mut checked = 0;
         let mut offenders = Vec::new();
         for f in report
@@ -2373,18 +2394,21 @@ fn no_fully_recovered_function_contains_a_hole() {
             .iter()
             .filter(|f| f.status.is_fully_recovered())
         {
-            let Some(start) = result.source.find(&format!("pub fn {}(", f.name)) else {
-                continue;
-            };
+            let name = emitted_name(&f.name);
+            // Plain, raw (`r#type`) or suffixed (`self_`) for keywords.
+            let start = [
+                format!("fn {name}("),
+                format!("fn r#{name}("),
+                format!("fn {name}_("),
+            ]
+            .iter()
+            .find_map(|needle| result.source.find(needle))
+            .unwrap_or_else(|| panic!("{contract}::{} is not in the source", f.name));
             let rest = &result.source[start + 1..];
             let end = rest.find("\n    pub fn ").unwrap_or(rest.len());
             checked += 1;
-            if rest[..end].contains("todo!") {
-                offenders.push(format!(
-                    "{}::{}",
-                    path.file_stem().unwrap().to_string_lossy(),
-                    f.name
-                ));
+            if has_hole(&rest[..end]) {
+                offenders.push(format!("{contract}::{}", f.name));
             }
         }
         (checked, offenders)
