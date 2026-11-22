@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — storage reads get the type the contract writes (campaign stage 3b)
+
+`env.storage().<kind>().get(&key)` is generic over the value type. Where the
+lifter saw no typed use of the result, rustc could not infer it (E0282 /
+E0283 / E0284); where the result flowed into a context of another type,
+rustc inferred that type, and the recompiled contract decoded the stored
+value as something it is not.
+
+- **Reads are annotated `get::<_, T>(&key)`** when every typed write to the
+  key in the contract (a parameter of a spec type, a struct or enum literal)
+  stores the same `T`, and no decode of a read or typed consumer of the key
+  disagrees. Keys compare by shape: an enum variant regardless of payload,
+  or a bare symbol. A write whose key is unknown cancels the entries of its
+  storage kind unless a decode confirms them. A decode of a read alone never
+  types a key: the struct it names is what the original reads, but inside
+  inlined helpers the lifter can attach the wrong key to the read (blend
+  pools decode an auction under a key rendered `ResConfig`, blend-backstop a
+  user balance under `PoolBalance`). New module `ir::stored_types`.
+- **Wrong values this exposed are holes.** fxdao-oracle `resolution()` and
+  `decimals()` returned the whole stored `CoreData` as their `u32`, and
+  `base() -> Asset` / `assets() -> Vec<Asset>` the whole `AssetsData` (the
+  bytecode returns one field, which the lifter lost): the read stays, the
+  returned value is `todo!()`. All four were graded fully recovered. A read of a union followed by
+  `.get(i)` is the SDK decoding the union's vec encoding, not a value
+  (soroban-domains, 34 sites): the read stays, the value is `todo!()`. blend
+  pools `accept_admin` started the admin from the storage key
+  `symbol_short!("PropAdmin")`; that default is now a hole, as it already
+  was for enum keys.
+- **Moved values.** Struct-literal fields count as moves for the existing
+  clone repair (comet's allowance key builds `AllowanceDataKey { from,
+  spender }` twice).
+- An annotation imports every type it names (`Vec<Address>`, `Symbol`, ..),
+  not only its head.
+
+Corpus hard errors 379 → 372: fxdao-oracle 12→6, phoenix 8→5, comet 19→17,
+band 12→11, blend-fixed-pool and yieldblox 16→15 each. soroban-domains rose
+56→63: its untyped reads had stopped type checking in those functions, and
+typing them unmasked 10 `vp = vp.adm` (a second value reusing a binding, the
+next step) and assignments that were already wrong (`oracle = 10` to an
+`Address`). Equivalence: 0 divergences, unchanged. Still 2 of 24 contracts
+compile. Restoration 90.0 → 89.6 (fxdao-oracle 98.4 → 91.0: the four
+getters above; soroban-domains 88.5 → 87.2: the union decode fragments);
+baseline refreshed.
+
 ### Fixed — wrong values that only showed up as compile errors (campaign stage 3a)
 
 Each of these failed to type-check, so the corpus soundness gate counted it

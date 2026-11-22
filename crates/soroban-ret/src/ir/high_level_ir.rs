@@ -30,6 +30,9 @@ pub struct ContractModule {
     pub crypto_usage: CryptoUsage,
     /// Whether the input was detected as a Soroban contract
     pub is_soroban: bool,
+    /// Stored-value types the lifter saw the contract decode (see
+    /// `ir::stored_types`).
+    pub stored_types: Vec<super::stored_types::StoredTypeEvidence>,
 }
 
 /// A type definition (struct, enum, error enum, event)
@@ -105,6 +108,7 @@ impl ContractModule {
             standard_interfaces: Vec::new(),
             crypto_usage: CryptoUsage::default(),
             is_soroban: true,
+            stored_types: Vec::new(),
         }
     }
 }

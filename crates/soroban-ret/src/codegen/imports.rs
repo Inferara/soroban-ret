@@ -499,17 +499,26 @@ fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
             // even when the function has no other Vec/Map (greptile P1 on
             // PR #47). Match a leading `Vec`/`Map`/`Bytes` type-name token so a
             // generic argument (`Vec<soroban_sdk::Val>`) still counts.
-            let head = target_type
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .next()
-                .unwrap_or("");
-            match head {
-                "Val" => needs.val = true,
-                "Address" => needs.address = true,
-                "Vec" => needs.vec_type = true,
-                "Map" => needs.map_type = true,
-                "Bytes" => needs.bytes = true,
-                _ => {}
+            // Every type-name token counts, not only the head: a stored-type
+            // annotation (`Vec<Address>`, `Map<Symbol, i128>`) names its
+            // element types too (campaign stage 3b). A path-qualified
+            // `soroban_sdk::Val` needs no import, but importing it is harmless.
+            for token in target_type.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                match token {
+                    "Val" => needs.val = true,
+                    "Address" => needs.address = true,
+                    "Vec" => needs.vec_type = true,
+                    "Map" => needs.map_type = true,
+                    "Bytes" => needs.bytes = true,
+                    "BytesN" => needs.bytes_n = true,
+                    "Symbol" => needs.symbol = true,
+                    "String" => needs.string_type = true,
+                    "Timepoint" => needs.timepoint = true,
+                    "Duration" => needs.duration = true,
+                    "U256" => needs.u256 = true,
+                    "I256" => needs.i256 = true,
+                    _ => {}
+                }
             }
             scan_expr(value, needs);
         }

@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 90.0,
+  "overall_restoration": 89.6,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -22,7 +22,7 @@
       "fn_clean": 19,
       "fn_partial": 51,
       "fn_logic_lost": 6,
-      "artifacts_total": 380,
+      "artifacts_total": 382,
       "wasm_size": 54833,
       "error": null
     },
@@ -65,7 +65,7 @@
     {
       "file": "blend-emitter-CCOQM6S7.wasm",
       "entity": "Blend Emitter",
-      "restoration_pct": 92.4,
+      "restoration_pct": 92.5,
       "spec_functions": 9,
       "fn_clean": 2,
       "fn_partial": 6,
@@ -77,12 +77,12 @@
     {
       "file": "blend-fixed-pool-CAJJZSGM.wasm",
       "entity": "Blend Fixed Pool",
-      "restoration_pct": 85.7,
+      "restoration_pct": 85.6,
       "spec_functions": 27,
       "fn_clean": 4,
       "fn_partial": 20,
       "fn_logic_lost": 3,
-      "artifacts_total": 192,
+      "artifacts_total": 193,
       "wasm_size": 57328,
       "error": null
     },
@@ -101,12 +101,12 @@
     {
       "file": "blend-yieldblox-pool-CCCCIQSD.wasm",
       "entity": "Blend Yieldblox Pool",
-      "restoration_pct": 85.7,
+      "restoration_pct": 85.6,
       "spec_functions": 27,
       "fn_clean": 4,
       "fn_partial": 20,
       "fn_logic_lost": 3,
-      "artifacts_total": 192,
+      "artifacts_total": 193,
       "wasm_size": 57328,
       "error": null
     },
@@ -149,12 +149,12 @@
     {
       "file": "fxdao-oracle-CB5OTV4G.wasm",
       "entity": "FxDAO Oracle",
-      "restoration_pct": 98.4,
+      "restoration_pct": 91.0,
       "spec_functions": 14,
-      "fn_clean": 10,
-      "fn_partial": 4,
+      "fn_clean": 6,
+      "fn_partial": 8,
       "fn_logic_lost": 0,
-      "artifacts_total": 6,
+      "artifacts_total": 13,
       "wasm_size": 17181,
       "error": null
     },
@@ -185,7 +185,7 @@
     {
       "file": "phoenix-amm-CCLZRD4E.wasm",
       "entity": "Phoenix AMM",
-      "restoration_pct": 89.0,
+      "restoration_pct": 89.2,
       "spec_functions": 12,
       "fn_clean": 3,
       "fn_partial": 9,
@@ -221,12 +221,12 @@
     {
       "file": "soroban-domains-CATRNPHY.wasm",
       "entity": "Soroban Domains",
-      "restoration_pct": 88.5,
+      "restoration_pct": 87.2,
       "spec_functions": 15,
       "fn_clean": 1,
       "fn_partial": 14,
       "fn_logic_lost": 0,
-      "artifacts_total": 194,
+      "artifacts_total": 223,
       "wasm_size": 20215,
       "error": null
     },
