@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — wrong values that only showed up as compile errors (campaign stage 3a)
+
+Each of these failed to type-check, so the corpus soundness gate counted it
+as a compile error. Once the errors around them were fixed they would have
+compiled and been silently wrong.
+
+- **A storage key called as a contract.** The SDK's `storage.get` helper,
+  monomorphised as `(sret, key)` writing `{present, value}`, is now lowered
+  at the call. Inlining it lost the stored value where the "absent" and
+  "present" paths join and kept the key in the value slot, so blend-emitter
+  rendered `invoke_contract(&symbol_short!("BToken"), ..)`, and the blend
+  pools did the same with `BLNDTkn`. They now call the address stored under
+  that key, behind the `has` check that panics like the original. Three
+  blend-backstop guards that were `if todo!() { panic!() }` are now the real
+  `has` check.
+- **The contract's own address compared with an integer.**
+  `if env.current_contract_address() != 0 { panic!() }` (15 sites in each
+  blend pool) is a Val tag check whose operand was lost. The condition is
+  now a hole and the panic is kept, as was already done for an `Address`
+  parameter.
+- **A literal returned where no literal can type.** `return 0` in
+  `-> Address` and symbol literals returned from a `-> Map<..>` function
+  (inlined helper returns, aqua-amm and aqua-rewards) are now holes. This
+  extends the existing rule for scalar `Result` ok-types to `Address`,
+  collections, user types, `Symbol`, `String` and `Bytes`.
+- **A Val-encoded constant in a TTL argument.** fxdao-vault builds
+  `extend_to` in Val space; it rendered as `sequence() + 2078076976496644`
+  and is now `sequence() + 483840`.
+- Corpus hard errors 433 → 379, no contract's count rose (blend-emitter
+  28 → 16, blend-fixed-pool and yieldblox 30 → 16 each, aqua-amm 73 → 62,
+  aqua-rewards 31 → 28). Mean restoration 90.1 % → 90.0 %: the fabricated
+  values are now counted holes.
+
 ### Changed — the recovery report stops calling incomplete functions recovered (#81)
 
 No decompiler output changes; only how it is graded and counted.

@@ -2183,6 +2183,58 @@ impl<'a> LiftContext<'a> {
         Some(true)
     }
 
+    /// Lower a call to the SDK's `Storage::get` helper (see
+    /// [`detect_storage_try_get_helper`]): the result struct's flag slot gets
+    /// `has(&key)` and its value slot `get(&key).unwrap()`. On the path where the
+    /// key is present (flag 1) this is exactly the value the helper stores; on
+    /// the absent path the helper stores the KEY there, which no SDK caller
+    /// reads (it checks the flag first). Inlining instead lost the stored value
+    /// at the helper's has-join and kept the key, so a caller using the value
+    /// used the key (blend-emitter: `invoke_contract(&symbol_short!("BToken"),
+    /// ..)`).
+    fn try_lower_storage_try_get(&mut self, target_idx: u32, args: &[StackVal]) -> Option<bool> {
+        let layout = detect_storage_try_get_helper(self.wasm_module, target_idx)?;
+        let [StackVal::FrameSlot(id, base), key] = args else {
+            return None;
+        };
+        if !base.is_static() {
+            return None;
+        }
+        let (id, base) = (*id, base.base);
+        let key = {
+            let slots = self.frame_slots.borrow();
+            stack_val_to_expr(key, self.params, self.registry, Some(&slots))
+        };
+        if matches!(key, SorobanExpr::UnknownVal) {
+            return None;
+        }
+        let has = SorobanExpr::StorageHas {
+            storage_type: layout.storage_type,
+            key: Box::new(key.clone()),
+        };
+        let get = SorobanExpr::StorageGet {
+            storage_type: layout.storage_type,
+            key: Box::new(key),
+            unwrap: true,
+            on_missing: None,
+        };
+        self.store_frame_slot(
+            id,
+            base + layout.value_off,
+            StackVal::HostCallResult(Box::new(get)),
+            8,
+        );
+        self.store_frame_slot(
+            id,
+            base + layout.flag_off,
+            StackVal::HostCallResult(Box::new(has)),
+            8,
+        );
+        self.found_host_calls = true;
+        cov_mark::hit!(storage_try_get_helper_lowered);
+        Some(true)
+    }
+
     /// Recover a call to a fallible storage GETTER helper (issue #67) by
     /// executing it: `get::<_, T>(&KEY).unwrap_or_else(|| panic_with_error!(env, E))`
     /// in any of the shapes LLVM gives it — the Option decode fused into the
@@ -5264,6 +5316,15 @@ impl<'a> LiftContext<'a> {
                             // past the inline depth limit: recover the symbol from the
                             // static `(ptr, len)` string args and write it to the result
                             // pointer, instead of degrading to `todo!`.
+                            handled
+                        } else if let Some(handled) =
+                            self.try_lower_storage_try_get(*target_idx, &args)
+                        {
+                            // SDK `storage.get::<_, T>(&key)` monomorphised as
+                            // `(sret, key)`: write `{present, value}` as the
+                            // has/get pair instead of inlining, which lost the
+                            // value at the has-join and left the KEY in the
+                            // value slot (blend-emitter called the key).
                             handled
                         } else if let Some(handled) =
                             self.try_lower_option_decode(*target_idx, &args)
@@ -11883,6 +11944,112 @@ fn func_reaches_host(
     func.body
         .iter()
         .any(|ins| matches!(ins, WasmInstr::Call(t) if func_reaches_host(module, *t, host_module, name, depth + 1)))
+}
+
+/// Layout of the SDK `Storage::get` helper's result struct.
+struct StorageTryGetLayout {
+    storage_type: StorageType,
+    /// Offset of the `i64` present flag (0 or 1).
+    flag_off: i32,
+    /// Offset of the stored value (the key itself when absent).
+    value_off: i32,
+}
+
+/// Recognize the SDK's `Storage::get::<K, V>` monomorphised as
+/// `(i32 sret, i64 key) -> ()`, instruction for instruction:
+///
+/// ```text
+/// block
+///   local.get 1; i64.const D; call has; (i32.eqz | i64.const 1; i64.ne); br_if 0
+///   i64.const 1; local.set 2
+///   local.get 1; i64.const D; call get; local.tee 1
+///   i64.const 255; i64.and; i64.const T; i64.eq; br_if 0
+///   unreachable
+/// end
+/// local.get 0; local.get 1; i64.store V
+/// local.get 0; local.get 2; i64.store F
+/// ```
+///
+/// i.e. `if has(key) { flag = 1; value = get(key); assert tag(value) == T }`,
+/// then `{flag, value}` is written out. `local 2` is the first declared local,
+/// so the flag is 0 on the absent path. Any other shape → `None`.
+fn detect_storage_try_get_helper(module: &WasmModule, idx: u32) -> Option<StorageTryGetLayout> {
+    use crate::wasm::ir::{WasmInstr as W, WasmType};
+    if module.imports.get_by_index(idx).is_some() {
+        return None;
+    }
+    let ft = module.get_func_type(idx)?;
+    if ft.params.as_slice() != [WasmType::I32, WasmType::I64] || !ft.results.is_empty() {
+        return None;
+    }
+    let body = &module.get_function(idx)?.body;
+    let ledger = |f: u32, name: &str| func_reaches_host(module, f, HostModule::Ledger, name, 0);
+    let (has, d1, rest) = match body.as_slice() {
+        [
+            W::Block { .. },
+            W::LocalGet(1),
+            W::I64Const(d),
+            W::Call(h),
+            W::I32Eqz,
+            W::BrIf(0),
+            rest @ ..,
+        ] => (*h, *d, rest),
+        [
+            W::Block { .. },
+            W::LocalGet(1),
+            W::I64Const(d),
+            W::Call(h),
+            W::I64Const(1),
+            W::I64Ne,
+            W::BrIf(0),
+            rest @ ..,
+        ] => (*h, *d, rest),
+        _ => return None,
+    };
+    let [
+        W::I64Const(1),
+        W::LocalSet(2),
+        W::LocalGet(1),
+        W::I64Const(d2),
+        W::Call(get),
+        W::LocalTee(1),
+        W::I64Const(255),
+        W::I64And,
+        W::I64Const(tag),
+        W::I64Eq,
+        W::BrIf(0),
+        W::Unreachable,
+        W::End,
+        W::LocalGet(0),
+        W::LocalGet(1),
+        W::I64Store(value_off),
+        W::LocalGet(0),
+        W::LocalGet(2),
+        W::I64Store(flag_off),
+        W::End,
+    ] = rest
+    else {
+        return None;
+    };
+    if d1 != *d2
+        || !(0..=2).contains(&d1)
+        || !(4..=14).contains(tag) && !(64..=78).contains(tag)
+        || !ledger(has, "has_contract_data")
+        || !ledger(*get, "get_contract_data")
+        || value_off == flag_off
+    {
+        return None;
+    }
+    let storage_type = match d1 {
+        0 => StorageType::Temporary,
+        1 => StorageType::Persistent,
+        _ => StorageType::Instance,
+    };
+    Some(StorageTryGetLayout {
+        storage_type,
+        flag_off: *flag_off as i32,
+        value_off: *value_off as i32,
+    })
 }
 
 /// Output-struct offsets of the SDK `Option<u32>` decode helper.

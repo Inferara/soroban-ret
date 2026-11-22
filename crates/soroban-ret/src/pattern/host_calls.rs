@@ -29,6 +29,28 @@ pub fn lift_host_call(func: &HostFunction, args: Vec<SorobanExpr>) -> SorobanExp
     }
 }
 
+/// A TTL argument is a `U32Val`, and LLVM sometimes builds it in Val space:
+/// `(sequence_val & !0xFFFF_FFFF) + U32Val(k)`, i.e. the payload of the ledger
+/// sequence plus the encoded constant `k << 32 | 4`. The lifter already reads
+/// the sequence as the decoded `u32`, so the encoded addend must be decoded
+/// too, or the argument renders as `sequence() + 2078076976496644` (fxdao-vault)
+/// for what is `sequence() + 483840`. Only an addend carrying the `U32Val` tag
+/// (low 32 bits = 4) added to the ledger sequence is decoded.
+fn decode_u32_val_sum(e: SorobanExpr) -> SorobanExpr {
+    if let SorobanExpr::Add(a, b) = &e
+        && matches!(**a, SorobanExpr::LedgerSequence)
+        && let SorobanExpr::I64Literal(k) = **b
+        && k as u64 & 0xFFFF_FFFF == 4
+    {
+        cov_mark::hit!(ttl_u32_val_addend_decoded);
+        return SorobanExpr::Add(
+            a.clone(),
+            Box::new(SorobanExpr::U32Literal((k as u64 >> 32) as u32)),
+        );
+    }
+    e
+}
+
 fn lift_ledger_call(name: &str, mut args: Vec<SorobanExpr>) -> SorobanExpr {
     match name {
         "put_contract_data" => {
@@ -69,8 +91,8 @@ fn lift_ledger_call(name: &str, mut args: Vec<SorobanExpr>) -> SorobanExpr {
             }
         }
         "extend_contract_data_ttl" => {
-            let extend_to = args.pop().unwrap_or(SorobanExpr::Void);
-            let threshold = args.pop().unwrap_or(SorobanExpr::Void);
+            let extend_to = decode_u32_val_sum(args.pop().unwrap_or(SorobanExpr::Void));
+            let threshold = decode_u32_val_sum(args.pop().unwrap_or(SorobanExpr::Void));
             let storage_type = extract_storage_type(args.pop());
             let key = args.pop().unwrap_or(SorobanExpr::Void);
             SorobanExpr::StorageExtendTtl {
@@ -81,8 +103,8 @@ fn lift_ledger_call(name: &str, mut args: Vec<SorobanExpr>) -> SorobanExpr {
             }
         }
         "extend_current_contract_instance_and_code_ttl" => {
-            let extend_to = args.pop().unwrap_or(SorobanExpr::Void);
-            let threshold = args.pop().unwrap_or(SorobanExpr::Void);
+            let extend_to = decode_u32_val_sum(args.pop().unwrap_or(SorobanExpr::Void));
+            let threshold = decode_u32_val_sum(args.pop().unwrap_or(SorobanExpr::Void));
             SorobanExpr::ExtendInstanceAndCodeTtl {
                 threshold: Box::new(threshold),
                 extend_to: Box::new(extend_to),

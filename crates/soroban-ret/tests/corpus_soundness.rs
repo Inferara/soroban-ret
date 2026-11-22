@@ -469,7 +469,21 @@ use std::process::Command;
 /// `.unwrap()` mapping; unlowered `*_linear_memory` host calls and
 /// `require_auth` on a non-address render as holes; tuple structs are
 /// constructed positionally.
-const ERROR_CEILING: u32 = 433;
+/// → 379 (−54; campaign stage 3a). Wrong values that only showed as compile
+/// errors, fixed before later steps make the code around them compile:
+/// (1) the SDK `storage.get` helper (`(sret, key)` writing `{present,
+/// value}`) is lowered at the call instead of inlined; inlining lost the
+/// value at the helper's has-join and kept the key, so blend-emitter called
+/// the `BToken` storage key as a contract (28→16), and blend pools the
+/// `BLNDTkn` key. (2) `env.current_contract_address() ==/!= <int>` is a
+/// collapsed tag check on a lost operand, holed like the same comparison on
+/// an `Address` parameter (blend-fixed-pool / yieldblox 30→16 each). (3) a
+/// literal returned where no literal can type (`return 0` in `-> Address`,
+/// a symbol in `-> Map<..>`) is a hole, as it already was for scalar
+/// `Result` ok-types (aqua-amm 73→62, aqua-rewards 31→28). (4) a TTL
+/// argument built in Val space (`sequence() + U32Val(483840)`) is decoded
+/// (fxdao-vault, count unchanged). No contract's count rose.
+const ERROR_CEILING: u32 = 379;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
