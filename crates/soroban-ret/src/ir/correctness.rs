@@ -907,7 +907,8 @@ fn is_non_copy_param_type(t: &ScSpecTypeDef) -> bool {
 /// "expected Address, found integer"). Reducing it to a hole clears the error
 /// *without* assuming the guard's outcome — we deliberately do NOT fold it to a
 /// constant, because the original branch behaviour is unrecoverable. Gated to a
-/// bare non-Copy `Param` operand against an integer literal, so it can never touch
+/// bare non-Copy `Param` operand (or `env.current_contract_address()`, which is
+/// an `Address` the same way) against an integer literal, so it can never touch
 /// a scalar param (where `!= 0` is real logic) or any compiling comparison.
 pub fn husk_handle_int_comparisons(
     stmts: Vec<SorobanStmt>,
@@ -918,9 +919,6 @@ pub fn husk_handle_int_comparisons(
         .filter(|p| is_non_copy_param_type(&p.type_def))
         .map(|p| p.name.clone())
         .collect();
-    if handles.is_empty() {
-        return stmts;
-    }
     map_exprs_in_stmts(stmts, &|e| husk_handle_int_cmp_expr(e, &handles))
 }
 
@@ -933,9 +931,18 @@ fn husk_handle_int_cmp_expr(expr: SorobanExpr, handles: &HashSet<String>) -> Sor
     map_subexprs(expr, &|e| husk_handle_int_cmp_expr(e, handles))
 }
 
-/// `param` is a bare non-Copy-handle `Param` and `lit` is an integer literal.
+/// `param` is a bare non-Copy-handle `Param` (or the contract's own address)
+/// and `lit` is an integer literal.
 fn is_handle_vs_int(param: &SorobanExpr, lit: &SorobanExpr, handles: &HashSet<String>) -> bool {
-    matches!(param, SorobanExpr::Param(p) if handles.contains(p))
+    let is_handle = match param {
+        SorobanExpr::Param(p) => handles.contains(p),
+        SorobanExpr::CurrentContractAddress => true,
+        _ => false,
+    };
+    if is_handle && matches!(param, SorobanExpr::CurrentContractAddress) {
+        cov_mark::hit!(contract_address_int_comparison_holed);
+    }
+    is_handle
         && matches!(
             lit,
             SorobanExpr::I32Literal(_)
@@ -1518,17 +1525,22 @@ fn map_subexprs(expr: SorobanExpr, f: &dyn Fn(SorobanExpr) -> SorobanExpr) -> So
 // so a genuinely-recovered constant return such as `Ok(0)` in `-> Result<i128, E>`
 // is **never** touched.
 
-/// Husk a type-mismatched literal in the success-value position(s) of a non-unit
-/// scalar `Result<T, E>` function. No-op for non-Result / non-scalar / unit
-/// ok-types and for any literal whose class unifies with `T`.
+/// Husk a type-mismatched literal in the returned-value position(s): the ok
+/// type of a `Result<T, E>` function, or the declared type of any other
+/// value-returning function (`return 0` in `-> Address` is the same fabrication
+/// as `Ok(false)` in `-> Result<u128, E>`). No-op for unit / `Option` / `Val`
+/// and other types a literal could plausibly convert into, and for any literal
+/// whose class unifies with `T`.
 pub fn husk_type_mismatched_ok_literal(
     mut stmts: Vec<SorobanStmt>,
     return_type: Option<&ScSpecTypeDef>,
 ) -> Vec<SorobanStmt> {
-    let Some(ScSpecTypeDef::Result(r)) = return_type else {
-        return stmts;
+    let value_type = match return_type {
+        Some(ScSpecTypeDef::Result(r)) => &*r.ok_type,
+        Some(t) => t,
+        None => return stmts,
     };
-    let Some(ok_class) = scalar_ok_class(&r.ok_type) else {
+    let Some(ok_class) = scalar_ok_class(value_type) else {
         return stmts;
     };
     // `return Ok(<lit>)` at any depth.
@@ -1797,12 +1809,13 @@ fn literal_mismatches(e: &SorobanExpr, ok_class: &str) -> bool {
     literal_scalar_class(inner).is_some_and(|c| c != ok_class)
 }
 
-/// Scalar class of a `Result` ok-type, but **only** for the primitive scalars
-/// where a literal of the wrong class is a guaranteed E0308 (so husking is always
-/// safe). Integer widths collapse to `"numeric"` (unsuffixed integer literals
-/// coerce between them). Non-scalar ok-types (`Address`/`Vec`/`Map`/`Symbol`/
-/// `String`/`Bytes`/UDT/`Option`/`Val`/`U256`/`I256`/…) return `None` → the pass
-/// never fires on them.
+/// Literal class of a returned type, but **only** for types where a literal of
+/// another class is a guaranteed E0308 (so husking is always safe). Integer
+/// widths collapse to `"numeric"` (unsuffixed integer literals coerce between
+/// them). `Symbol`, `String` and `Bytes`/`BytesN` accept only their own literal
+/// form; `Address`, collections and user types accept no literal at all
+/// (`"handle"` matches no literal class). `Option`/`Val`/`U256`/`I256`/time
+/// types/tuples return `None` → the pass never fires on them.
 fn scalar_ok_class(ok: &ScSpecTypeDef) -> Option<&'static str> {
     match ok {
         ScSpecTypeDef::U32
@@ -1812,6 +1825,13 @@ fn scalar_ok_class(ok: &ScSpecTypeDef) -> Option<&'static str> {
         | ScSpecTypeDef::U128
         | ScSpecTypeDef::I128 => Some("numeric"),
         ScSpecTypeDef::Bool => Some("bool"),
+        ScSpecTypeDef::Symbol => Some("symbol"),
+        ScSpecTypeDef::String => Some("string"),
+        ScSpecTypeDef::Bytes | ScSpecTypeDef::BytesN(_) => Some("bytes"),
+        ScSpecTypeDef::Address
+        | ScSpecTypeDef::Vec(_)
+        | ScSpecTypeDef::Map(_)
+        | ScSpecTypeDef::Udt(_) => Some("handle"),
         _ => None,
     }
 }
@@ -3063,6 +3083,38 @@ mod tests {
     }
 
     #[test]
+    fn husks_contract_address_vs_int_comparison() {
+        // `env.current_contract_address() != 0` is an `Address` compared with
+        // an integer: a collapsed tag check on a lost operand.
+        cov_mark::check!(contract_address_int_comparison_holed);
+        let cond = SorobanExpr::Ne(
+            Box::new(SorobanExpr::CurrentContractAddress),
+            Box::new(SorobanExpr::I64Literal(0)),
+        );
+        let out = husk_handle_int_comparisons(
+            vec![SorobanStmt::If {
+                condition: cond,
+                then_body: vec![SorobanStmt::Expr(SorobanExpr::Panic)],
+                else_body: vec![],
+            }],
+            &[],
+        );
+        let SorobanStmt::If {
+            condition,
+            then_body,
+            ..
+        } = &out[0]
+        else {
+            panic!("expected If, got {out:?}");
+        };
+        assert!(
+            matches!(condition, SorobanExpr::UnknownVal),
+            "{condition:?}"
+        );
+        assert_eq!(then_body.len(), 1, "the guarded panic is kept");
+    }
+
+    #[test]
     fn leaves_scalar_vs_int_comparison() {
         // A scalar param `n != 0` is genuine logic — must NOT be husked.
         let cond = SorobanExpr::Ne(
@@ -3178,20 +3230,61 @@ mod tests {
     }
 
     #[test]
-    fn keeps_literal_when_ok_type_nonscalar() {
-        // Non-scalar ok-type (Address) is out of scope — a literal there is a
-        // different error class; leave it honest rather than guess.
+    fn husks_literal_returned_as_a_handle() {
+        // No literal is ever an `Address`: `return 0` in `-> Address` and
+        // `Ok(false)` in `-> Result<Address, E>` are both fabrications.
+        let out = husk_type_mismatched_ok_literal(
+            vec![SorobanStmt::Return(Some(SorobanExpr::I32Literal(0)))],
+            Some(&ScSpecTypeDef::Address),
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SorobanStmt::Return(Some(SorobanExpr::UnknownVal))]
+            ),
+            "{out:?}"
+        );
         let rt = result_of(ScSpecTypeDef::Address);
         let out = husk_type_mismatched_ok_literal(
             vec![SorobanStmt::Expr(SorobanExpr::BoolLiteral(false))],
             Some(&rt),
         );
         assert!(
+            matches!(out.as_slice(), [SorobanStmt::Expr(SorobanExpr::UnknownVal)]),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn keeps_a_literal_of_the_returned_kind() {
+        // A symbol literal is a `Symbol`; an `Option` or `Val` return is out of
+        // scope (a literal can plausibly convert there).
+        let out = husk_type_mismatched_ok_literal(
+            vec![SorobanStmt::Return(Some(SorobanExpr::SymbolLiteral(
+                "Admin".into(),
+            )))],
+            Some(&ScSpecTypeDef::Symbol),
+        );
+        assert!(
             matches!(
                 out.as_slice(),
-                [SorobanStmt::Expr(SorobanExpr::BoolLiteral(false))]
+                [SorobanStmt::Return(Some(SorobanExpr::SymbolLiteral(_)))]
             ),
-            "non-scalar ok-type must not be touched: {out:?}"
+            "{out:?}"
+        );
+        let option = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+            value_type: Box::new(ScSpecTypeDef::Address),
+        }));
+        let out = husk_type_mismatched_ok_literal(
+            vec![SorobanStmt::Return(Some(SorobanExpr::I32Literal(0)))],
+            Some(&option),
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SorobanStmt::Return(Some(SorobanExpr::I32Literal(0)))]
+            ),
+            "{out:?}"
         );
     }
 

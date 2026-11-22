@@ -6137,13 +6137,21 @@ fn expr_has_side_effects(expr: &SorobanExpr) -> bool {
     // fallible-getter recoveries) panics on a missing key, so deleting an
     // unused binding of it drops the panic, and relocating it past a later
     // `set` reads a different value (issue #67); `.unwrap()` traps the same
-    // way. Deliberately narrow: the
+    // way. A plain typed read (`on_missing: None`, the storage try-get
+    // lowering) is the bare `StorageGet` below with an annotation, so it is
+    // treated the same: treated as pure, the CSE pass merged a read made
+    // after a `set` of the same key into the one made before it, and the
+    // caller used the old value (PR #94 review). Deliberately narrow: the
     // defaulting forms (`unwrap_or(..)`) cannot trap and stay droppable.
     if let SorobanExpr::CastAs { value, .. } = expr
         && let SorobanExpr::StorageGet {
             on_missing, unwrap, ..
         } = value.as_ref()
-        && (*unwrap || matches!(on_missing.as_deref(), Some(SorobanExpr::PanicWithError(_))))
+        && (*unwrap
+            || matches!(
+                on_missing.as_deref(),
+                None | Some(SorobanExpr::PanicWithError(_))
+            ))
     {
         return true;
     }
@@ -10262,6 +10270,67 @@ mod tests {
                 ]
             ),
             "the read must not move past the storage write: {out:?}"
+        );
+    }
+
+    /// PR #94 review: a plain typed read (`get::<_, Address>(&K)`, from the
+    /// storage try-get lowering) is a storage read like the bare one. Two of
+    /// them with a `set(K)` in between read different values, so the second
+    /// must not be merged into the first, and neither may move past the
+    /// write.
+    #[test]
+    fn typed_reads_around_a_write_are_not_merged() {
+        let key = || Box::new(SorobanExpr::SymbolLiteral("K".to_string()));
+        let read = || SorobanExpr::CastAs {
+            value: Box::new(SorobanExpr::StorageGet {
+                storage_type: StorageType::Instance,
+                key: key(),
+                unwrap: false,
+                on_missing: None,
+            }),
+            target_type: "Address".to_string(),
+        };
+        assert!(expr_has_side_effects(&read()));
+
+        let use_of = |idx| SorobanExpr::MethodCall {
+            object: Box::new(SorobanExpr::Local(idx)),
+            method: "is_some".to_string(),
+            args: vec![],
+        };
+        let out = remove_redundant_lets(vec![
+            SorobanStmt::Let {
+                name: "var_3".to_string(),
+                mutable: false,
+                value: read(),
+            },
+            SorobanStmt::Expr(SorobanExpr::StorageSet {
+                storage_type: StorageType::Instance,
+                key: key(),
+                value: Box::new(SorobanExpr::Param("new".to_string())),
+            }),
+            SorobanStmt::Let {
+                name: "var_4".to_string(),
+                mutable: false,
+                value: read(),
+            },
+            SorobanStmt::Return(Some(SorobanExpr::Eq(
+                Box::new(use_of(3)),
+                Box::new(use_of(4)),
+            ))),
+        ]);
+        // The first read stays before the write; the second stays after it
+        // (it may be inlined into its single use, the next statement).
+        assert!(
+            matches!(
+                out.as_slice(),
+                [SorobanStmt::Let { value, .. }, SorobanStmt::Expr(SorobanExpr::StorageSet { .. }), ..]
+                    if *value == read()
+            ),
+            "the first read stays before the write: {out:?}"
+        );
+        assert!(
+            format!("{:?}", &out[2..]).contains("StorageGet"),
+            "the read after the write is not merged into the one before it: {out:?}"
         );
     }
 

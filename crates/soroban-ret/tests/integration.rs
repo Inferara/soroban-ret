@@ -2434,6 +2434,54 @@ fn no_fully_recovered_function_contains_a_hole() {
     );
 }
 
+/// Wrong values that only surfaced as compile errors (campaign stage 3a).
+/// Each would compile, silently wrong, once the errors around it were fixed.
+#[test]
+fn wrong_values_exposed_by_compile_errors_are_gone() {
+    let source = |wasm: &[u8]| {
+        soroban_ret::decompile_with_options(wasm, &soroban_ret::DecompileOptions::default())
+            .expect("decompile")
+            .source
+    };
+    let compact = |s: &str| s.split_whitespace().collect::<String>();
+
+    // The SDK `storage.get` helper writes `{present, value}`; inlining kept
+    // the KEY in the value slot, so the token contract was "called" at the
+    // storage key. The value read under the key is the address.
+    let emitter = compact(&source(include_bytes!(
+        "../../../benchmark-data/mainnet/blend-emitter-CCOQM6S7.wasm"
+    )));
+    assert!(
+        !emitter.contains(r#"invoke_contract::<soroban_sdk::Val>(&symbol_short!("BToken")"#),
+        "the storage key is called as a contract"
+    );
+    assert!(emitter.contains(
+        r#"letb_token=env.storage().instance().get::<_,Address>(&symbol_short!("BToken"));"#
+    ));
+    assert!(emitter.contains(r#"invoke_contract::<soroban_sdk::Val>(&b_token.clone().unwrap()"#));
+
+    // An `Address` compared with an integer: a tag check on a lost operand.
+    let pool = source(include_bytes!(
+        "../../../benchmark-data/mainnet/blend-fixed-pool-CAJJZSGM.wasm"
+    ));
+    assert!(!pool.contains("current_contract_address() != 0"));
+
+    // `extend_to` built in Val space: `sequence() + U32Val(483840)`.
+    let vault = source(include_bytes!(
+        "../../../benchmark-data/mainnet/fxdao-vault-CCUN4RXU.wasm"
+    ));
+    assert!(!vault.contains("2078076976496644"));
+    assert!(vault.contains("env.ledger().sequence() + 483840"));
+
+    // `return 0` in `-> Address`.
+    let amm = source(include_bytes!(
+        "../../../benchmark-data/mainnet/aqua-amm-CBQDHNBF.wasm"
+    ));
+    let start = amm.find("pub fn get_future_address(").expect("function");
+    let body = &amm[start..start + amm[start..].find("\n    pub fn ").unwrap()];
+    assert!(!body.contains("return 0;"), "{body}");
+}
+
 /// `errors::hello` dispatches on a five-variant enum with a `br_table`; the
 /// `Flag::B` target is *outside* the switch (it falls through to the shared
 /// `return Err(AnError)`), while the default target is a case body. Dropping
