@@ -15,13 +15,16 @@ compiled and been silently wrong.
 
 - **A storage key called as a contract.** The SDK's `storage.get` helper,
   monomorphised as `(sret, key)` writing `{present, value}`, is now lowered
-  at the call. Inlining it lost the stored value where the "absent" and
-  "present" paths join and kept the key in the value slot, so blend-emitter
-  rendered `invoke_contract(&symbol_short!("BToken"), ..)`, and the blend
-  pools did the same with `BLNDTkn`. They now call the address stored under
-  that key, behind the `has` check that panics like the original. Three
-  blend-backstop guards that were `if todo!() { panic!() }` are now the real
-  `has` check.
+  at the call to the call it is: `let b_token = get::<_, Address>(&key);`,
+  with the flag read as `b_token.is_some()` and the value as
+  `b_token.clone().unwrap()`. The typed read keeps the helper's stored-type
+  check even where a caller only looks at the flag. Inlining it lost the
+  stored value where the "absent" and "present" paths join and kept the key
+  in the value slot, so blend-emitter rendered
+  `invoke_contract(&symbol_short!("BToken"), ..)`, and the blend pools did
+  the same with `BLNDTkn`. They now call the address stored under that key,
+  read once. Three blend-backstop guards that were `if todo!() { panic!() }`
+  are now `if !u_s_d_c_tkn.is_some() { panic!() }` on the typed read.
 - **The contract's own address compared with an integer.**
   `if env.current_contract_address() != 0 { panic!() }` (15 sites in each
   blend pool) is a Val tag check whose operand was lost. The condition is

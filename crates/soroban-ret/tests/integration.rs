@@ -2456,8 +2456,9 @@ fn wrong_values_exposed_by_compile_errors_are_gone() {
         "the storage key is called as a contract"
     );
     assert!(emitter.contains(
-        r#"invoke_contract::<soroban_sdk::Val>(&env.storage().instance().get(&symbol_short!("BToken")).unwrap()"#
+        r#"letb_token=env.storage().instance().get::<_,Address>(&symbol_short!("BToken"));"#
     ));
+    assert!(emitter.contains(r#"invoke_contract::<soroban_sdk::Val>(&b_token.clone().unwrap()"#));
 
     // An `Address` compared with an integer: a tag check on a lost operand.
     let pool = source(include_bytes!(

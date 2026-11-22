@@ -2184,16 +2184,25 @@ impl<'a> LiftContext<'a> {
     }
 
     /// Lower a call to the SDK's `Storage::get` helper (see
-    /// [`detect_storage_try_get_helper`]): the result struct's flag slot gets
-    /// `has(&key)` and its value slot `get(&key).unwrap()`. On the path where the
-    /// key is present (flag 1) this is exactly the value the helper stores; on
-    /// the absent path the helper stores the KEY there, which no SDK caller
-    /// reads (it checks the flag first). Inlining instead lost the stored value
-    /// at the helper's has-join and kept the key, so a caller using the value
+    /// [`detect_storage_try_get_helper`]) to the call it is:
+    /// `let var_N = env.storage().<kind>().get::<_, T>(&key);`, with the result
+    /// struct's flag slot holding `var_N.is_some()` and its value slot
+    /// `var_N.unwrap()`. The typed read is emitted at the helper's call site, so
+    /// the stored-type check the helper performs (it traps when the value does
+    /// not carry the tag of `T`) still runs even when the caller only looks at
+    /// the flag. Inlining instead lost the stored value at the helper's
+    /// has-join and kept the KEY in the value slot, so a caller using the value
     /// used the key (blend-emitter: `invoke_contract(&symbol_short!("BToken"),
     /// ..)`).
+    ///
+    /// Only for a tag that names exactly one type whose `TryFromVal` checks
+    /// that tag alone (`AddressObject` → `Address`); any other tag declines.
     fn try_lower_storage_try_get(&mut self, target_idx: u32, args: &[StackVal]) -> Option<bool> {
         let layout = detect_storage_try_get_helper(self.wasm_module, target_idx)?;
+        let ty = match layout.tag {
+            77 => "Address",
+            _ => return None,
+        };
         let [StackVal::FrameSlot(id, base), key] = args else {
             return None;
         };
@@ -2208,26 +2217,43 @@ impl<'a> LiftContext<'a> {
         if matches!(key, SorobanExpr::UnknownVal) {
             return None;
         }
-        let has = SorobanExpr::StorageHas {
-            storage_type: layout.storage_type,
-            key: Box::new(key.clone()),
+        let binding = {
+            let mut ctr = self.next_frame_id.borrow_mut();
+            *ctr += 1;
+            PROTO_BINDING_BASE + *ctr
         };
-        let get = SorobanExpr::StorageGet {
-            storage_type: layout.storage_type,
-            key: Box::new(key),
-            unwrap: true,
-            on_missing: None,
+        self.stmts.push(SorobanStmt::Let {
+            name: format!("var_{binding}"),
+            mutable: false,
+            value: SorobanExpr::CastAs {
+                value: Box::new(SorobanExpr::StorageGet {
+                    storage_type: layout.storage_type,
+                    key: Box::new(key),
+                    unwrap: false,
+                    on_missing: None,
+                }),
+                target_type: ty.to_string(),
+            },
+        });
+        let call = |object: SorobanExpr, m: &str| SorobanExpr::MethodCall {
+            object: Box::new(object),
+            method: m.to_string(),
+            args: Vec::new(),
         };
+        // The value may be used more than once; `clone` is a refcount bump of
+        // the same host object, so each use is the stored value.
+        let value = call(call(SorobanExpr::Local(binding), "clone"), "unwrap");
+        let flag = call(SorobanExpr::Local(binding), "is_some");
         self.store_frame_slot(
             id,
             base + layout.value_off,
-            StackVal::HostCallResult(Box::new(get)),
+            StackVal::HostCallResult(Box::new(value)),
             8,
         );
         self.store_frame_slot(
             id,
             base + layout.flag_off,
-            StackVal::HostCallResult(Box::new(has)),
+            StackVal::HostCallResult(Box::new(flag)),
             8,
         );
         self.found_host_calls = true;
@@ -11953,6 +11979,8 @@ struct StorageTryGetLayout {
     flag_off: i32,
     /// Offset of the stored value (the key itself when absent).
     value_off: i32,
+    /// The Val tag the stored value must carry, or the helper traps.
+    tag: u8,
 }
 
 /// Recognize the SDK's `Storage::get::<K, V>` monomorphised as
@@ -12049,6 +12077,7 @@ fn detect_storage_try_get_helper(module: &WasmModule, idx: u32) -> Option<Storag
         storage_type,
         flag_off: *flag_off as i32,
         value_off: *value_off as i32,
+        tag: *tag as u8,
     })
 }
 
@@ -25774,6 +25803,72 @@ mod tests {
         assert!(
             !is_symbol_from_lm_builder(&m, 3),
             "wrong signature is not a builder even if it reaches the encoder"
+        );
+    }
+
+    /// The SDK `storage.get::<_, Address>` helper traps when the stored value
+    /// is not an address. A caller that only looks at the "present" flag must
+    /// keep that check: the flag comes from the typed read, never from a bare
+    /// `has` (greptile P1 on PR #94). Function 4 returns only the flag.
+    #[test]
+    fn storage_try_get_flag_keeps_the_stored_type_check() {
+        let wasm = wat::parse_str(
+            r#"(module
+      (import "l" "0" (func $has (param i64 i64) (result i64)))
+      (import "l" "1" (func $get (param i64 i64) (result i64)))
+      (memory 1)
+      (global $sp (mut i32) (i32.const 1024))
+      (func $has_w (param i64 i64) (result i32)
+        local.get 0 local.get 1 call $has i64.const 1 i64.eq)
+      (func $try_get (param i32 i64) (local i64)
+        block
+          local.get 1 i64.const 2 call $has_w i32.eqz br_if 0
+          i64.const 1 local.set 2
+          local.get 1 i64.const 2 call $get local.tee 1
+          i64.const 255 i64.and i64.const 77 i64.eq br_if 0
+          unreachable
+        end
+        local.get 0 local.get 1 i64.store offset=8
+        local.get 0 local.get 2 i64.store)
+      (func (export "is_set") (param $key i64) (result i64) (local $f i32)
+        global.get $sp i32.const 16 i32.sub local.tee $f global.set $sp
+        local.get $f local.get $key call $try_get
+        local.get $f i64.load
+        local.get $f i32.const 16 i32.add global.set $sp))"#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        let layout = detect_storage_try_get_helper(&m, 3).expect("helper recognized");
+        assert_eq!((layout.tag, layout.flag_off, layout.value_off), (77, 0, 8));
+        assert!(detect_storage_try_get_helper(&m, 2).is_none());
+
+        let params = [FnParam {
+            name: "key".into(),
+            type_def: ScSpecTypeDef::Symbol,
+        }];
+        let lifted = {
+            cov_mark::check!(storage_try_get_helper_lowered);
+            lift_function_body(
+                &m,
+                &empty_registry(),
+                4,
+                &params,
+                &Some(ScSpecTypeDef::Bool),
+            )
+        };
+        let dump = format!("{:?}", lifted.stmts);
+        assert!(
+            dump.contains(r#"CastAs { value: StorageGet { storage_type: Instance, key: Param("key"), unwrap: false"#)
+                && dump.contains(r#"target_type: "Address""#),
+            "the typed read is kept: {dump}"
+        );
+        assert!(
+            dump.contains(r#"method: "is_some""#),
+            "flag from the read: {dump}"
+        );
+        assert!(
+            !dump.contains("StorageHas"),
+            "a bare has drops the check: {dump}"
         );
     }
 
