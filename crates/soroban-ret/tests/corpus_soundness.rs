@@ -502,7 +502,15 @@ use std::process::Command;
 /// them unmasked 10 `vp = vp.adm` (a second value reusing a binding, stage
 /// 3c) and assignments that were already wrong (`oracle = 10` to an
 /// `Address`, `node = caller` across types).
-const ERROR_CEILING: u32 = 372;
+/// → 371 (−1; stage 3b review). A write to a key whose value type the IR
+/// does not prove (a lost value, a literal, a `Val`) now cancels the key's
+/// entry, since it may have stored anything. fxdao-oracle's temporary
+/// `AssetsData` key is written once with an `AssetRecord` literal and once
+/// with an integer, so its reads are no longer typed: back to main's
+/// untyped reads, and the E0308 that typing raised at `next: assets_data`
+/// goes with it (fxdao-oracle 6→5). aqua-rewards and xycloans reads go
+/// back to `Val` (integer-literal writes), no count change.
+const ERROR_CEILING: u32 = 371;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

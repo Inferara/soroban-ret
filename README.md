@@ -219,7 +219,7 @@ Three heavier gates compile decompiled output back for `wasm32v1-none` and are o
 # ≥95% of fixtures recompile (cargo check) — currently 38/39 = 97%
 SOROBAN_RET_COMPILE_BACK=1 cargo test -p soroban-ret --test compile_back
 
-# mainnet corpus hard-error ratchet — currently 372 errors, 2 of 24 clean
+# mainnet corpus hard-error ratchet — currently 371 errors, 2 of 24 clean
 SOROBAN_RET_CORPUS_SOUNDNESS=1 cargo test -p soroban-ret --test corpus_soundness
 
 # functional equivalence: recompile to wasm, run BOTH the original and

@@ -964,7 +964,8 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
             body,
             func.return_type.as_ref(),
         );
-        let body = crate::ir::stored_types::hole_decode_fragments(body, &registry);
+        let body =
+            crate::ir::stored_types::hole_decode_fragments(body, &registry, body_supplies_tail);
         let body = annotate_uninferable_gets(body, body_supplies_tail);
         let body = annotate_uninferable_collections(body);
         // Lever 2: a fabricated literal in the success tail whose type contradicts a

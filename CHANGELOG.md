@@ -20,7 +20,9 @@ value as something it is not.
   stores the same `T`, and no decode of a read or typed consumer of the key
   disagrees. Keys compare by shape: an enum variant regardless of payload,
   or a bare symbol. A write whose key is unknown cancels the entries of its
-  storage kind unless a decode confirms them. A decode of a read alone never
+  storage kind unless a decode confirms them. A write to the key whose value
+  type is not proven (a lost value, a literal, a `Val`) cancels the key's
+  entry outright: it may have stored anything. A decode of a read alone never
   types a key: the struct it names is what the original reads, but inside
   inlined helpers the lifter can attach the wrong key to the read (blend
   pools decode an auction under a key rendered `ResConfig`, blend-backstop a
@@ -41,13 +43,13 @@ value as something it is not.
 - An annotation imports every type it names (`Vec<Address>`, `Symbol`, ..),
   not only its head.
 
-Corpus hard errors 379 → 372: fxdao-oracle 12→6, phoenix 8→5, comet 19→17,
+Corpus hard errors 379 → 371: fxdao-oracle 12→5, phoenix 8→5, comet 19→17,
 band 12→11, blend-fixed-pool and yieldblox 16→15 each. soroban-domains rose
 56→63: its untyped reads had stopped type checking in those functions, and
 typing them unmasked 10 `vp = vp.adm` (a second value reusing a binding, the
 next step) and assignments that were already wrong (`oracle = 10` to an
 `Address`). Equivalence: 0 divergences, unchanged. Still 2 of 24 contracts
-compile. Restoration 90.0 → 89.6 (fxdao-oracle 98.4 → 91.0: the four
+compile. Restoration 90.0 → 89.6 (fxdao-oracle 98.4 → 91.4: the four
 getters above; soroban-domains 88.5 → 87.2: the union decode fragments);
 baseline refreshed.
 

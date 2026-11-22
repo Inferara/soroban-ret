@@ -278,7 +278,7 @@ every mainnet corpus contract and `cargo check`s the result for
 lifter emitted: output that *looks* like code but does not type-check. The
 metric is "wrong output", not "incomplete output".
 
-Current status: **372 hard errors across 24 contracts** (ceiling 372), with
+Current status: **371 hard errors across 24 contracts** (ceiling 371), with
 **2 contracts compiling cleanly** — `digicus` and `unknown-oracle`.
 Down from 1042 at the start of the v0.0.4 cycle, and up from 303: the
 equivalence gate showed that `fxdao-oracle` and `soroswap-CA4HEQTL` compiled
@@ -286,7 +286,7 @@ cleanly only because function bodies had been silently truncated; with the
 truncation fixed the missing code is back, partly unrecovered. The step to
 379 removed wrong values that only showed as type errors (a storage key
 called as a contract, an address compared with `0`, an integer returned as
-an `Address`, a Val-encoded constant in a TTL argument). The step to 372
+an `Address`, a Val-encoded constant in a TTL argument). The step to 371
 gave storage reads the value type the contract writes under their key
 (`get::<_, T>(&key)`), and turned the wrong values that exposed into holes
 (a stored struct returned as a `u32`, a union's internal vec decoding read

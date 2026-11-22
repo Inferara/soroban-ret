@@ -1004,13 +1004,15 @@ fn count_enum_field_params(
             return;
         }
     };
+    // The fields are the construct's only sub-expressions: walking them again
+    // through `for_each_subexpr` would count a nested construct's move twice
+    // (PR #95 review).
     for field in fields {
         match var_name_of(field) {
             Some(n) if eligible.contains(&n) => *counts.entry(n).or_insert(0) += 1,
             _ => count_enum_field_params(field, eligible, counts),
         }
     }
-    for_each_subexpr(expr, &mut |c| count_enum_field_params(c, eligible, counts));
 }
 
 /// Wrap every bare `to_clone` variable that appears as an `EnumConstruct` field
@@ -3160,6 +3162,24 @@ mod tests {
         assert!(
             !enum_field_is_clone(&out[0]),
             "single-use param must not be cloned: {out:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_single_use_param_in_a_nested_construct() {
+        // `DataKey::Allowance(AllowanceKey { from })`: one move, counted once.
+        let nested = datakey(SorobanExpr::StructConstruct {
+            type_name: "AllowanceKey".into(),
+            fields: vec![("from".into(), SorobanExpr::Param("from".into()))],
+        });
+        let out = clone_reused_move_params(vec![nested], &[addr_param("from")]);
+        let SorobanStmt::Expr(SorobanExpr::EnumConstruct { fields, .. }) = &out[0] else {
+            panic!("{out:?}");
+        };
+        assert!(
+            matches!(&fields[0], SorobanExpr::StructConstruct { fields, .. }
+                if matches!(fields[0].1, SorobanExpr::Param(_))),
+            "a single nested use must not be cloned: {out:?}"
         );
     }
 

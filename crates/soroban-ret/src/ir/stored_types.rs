@@ -213,6 +213,10 @@ struct Entry {
     types: BTreeSet<String>,
     decoded: bool,
     written: bool,
+    /// A write to this key whose value type the IR does not prove (a lost
+    /// value, a literal, a `Val`): it may have stored anything, so no read of
+    /// the key is annotated, whatever else is known (PR #95 review).
+    unknown_write: bool,
 }
 
 /// The per-contract table of proven stored-value types.
@@ -272,15 +276,18 @@ impl StoredTypes {
                 value,
             } => match key_shape(key, lets) {
                 Some(shape) => {
-                    if let Some(ty) = written_type(value, params, lets, registry, 0) {
-                        let concrete = is_concrete(&ty);
-                        self.add(*storage_type, shape.clone(), ty);
-                        if concrete {
-                            self.entries
-                                .entry((kind_index(*storage_type), shape))
-                                .or_default()
-                                .written = true;
+                    let ty =
+                        written_type(value, params, lets, registry, 0).filter(|ty| is_concrete(ty));
+                    let entry = self
+                        .entries
+                        .entry((kind_index(*storage_type), shape))
+                        .or_default();
+                    match ty {
+                        Some(ty) => {
+                            entry.types.insert(ty);
+                            entry.written = true;
                         }
+                        None => entry.unknown_write = true,
                     }
                 }
                 None => {
@@ -317,7 +324,7 @@ impl StoredTypes {
         if entry.types.len() != 1 {
             return None;
         }
-        if !entry.written {
+        if !entry.written || entry.unknown_write {
             return None;
         }
         if !entry.decoded && self.blind_writes.contains(&k) {
@@ -479,8 +486,24 @@ fn hole_in_stmts(stmts: Vec<SorobanStmt>, want: &str, is_tail: bool) -> Vec<Soro
 /// type has no `get` method, so the fragment cannot be a value of the
 /// original; it becomes an honest `todo!()`. The read itself stays as a
 /// statement (it traps when the key is missing). Statement-level only:
-/// `let x = read.get(i)`, `x = read.get(i)`, `read.get(i);`.
-pub fn hole_decode_fragments(stmts: Vec<SorobanStmt>, registry: &TypeRegistry) -> Vec<SorobanStmt> {
+/// `let x = read.get(i)`, `x = read.get(i)`, `read.get(i);`, `return
+/// read.get(i)`. When the fragment is the body's value (`value_tail`), the
+/// value becomes `todo!()` after the read, never the read itself: returning
+/// the whole struct from a field getter would be a value the original never
+/// returned (PR #95 review).
+pub fn hole_decode_fragments(
+    stmts: Vec<SorobanStmt>,
+    registry: &TypeRegistry,
+    value_tail: bool,
+) -> Vec<SorobanStmt> {
+    holed_fragments(stmts, registry, value_tail)
+}
+
+fn holed_fragments(
+    stmts: Vec<SorobanStmt>,
+    registry: &TypeRegistry,
+    is_tail: bool,
+) -> Vec<SorobanStmt> {
     let fragment = |e: &SorobanExpr| -> Option<SorobanExpr> {
         let SorobanExpr::MethodCall {
             object,
@@ -507,8 +530,10 @@ pub fn hole_decode_fragments(stmts: Vec<SorobanStmt>, registry: &TypeRegistry) -
         (registry.unions.contains_key(target_type) || registry.structs.contains_key(target_type))
             .then(|| (**object).clone())
     };
+    let last = stmts.len().saturating_sub(1);
     let mut out = Vec::with_capacity(stmts.len());
-    for stmt in stmts {
+    for (i, stmt) in stmts.into_iter().enumerate() {
+        let tail = is_tail && i == last;
         match stmt {
             SorobanStmt::Let {
                 name,
@@ -534,6 +559,14 @@ pub fn hole_decode_fragments(stmts: Vec<SorobanStmt>, registry: &TypeRegistry) -
             SorobanStmt::Expr(e) if fragment(&e).is_some() => {
                 cov_mark::hit!(decode_fragment_holed);
                 out.push(SorobanStmt::Expr(fragment(&e).unwrap()));
+                if tail {
+                    out.push(SorobanStmt::Expr(SorobanExpr::UnknownVal));
+                }
+            }
+            SorobanStmt::Return(Some(e)) if fragment(&e).is_some() => {
+                cov_mark::hit!(decode_fragment_holed);
+                out.push(SorobanStmt::Expr(fragment(&e).unwrap()));
+                out.push(SorobanStmt::Return(Some(SorobanExpr::UnknownVal)));
             }
             SorobanStmt::If {
                 condition,
@@ -541,8 +574,8 @@ pub fn hole_decode_fragments(stmts: Vec<SorobanStmt>, registry: &TypeRegistry) -
                 else_body,
             } => out.push(SorobanStmt::If {
                 condition,
-                then_body: hole_decode_fragments(then_body, registry),
-                else_body: hole_decode_fragments(else_body, registry),
+                then_body: holed_fragments(then_body, registry, tail),
+                else_body: holed_fragments(else_body, registry, tail),
             }),
             SorobanStmt::Match { scrutinee, arms } => out.push(SorobanStmt::Match {
                 scrutinee,
@@ -550,15 +583,15 @@ pub fn hole_decode_fragments(stmts: Vec<SorobanStmt>, registry: &TypeRegistry) -
                     .into_iter()
                     .map(|a| super::soroban_ir::MatchArm {
                         pattern: a.pattern,
-                        body: hole_decode_fragments(a.body, registry),
+                        body: holed_fragments(a.body, registry, tail),
                     })
                     .collect(),
             }),
             SorobanStmt::Loop { body } => out.push(SorobanStmt::Loop {
-                body: hole_decode_fragments(body, registry),
+                body: holed_fragments(body, registry, false),
             }),
             SorobanStmt::Block(body) => {
-                out.push(SorobanStmt::Block(hole_decode_fragments(body, registry)))
+                out.push(SorobanStmt::Block(holed_fragments(body, registry, tail)))
             }
             SorobanStmt::For {
                 var,
@@ -571,7 +604,7 @@ pub fn hole_decode_fragments(stmts: Vec<SorobanStmt>, registry: &TypeRegistry) -
                 start,
                 end,
                 step,
-                body: hole_decode_fragments(body, registry),
+                body: holed_fragments(body, registry, false),
             }),
             other => out.push(other),
         }
@@ -756,6 +789,33 @@ mod tests {
     }
 
     #[test]
+    fn a_write_of_an_unproven_type_cancels_the_key() {
+        let params = [
+            param("a", ScSpecTypeDef::Address),
+            param("v", ScSpecTypeDef::Val),
+        ];
+        for other in [
+            SorobanExpr::U32Literal(7),
+            SorobanExpr::Param("v".into()),
+            SorobanExpr::UnknownVal,
+        ] {
+            let body = [
+                set("Admin", SorobanExpr::Param("a".into())),
+                set("Admin", other),
+            ];
+            assert_eq!(annotated(&table(&[], &body, &params), "Admin"), None);
+            assert_eq!(
+                annotated(
+                    &table(&[decoded("Admin", "Address")], &body, &params),
+                    "Admin"
+                ),
+                None,
+                "a decode does not vouch for what an unproven write stored"
+            );
+        }
+    }
+
+    #[test]
     fn val_is_never_evidence() {
         let params = [param("v", ScSpecTypeDef::Val)];
         let t = table(&[], &[set("K", SorobanExpr::Param("v".into()))], &params);
@@ -833,6 +893,7 @@ mod tests {
                 },
             }],
             &registry(),
+            true,
         );
         assert!(
             matches!(
@@ -843,6 +904,45 @@ mod tests {
                 ] if *r == read
             ),
             "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_decode_fragment_returned_as_the_value_becomes_a_hole() {
+        let read = SorobanExpr::CastAs {
+            value: Box::new(get("Cfg")),
+            target_type: "Config".into(),
+        };
+        let fragment = SorobanExpr::MethodCall {
+            object: Box::new(read.clone()),
+            method: "get".into(),
+            args: vec![SorobanExpr::U32Literal(1)],
+        };
+        let tail =
+            hole_decode_fragments(vec![SorobanStmt::Expr(fragment.clone())], &registry(), true);
+        assert!(
+            matches!(
+                tail.as_slice(),
+                [SorobanStmt::Expr(r), SorobanStmt::Expr(SorobanExpr::UnknownVal)] if *r == read
+            ),
+            "{tail:?}"
+        );
+        let ret = hole_decode_fragments(
+            vec![SorobanStmt::Return(Some(fragment.clone()))],
+            &registry(),
+            false,
+        );
+        assert!(
+            matches!(
+                ret.as_slice(),
+                [SorobanStmt::Expr(r), SorobanStmt::Return(Some(SorobanExpr::UnknownVal))] if *r == read
+            ),
+            "{ret:?}"
+        );
+        let stmt = hole_decode_fragments(vec![SorobanStmt::Expr(fragment)], &registry(), false);
+        assert!(
+            matches!(stmt.as_slice(), [SorobanStmt::Expr(r)] if *r == read),
+            "a discarded fragment adds no trap: {stmt:?}"
         );
     }
 }

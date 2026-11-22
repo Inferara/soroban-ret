@@ -149,12 +149,12 @@
     {
       "file": "fxdao-oracle-CB5OTV4G.wasm",
       "entity": "FxDAO Oracle",
-      "restoration_pct": 91.0,
+      "restoration_pct": 91.4,
       "spec_functions": 14,
       "fn_clean": 6,
       "fn_partial": 8,
       "fn_logic_lost": 0,
-      "artifacts_total": 13,
+      "artifacts_total": 10,
       "wasm_size": 17181,
       "error": null
     },
