@@ -1995,7 +1995,7 @@ fn fxdao_oracle_recovers_real_symbol_keys() {
     let wasm = include_bytes!("../../../benchmark-data/mainnet/fxdao-oracle-CB5OTV4G.wasm");
     let source = decompile(wasm).expect("decompile fxdao-oracle");
     assert!(
-        source.contains(".get(&AssetsKeys::AssetsData)"),
+        source.contains(".get::<_, AssetsData>(&AssetsKeys::AssetsData)"),
         "the executed constructor yields the AssetsData key:\n{}",
         &source[..source.len().min(4000)]
     );
@@ -2480,6 +2480,70 @@ fn wrong_values_exposed_by_compile_errors_are_gone() {
     let start = amm.find("pub fn get_future_address(").expect("function");
     let body = &amm[start..start + amm[start..].find("\n    pub fn ").unwrap()];
     assert!(!body.contains("return 0;"), "{body}");
+}
+
+/// Campaign stage 3b: a storage read gets the type the contract writes under
+/// its key (`get::<_, T>(&key)`), and only that. A decode alone does not type
+/// a key: inside inlined helpers the lifter can attach the wrong key to it.
+#[test]
+fn storage_reads_get_the_type_the_contract_writes() {
+    let source = |wasm: &[u8]| {
+        soroban_ret::decompile_with_options(wasm, &soroban_ret::DecompileOptions::default())
+            .expect("decompile")
+            .source
+    };
+    let compact = |s: &str| s.split_whitespace().collect::<String>();
+    let body_of = |src: &str, name: &str| {
+        let start = src.find(&format!("pub fn {name}(")).expect("function");
+        let end = src[start..]
+            .find("\n    pub fn ")
+            .unwrap_or(src.len() - start);
+        src[start..start + end].to_string()
+    };
+
+    // `CoreData` is written from a `CoreData` parameter.
+    let oracle = source(include_bytes!(
+        "../../../benchmark-data/mainnet/fxdao-oracle-CB5OTV4G.wasm"
+    ));
+    assert!(compact(&oracle).contains("get::<_,CoreData>(&vp).unwrap().adm"));
+    // `resolution() -> u32` returned the whole stored struct; the bytecode
+    // returns its `tick` field, which the lifter lost. Same for the other
+    // single-field getters.
+    for (name, read) in [
+        ("resolution", "get::<_,CoreData>(&CoreDataKeys::CoreData)"),
+        ("decimals", "get::<_,CoreData>(&CoreDataKeys::CoreData)"),
+        ("base", "get::<_,AssetsData>(&AssetsKeys::AssetsData)"),
+        ("assets", "get::<_,AssetsData>(&AssetsKeys::AssetsData)"),
+    ] {
+        let body = compact(&body_of(&oracle, name));
+        assert!(
+            body.contains(&format!("{read}.unwrap();todo!(")),
+            "{name}: {body}"
+        );
+    }
+
+    // `Admin` / `FactoryKey` are written from `Address` parameters.
+    let phoenix = compact(&source(include_bytes!(
+        "../../../benchmark-data/mainnet/phoenix-amm-CCLZRD4E.wasm"
+    )));
+    assert!(phoenix.contains("get::<_,Address>(&DataKey::FactoryKey)"));
+    assert!(!phoenix.contains(".get(&DataKey::Admin)"));
+
+    // blend-backstop decodes a `{q4w, shares}` struct from a read the lifter
+    // keyed `PoolBalance(pool)`; nothing writes that key with that type, so
+    // the read is not typed from the decode.
+    let backstop = compact(&source(include_bytes!(
+        "../../../benchmark-data/mainnet/blend-backstop-CAQQR5SW.wasm"
+    )));
+    assert!(!backstop.contains("get::<_,UserBalance>(&BackstopDataKey::PoolBalance"));
+    let pool = source(include_bytes!(
+        "../../../benchmark-data/mainnet/blend-fixed-pool-CAJJZSGM.wasm"
+    ));
+    assert!(!compact(&pool).contains("get::<_,AuctionData>(&PoolDataKey::ResConfig"));
+    // `accept_admin` started from the storage KEY as the admin's default.
+    assert!(
+        !body_of(&pool, "accept_admin").contains(r#"let mut var_0 = symbol_short!("PropAdmin")"#)
+    );
 }
 
 /// `errors::hello` dispatches on a five-variant enum with a `br_table`; the

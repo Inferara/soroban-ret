@@ -183,6 +183,7 @@ pub fn lift_functions(
 ) -> ContractModule {
     let mut contract = ContractModule::new("Contract".to_string());
     contract.is_soroban = is_soroban;
+    STORED_TYPES.with(|t| t.borrow_mut().clear());
 
     if is_soroban {
         // Generate type definitions from spec
@@ -335,6 +336,7 @@ pub fn lift_functions(
     }
 
     contract.has_constructor = resolved.iter().any(|r| r.is_constructor);
+    contract.stored_types = STORED_TYPES.with(|t| std::mem::take(&mut *t.borrow_mut()));
 
     // Detect crypto module usage and re-generate struct tokens with type aliases
     contract.crypto_usage = detect_crypto_usage(&contract);
@@ -3363,7 +3365,10 @@ impl<'a> LiftContext<'a> {
                 *slot = StackVal::LoopPhi(l);
             }
         }
+        let stored_mark = STORED_TYPES.with(|t| t.borrow().len());
         sim.lift_structured_loop(body);
+        // A speculative run's observations are not facts about the body.
+        STORED_TYPES.with(|t| t.borrow_mut().truncate(stored_mark));
 
         written
             .into_iter()
@@ -3828,7 +3833,10 @@ impl<'a> LiftContext<'a> {
                 *slot = StackVal::LoopPhi(*idx);
             }
         }
+        let stored_mark = STORED_TYPES.with(|t| t.borrow().len());
         sim.lift_structured_loop(body);
+        // A speculative run's observations are not facts about the body.
+        STORED_TYPES.with(|t| t.borrow_mut().truncate(stored_mark));
 
         let result = sim.frame_slots.borrow();
         pre_keys
@@ -4457,6 +4465,7 @@ impl<'a> LiftContext<'a> {
                                             StackVal::HostCallResult(Box::new(field_expr)),
                                         );
                                     }
+                                    self.note_stored_type(&map_expr, &field_names);
                                     cov_mark::hit!(map_unpack_thunk_field_access);
                                 }
                             }
@@ -4787,6 +4796,7 @@ impl<'a> LiftContext<'a> {
                                         .borrow_mut()
                                         .insert((*id, base.base), StackVal::I64(0));
                                     // result_ptr + 8*(i+1) = decoded native field value
+                                    self.note_stored_type(&struct_expr, &unpack_info.field_names);
                                     for (i, name) in unpack_info.field_names.iter().enumerate() {
                                         let field_expr = SorobanExpr::FieldAccess {
                                             object: Box::new(struct_expr.clone()),
@@ -5440,6 +5450,7 @@ impl<'a> LiftContext<'a> {
                                     .cloned()
                                     .collect();
                                 drop(slots);
+                                self.note_stored_type(&struct_expr, &load_info.field_names);
                                 if !unknown_offsets.is_empty() {
                                     self.found_host_calls = true;
                                 }
@@ -9792,6 +9803,44 @@ impl<'a> LiftContext<'a> {
     /// FrameSlot entries with field access expressions. This makes the unpacked struct fields
     /// available for subsequent loads, replacing stale Void placeholders with `v.field_name`
     /// expressions that propagate through the decode→compute→encode→construct chain.
+    /// Record that a storage read is decoded as the struct whose exact field
+    /// list is `field_names` (campaign stage 3b, see `ir::stored_types`). The
+    /// SDK decodes a stored struct by unpacking the map over that struct's
+    /// field-name array, so the list names the type the original reads.
+    /// Recorded only when exactly one spec struct has that list, and only
+    /// when the unpacked value is a storage read (directly, or a `let` of
+    /// this body bound to one) whose key has a known shape.
+    fn note_stored_type(&self, object: &SorobanExpr, field_names: &[String]) {
+        let Some(type_name) = unique_struct_by_fields(self.registry, field_names) else {
+            return;
+        };
+        let lets = crate::ir::stored_types::single_lets(&self.stmts);
+        let read = match object {
+            SorobanExpr::StorageGet { .. } => Some(object),
+            SorobanExpr::Local(i) => lets.get(&format!("var_{i}")),
+            SorobanExpr::NamedLocal(n) => lets.get(n),
+            _ => None,
+        };
+        let Some(SorobanExpr::StorageGet {
+            storage_type, key, ..
+        }) = read
+        else {
+            return;
+        };
+        let Some(key) = crate::ir::stored_types::key_shape(key, &lets) else {
+            return;
+        };
+        cov_mark::hit!(stored_type_recorded_from_decode);
+        STORED_TYPES.with(|t| {
+            t.borrow_mut()
+                .push(crate::ir::stored_types::StoredTypeEvidence {
+                    storage_type: *storage_type,
+                    key,
+                    type_name,
+                })
+        });
+    }
+
     fn handle_map_unpack_raw(&mut self, raw_args: &[StackVal]) {
         // map_unpack_to_linear_memory(map, keys_pos, vals_pos, count)
         if raw_args.len() < 4 {
@@ -9838,6 +9887,7 @@ impl<'a> LiftContext<'a> {
                         StackVal::HostCallResult(Box::new(field_expr)),
                     );
                 }
+                self.note_stored_type(&map_expr, &field_names);
                 cov_mark::hit!(map_unpack_raw_field_access);
             }
         }
@@ -10091,6 +10141,16 @@ impl<'a> LiftContext<'a> {
 
         Some(exprs)
     }
+}
+
+thread_local! {
+    /// Stored-type observations made while lifting the current contract
+    /// (`LiftContext::note_stored_type`). Per thread because lifting a
+    /// contract is single-threaded and the observations come from contexts
+    /// at every inline depth, which are created in many places; the contract
+    /// lift clears it first and takes it at the end.
+    static STORED_TYPES: RefCell<Vec<crate::ir::stored_types::StoredTypeEvidence>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Lift a single function body from WASM instructions to Soroban IR.
@@ -15042,6 +15102,8 @@ struct LoadStructWrapperInfo {
     /// Maps output_ptr offset (in bytes) to field name.
     /// Extracted by tracing stores in the function body back to map_unpack field order.
     offset_to_field: Vec<(i32, String)>,
+    /// The decoded struct's field names, in the order of its map keys.
+    field_names: Vec<String>,
     #[allow(dead_code)]
     type_name: Option<String>,
     storage_type: Option<StorageType>,
@@ -15402,6 +15464,7 @@ fn detect_load_struct_wrapper(
     cov_mark::hit!(detect_load_struct_wrapper_hit);
     Some(LoadStructWrapperInfo {
         offset_to_field,
+        field_names,
         type_name,
         storage_type,
         const_key,
@@ -15939,6 +16002,25 @@ fn detect_storage_type_in_body(
 }
 
 /// Find a struct/event type name by its field names.
+/// The spec struct whose field list is exactly `field_names`, when exactly one
+/// struct has it. Unlike [`find_type_by_field_names`] there is no fallback to
+/// the first of several: a stored-type annotation must name the one type the
+/// decode proves.
+fn unique_struct_by_fields(registry: &TypeRegistry, field_names: &[String]) -> Option<String> {
+    let mut found = registry.structs.iter().filter(|(_, spec)| {
+        spec.fields
+            .iter()
+            .map(|f| f.name.to_utf8_string().ok())
+            .collect::<Option<Vec<_>>>()
+            .is_some_and(|names| names == field_names)
+    });
+    let (name, _) = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    Some(name.clone())
+}
+
 fn find_type_by_field_names(
     registry: &TypeRegistry,
     field_names: &[String],

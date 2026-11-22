@@ -915,6 +915,19 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
     // (E0283 → `Map::<_, Val>`). Runs last, on the fully-shaped body after every
     // other stage, and applies to all output (not just SDK contracts). See
     // `ir::correctness::{annotate_uninferable_gets, annotate_uninferable_collections}`.
+    //
+    // First, the stored-value types the contract proves (campaign stage 3b):
+    // collected over every function before any is changed, then every read of
+    // a key with exactly one proven type is annotated with it. See
+    // `ir::stored_types`.
+    let stored_types = crate::ir::stored_types::StoredTypes::collect(
+        &contract_module.stored_types,
+        contract_module
+            .functions
+            .iter()
+            .map(|f| (f.body.as_slice(), f.params.as_slice())),
+        &registry,
+    );
     for func in &mut contract_module.functions {
         let returns_value = !matches!(&func.return_type, None | Some(ScSpecTypeDef::Void));
         let body = std::mem::take(&mut func.body);
@@ -946,6 +959,13 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // mistaken for the return value and left to fail inference (E0284).
         let body_supplies_tail = returns_value
             && !crate::codegen::module::codegen_synthesizes_tail(&func.return_type, &body);
+        let body = stored_types.annotate(body);
+        let body = crate::ir::stored_types::hole_reads_returned_as_another_type(
+            body,
+            func.return_type.as_ref(),
+        );
+        let body =
+            crate::ir::stored_types::hole_decode_fragments(body, &registry, body_supplies_tail);
         let body = annotate_uninferable_gets(body, body_supplies_tail);
         let body = annotate_uninferable_collections(body);
         // Lever 2: a fabricated literal in the success tail whose type contradicts a
@@ -3741,8 +3761,17 @@ fn repair_key_adopted_defaults(stmts: &mut [SorobanStmt]) {
                     mutable: true,
                     value,
                 } => {
-                    if matches!(value, SorobanExpr::EnumConstruct { .. })
-                        && let_counts.get(name).copied().unwrap_or(0) == 1
+                    // A bare symbol key (`symbol_short!("PropAdmin")`) is
+                    // adopted the same way (blend pools `accept_admin`, stage
+                    // 3b: once the read is typed `Address`, the `Symbol` init
+                    // no longer type-checks; before, the read was inferred as
+                    // `Symbol` and decoded the stored admin as one).
+                    if matches!(
+                        value,
+                        SorobanExpr::EnumConstruct { .. }
+                            | SorobanExpr::SymbolLiteral(_)
+                            | SorobanExpr::VecConstruct(_)
+                    ) && let_counts.get(name).copied().unwrap_or(0) == 1
                         && get_keys
                             .get(name)
                             .is_some_and(|keys| keys.iter().any(|k| k == value))

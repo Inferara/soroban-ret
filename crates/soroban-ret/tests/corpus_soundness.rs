@@ -483,7 +483,34 @@ use std::process::Command;
 /// `Result` ok-types (aqua-amm 73→62, aqua-rewards 31→28). (4) a TTL
 /// argument built in Val space (`sequence() + U32Val(483840)`) is decoded
 /// (fxdao-vault, count unchanged). No contract's count rose.
-const ERROR_CEILING: u32 = 379;
+/// → 372 (−7; campaign stage 3b). A storage read gets the value type the
+/// contract writes under its key (`get::<_, T>(&key)`): every typed write
+/// to the key (parameter of a spec type, struct or enum literal) names the
+/// same `T`, and no decode or typed consumer of the key disagrees. A decode
+/// alone never types a key, because inside inlined helpers the lifter can
+/// attach the wrong key to it (blend pools decode an auction under a key it
+/// renders `ResConfig`). Wrong values this exposed are holes: fxdao-oracle
+/// `resolution`/`decimals` returned the whole stored `CoreData` as a `u32`
+/// (the field they return was lost); a union read followed by `.get(i)` is
+/// the SDK's vec decoding of the union, not a value (soroban-domains, 34
+/// sites); a local initialised with the bare symbol key of the read that
+/// fills it (blend pools `accept_admin`). Also: struct-literal fields count
+/// as moves for the clone repair (comet's allowance key).
+/// Per contract: fxdao-oracle 12→6, phoenix 8→5, comet 19→17, band 12→11,
+/// blend-fixed-pool / yieldblox 16→15 each; **soroban-domains 56→63**:
+/// untyped reads had stopped type checking in those functions, and typing
+/// them unmasked 10 `vp = vp.adm` (a second value reusing a binding, stage
+/// 3c) and assignments that were already wrong (`oracle = 10` to an
+/// `Address`, `node = caller` across types).
+/// → 371 (−1; stage 3b review). A write to a key whose value type the IR
+/// does not prove (a lost value, a literal, a `Val`) now cancels the key's
+/// entry, since it may have stored anything. fxdao-oracle's temporary
+/// `AssetsData` key is written once with an `AssetRecord` literal and once
+/// with an integer, so its reads are no longer typed: back to main's
+/// untyped reads, and the E0308 that typing raised at `next: assets_data`
+/// goes with it (fxdao-oracle 6→5). aqua-rewards and xycloans reads go
+/// back to `Val` (integer-literal writes), no count change.
+const ERROR_CEILING: u32 = 371;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

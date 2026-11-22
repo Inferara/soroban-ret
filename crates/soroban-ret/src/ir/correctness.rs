@@ -749,7 +749,7 @@ fn visit_expr_names(expr: &SorobanExpr, out: &mut HashSet<String>) {
 /// Borrowed read-only twin of [`map_subexprs`]: invoke `f` on each *direct*
 /// sub-expression of `expr`. Kept structurally identical to `map_subexprs` —
 /// update both together when a variant gains a sub-expression.
-fn for_each_subexpr(expr: &SorobanExpr, f: &mut dyn FnMut(&SorobanExpr)) {
+pub(super) fn for_each_subexpr(expr: &SorobanExpr, f: &mut dyn FnMut(&SorobanExpr)) {
     use SorobanExpr as E;
     match expr {
         E::Add(a, b)
@@ -993,16 +993,26 @@ fn count_enum_field_params(
     eligible: &HashSet<String>,
     counts: &mut HashMap<String, u32>,
 ) {
-    if let SorobanExpr::EnumConstruct { fields, .. } = expr {
-        for field in fields {
-            match var_name_of(field) {
-                Some(n) if eligible.contains(&n) => *counts.entry(n).or_insert(0) += 1,
-                _ => count_enum_field_params(field, eligible, counts),
-            }
+    // Struct literal fields are by-value move sites too (comet's
+    // `DataKeyToken::Allowance(AllowanceDataKey { from, spender })`, built
+    // once to read and once to write the allowance — campaign stage 3b).
+    let fields: Vec<&SorobanExpr> = match expr {
+        SorobanExpr::EnumConstruct { fields, .. } => fields.iter().collect(),
+        SorobanExpr::StructConstruct { fields, .. } => fields.iter().map(|(_, v)| v).collect(),
+        _ => {
+            for_each_subexpr(expr, &mut |c| count_enum_field_params(c, eligible, counts));
+            return;
         }
-        return;
+    };
+    // The fields are the construct's only sub-expressions: walking them again
+    // through `for_each_subexpr` would count a nested construct's move twice
+    // (PR #95 review).
+    for field in fields {
+        match var_name_of(field) {
+            Some(n) if eligible.contains(&n) => *counts.entry(n).or_insert(0) += 1,
+            _ => count_enum_field_params(field, eligible, counts),
+        }
     }
-    for_each_subexpr(expr, &mut |c| count_enum_field_params(c, eligible, counts));
 }
 
 /// Wrap every bare `to_clone` variable that appears as an `EnumConstruct` field
@@ -1010,7 +1020,22 @@ fn count_enum_field_params(
 /// redundant handle clone still yields the same value and compiles — and avoids
 /// threading evaluation-order state through the rewrite.
 fn clone_enum_field_params(expr: SorobanExpr, to_clone: &HashSet<String>) -> SorobanExpr {
+    let clone_field = |field: SorobanExpr| match var_name_of(&field) {
+        Some(n) if to_clone.contains(&n) => SorobanExpr::MethodCall {
+            object: Box::new(field),
+            method: "clone".to_string(),
+            args: vec![],
+        },
+        _ => clone_enum_field_params(field, to_clone),
+    };
     match expr {
+        SorobanExpr::StructConstruct { type_name, fields } => SorobanExpr::StructConstruct {
+            type_name,
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| (name, clone_field(value)))
+                .collect(),
+        },
         SorobanExpr::EnumConstruct {
             type_name,
             variant,
@@ -1018,17 +1043,7 @@ fn clone_enum_field_params(expr: SorobanExpr, to_clone: &HashSet<String>) -> Sor
         } => SorobanExpr::EnumConstruct {
             type_name,
             variant,
-            fields: fields
-                .into_iter()
-                .map(|field| match var_name_of(&field) {
-                    Some(n) if to_clone.contains(&n) => SorobanExpr::MethodCall {
-                        object: Box::new(field),
-                        method: "clone".to_string(),
-                        args: vec![],
-                    },
-                    _ => clone_enum_field_params(field, to_clone),
-                })
-                .collect(),
+            fields: fields.into_iter().map(clone_field).collect(),
         },
         other => map_subexprs(other, &|e| clone_enum_field_params(e, to_clone)),
     }
@@ -1037,7 +1052,7 @@ fn clone_enum_field_params(expr: SorobanExpr, to_clone: &HashSet<String>) -> Sor
 /// Apply `f` to every expression appearing directly in `stmts`, recursing into
 /// nested statement bodies — the borrowed read-only counterpart of
 /// [`map_exprs_in_stmts`].
-fn for_each_expr_in_stmts(stmts: &[SorobanStmt], f: &mut dyn FnMut(&SorobanExpr)) {
+pub(super) fn for_each_expr_in_stmts(stmts: &[SorobanStmt], f: &mut dyn FnMut(&SorobanExpr)) {
     for stmt in stmts {
         match stmt {
             SorobanStmt::Expr(e)
@@ -1250,7 +1265,7 @@ pub fn lifetime_extensions_under_has(
 /// Apply `f` to every expression that appears directly in `stmts`, recursing
 /// into nested statement bodies. `f` is responsible for its own sub-expression
 /// recursion (it receives whole expressions).
-fn map_exprs_in_stmts(
+pub(super) fn map_exprs_in_stmts(
     stmts: Vec<SorobanStmt>,
     f: &dyn Fn(SorobanExpr) -> SorobanExpr,
 ) -> Vec<SorobanStmt> {
@@ -1316,7 +1331,10 @@ fn map_exprs_in_stmts(
 /// Apply `f` to the *direct* sub-expressions of `expr`, rebuilding it. Used as
 /// the recursion fall-through for expression rewriters that only special-case a
 /// few node kinds. Leaf nodes are returned unchanged.
-fn map_subexprs(expr: SorobanExpr, f: &dyn Fn(SorobanExpr) -> SorobanExpr) -> SorobanExpr {
+pub(super) fn map_subexprs(
+    expr: SorobanExpr,
+    f: &dyn Fn(SorobanExpr) -> SorobanExpr,
+) -> SorobanExpr {
     use SorobanExpr as E;
     let b = |e: Box<SorobanExpr>, f: &dyn Fn(SorobanExpr) -> SorobanExpr| Box::new(f(*e));
     match expr {
@@ -3144,6 +3162,24 @@ mod tests {
         assert!(
             !enum_field_is_clone(&out[0]),
             "single-use param must not be cloned: {out:?}"
+        );
+    }
+
+    #[test]
+    fn leaves_single_use_param_in_a_nested_construct() {
+        // `DataKey::Allowance(AllowanceKey { from })`: one move, counted once.
+        let nested = datakey(SorobanExpr::StructConstruct {
+            type_name: "AllowanceKey".into(),
+            fields: vec![("from".into(), SorobanExpr::Param("from".into()))],
+        });
+        let out = clone_reused_move_params(vec![nested], &[addr_param("from")]);
+        let SorobanStmt::Expr(SorobanExpr::EnumConstruct { fields, .. }) = &out[0] else {
+            panic!("{out:?}");
+        };
+        assert!(
+            matches!(&fields[0], SorobanExpr::StructConstruct { fields, .. }
+                if matches!(fields[0].1, SorobanExpr::Param(_))),
+            "a single nested use must not be cloned: {out:?}"
         );
     }
 

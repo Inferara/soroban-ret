@@ -207,7 +207,7 @@ functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
 
-The headline restoration figure this produces — **90.0 %**
+The headline restoration figure this produces — **89.6 %**
 (`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
 mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
 **correctness-blind**: it grades how much of each function lifted to concrete
@@ -278,7 +278,7 @@ every mainnet corpus contract and `cargo check`s the result for
 lifter emitted: output that *looks* like code but does not type-check. The
 metric is "wrong output", not "incomplete output".
 
-Current status: **379 hard errors across 24 contracts** (ceiling 379), with
+Current status: **371 hard errors across 24 contracts** (ceiling 371), with
 **2 contracts compiling cleanly** — `digicus` and `unknown-oracle`.
 Down from 1042 at the start of the v0.0.4 cycle, and up from 303: the
 equivalence gate showed that `fxdao-oracle` and `soroswap-CA4HEQTL` compiled
@@ -286,7 +286,11 @@ cleanly only because function bodies had been silently truncated; with the
 truncation fixed the missing code is back, partly unrecovered. The step to
 379 removed wrong values that only showed as type errors (a storage key
 called as a contract, an address compared with `0`, an integer returned as
-an `Address`, a Val-encoded constant in a TTL argument). Every intermediate *rise* in
+an `Address`, a Val-encoded constant in a TTL argument). The step to 371
+gave storage reads the value type the contract writes under their key
+(`get::<_, T>(&key)`), and turned the wrong values that exposed into holes
+(a stored struct returned as a `u32`, a union's internal vec decoding read
+as a value). Every intermediate *rise* in
 this ratchet has been an audited, deliberate unmask (fixing a type error
 un-suppresses pre-existing brokenness rustc's error recovery was hiding); see
 the running commentary in the `ERROR_CEILING` docstring, which is the
