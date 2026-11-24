@@ -1573,6 +1573,216 @@ pub fn husk_type_mismatched_ok_literal(
     stmts
 }
 
+/// Every value a returned local can hold is a literal its type cannot → each of
+/// them is a hole (campaign stage 3d).
+///
+/// One wasm local is a slot that carries several values, and reflector's
+/// `base()` fills one with two values the declared return type can hold
+/// neither of:
+///
+/// ```text
+/// let mut var_2 = String::from_str(&env, "base_asset");   // the storage KEY
+/// if env.storage().instance().has(&String::from_str(&env, "base_asset")) {
+///     env.storage().instance().get::<_, Val>(&..).unwrap();   // value discarded
+///     var_2 = 1;                                          // a lost value
+/// }
+/// var_2                                                   // -> Asset
+/// ```
+///
+/// An `Asset` holds neither a string nor an integer, so BOTH values are
+/// fabrications: the key adopted as the lost default arm (stage 4m6 holes that
+/// one), and a `1` standing in for the read whose value the lifter dropped into
+/// a discarded statement one line above.
+///
+/// What makes this provable without a live-range analysis is that the slot's
+/// WHOLE value set is wrong. If every value a returned local can hold is a
+/// literal of a class the return type can never hold, then no live range of
+/// that slot carries the real value, and which range a given read belongs to
+/// stops mattering — each of those literals is a hole.
+///
+/// The gate, therefore:
+///
+/// - the function's returned type must have a decidable literal class
+///   (`scalar_ok_class`: `Option`, `Val`, tuples and the rest return `None`),
+/// - the local must be RETURNED — `return <local>` at any depth, or the body's
+///   own last statement. A tail that codegen propagates INTO an `if` or a
+///   `match` arm is deliberately not followed: missing one only withholds the
+///   husk, and the error it leaves stays visible in the soundness ratchet,
+/// - it must be bound at most once. A name bound twice may be two separate Rust
+///   variables, since a `let` inside a block shadows rather than writes, and the
+///   inner one carries a type of its own that the literal may genuinely hold,
+/// - every `let` and every write of it must be either a hole or a literal of a
+///   class the return type cannot hold. One real value anywhere — a matching
+///   literal, an expression, a read — and the pass does nothing: the slot may
+///   then genuinely carry that value, and holing a mismatching literal
+///   elsewhere in it would be a live-range claim this pass does not make.
+///
+/// Numeric against numeric never fires (unsuffixed integer literals coerce
+/// between widths), so a recovered constant return is never touched.
+pub fn husk_wholly_fabricated_returned_locals(
+    mut stmts: Vec<SorobanStmt>,
+    return_type: Option<&ScSpecTypeDef>,
+) -> Vec<SorobanStmt> {
+    use std::collections::{HashMap, HashSet};
+
+    let value_type = match return_type {
+        Some(ScSpecTypeDef::Result(r)) => &*r.ok_type,
+        Some(t) => t,
+        None => return stmts,
+    };
+    let Some(ok_class) = scalar_ok_class(value_type) else {
+        return stmts;
+    };
+
+    /// The local name an expression IS, for the two spellings of a local read.
+    /// Anything else (a projection, a call, a literal) is not a returned local.
+    fn local_name(e: &SorobanExpr) -> Option<String> {
+        match e {
+            SorobanExpr::Local(i) => Some(format!("var_{i}")),
+            SorobanExpr::NamedLocal(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
+
+    /// Names in returned position: `return <local>` at any depth.
+    fn returned(stmts: &[SorobanStmt], out: &mut HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Return(Some(e)) => {
+                    if let Some(name) = local_name(e) {
+                        out.insert(name);
+                    }
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    returned(then_body, out);
+                    returned(else_body, out);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        returned(&arm.body, out);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => returned(body, out),
+                _ => {}
+            }
+        }
+    }
+
+    /// `true` once the name holds a value this pass may not touch: anything
+    /// that is neither a hole nor a literal of a class the return type cannot
+    /// hold. `lets` counts the bindings of each name, because a name bound
+    /// twice may be two SEPARATE Rust variables (a `let` inside a block shadows
+    /// rather than writes, and the inner one carries a type of its own), and
+    /// holing a literal in the shadow would throw away a value that type
+    /// genuinely holds.
+    fn scan(
+        stmts: &[SorobanStmt],
+        ok_class: &str,
+        real: &mut HashMap<String, bool>,
+        lets: &mut HashMap<String, u32>,
+    ) {
+        let note = |name: &str, value: &SorobanExpr, real: &mut HashMap<String, bool>| {
+            let huskable = value.is_never_rooted() || literal_mismatches(value, ok_class);
+            let entry = real.entry(name.to_string()).or_insert(false);
+            *entry |= !huskable;
+        };
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Let { name, value, .. } => {
+                    *lets.entry(name.clone()).or_insert(0) += 1;
+                    note(name, value, real)
+                }
+                SorobanStmt::Assign { target, value } => note(target, value, real),
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    scan(then_body, ok_class, real, lets);
+                    scan(else_body, ok_class, real, lets);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        scan(&arm.body, ok_class, real, lets);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => scan(body, ok_class, real, lets),
+                _ => {}
+            }
+        }
+    }
+
+    fn rewrite(stmts: &mut [SorobanStmt], ok_class: &str, wholly: &HashSet<String>) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                SorobanStmt::Let { name, value, .. }
+                    if wholly.contains(name) && literal_mismatches(value, ok_class) =>
+                {
+                    cov_mark::hit!(wholly_fabricated_returned_local_holed);
+                    *value = SorobanExpr::UnknownVal;
+                }
+                SorobanStmt::Assign { target, value }
+                    if wholly.contains(target) && literal_mismatches(value, ok_class) =>
+                {
+                    cov_mark::hit!(wholly_fabricated_returned_local_holed);
+                    *value = SorobanExpr::UnknownVal;
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    rewrite(then_body, ok_class, wholly);
+                    rewrite(else_body, ok_class, wholly);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        rewrite(&mut arm.body, ok_class, wholly);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => rewrite(body, ok_class, wholly),
+                _ => {}
+            }
+        }
+    }
+
+    let mut names = HashSet::new();
+    returned(&stmts, &mut names);
+    // The body's tail is the returned value too, when the body supplies one.
+    if let Some(SorobanStmt::Expr(e)) = stmts.last()
+        && let Some(name) = local_name(e)
+    {
+        names.insert(name);
+    }
+    if names.is_empty() {
+        return stmts;
+    }
+    let mut real = HashMap::new();
+    let mut lets = HashMap::new();
+    scan(&stmts, ok_class, &mut real, &mut lets);
+    let wholly: HashSet<String> = names
+        .into_iter()
+        .filter(|name| {
+            real.get(name) == Some(&false) && lets.get(name).copied().unwrap_or(0) <= 1
+        })
+        .collect();
+    if wholly.is_empty() {
+        return stmts;
+    }
+    rewrite(&mut stmts, ok_class, &wholly);
+    stmts
+}
+
 /// A `try_invoke_contract` result in value position → the call, then an
 /// honest hole for the value.
 ///
@@ -3550,5 +3760,133 @@ mod tests {
             &SorobanExpr::I32Literal(3),
             "a `Val` holds any literal"
         );
+    }
+
+    /// Stage 3d: reflector's `base()` fills one slot with the storage KEY and
+    /// then a `1`, and returns it as an `Asset` — which holds neither, so every
+    /// value the slot can carry is fabricated and each one is a hole.
+    #[test]
+    fn wholly_fabricated_returned_local_holes_every_value() {
+        cov_mark::check!(wholly_fabricated_returned_local_holed);
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_2".into(),
+                mutable: true,
+                value: SorobanExpr::StringLiteral("base_asset".into()),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::UnknownVal,
+                then_body: vec![SorobanStmt::Assign {
+                    target: "var_2".into(),
+                    value: SorobanExpr::I64Literal(1),
+                }],
+                else_body: vec![],
+            },
+            SorobanStmt::Return(Some(SorobanExpr::Local(2))),
+        ];
+        let out = husk_wholly_fabricated_returned_locals(
+            stmts,
+            Some(&ScSpecTypeDef::Udt(stellar_xdr::curr::ScSpecTypeUdt {
+                name: "Asset".try_into().unwrap(),
+            })),
+        );
+        assert_eq!(
+            match &out[0] {
+                SorobanStmt::Let { value, .. } => value,
+                other => panic!("{other:?}"),
+            },
+            &SorobanExpr::UnknownVal,
+            "an Asset holds no string: {out:?}"
+        );
+        let SorobanStmt::If { then_body, .. } = &out[1] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(
+            match &then_body[0] {
+                SorobanStmt::Assign { value, .. } => value,
+                other => panic!("{other:?}"),
+            },
+            &SorobanExpr::UnknownVal,
+            "an Asset holds no 1: {out:?}"
+        );
+    }
+
+    /// The refusal: ONE real value anywhere in the slot and the pass does
+    /// nothing. Holing the other value would claim a live range this pass does
+    /// not analyse — the slot may genuinely carry the real value at the return.
+    #[test]
+    fn wholly_fabricated_returned_local_refused_when_one_value_is_real() {
+        let real = SorobanExpr::StorageGet {
+            storage_type: crate::ir::soroban_ir::StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral("base".into())),
+            unwrap: true,
+            on_missing: None,
+        };
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_2".into(),
+                mutable: true,
+                value: SorobanExpr::StringLiteral("base_asset".into()),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::UnknownVal,
+                then_body: vec![SorobanStmt::Assign {
+                    target: "var_2".into(),
+                    value: real.clone(),
+                }],
+                else_body: vec![],
+            },
+            SorobanStmt::Return(Some(SorobanExpr::NamedLocal("var_2".into()))),
+        ];
+        let out = husk_wholly_fabricated_returned_locals(
+            stmts.clone(),
+            Some(&ScSpecTypeDef::Udt(stellar_xdr::curr::ScSpecTypeUdt {
+                name: "Asset".try_into().unwrap(),
+            })),
+        );
+        assert_eq!(format!("{out:?}"), format!("{stmts:?}"), "one real value disqualifies the whole slot");
+    }
+
+    /// A numeric literal in a numeric-returning function is a recovered
+    /// constant, never a fabrication: unsuffixed integer literals coerce
+    /// between widths, so the classes unify and the pass is a no-op.
+    #[test]
+    fn wholly_fabricated_returned_local_leaves_a_matching_literal() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_2".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(0),
+            },
+            SorobanStmt::Return(Some(SorobanExpr::Local(2))),
+        ];
+        let out = husk_wholly_fabricated_returned_locals(
+            stmts.clone(),
+            Some(&ScSpecTypeDef::U64),
+        );
+        assert_eq!(format!("{out:?}"), format!("{stmts:?}"), "numeric into numeric coerces");
+    }
+
+    /// A return type that holds more than one literal class (`Option`, `Val`,
+    /// a tuple) decides nothing, so the pass never fires on one.
+    #[test]
+    fn wholly_fabricated_returned_local_refused_for_an_undecidable_return_type() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_2".into(),
+                mutable: true,
+                value: SorobanExpr::StringLiteral("base_asset".into()),
+            },
+            SorobanStmt::Return(Some(SorobanExpr::Local(2))),
+        ];
+        let out = husk_wholly_fabricated_returned_locals(
+            stmts.clone(),
+            Some(&ScSpecTypeDef::Option(Box::new(
+                stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: Box::new(ScSpecTypeDef::Address),
+                },
+            ))),
+        );
+        assert_eq!(format!("{out:?}"), format!("{stmts:?}"), "an Option holds a literal of any class");
     }
 }
