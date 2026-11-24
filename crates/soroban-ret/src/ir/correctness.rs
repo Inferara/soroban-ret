@@ -1827,6 +1827,140 @@ fn literal_mismatches(e: &SorobanExpr, ok_class: &str) -> bool {
     literal_scalar_class(inner).is_some_and(|c| c != ok_class)
 }
 
+/// A local whose type a typed storage read pins, assigned a literal that type
+/// can never hold → the literal is a hole.
+///
+/// soroban-domains' `transfer_record` reads the oracle address
+/// (`let mut oracle = get::<_, Address>(&CoreDataKeys::Oracle).unwrap();`) and
+/// then writes `oracle = 10` on a branch whose real value the lifter lost. The
+/// `10` is not the contract's: an `Address` holds no integer, so the assignment
+/// is a guaranteed E0308 and a fabricated value at the same time. The read stays
+/// and the written value becomes `todo!()`.
+///
+/// Gate: the local's type must be PROVEN by the annotation this campaign derives
+/// (`CastAs { StorageGet, T }` — stage 3a/3b), it must be bound exactly once, and
+/// the written value must be a literal of a class `T` can never hold. Numeric
+/// against numeric never fires (unsuffixed integer literals coerce between
+/// widths), and a type whose class is not decidable is left alone.
+pub fn husk_type_mismatched_assignments(mut stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    use std::collections::HashMap;
+
+    /// Class of a type NAME, for the types where a literal of another class is a
+    /// guaranteed error — the name-level mirror of [`scalar_ok_class`].
+    fn type_name_class(name: &str) -> Option<&'static str> {
+        match name {
+            "u32" | "i32" | "u64" | "i64" | "u128" | "i128" => Some("numeric"),
+            "bool" => Some("bool"),
+            "Symbol" => Some("symbol"),
+            "String" => Some("string"),
+            "Bytes" => Some("bytes"),
+            "Address" => Some("handle"),
+            n if n.starts_with("BytesN<") => Some("bytes"),
+            n if n.starts_with("Vec<") || n.starts_with("Map<") => Some("handle"),
+            // `Val`, `Option<..>`, tuples, U256/I256 and the time types hold
+            // more than one literal class, or a literal of any class.
+            "Val" | "Void" => None,
+            n if n.starts_with("Option<") || n.starts_with('(') => None,
+            // A user type (a struct, union or enum of the contract's spec)
+            // starts upper-case and holds no literal.
+            n if n.starts_with(char::is_uppercase) => Some("handle"),
+            _ => None,
+        }
+    }
+
+    /// Locals bound once to a read of a proven type, by that type's class. A
+    /// local bound more than once, or bound to anything else, is dropped.
+    fn collect(stmts: &[SorobanStmt], out: &mut HashMap<String, Option<&'static str>>) {
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Let { name, value, .. } => {
+                    let class = match value {
+                        SorobanExpr::CastAs { value, target_type }
+                            if matches!(strip_unwrap(value), SorobanExpr::StorageGet { .. }) =>
+                        {
+                            type_name_class(target_type)
+                        }
+                        _ => None,
+                    };
+                    out.entry(name.clone())
+                        .and_modify(|slot| *slot = None)
+                        .or_insert(class);
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect(then_body, out);
+                    collect(else_body, out);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        collect(&arm.body, out);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => collect(body, out),
+                _ => {}
+            }
+        }
+    }
+
+    fn strip_unwrap(e: &SorobanExpr) -> &SorobanExpr {
+        match e {
+            SorobanExpr::MethodCall { object, method, .. } if method == "unwrap" => {
+                strip_unwrap(object)
+            }
+            other => other,
+        }
+    }
+
+    fn rewrite(stmts: &mut [SorobanStmt], classes: &HashMap<String, &'static str>) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                SorobanStmt::Assign { target, value } => {
+                    if let Some(class) = classes.get(target)
+                        && literal_mismatches(value, class)
+                    {
+                        cov_mark::hit!(type_mismatched_assignment_holed);
+                        *value = SorobanExpr::UnknownVal;
+                    }
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    rewrite(then_body, classes);
+                    rewrite(else_body, classes);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        rewrite(&mut arm.body, classes);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => rewrite(body, classes),
+                _ => {}
+            }
+        }
+    }
+
+    let mut bound = HashMap::new();
+    collect(&stmts, &mut bound);
+    let classes: HashMap<String, &'static str> = bound
+        .into_iter()
+        .filter_map(|(name, class)| class.map(|c| (name, c)))
+        .collect();
+    if classes.is_empty() {
+        return stmts;
+    }
+    rewrite(&mut stmts, &classes);
+    stmts
+}
+
 /// Literal class of a returned type, but **only** for types where a literal of
 /// another class is a guaranteed E0308 (so husking is always safe). Integer
 /// widths collapse to `"numeric"` (unsuffixed integer literals coerce between
@@ -3338,6 +3472,83 @@ mod tests {
                 [SorobanStmt::Expr(SorobanExpr::BoolLiteral(false))]
             ),
             "matching bool literal must be left untouched: {out:?}"
+        );
+    }
+
+    /// `oracle = 10` where the local is a typed `Address` read: the literal is
+    /// fabricated and cannot type, so it holes. A numeric local keeps a numeric
+    /// literal, and a local whose read is untyped is left alone.
+    #[test]
+    fn type_mismatched_assignment_holes_the_literal() {
+        cov_mark::check!(type_mismatched_assignment_holed);
+        let read = |ty: &str| SorobanExpr::CastAs {
+            value: Box::new(SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::StorageGet {
+                    storage_type: crate::ir::soroban_ir::StorageType::Instance,
+                    key: Box::new(SorobanExpr::SymbolLiteral("K".into())),
+                    unwrap: false,
+                    on_missing: None,
+                }),
+                method: "unwrap".into(),
+                args: vec![],
+            }),
+            target_type: ty.into(),
+        };
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "oracle".into(),
+                mutable: true,
+                value: read("Address"),
+            },
+            SorobanStmt::Let {
+                name: "cache".into(),
+                mutable: true,
+                value: read("u32"),
+            },
+            SorobanStmt::Let {
+                name: "raw".into(),
+                mutable: true,
+                value: read("Val"),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::UnknownVal,
+                then_body: vec![
+                    SorobanStmt::Assign {
+                        target: "oracle".into(),
+                        value: SorobanExpr::I32Literal(10),
+                    },
+                    SorobanStmt::Assign {
+                        target: "cache".into(),
+                        value: SorobanExpr::I32Literal(2),
+                    },
+                    SorobanStmt::Assign {
+                        target: "raw".into(),
+                        value: SorobanExpr::I32Literal(3),
+                    },
+                ],
+                else_body: vec![],
+            },
+        ];
+        let out = husk_type_mismatched_assignments(stmts);
+        let SorobanStmt::If { then_body, .. } = &out[3] else {
+            panic!("{out:?}");
+        };
+        let value = |i: usize| {
+            let SorobanStmt::Assign { value, .. } = &then_body[i] else {
+                panic!("{then_body:?}");
+            };
+            value
+        };
+        assert_eq!(value(0), &SorobanExpr::UnknownVal, "an Address holds no 10");
+        assert_eq!(
+            value(1),
+            &SorobanExpr::I32Literal(2),
+            "numeric into numeric coerces"
+        );
+        assert_eq!(
+            value(2),
+            &SorobanExpr::I32Literal(3),
+            "a `Val` holds any literal"
         );
     }
 }

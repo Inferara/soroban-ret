@@ -510,7 +510,52 @@ use std::process::Command;
 /// untyped reads, and the E0308 that typing raised at `next: assets_data`
 /// goes with it (fxdao-oracle 6→5). aqua-rewards and xycloans reads go
 /// back to `Val` (integer-literal writes), no count change.
-const ERROR_CEILING: u32 = 371;
+/// → 358 (−13; campaign stage 3c). One wasm local is a slot, not a variable:
+/// it carries several values over a function's life, and the lifter emits a
+/// `Let` for each of them under the slot's own name (`var_3`). Rendering two of
+/// them under one name merged them — the inner `let` shadowed the outer
+/// binding, so the write that followed hit the immutable inner binding (E0384)
+/// across types (E0308), and later reads of the slot took the wrong value:
+/// `let mut vp = CoreDataKeys::CoreData; if has(..) { let vp = get::<_,
+/// CoreData>(..).unwrap(); vp = vp.adm; }` (19 sites in four contracts).
+/// New optimizer pass `split_shadowed_bindings` (phase 5d, before naming) gives
+/// each binding its own name and points the reads inside the shadow's region at
+/// it, while a write keeps going to the slot's HOME binding — the one an
+/// enclosing scope declared, and so the one a reader after the block sees. Two
+/// guards keep it to what it can prove: a `Loop`/`For` in the region that
+/// assigns the slot (the loop reads the previous iteration's value, which lives
+/// in the home binding), and a region that writes the slot from inside a block
+/// and then reads it — that read wants the merge of two incoming values, the
+/// shadow's and the written one, which only one mutable variable models
+/// (soroswap's `create_pair` builds the `PairWasmHash` key in the slot, writes
+/// an error sentinel over it when the key is absent, then reads the slot as its
+/// read's key; it keeps today's rendering). The merge guard is lifted only when
+/// BOTH incoming values are holes: a read that follows the write then lands on
+/// the home binding, which offers the home's value in place of the shadow's —
+/// exact when both are holes, a fabricated value when the home holds a vec, a
+/// literal or a field read, since the rendering would claim that value on the
+/// path where the truth is unknown. 37 of the corpus's 45 merge-guarded shadows
+/// have a hole on both sides and split; the other 8 keep today's rendering.
+/// Two follow-on fixes: stage 4m6 now holes a key-adopted default through a
+/// read bound to a local of its own and projected (`vp = core_data.adm`), and a
+/// literal written into a local whose type a typed read pins (`oracle = 10` on
+/// an `Address`) is an honest hole (`husk_type_mismatched_assignments`, one
+/// corpus site). A third fix came out of the PR review: `rename_in_expr` ended
+/// in a catch-all `other => other`, so it returned `Shl`, `Some`, `Try`,
+/// `SretResult`, `ValTag` and `VecTryIterFold` unvisited — a rename reached the
+/// binding but not a read inside one of those, leaving the read on the old name.
+/// The match is now exhaustive, so the compiler names the next variant that is
+/// added. It also recovers four values that were holes, among them
+/// blend-backstop's second `try_invoke_contract` target inside a `.get_tag()`
+/// (`todo!()` → `&emitter`) and three soroswap reads.
+/// Per contract: soroban-domains 63→56, blend-emitter 16→11 (its three
+/// swap-backstop bodies read the queued `Swap`'s fields off the field that had
+/// taken the struct's name — issue #80 class B), fxdao-vault 5→3, soroswap
+/// -CA4HEQTL 8→9 (the one rise: refusing the merge-guarded shadow restores the
+/// E0308 that names the slot's two types, which is the honest diagnosis of the
+/// live-range split stage 3d owes). Clean contracts stay 2. `x = x.field`
+/// 19 → 1, the one left being the merge the guard protects.
+const ERROR_CEILING: u32 = 358;
 
 #[test]
 fn corpus_soundness_within_ceiling() {
