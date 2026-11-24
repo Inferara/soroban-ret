@@ -207,7 +207,7 @@ functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
 
-The headline restoration figure this produces — **89.3 %**
+The headline restoration figure this produces — **89.4 %**
 (`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
 mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
 **correctness-blind**: it grades how much of each function lifted to concrete
@@ -278,7 +278,7 @@ every mainnet corpus contract and `cargo check`s the result for
 lifter emitted: output that *looks* like code but does not type-check. The
 metric is "wrong output", not "incomplete output".
 
-Current status: **354 hard errors across 24 contracts** (ceiling 354), with
+Current status: **358 hard errors across 24 contracts** (ceiling 358), with
 **2 contracts compiling cleanly** — `digicus` and `unknown-oracle`.
 Down from 1042 at the start of the v0.0.4 cycle, and up from 303: the
 equivalence gate showed that `fxdao-oracle` and `soroswap-CA4HEQTL` compiled
@@ -290,10 +290,13 @@ an `Address`, a Val-encoded constant in a TTL argument). The step to 371
 gave storage reads the value type the contract writes under their key
 (`get::<_, T>(&key)`), and turned the wrong values that exposed into holes
 (a stored struct returned as a `u32`, a union's internal vec decoding read
-as a value). The step to 354 gave every value of a reused wasm local its own
+as a value). The step to 358 gave every value of a reused wasm local its own
 name: one slot carries the storage key, the struct read under it and one field
 of that struct, and rendering them under one name wrote the immutable inner
-binding across types and took the wrong value at later reads. Every intermediate *rise* in
+binding across types and took the wrong value at later reads. A slot whose
+two values meet at a merge is split only when both are holes; otherwise the
+single-name rendering stands, and the type error it raises is the honest
+diagnosis of a live-range split the decompiler does not yet do. Every intermediate *rise* in
 this ratchet has been an audited, deliberate unmask (fixing a type error
 un-suppresses pre-existing brokenness rustc's error recovery was hiding); see
 the running commentary in the `ERROR_CEILING` docstring, which is the

@@ -7310,11 +7310,14 @@ fn collect_used_names(stmts: &[SorobanStmt], names: &mut std::collections::HashS
 ///   reads the slot as the key of its own read. One mutable variable is what
 ///   models that merge, so those slots keep today's single-name rendering.
 ///
-/// Two shadows carry nothing to merge and are always split: one that is itself
-/// a hole, and one whose value is the storage KEY of a read the same slot is
-/// filled from (the lost default arm stage 4m6 holes — on the path where the
-/// key is absent the slot holds the key, which is not a value the contract
-/// wrote).
+/// The merge guard has one exemption, and it needs BOTH incoming values of the
+/// merge to be holes: the shadow's value and the home binding's. A read that
+/// follows the write then lands on the home binding, which offers the home's
+/// value in place of the shadow's — exact when both are holes, a fabricated
+/// value when the home holds a vec, a literal or a field read, because the
+/// rendering would then claim that value on the path where the truth is
+/// unknown. 37 of the corpus's 45 merge-guarded shadows have a hole on both
+/// sides and split; the other 8 keep today's rendering.
 ///
 /// Where the slot is only read through the shadow, and a write ends its life
 /// (`vp = core_data.adm` is the last use of slot 3), the split is exact.
@@ -7448,86 +7451,14 @@ fn split_shadowed_bindings(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
         false
     }
 
-    /// The key of the `StorageGet` an expression is rooted at, through the
-    /// projections that carry a read's value and through a local the read was
-    /// bound to (`let core_data = get(&K).unwrap(); slot = core_data.adm`).
-    fn read_key<'a>(
-        expr: &'a SorobanExpr,
-        bound: &'a HashMap<String, SorobanExpr>,
-    ) -> Option<&'a SorobanExpr> {
-        match expr {
-            SorobanExpr::StorageGet { key, .. } => Some(key),
-            SorobanExpr::FieldAccess { object, .. } => read_key(object, bound),
-            SorobanExpr::CastAs { value, .. } | SorobanExpr::ValConvert { value, .. } => {
-                read_key(value, bound)
-            }
-            SorobanExpr::MethodCall { object, method, .. } if method == "unwrap" => {
-                read_key(object, bound)
-            }
-            SorobanExpr::NamedLocal(name) => bound.get(name),
-            _ => None,
-        }
-    }
-
-    /// Is `init` the storage KEY of a read that fills the same slot further on?
-    /// Then it is the lost default arm of `if has(k) { slot = get(k) }`, not a
-    /// value of the slot, and nothing is lost by splitting it off.
-    fn init_is_adopted_key(init: &SorobanExpr, region: &[SorobanStmt], name: &str) -> bool {
-        if !matches!(
-            init,
-            SorobanExpr::EnumConstruct { .. }
-                | SorobanExpr::SymbolLiteral(_)
-                | SorobanExpr::VecConstruct(_)
-        ) {
-            return false;
-        }
-        fn scan(
-            stmts: &[SorobanStmt],
-            init: &SorobanExpr,
-            name: &str,
-            bound: &mut HashMap<String, SorobanExpr>,
-        ) -> bool {
-            for stmt in stmts {
-                let hit = match stmt {
-                    SorobanStmt::Let {
-                        name: bind, value, ..
-                    } => {
-                        if let Some(key) = read_key(value, bound) {
-                            let key = key.clone();
-                            bound.insert(bind.clone(), key);
-                        }
-                        false
-                    }
-                    SorobanStmt::Assign { target, value } => {
-                        target == name && read_key(value, bound).is_some_and(|k| k == init)
-                    }
-                    SorobanStmt::If {
-                        then_body,
-                        else_body,
-                        ..
-                    } => scan(then_body, init, name, bound) || scan(else_body, init, name, bound),
-                    SorobanStmt::Match { arms, .. } => {
-                        arms.iter().any(|arm| scan(&arm.body, init, name, bound))
-                    }
-                    SorobanStmt::Loop { body }
-                    | SorobanStmt::Block(body)
-                    | SorobanStmt::For { body, .. } => scan(body, init, name, bound),
-                    _ => false,
-                };
-                if hit {
-                    return true;
-                }
-            }
-            false
-        }
-        scan(region, init, name, &mut HashMap::new())
-    }
-
     struct Splitter {
         /// slot name → (home binding name, name the reads currently see)
         env: HashMap<String, (String, String)>,
         /// every name in the tree, plus the ones minted here
         used: HashSet<String>,
+        /// home binding name → the value it is known to hold (its init, or the
+        /// last value written to it)
+        home_value: HashMap<String, SorobanExpr>,
     }
 
     impl Splitter {
@@ -7543,6 +7474,27 @@ fn split_shadowed_bindings(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             } else {
                 rename_in_expr(expr, &map)
             }
+        }
+
+        /// Does the slot's home binding hold no value of its own — a hole?
+        ///
+        /// Only then may a shadow be split off THROUGH a merge. A read that
+        /// follows a conditional write of the slot wants the merge of two
+        /// incoming values: the one the shadow bound, and the written one.
+        /// After a split that read lands on the home binding, which offers the
+        /// home's value in place of the shadow's. When both are holes the
+        /// substitution is exact. When the home holds a real value — a vec, a
+        /// literal, a field — the rendering would claim that value on the path
+        /// where the truth is unknown, which is a fabrication, so the merge
+        /// guard stands and the slot keeps its single-name rendering.
+        fn home_is_a_hole(&self, slot: &str) -> bool {
+            let home = match self.env.get(slot) {
+                Some((home, _)) => home,
+                None => return false,
+            };
+            self.home_value
+                .get(home)
+                .is_some_and(|value| value.is_never_rooted())
         }
 
         fn fresh(&mut self, base: &str) -> String {
@@ -7612,11 +7564,12 @@ fn split_shadowed_bindings(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                         // so the write-then-read guard does not apply to it: the
                         // slot's only real value is the written one, which lives
                         // in the home binding.
+                        // `&&` short-circuits: the region scans run only for
+                        // a name an enclosing scope already bound.
                         if self.env.contains_key(&name)
                             && !loop_assigns(region, &name)
-                            && (value.is_never_rooted()
-                                || init_is_adopted_key(&value, region, &name)
-                                || !write_then_read(region, &name, &mut false))
+                            && (!write_then_read(region, &name, &mut false)
+                                || (value.is_never_rooted() && self.home_is_a_hole(&name)))
                         {
                             cov_mark::hit!(shadowed_binding_split);
                             let fresh = self.fresh(&name);
@@ -7633,6 +7586,7 @@ fn split_shadowed_bindings(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                             self.env
                                 .entry(name.clone())
                                 .or_insert_with(|| (name.clone(), name.clone()));
+                            self.home_value.insert(name.clone(), value.clone());
                             SorobanStmt::Let {
                                 name,
                                 mutable,
@@ -7649,6 +7603,10 @@ fn split_shadowed_bindings(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
                             }
                             None => target,
                         };
+                        // The write lands in the home binding, so this is the
+                        // home's value from here on — what a later shadow has
+                        // to answer for at a merge.
+                        self.home_value.insert(target.clone(), value.clone());
                         SorobanStmt::Assign { target, value }
                     }
                     SorobanStmt::Expr(e) => SorobanStmt::Expr(self.rewrite(e)),
@@ -7765,6 +7723,7 @@ fn split_shadowed_bindings(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     let mut splitter = Splitter {
         env: HashMap::new(),
         used,
+        home_value: HashMap::new(),
     };
     splitter.walk(stmts)
 }
@@ -8107,8 +8066,45 @@ fn rename_in_expr(
             function,
             args: rv(args),
         },
-        // Leaves: literals, Param, Env, NamedLocal, etc.
-        other => other,
+        SorobanExpr::Shl(a, b) => SorobanExpr::Shl(rb(a), rb(b)),
+        SorobanExpr::Some(a) => SorobanExpr::Some(rb(a)),
+        SorobanExpr::Try(a) => SorobanExpr::Try(rb(a)),
+        SorobanExpr::SretResult(a) => SorobanExpr::SretResult(rb(a)),
+        SorobanExpr::ValTag(a) => SorobanExpr::ValTag(rb(a)),
+        SorobanExpr::VecTryIterFold { vec, init } => SorobanExpr::VecTryIterFold {
+            vec: rb(vec),
+            init: rb(init),
+        },
+        // Leaves. Listed one by one on purpose: a catch-all `other => other`
+        // silently stopped the walk at any variant that was added later and
+        // carries children, which renamed a binding while leaving reads inside
+        // such an expression on the OLD name — a wrong value, not a hole. An
+        // exhaustive match makes the compiler name the next one.
+        SorobanExpr::U32Literal(_)
+        | SorobanExpr::I32Literal(_)
+        | SorobanExpr::U64Literal(_)
+        | SorobanExpr::I64Literal(_)
+        | SorobanExpr::U128Literal(_)
+        | SorobanExpr::I128Literal(_)
+        | SorobanExpr::BoolLiteral(_)
+        | SorobanExpr::SymbolLiteral(_)
+        | SorobanExpr::StringLiteral(_)
+        | SorobanExpr::BytesLiteral(_)
+        | SorobanExpr::Void
+        | SorobanExpr::None
+        | SorobanExpr::Param(_)
+        | SorobanExpr::Env
+        | SorobanExpr::ContractError { .. }
+        | SorobanExpr::Panic
+        | SorobanExpr::LedgerSequence
+        | SorobanExpr::LedgerTimestamp
+        | SorobanExpr::LedgerNetworkId
+        | SorobanExpr::CurrentContractAddress
+        | SorobanExpr::MaxLiveUntilLedger
+        | SorobanExpr::CollectionNew(_)
+        | SorobanExpr::UnknownVal
+        | SorobanExpr::CyclicSlot { .. }
+        | SorobanExpr::ValTagName(_) => expr,
     }
 }
 
@@ -11086,16 +11082,54 @@ mod tests {
         assert_eq!(after, &SorobanExpr::Local(3), "after the block: the home");
     }
 
-    /// A shadow that is the storage key of the read the slot is filled from is
-    /// the lost default arm, not a value: it is split even though the region
-    /// writes the slot from inside a block and then reads it.
+    /// A read inside a `Shl`, a `Some`, a `Try` or a `VecTryIterFold` follows
+    /// the rename like any other. `rename_in_expr` used to end in a catch-all
+    /// that returned those variants unvisited, so the split renamed the binding
+    /// and left the read on the old name — a wrong value, not a hole.
     #[test]
-    fn adopted_key_shadow_is_split_through_a_merge() {
-        let key = || SorobanExpr::EnumConstruct {
-            type_name: "CoreDataKeys".into(),
-            variant: "CoreData".into(),
-            fields: vec![],
-        };
+    fn a_read_in_every_expression_follows_the_rename() {
+        let renames: std::collections::HashMap<String, String> =
+            [("var_3".to_string(), "fresh".to_string())]
+                .into_iter()
+                .collect();
+        let read = || SorobanExpr::NamedLocal("var_3".into());
+        let renamed = SorobanExpr::NamedLocal("fresh".into());
+        let cases = vec![
+            SorobanExpr::Shl(Box::new(read()), Box::new(SorobanExpr::I32Literal(2))),
+            SorobanExpr::Some(Box::new(read())),
+            SorobanExpr::Try(Box::new(read())),
+            SorobanExpr::SretResult(Box::new(read())),
+            SorobanExpr::ValTag(Box::new(read())),
+            SorobanExpr::VecTryIterFold {
+                vec: Box::new(read()),
+                init: Box::new(SorobanExpr::I64Literal(0)),
+            },
+        ];
+        for case in cases {
+            let out = rename_in_expr(case.clone(), &renames);
+            let text = format!("{out:?}");
+            assert!(
+                !text.contains("var_3"),
+                "a read survived the rename in {case:?}: {text}"
+            );
+            assert!(
+                text.contains("fresh"),
+                "the rename did not reach into {case:?}: {text}"
+            );
+        }
+        assert_eq!(
+            rename_in_expr(read(), &renames),
+            renamed,
+            "the leaf itself still renames"
+        );
+    }
+
+    /// A merge whose two incoming values are BOTH holes: the home binding
+    /// offers a hole in place of the shadow's hole, which is exact, so the
+    /// shadow is split even though the region writes the slot from inside a
+    /// block and then reads it.
+    #[test]
+    fn shadow_splits_through_a_merge_when_both_sides_are_holes() {
         let stmts = vec![
             SorobanStmt::Let {
                 name: "var_3".into(),
@@ -11105,32 +11139,14 @@ mod tests {
             SorobanStmt::Let {
                 name: "var_3".into(),
                 mutable: true,
-                value: key(),
+                value: SorobanExpr::UnknownVal,
             },
             SorobanStmt::If {
-                condition: SorobanExpr::StorageHas {
-                    storage_type: StorageType::Instance,
-                    key: Box::new(key()),
-                },
-                then_body: vec![
-                    SorobanStmt::Let {
-                        name: "core_data".into(),
-                        mutable: false,
-                        value: SorobanExpr::StorageGet {
-                            storage_type: StorageType::Instance,
-                            key: Box::new(key()),
-                            unwrap: true,
-                            on_missing: None,
-                        },
-                    },
-                    SorobanStmt::Assign {
-                        target: "var_3".into(),
-                        value: SorobanExpr::FieldAccess {
-                            object: Box::new(SorobanExpr::NamedLocal("core_data".into())),
-                            field: "adm".into(),
-                        },
-                    },
-                ],
+                condition: SorobanExpr::BoolLiteral(true),
+                then_body: vec![SorobanStmt::Assign {
+                    target: "var_3".into(),
+                    value: SorobanExpr::I32Literal(7),
+                }],
                 else_body: vec![],
             },
             SorobanStmt::Expr(SorobanExpr::Local(3)),
@@ -11139,7 +11155,84 @@ mod tests {
         let SorobanStmt::Let { name, .. } = &out[1] else {
             panic!("{out:?}");
         };
-        assert_eq!(name, "var_3_2", "the adopted key is split off");
+        assert_eq!(
+            name, "var_3_2",
+            "both sides are holes, so the shadow splits"
+        );
+    }
+
+    /// The same shape, but the home binding holds a real value. Splitting would
+    /// put that value on the path where the truth is unknown, so the merge
+    /// guard stands.
+    #[test]
+    fn shadow_refused_through_a_merge_when_the_home_holds_a_value() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::VecConstruct(vec![SorobanExpr::I32Literal(1)]),
+            },
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::UnknownVal,
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::BoolLiteral(true),
+                then_body: vec![SorobanStmt::Assign {
+                    target: "var_3".into(),
+                    value: SorobanExpr::I32Literal(7),
+                }],
+                else_body: vec![],
+            },
+            SorobanStmt::Expr(SorobanExpr::Local(3)),
+        ];
+        let out = split_shadowed_bindings(stmts);
+        let SorobanStmt::Let { name, .. } = &out[1] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(name, "var_3", "a real home value keeps the merge guard");
+    }
+
+    /// A write inside a nested block lands in the home binding, so it is the
+    /// home's value from then on: a later shadow must not be split through a
+    /// merge on the strength of the home's (hole) initializer.
+    #[test]
+    fn a_nested_write_makes_the_home_hold_a_value() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::UnknownVal,
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::BoolLiteral(true),
+                then_body: vec![SorobanStmt::Assign {
+                    target: "var_3".into(),
+                    value: SorobanExpr::I32Literal(5),
+                }],
+                else_body: vec![],
+            },
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::UnknownVal,
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::BoolLiteral(true),
+                then_body: vec![SorobanStmt::Assign {
+                    target: "var_3".into(),
+                    value: SorobanExpr::I32Literal(7),
+                }],
+                else_body: vec![],
+            },
+            SorobanStmt::Expr(SorobanExpr::Local(3)),
+        ];
+        let out = split_shadowed_bindings(stmts);
+        let SorobanStmt::Let { name, .. } = &out[2] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(name, "var_3", "the nested write is remembered");
     }
 
     /// A loop that assigns the slot reads the previous iteration's value, which

@@ -1,6 +1,6 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 89.3,
+  "overall_restoration": 89.4,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
@@ -53,12 +53,12 @@
     {
       "file": "blend-backstop-CAQQR5SW.wasm",
       "entity": "Blend Backstop",
-      "restoration_pct": 86.0,
+      "restoration_pct": 86.1,
       "spec_functions": 17,
       "fn_clean": 4,
       "fn_partial": 12,
       "fn_logic_lost": 1,
-      "artifacts_total": 105,
+      "artifacts_total": 104,
       "wasm_size": 30772,
       "error": null
     },
@@ -221,24 +221,24 @@
     {
       "file": "soroban-domains-CATRNPHY.wasm",
       "entity": "Soroban Domains",
-      "restoration_pct": 83.8,
+      "restoration_pct": 85.0,
       "spec_functions": 15,
       "fn_clean": 1,
       "fn_partial": 14,
       "fn_logic_lost": 0,
-      "artifacts_total": 373,
+      "artifacts_total": 253,
       "wasm_size": 20215,
       "error": null
     },
     {
       "file": "soroswap-CA4HEQTL.wasm",
       "entity": "Soroswap",
-      "restoration_pct": 85.1,
+      "restoration_pct": 85.4,
       "spec_functions": 12,
       "fn_clean": 2,
       "fn_partial": 10,
       "fn_logic_lost": 0,
-      "artifacts_total": 40,
+      "artifacts_total": 36,
       "wasm_size": 9894,
       "error": null
     },

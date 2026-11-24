@@ -35,12 +35,16 @@ later reads of the slot took the wrong value. 19 sites in four contracts.
 - **Two guards keep it to what it can prove.** A `Loop`/`For` in the region that
   assigns the slot reads the previous iteration's value, which lives in the home
   binding, so that slot is left alone. So is a region that writes the slot from
-  inside a block and then reads it again while the shadow carries a value of its
-  own: that read wants the merge of the two, and only one mutable variable
-  models it (soroswap's `create_pair` builds the `PairWasmHash` key in the slot,
-  writes an error sentinel over it when the key is absent, then reads the slot
-  as its own read's key). A shadow that is a hole, or that is the storage KEY of
-  the read the slot is filled from, has nothing to merge and is always split.
+  inside a block and then reads it again: that read wants the merge of two
+  incoming values, the shadow's and the written one, and only one mutable
+  variable models it (soroswap's `create_pair` builds the `PairWasmHash` key in
+  the slot, writes an error sentinel over it when the key is absent, then reads
+  the slot as its own read's key). The merge guard is lifted only when **both**
+  incoming values are holes, because a read that follows the write lands on the
+  home binding, which offers the home's value in place of the shadow's: exact
+  when both are holes, a fabricated value when the home holds a vec, a literal
+  or a field read. 37 of the corpus's 45 merge-guarded shadows have a hole on
+  both sides and split; the other 8 keep today's rendering.
 - **blend-emitter's swap functions read the right fields now.**
   `queue_swap_backstop`, `cancel_swap_backstop` and `swap_backstop` published
   `Swap { new_backstop, new_backstop_token: new_backstop.new_backstop_token,
@@ -56,19 +60,33 @@ later reads of the slot took the wrong value. 19 sites in four contracts.
   lifter lost. An `Address` holds no integer, so the write was fabricated and a
   guaranteed error at once; it is now `todo!()`
   (`ir::correctness::husk_type_mismatched_assignments`, one corpus site).
+- **A rename now reaches into every expression.** `rename_in_expr` ended in a
+  catch-all `other => other`, so it returned `Shl`, `Some`, `Try`, `SretResult`,
+  `ValTag` and `VecTryIterFold` unvisited: a rename reached the binding but not
+  a read inside one of those, which left the read on the old name. The match is
+  exhaustive now, so the compiler names the next variant that is added. It also
+  recovers four values that were holes, among them blend-backstop's second
+  `try_invoke_contract` target inside a `.get_tag()` (`todo!()` → `&emitter`).
 
-Corpus hard errors 371 → 354, **no contract's count rose**: soroban-domains
-63→53, blend-emitter 16→11, fxdao-vault 5→3. `x = x.field` 19 → 1, the one left
-being the merge the guard protects. Clean contracts still 2 of 24. Equivalence:
+Corpus hard errors 371 → 358: soroban-domains 63→56, blend-emitter 16→11,
+fxdao-vault 5→3, and one rise — soroswap-CA4HEQTL 8→9, where refusing the
+merge-guarded shadow restores the `E0308` that names the slot's two types, the
+honest diagnosis of the live-range split below. `x = x.field` 19 → 1, the one
+left being the merge the guard protects. Clean contracts still 2 of 24.
+Equivalence:
 147 functions, 3724 cases, **0 divergences**, hole cases 918 in 12 functions
 (unchanged). Compile-back 97 %, only `test_liquidity_pool` failing, as on main
-(#74). Restoration 89.6 → 89.3: the split brings back statements the merged
-name had made dead (soroban-domains' `key.get(i)` parameter reads, 223 → 373
-artifacts) and replaces adopted keys with holes, while soroswap (44 → 40
+(#74). Restoration 89.6 → 89.4: the split brings back statements the merged
+name had made dead (soroban-domains' `key.get(i)` parameter reads, 223 → 253
+artifacts) and replaces adopted keys with holes, while soroswap (44 → 36
 artifacts) and arb-bot (97.4 → 97.8 %, an invoke function symbol recovered)
 improve. fxdao-vault's one clean function was clean only because its lost
 default arm was rendered as the storage key: it is now a hole, and the function
-is graded partial. Baseline refreshed.
+is graded partial. Part of soroban-domains' artifact count is bookkeeping, not
+recovery: once a read resolves to its binding, a hole that had been inlined at
+each use is one named hole (`SubRecord(todo!())` → `SubRecord(var_3_4)`, where
+`var_3_4` holds a hole), and 15 empty `if todo!() { } else { }` husks drop out.
+Baseline refreshed.
 
 Not addressed: a `let` may still shadow a function **parameter**
 (`let min_duration = core_data.min_duration;` in soroban-domains' `init`). The
