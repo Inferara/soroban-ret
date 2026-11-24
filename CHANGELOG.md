@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — every value of a reused wasm local gets its own name (campaign stage 3c)
+
+A wasm local is a slot, not a variable: it carries several values over a
+function's life, and the lifter emits a binding for each of them under the
+slot's own name. Two of them in nested scopes were rendered under one name, so
+the inner `let` shadowed the outer binding:
+
+```rust
+let mut vp = CoreDataKeys::CoreData;              // slot 3: the storage key
+if env.storage().instance().has(&CoreDataKeys::CoreData) {
+    let vp = env.storage().instance()
+        .get::<_, CoreData>(&CoreDataKeys::CoreData).unwrap();   // slot 3: the struct
+    vp = vp.adm;                                  // slot 3: the admin
+}
+```
+
+The write hit the immutable inner binding (E0384) across types (E0308), and
+later reads of the slot took the wrong value. 19 sites in four contracts.
+
+- **Each binding gets its own name** (`ir::optimizer::split_shadowed_bindings`,
+  a new pass before name propagation). The reads inside a shadow's region point
+  at the shadow; a write keeps going to the slot's **home** binding — the one an
+  enclosing scope declared, and so the one a reader after the block sees. The
+  example above becomes `let core_data = get::<_, CoreData>(..).unwrap(); ..;
+  vp = core_data.adm;`.
+- **Two guards keep it to what it can prove.** A `Loop`/`For` in the region that
+  assigns the slot reads the previous iteration's value, which lives in the home
+  binding, so that slot is left alone. So is a region that writes the slot from
+  inside a block and then reads it again while the shadow carries a value of its
+  own: that read wants the merge of the two, and only one mutable variable
+  models it (soroswap's `create_pair` builds the `PairWasmHash` key in the slot,
+  writes an error sentinel over it when the key is absent, then reads the slot
+  as its own read's key). A shadow that is a hole, or that is the storage KEY of
+  the read the slot is filled from, has nothing to merge and is always split.
+- **blend-emitter's swap functions read the right fields now.**
+  `queue_swap_backstop`, `cancel_swap_backstop` and `swap_backstop` published
+  `Swap { new_backstop, new_backstop_token: new_backstop.new_backstop_token,
+  unlock_time: new_backstop.new_backstop }` — the fields read off the `Address`
+  field that had taken the struct's name (issue #80, class B).
+- **A key-adopted default is holed through a bound read.** Stage 4m6 accepted
+  only a read assigned straight to the local; it now follows the read through a
+  binding of its own and a field projection, so `let mut vp =
+  CoreDataKeys::CoreData` is the honest `todo!()` it already was for the direct
+  form. The key itself loses nothing — every use of it renders inline.
+- **A literal written into a typed local is a hole.** soroban-domains reads the
+  oracle address and then writes `oracle = 10` on a branch whose real value the
+  lifter lost. An `Address` holds no integer, so the write was fabricated and a
+  guaranteed error at once; it is now `todo!()`
+  (`ir::correctness::husk_type_mismatched_assignments`, one corpus site).
+
+Corpus hard errors 371 → 354, **no contract's count rose**: soroban-domains
+63→53, blend-emitter 16→11, fxdao-vault 5→3. `x = x.field` 19 → 1, the one left
+being the merge the guard protects. Clean contracts still 2 of 24. Equivalence:
+147 functions, 3724 cases, **0 divergences**, hole cases 918 in 12 functions
+(unchanged). Compile-back 97 %, only `test_liquidity_pool` failing, as on main
+(#74). Restoration 89.6 → 89.3: the split brings back statements the merged
+name had made dead (soroban-domains' `key.get(i)` parameter reads, 223 → 373
+artifacts) and replaces adopted keys with holes, while soroswap (44 → 40
+artifacts) and arb-bot (97.4 → 97.8 %, an invoke function symbol recovered)
+improve. fxdao-vault's one clean function was clean only because its lost
+default arm was rendered as the storage key: it is now a hole, and the function
+is graded partial. Baseline refreshed.
+
+Not addressed: a `let` may still shadow a function **parameter**
+(`let min_duration = core_data.min_duration;` in soroban-domains' `init`). The
+collision is minted by name propagation, whose first run deliberately passes no
+reserved names so that parameter spills collapse onto the parameter; reserving
+them there breaks that. One slot reused for values of different types in one
+scope (soroban-domains' `node = caller` followed by `snapshot: node`) needs a
+live-range split, not a rename.
+
 ### Fixed — storage reads get the type the contract writes (campaign stage 3b)
 
 `env.storage().<kind>().get(&key)` is generic over the value type. Where the

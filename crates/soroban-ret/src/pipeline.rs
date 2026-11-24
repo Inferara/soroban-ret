@@ -972,6 +972,10 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // scalar `Result<T, E>` ok-type (e.g. `Ok(false)` in `-> Result<u128, E>`) →
         // honest `todo!()`. Guaranteed-mismatch only; never touches a coercing value.
         let body = husk_type_mismatched_ok_literal(body, func.return_type.as_ref());
+        // Stage 3c: a literal written into a local whose type a typed read pins
+        // (`oracle = 10` where `oracle` is an `Address`) is a fabricated value
+        // and a guaranteed E0308 → an honest hole.
+        let body = crate::ir::correctness::husk_type_mismatched_assignments(body);
         func.body = clone_reused_move_params(body, &func.params);
     }
 
@@ -3707,44 +3711,118 @@ fn fold_option_void_compares_in(stmts: &mut [SorobanStmt], use_counts: &HashMap<
 /// assigned to the SAME local. The default arm's real value is lost →
 /// honest `todo!()` init. Locals with more than one `let` of the same name
 /// (shadowing) are skipped.
+///
+/// The assigned read is accepted through a projection and through a binding of
+/// its own (stage 3c): one wasm slot carries the key, then the struct read under
+/// it, then one field of that struct, and
+///
+/// ```text
+/// let mut vp = CoreDataKeys::CoreData;
+/// if has(&CoreDataKeys::CoreData) {
+///     let core_data = get::<_, CoreData>(&CoreDataKeys::CoreData).unwrap();
+///     vp = core_data.adm;
+/// }
+/// ```
+///
+/// is the same adoption as the direct form: the init is the KEY of the read the
+/// local is filled from, so it is the lost default arm, not a value. The key
+/// itself loses nothing by becoming a hole — every use of it renders inline.
 fn repair_key_adopted_defaults(stmts: &mut [SorobanStmt]) {
-    // Collect per-name: how many Lets, the EnumConstruct inits, and the keys
-    // of gets assigned to the name.
-    fn collect(
+    /// The key of the `StorageGet` an expression is rooted at: through the
+    /// projections that carry a read's value (a field of the struct read, a
+    /// type cast, an `unwrap`), and through a local the read was bound to.
+    fn read_key<'a>(
+        expr: &'a SorobanExpr,
+        let_read_keys: &'a HashMap<String, SorobanExpr>,
+    ) -> Option<&'a SorobanExpr> {
+        match expr {
+            SorobanExpr::StorageGet { key, .. } => Some(key),
+            SorobanExpr::FieldAccess { object, .. } => read_key(object, let_read_keys),
+            SorobanExpr::CastAs { value, .. } | SorobanExpr::ValConvert { value, .. } => {
+                read_key(value, let_read_keys)
+            }
+            SorobanExpr::MethodCall { object, method, .. } if method == "unwrap" => {
+                read_key(object, let_read_keys)
+            }
+            SorobanExpr::NamedLocal(name) => let_read_keys.get(name),
+            _ => None,
+        }
+    }
+
+    /// Locals bound to a storage read, by the key read. A name bound twice is
+    /// ambiguous and is dropped.
+    fn collect_read_bindings(
         stmts: &[SorobanStmt],
-        let_counts: &mut HashMap<String, u32>,
-        get_keys: &mut HashMap<String, Vec<SorobanExpr>>,
+        out: &mut HashMap<String, Option<SorobanExpr>>,
     ) {
         for stmt in stmts {
             match stmt {
-                SorobanStmt::Let { name, .. } => {
-                    *let_counts.entry(name.clone()).or_insert(0) += 1;
-                }
-                SorobanStmt::Assign {
-                    target,
-                    value: SorobanExpr::StorageGet { key, .. },
-                } => {
-                    get_keys
-                        .entry(target.clone())
-                        .or_default()
-                        .push((**key).clone());
+                SorobanStmt::Let { name, value, .. } => {
+                    let key = read_key(value, &HashMap::new()).cloned();
+                    out.entry(name.clone())
+                        .and_modify(|slot| *slot = None)
+                        .or_insert(key);
                 }
                 SorobanStmt::If {
                     then_body,
                     else_body,
                     ..
                 } => {
-                    collect(then_body, let_counts, get_keys);
-                    collect(else_body, let_counts, get_keys);
+                    collect_read_bindings(then_body, out);
+                    collect_read_bindings(else_body, out);
                 }
                 SorobanStmt::Match { arms, .. } => {
                     for arm in arms {
-                        collect(&arm.body, let_counts, get_keys);
+                        collect_read_bindings(&arm.body, out);
                     }
                 }
                 SorobanStmt::Loop { body }
                 | SorobanStmt::Block(body)
-                | SorobanStmt::For { body, .. } => collect(body, let_counts, get_keys),
+                | SorobanStmt::For { body, .. } => collect_read_bindings(body, out),
+                _ => {}
+            }
+        }
+    }
+
+    // Collect per-name: how many Lets, the EnumConstruct inits, and the keys
+    // of gets assigned to the name.
+    fn collect(
+        stmts: &[SorobanStmt],
+        let_counts: &mut HashMap<String, u32>,
+        get_keys: &mut HashMap<String, Vec<SorobanExpr>>,
+        let_read_keys: &HashMap<String, SorobanExpr>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Let { name, .. } => {
+                    *let_counts.entry(name.clone()).or_insert(0) += 1;
+                }
+                SorobanStmt::Assign { target, value } => {
+                    if let Some(key) = read_key(value, let_read_keys) {
+                        get_keys
+                            .entry(target.clone())
+                            .or_default()
+                            .push(key.clone());
+                    }
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect(then_body, let_counts, get_keys, let_read_keys);
+                    collect(else_body, let_counts, get_keys, let_read_keys);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        collect(&arm.body, let_counts, get_keys, let_read_keys);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => {
+                    collect(body, let_counts, get_keys, let_read_keys)
+                }
                 _ => {}
             }
         }
@@ -3800,9 +3878,15 @@ fn repair_key_adopted_defaults(stmts: &mut [SorobanStmt]) {
             }
         }
     }
+    let mut read_bindings = HashMap::new();
+    collect_read_bindings(stmts, &mut read_bindings);
+    let let_read_keys: HashMap<String, SorobanExpr> = read_bindings
+        .into_iter()
+        .filter_map(|(name, key)| key.map(|k| (name, k)))
+        .collect();
     let mut let_counts = HashMap::new();
     let mut get_keys = HashMap::new();
-    collect(stmts, &mut let_counts, &mut get_keys);
+    collect(stmts, &mut let_counts, &mut get_keys, &let_read_keys);
     if get_keys.is_empty() {
         return;
     }
@@ -11119,6 +11203,87 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// soroban-domains `init`: the read is bound to a local of its own and the
+    /// slot takes one FIELD of it (`vp = core_data.adm`). The init is still the
+    /// KEY of that read, so it is still the lost default arm.
+    #[test]
+    fn key_adopted_default_through_a_bound_read_holes() {
+        let key = |variant: &str| SorobanExpr::EnumConstruct {
+            type_name: "CoreDataKeys".into(),
+            variant: variant.into(),
+            fields: vec![],
+        };
+        let read = |variant: &str| SorobanExpr::StorageGet {
+            storage_type: crate::ir::soroban_ir::StorageType::Instance,
+            key: Box::new(key(variant)),
+            unwrap: true,
+            on_missing: None,
+        };
+        let mut stmts = vec![
+            SorobanStmt::Let {
+                name: "vp".into(),
+                mutable: true,
+                value: key("CoreData"),
+            },
+            // A second local with the same shape, whose read is under ANOTHER
+            // key: not the default arm of that read, so it is untouched.
+            SorobanStmt::Let {
+                name: "other".into(),
+                mutable: true,
+                value: key("OffersConfig"),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::StorageHas {
+                    storage_type: crate::ir::soroban_ir::StorageType::Instance,
+                    key: Box::new(key("CoreData")),
+                },
+                then_body: vec![
+                    SorobanStmt::Let {
+                        name: "core_data".into(),
+                        mutable: false,
+                        value: read("CoreData"),
+                    },
+                    SorobanStmt::Assign {
+                        target: "vp".into(),
+                        value: SorobanExpr::FieldAccess {
+                            object: Box::new(SorobanExpr::NamedLocal("core_data".into())),
+                            field: "adm".into(),
+                        },
+                    },
+                    SorobanStmt::Assign {
+                        target: "other".into(),
+                        value: SorobanExpr::FieldAccess {
+                            object: Box::new(SorobanExpr::NamedLocal("core_data".into())),
+                            field: "adm".into(),
+                        },
+                    },
+                ],
+                else_body: vec![],
+            },
+        ];
+        repair_key_adopted_defaults(&mut stmts);
+        assert!(
+            matches!(
+                &stmts[0],
+                SorobanStmt::Let {
+                    value: SorobanExpr::UnknownVal,
+                    ..
+                }
+            ),
+            "{stmts:?}"
+        );
+        assert!(
+            matches!(
+                &stmts[1],
+                SorobanStmt::Let {
+                    value: SorobanExpr::EnumConstruct { .. },
+                    ..
+                }
+            ),
+            "a key that is not the read's own key stays: {stmts:?}"
+        );
     }
 
     #[test]

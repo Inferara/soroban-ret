@@ -5,10 +5,14 @@ use soroban_ret::{decompile_to_ir, ir::ContractFn};
 fn dump_ir() {
     let fixture = std::env::var("DBG_FIXTURE").unwrap_or_else(|_| "test_bls".into());
     let only = std::env::var("DBG_FN").unwrap_or_default();
-    let path = format!(
-        "{}/../../tests/fixtures/{fixture}.wasm",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    // `DBG_WASM` takes a path to any wasm (a corpus contract, say); `DBG_FIXTURE`
+    // names one of the repo fixtures.
+    let path = std::env::var("DBG_WASM").unwrap_or_else(|_| {
+        format!(
+            "{}/../../tests/fixtures/{fixture}.wasm",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
     let wasm = std::fs::read(&path).unwrap();
     #[cfg(feature = "wasmprinter")]
     if std::env::var("DBG_WAT").is_ok() {

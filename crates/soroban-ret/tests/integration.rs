@@ -2546,6 +2546,101 @@ fn storage_reads_get_the_type_the_contract_writes() {
     );
 }
 
+/// Stage 3c: one wasm slot carries several values, and each gets its own name.
+///
+/// The inner `let` used to take the outer binding's name, so the assignment that
+/// follows wrote the immutable inner binding across types (`vp = vp.adm`), and
+/// later reads of the slot took the wrong value.
+#[test]
+fn each_value_of_a_reused_slot_gets_its_own_name() {
+    let source = |wasm: &[u8]| {
+        soroban_ret::decompile_with_options(wasm, &soroban_ret::DecompileOptions::default())
+            .expect("decompile")
+            .source
+    };
+    let compact = |s: &str| s.split_whitespace().collect::<String>();
+    // `x = x.field`: a write to a slot whose value is read through a binding of
+    // the same name — the shadow this stage splits. 19 sites on main, in four
+    // contracts.
+    let self_field_assigns = |src: &str| {
+        src.lines()
+            .filter(|line| {
+                let line = line.trim().trim_end_matches(';');
+                match line.split_once(" = ") {
+                    Some((target, value)) => value
+                        .strip_prefix(target)
+                        .is_some_and(|rest| rest.starts_with('.')),
+                    None => false,
+                }
+            })
+            .count()
+    };
+
+    let domains = source(include_bytes!(
+        "../../../benchmark-data/mainnet/soroban-domains-CATRNPHY.wasm"
+    ));
+    // 10 on main. The one that is left is the merge the guard protects: the
+    // block writes the slot and then reads it again through the shadow
+    // (`node = vp.col_asset` after `vp = vp.adm`), and that read is right where
+    // the home binding's would not be.
+    assert_eq!(
+        self_field_assigns(&domains),
+        1,
+        "soroban-domains: 10 on main"
+    );
+    // `init`: the key, the struct read under it, and the admin field of that
+    // struct are three values of one slot.
+    let compacted = compact(&domains);
+    let body_of = |src: &str, name: &str| {
+        let start = src.find(&format!("pub fn {name}(")).expect("function");
+        let end = src[start..]
+            .find("\n    pub fn ")
+            .unwrap_or(src.len() - start);
+        compact(&src[start..start + end])
+    };
+    let init = body_of(&domains, "init");
+    assert!(
+        init.contains("letcore_data=env.storage().instance().get::<_,CoreData>(&CoreDataKeys::CoreData).unwrap();"),
+        "{init}"
+    );
+    assert!(init.contains("vp=core_data.adm;"), "{init}");
+    // The slot's own init was the KEY of that read — the lost default arm — and
+    // is a hole, not a `CoreDataKeys` value (stage 4m6 through a bound read).
+    assert!(!init.contains("letmutvp=CoreDataKeys::CoreData;"), "{init}");
+
+    // blend-emitter's swap functions read the queued `Swap` the same way.
+    let emitter = source(include_bytes!(
+        "../../../benchmark-data/mainnet/blend-emitter-CCOQM6S7.wasm"
+    ));
+    assert_eq!(self_field_assigns(&emitter), 0, "blend-emitter: 5 on main");
+    assert!(compact(&emitter).contains(
+        "letswap=env.storage().persistent().get::<_,Swap>(&symbol_short!(\"Swap\")).unwrap();"
+    ));
+
+    // fxdao-vault's `CoreState` admin read: the same three values in one slot.
+    let vault = source(include_bytes!(
+        "../../../benchmark-data/mainnet/fxdao-vault-CCUN4RXU.wasm"
+    ));
+    assert_eq!(self_field_assigns(&vault), 0, "fxdao-vault: 2 on main");
+
+    // soroswap's `create_pair` builds the `PairWasmHash` key in a slot, writes
+    // an error sentinel over it when the key is absent, and then reads the slot
+    // as its read's key. That merge needs ONE mutable variable, so the slot is
+    // not split.
+    let factory = compact(&source(include_bytes!(
+        "../../../benchmark-data/mainnet/soroswap-CA4HEQTL.wasm"
+    )));
+    assert!(factory.contains("letmutvp=DataKey::PairWasmHash;"));
+    assert!(factory.contains("vp=201;"));
+
+    // A literal written into a local whose type a read pins is a hole, not a
+    // fabricated value (`oracle = 10` where `oracle` is an `Address`).
+    assert!(compacted.contains(
+        "letmutoracle=env.storage().instance().get::<_,Address>(&CoreDataKeys::Oracle).unwrap();"
+    ));
+    assert!(!compacted.contains("oracle=10;"));
+}
+
 /// `errors::hello` dispatches on a five-variant enum with a `br_table`; the
 /// `Flag::B` target is *outside* the switch (it falls through to the shared
 /// `return Err(AnError)`), while the default target is a case body. Dropping

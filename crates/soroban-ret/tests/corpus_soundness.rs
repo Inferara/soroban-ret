@@ -510,7 +510,38 @@ use std::process::Command;
 /// untyped reads, and the E0308 that typing raised at `next: assets_data`
 /// goes with it (fxdao-oracle 6→5). aqua-rewards and xycloans reads go
 /// back to `Val` (integer-literal writes), no count change.
-const ERROR_CEILING: u32 = 371;
+/// → 354 (−17; campaign stage 3c). One wasm local is a slot, not a variable:
+/// it carries several values over a function's life, and the lifter emits a
+/// `Let` for each of them under the slot's own name (`var_3`). Rendering two of
+/// them under one name merged them — the inner `let` shadowed the outer
+/// binding, so the write that followed hit the immutable inner binding (E0384)
+/// across types (E0308), and later reads of the slot took the wrong value:
+/// `let mut vp = CoreDataKeys::CoreData; if has(..) { let vp = get::<_,
+/// CoreData>(..).unwrap(); vp = vp.adm; }` (19 sites in four contracts).
+/// New optimizer pass `split_shadowed_bindings` (phase 5d, before naming) gives
+/// each binding its own name and points the reads inside the shadow's region at
+/// it, while a write keeps going to the slot's HOME binding — the one an
+/// enclosing scope declared, and so the one a reader after the block sees. Two
+/// guards keep it to what it can prove: a `Loop`/`For` in the region that
+/// assigns the slot (the loop reads the previous iteration's value, which lives
+/// in the home binding), and a region that writes the slot from inside a block
+/// and then reads it while the shadow carries a value of its own — that read
+/// wants the merge of the two, which only one mutable variable models
+/// (soroswap's `create_pair` builds the `PairWasmHash` key in the slot, writes
+/// an error sentinel over it when the key is absent, then reads the slot as its
+/// read's key; it keeps today's rendering). A shadow that is a hole, or that is
+/// the storage KEY of the read the slot is filled from, has nothing to merge and
+/// is always split. Two follow-on fixes: stage 4m6 now holes a key-adopted
+/// default through a read bound to a local of its own and projected
+/// (`vp = core_data.adm`), and a literal written into a local whose type a typed
+/// read pins (`oracle = 10` on an `Address`) is an honest hole
+/// (`husk_type_mismatched_assignments`, one corpus site).
+/// Per contract: soroban-domains 63→53, blend-emitter 16→11 (its three
+/// swap-backstop bodies read the queued `Swap`'s fields off the field that had
+/// taken the struct's name — issue #80 class B), fxdao-vault 5→3. No contract's
+/// count rose; clean contracts stay 2. `x = x.field` 19 → 1, the one left being
+/// the merge the guard protects.
+const ERROR_CEILING: u32 = 354;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

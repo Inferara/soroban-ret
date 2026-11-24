@@ -243,6 +243,16 @@ fn optimize_stmts_inner(stmts: Vec<SorobanStmt>, preserve_orphans: bool) -> Vec<
         "Optimizer pass: bind_unbound_locals ({} stmts)",
         stmts.len()
     );
+    // Phase 5d: one name per binding — a `Let` that re-binds a name an
+    // enclosing scope already bound is a DIFFERENT value in the same wasm slot,
+    // and merging the two under one name wrote the immutable inner binding
+    // (E0384) across types (E0308) and took the wrong value at every later read
+    // of the slot. Runs before naming, so each binding derives its own name.
+    let stmts = split_shadowed_bindings(stmts);
+    log::trace!(
+        "Optimizer pass: split_shadowed_bindings ({} stmts)",
+        stmts.len()
+    );
     // Phase 6: Improve readability — propagate meaningful names from spec/context
     let stmts = propagate_variable_names(stmts, &[]);
     log::trace!(
@@ -7243,6 +7253,522 @@ fn collect_used_names(stmts: &[SorobanStmt], names: &mut std::collections::HashS
     }
 }
 
+/// Phase 5d: one name per binding, and an `Assign` keeps writing the slot's
+/// home binding.
+///
+/// A wasm local is a slot, not a variable: one slot carries several values over
+/// a function's life, and the lifter emits a `Let` for each of them under the
+/// slot's own name (`var_3`). Two `Let var_3` in nested scopes are therefore two
+/// different values, and rendering both under one name merged them — the inner
+/// `let` shadowed the outer binding, so the assignment that follows wrote the
+/// immutable inner binding (E0384) across types (E0308), and every later read of
+/// the slot took the wrong value:
+///
+/// ```text
+/// let mut vp = CoreDataKeys::CoreData;              // slot 3: the key
+/// if has(&CoreDataKeys::CoreData) {
+///     let vp = get::<_, CoreData>(..).unwrap();     // slot 3: the struct
+///     let min_duration = vp.min_duration;
+///     vp = vp.adm;                                  // slot 3: the admin
+/// }
+/// ```
+///
+/// This pass gives the shadowing `Let` its own name and points the reads inside
+/// its region at it, while an `Assign` keeps writing the slot's HOME binding —
+/// the one an enclosing scope declared, and so the one a reader after the block
+/// sees. The result splits the three values of slot 3 apart:
+///
+/// ```text
+/// let mut vp = CoreDataKeys::CoreData;
+/// if has(&CoreDataKeys::CoreData) {
+///     let core_data = get::<_, CoreData>(..).unwrap();
+///     let min_duration_2 = core_data.min_duration;
+///     vp = core_data.adm;
+/// }
+/// ```
+///
+/// (`vp`'s own init is the storage KEY of that same read — the lost default arm
+/// of the `if has` idiom — which stage 4m6 holes once this split makes the
+/// binding unambiguous.)
+///
+/// Why an `Assign` is never redirected to the shadow: the shadow's scope ends
+/// with its block, so a write parked there would be invisible to a reader after
+/// the block, which would silently read the stale home value. Writing the home
+/// binding is what the wasm does — one slot — and reads that follow the write in
+/// the same scope are pointed back at the home binding.
+///
+/// Two guards keep the split to the slots it can prove. A shadow is refused
+/// when:
+///
+/// - a `Loop` or `For` in its region assigns the same slot. Such a loop reads
+///   the slot's PREVIOUS iteration value, which lives in the home binding, so a
+///   shadow would be right on the first iteration and wrong on every later one.
+/// - its region writes the slot from inside a block and then reads it again,
+///   while the shadow carries a value of its own. That read wants the merge of
+///   the two: soroswap's `create_pair` builds the `PairWasmHash` key in the
+///   slot, writes an error sentinel over it when the key is absent, and then
+///   reads the slot as the key of its own read. One mutable variable is what
+///   models that merge, so those slots keep today's single-name rendering.
+///
+/// Two shadows carry nothing to merge and are always split: one that is itself
+/// a hole, and one whose value is the storage KEY of a read the same slot is
+/// filled from (the lost default arm stage 4m6 holes — on the path where the
+/// key is absent the slot holds the key, which is not a value the contract
+/// wrote).
+///
+/// Where the slot is only read through the shadow, and a write ends its life
+/// (`vp = core_data.adm` is the last use of slot 3), the split is exact.
+fn split_shadowed_bindings(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+    use std::collections::{HashMap, HashSet};
+
+    /// Every `Assign` target in the tree, `For` bodies included (the shared
+    /// `collect_assign_targets` stops at `For`).
+    fn assign_targets(stmts: &[SorobanStmt], names: &mut HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Assign { target, .. } => {
+                    names.insert(target.clone());
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    assign_targets(then_body, names);
+                    assign_targets(else_body, names);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        assign_targets(&arm.body, names);
+                    }
+                }
+                SorobanStmt::Loop { body }
+                | SorobanStmt::Block(body)
+                | SorobanStmt::For { body, .. } => assign_targets(body, names),
+                _ => {}
+            }
+        }
+    }
+
+    /// Does a `Loop`/`For` anywhere in `stmts` assign `name`?
+    fn loop_assigns(stmts: &[SorobanStmt], name: &str) -> bool {
+        for stmt in stmts {
+            let hit = match stmt {
+                SorobanStmt::Loop { body } | SorobanStmt::For { body, .. } => {
+                    let mut assigned = HashSet::new();
+                    assign_targets(body, &mut assigned);
+                    assigned.contains(name) || loop_assigns(body, name)
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => loop_assigns(then_body, name) || loop_assigns(else_body, name),
+                SorobanStmt::Match { arms, .. } => {
+                    arms.iter().any(|arm| loop_assigns(&arm.body, name))
+                }
+                SorobanStmt::Block(body) => loop_assigns(body, name),
+                _ => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Does `stmts` write `name` and then read it again? The read wants the
+    /// merge of the written value and the one the shadow holds, and only a
+    /// single mutable variable can carry that.
+    fn write_then_read(stmts: &[SorobanStmt], name: &str, written: &mut bool) -> bool {
+        let names = [name.to_string()];
+        let reads = |e: &SorobanExpr| expr_reads_any_var(e, &names);
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Assign { target, value } => {
+                    if *written && reads(value) {
+                        return true;
+                    }
+                    if target == name {
+                        *written = true;
+                    }
+                }
+                SorobanStmt::Let { value, .. } => {
+                    if *written && reads(value) {
+                        return true;
+                    }
+                }
+                SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => {
+                    if *written && reads(e) {
+                        return true;
+                    }
+                }
+                SorobanStmt::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    if *written && reads(condition) {
+                        return true;
+                    }
+                    if write_then_read(then_body, name, written)
+                        || write_then_read(else_body, name, written)
+                    {
+                        return true;
+                    }
+                }
+                SorobanStmt::Match { scrutinee, arms } => {
+                    if *written && reads(scrutinee) {
+                        return true;
+                    }
+                    for arm in arms {
+                        if write_then_read(&arm.body, name, written) {
+                            return true;
+                        }
+                    }
+                }
+                SorobanStmt::For {
+                    start, end, body, ..
+                } => {
+                    if *written && (reads(start) || reads(end)) {
+                        return true;
+                    }
+                    if write_then_read(body, name, written) {
+                        return true;
+                    }
+                }
+                SorobanStmt::Loop { body } | SorobanStmt::Block(body)
+                    if write_then_read(body, name, written) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The key of the `StorageGet` an expression is rooted at, through the
+    /// projections that carry a read's value and through a local the read was
+    /// bound to (`let core_data = get(&K).unwrap(); slot = core_data.adm`).
+    fn read_key<'a>(
+        expr: &'a SorobanExpr,
+        bound: &'a HashMap<String, SorobanExpr>,
+    ) -> Option<&'a SorobanExpr> {
+        match expr {
+            SorobanExpr::StorageGet { key, .. } => Some(key),
+            SorobanExpr::FieldAccess { object, .. } => read_key(object, bound),
+            SorobanExpr::CastAs { value, .. } | SorobanExpr::ValConvert { value, .. } => {
+                read_key(value, bound)
+            }
+            SorobanExpr::MethodCall { object, method, .. } if method == "unwrap" => {
+                read_key(object, bound)
+            }
+            SorobanExpr::NamedLocal(name) => bound.get(name),
+            _ => None,
+        }
+    }
+
+    /// Is `init` the storage KEY of a read that fills the same slot further on?
+    /// Then it is the lost default arm of `if has(k) { slot = get(k) }`, not a
+    /// value of the slot, and nothing is lost by splitting it off.
+    fn init_is_adopted_key(init: &SorobanExpr, region: &[SorobanStmt], name: &str) -> bool {
+        if !matches!(
+            init,
+            SorobanExpr::EnumConstruct { .. }
+                | SorobanExpr::SymbolLiteral(_)
+                | SorobanExpr::VecConstruct(_)
+        ) {
+            return false;
+        }
+        fn scan(
+            stmts: &[SorobanStmt],
+            init: &SorobanExpr,
+            name: &str,
+            bound: &mut HashMap<String, SorobanExpr>,
+        ) -> bool {
+            for stmt in stmts {
+                let hit = match stmt {
+                    SorobanStmt::Let {
+                        name: bind, value, ..
+                    } => {
+                        if let Some(key) = read_key(value, bound) {
+                            let key = key.clone();
+                            bound.insert(bind.clone(), key);
+                        }
+                        false
+                    }
+                    SorobanStmt::Assign { target, value } => {
+                        target == name && read_key(value, bound).is_some_and(|k| k == init)
+                    }
+                    SorobanStmt::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => scan(then_body, init, name, bound) || scan(else_body, init, name, bound),
+                    SorobanStmt::Match { arms, .. } => {
+                        arms.iter().any(|arm| scan(&arm.body, init, name, bound))
+                    }
+                    SorobanStmt::Loop { body }
+                    | SorobanStmt::Block(body)
+                    | SorobanStmt::For { body, .. } => scan(body, init, name, bound),
+                    _ => false,
+                };
+                if hit {
+                    return true;
+                }
+            }
+            false
+        }
+        scan(region, init, name, &mut HashMap::new())
+    }
+
+    struct Splitter {
+        /// slot name → (home binding name, name the reads currently see)
+        env: HashMap<String, (String, String)>,
+        /// every name in the tree, plus the ones minted here
+        used: HashSet<String>,
+    }
+
+    impl Splitter {
+        fn rewrite(&self, expr: SorobanExpr) -> SorobanExpr {
+            let map: HashMap<String, String> = self
+                .env
+                .iter()
+                .filter(|(slot, (_, current))| current != *slot)
+                .map(|(slot, (_, current))| (slot.clone(), current.clone()))
+                .collect();
+            if map.is_empty() {
+                expr
+            } else {
+                rename_in_expr(expr, &map)
+            }
+        }
+
+        fn fresh(&mut self, base: &str) -> String {
+            let mut n = 2u32;
+            loop {
+                let candidate = format!("{base}_{n}");
+                if !self.used.contains(&candidate) {
+                    self.used.insert(candidate.clone());
+                    return candidate;
+                }
+                n += 1;
+            }
+        }
+
+        /// Walk a nested body. `extra` are names the body itself binds (a `for`
+        /// variable, a match arm's payload bindings), which are not slots.
+        fn scoped(&mut self, extra: &[String], body: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+            let snapshot = self.env.clone();
+            for name in extra {
+                self.env.insert(name.clone(), (name.clone(), name.clone()));
+            }
+            let body = self.walk(body);
+            let mut assigned = HashSet::new();
+            assign_targets(&body, &mut assigned);
+            self.env = snapshot;
+            // A write inside the body lands in the slot's home binding, so a
+            // read after the body must see the home binding and not a shadow an
+            // enclosing scope had introduced.
+            for name in assigned {
+                if let Some(entry) = self.env.get_mut(&name) {
+                    entry.1 = entry.0.clone();
+                }
+            }
+            body
+        }
+
+        /// A loop body reads the slot it assigns across iterations, so the reads
+        /// must see the home binding from the first iteration on.
+        fn home_for_loop_assigns(&mut self, body: &[SorobanStmt]) {
+            let mut assigned = HashSet::new();
+            assign_targets(body, &mut assigned);
+            for name in assigned {
+                if let Some(entry) = self.env.get_mut(&name) {
+                    entry.1 = entry.0.clone();
+                }
+            }
+        }
+
+        fn walk(&mut self, stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
+            let mut rest: Vec<SorobanStmt> = stmts;
+            let mut out: Vec<SorobanStmt> = Vec::with_capacity(rest.len());
+            let mut i = 0;
+            while i < rest.len() {
+                let stmt = std::mem::replace(&mut rest[i], SorobanStmt::Break);
+                let stmt = match stmt {
+                    SorobanStmt::Let {
+                        name,
+                        mutable,
+                        value,
+                    } => {
+                        let value = self.rewrite(value);
+                        let region = &rest[i + 1..];
+                        // `&&` short-circuits: the region scans run only for a
+                        // name an enclosing scope already bound. A shadow with
+                        // no value of its own — a hole, or the key of the read
+                        // that fills the slot — has nothing to lose at a merge,
+                        // so the write-then-read guard does not apply to it: the
+                        // slot's only real value is the written one, which lives
+                        // in the home binding.
+                        if self.env.contains_key(&name)
+                            && !loop_assigns(region, &name)
+                            && (value.is_never_rooted()
+                                || init_is_adopted_key(&value, region, &name)
+                                || !write_then_read(region, &name, &mut false))
+                        {
+                            cov_mark::hit!(shadowed_binding_split);
+                            let fresh = self.fresh(&name);
+                            if let Some(entry) = self.env.get_mut(&name) {
+                                entry.1 = fresh.clone();
+                            }
+                            SorobanStmt::Let {
+                                name: fresh,
+                                mutable,
+                                value,
+                            }
+                        } else {
+                            self.used.insert(name.clone());
+                            self.env
+                                .entry(name.clone())
+                                .or_insert_with(|| (name.clone(), name.clone()));
+                            SorobanStmt::Let {
+                                name,
+                                mutable,
+                                value,
+                            }
+                        }
+                    }
+                    SorobanStmt::Assign { target, value } => {
+                        let value = self.rewrite(value);
+                        let target = match self.env.get_mut(&target) {
+                            Some(entry) => {
+                                entry.1 = entry.0.clone();
+                                entry.0.clone()
+                            }
+                            None => target,
+                        };
+                        SorobanStmt::Assign { target, value }
+                    }
+                    SorobanStmt::Expr(e) => SorobanStmt::Expr(self.rewrite(e)),
+                    SorobanStmt::Return(v) => SorobanStmt::Return(v.map(|e| self.rewrite(e))),
+                    SorobanStmt::If {
+                        condition,
+                        then_body,
+                        else_body,
+                    } => {
+                        let condition = self.rewrite(condition);
+                        let then_body = self.scoped(&[], then_body);
+                        let else_body = self.scoped(&[], else_body);
+                        SorobanStmt::If {
+                            condition,
+                            then_body,
+                            else_body,
+                        }
+                    }
+                    SorobanStmt::Match { scrutinee, arms } => {
+                        let scrutinee = self.rewrite(scrutinee);
+                        let arms = arms
+                            .into_iter()
+                            .map(|arm| {
+                                let extra =
+                                    if let crate::ir::soroban_ir::MatchPattern::EnumVariant {
+                                        bindings,
+                                        ..
+                                    } = &arm.pattern
+                                    {
+                                        bindings.clone()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                let body = self.scoped(&extra, arm.body);
+                                crate::ir::soroban_ir::MatchArm { body, ..arm }
+                            })
+                            .collect();
+                        SorobanStmt::Match { scrutinee, arms }
+                    }
+                    SorobanStmt::Loop { body } => {
+                        self.home_for_loop_assigns(&body);
+                        SorobanStmt::Loop {
+                            body: self.scoped(&[], body),
+                        }
+                    }
+                    SorobanStmt::For {
+                        var,
+                        start,
+                        end,
+                        step,
+                        body,
+                    } => {
+                        let start = self.rewrite(start);
+                        let end = self.rewrite(end);
+                        self.home_for_loop_assigns(&body);
+                        let body = self.scoped(std::slice::from_ref(&var), body);
+                        SorobanStmt::For {
+                            var,
+                            start,
+                            end,
+                            step,
+                            body,
+                        }
+                    }
+                    SorobanStmt::Block(body) => SorobanStmt::Block(self.scoped(&[], body)),
+                    other => other,
+                };
+                out.push(stmt);
+                i += 1;
+            }
+            out
+        }
+    }
+
+    /// Every binding name in the tree (`collect_used_names` stops at `For`).
+    fn binding_names(stmts: &[SorobanStmt], names: &mut HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                SorobanStmt::Let { name, .. } => {
+                    names.insert(name.clone());
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    binding_names(then_body, names);
+                    binding_names(else_body, names);
+                }
+                SorobanStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        if let crate::ir::soroban_ir::MatchPattern::EnumVariant {
+                            bindings, ..
+                        } = &arm.pattern
+                        {
+                            names.extend(bindings.iter().cloned());
+                        }
+                        binding_names(&arm.body, names);
+                    }
+                }
+                SorobanStmt::For { var, body, .. } => {
+                    names.insert(var.clone());
+                    binding_names(body, names);
+                }
+                SorobanStmt::Loop { body } | SorobanStmt::Block(body) => binding_names(body, names),
+                _ => {}
+            }
+        }
+    }
+
+    let mut used = HashSet::new();
+    binding_names(&stmts, &mut used);
+    assign_targets(&stmts, &mut used);
+    let mut splitter = Splitter {
+        env: HashMap::new(),
+        used,
+    };
+    splitter.walk(stmts)
+}
+
 /// De-shadow variable names: when multiple Let bindings have the same name,
 /// rename later ones to `name_2`, `name_3`, etc. and update references.
 /// This only processes top-level statements (not nested scopes where shadowing
@@ -10422,5 +10948,340 @@ mod tests {
         assert_eq!(t[0], local(2), "the old value: {out:?}");
         assert_ne!(t[1], local(2), "the new value is not the old one: {out:?}");
         assert_eq!(t[1], t[2]);
+    }
+
+    // ----- Phase 5d: one name per binding (stage 3c) -----
+
+    /// soroban-domains `init`: slot 3 carries the storage key, then the struct
+    /// read under it, then one field of that struct. The inner `Let` gets its
+    /// own name, the reads inside the block follow it, and the `Assign` keeps
+    /// writing the slot's home binding — the one a reader after the block sees.
+    #[test]
+    fn shadowed_binding_gets_its_own_name() {
+        cov_mark::check!(shadowed_binding_split);
+        let key = SorobanExpr::EnumConstruct {
+            type_name: "CoreDataKeys".into(),
+            variant: "CoreData".into(),
+            fields: vec![],
+        };
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: key.clone(),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::StorageHas {
+                    storage_type: StorageType::Instance,
+                    key: Box::new(key.clone()),
+                },
+                then_body: vec![
+                    SorobanStmt::Let {
+                        name: "var_3".into(),
+                        mutable: false,
+                        value: SorobanExpr::StorageGet {
+                            storage_type: StorageType::Instance,
+                            key: Box::new(key.clone()),
+                            unwrap: true,
+                            on_missing: None,
+                        },
+                    },
+                    SorobanStmt::Assign {
+                        target: "var_3".into(),
+                        value: SorobanExpr::FieldAccess {
+                            object: Box::new(SorobanExpr::Local(3)),
+                            field: "adm".into(),
+                        },
+                    },
+                ],
+                else_body: vec![],
+            },
+            SorobanStmt::Return(Some(SorobanExpr::Local(3))),
+        ];
+        let out = split_shadowed_bindings(stmts);
+        let SorobanStmt::If { then_body, .. } = &out[1] else {
+            panic!("{out:?}");
+        };
+        // The inner binding is a name of its own.
+        let SorobanStmt::Let { name: inner, .. } = &then_body[0] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(inner, "var_3_2");
+        // The write stays on the home binding, and reads it from the shadow.
+        let SorobanStmt::Assign { target, value } = &then_body[1] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(target, "var_3");
+        assert_eq!(
+            value,
+            &SorobanExpr::FieldAccess {
+                object: Box::new(SorobanExpr::NamedLocal("var_3_2".into())),
+                field: "adm".into(),
+            }
+        );
+        // A read after the block sees the home binding, which the write filled.
+        let SorobanStmt::Return(Some(tail)) = &out[2] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(tail, &SorobanExpr::Local(3));
+    }
+
+    /// Reads inside the shadow's region see the shadow; the write at the end of
+    /// its life goes to the home binding, which a reader after the block sees.
+    #[test]
+    fn reads_in_the_region_see_the_shadow_and_the_write_leaves_it() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(0),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::BoolLiteral(true),
+                then_body: vec![
+                    SorobanStmt::Let {
+                        name: "var_3".into(),
+                        mutable: false,
+                        value: SorobanExpr::Param("p".into()),
+                    },
+                    SorobanStmt::Expr(SorobanExpr::Local(3)),
+                    SorobanStmt::Assign {
+                        target: "var_3".into(),
+                        value: SorobanExpr::FieldAccess {
+                            object: Box::new(SorobanExpr::Local(3)),
+                            field: "f".into(),
+                        },
+                    },
+                ],
+                else_body: vec![],
+            },
+            SorobanStmt::Expr(SorobanExpr::Local(3)),
+        ];
+        let out = split_shadowed_bindings(stmts);
+        let SorobanStmt::If { then_body, .. } = &out[1] else {
+            panic!("{out:?}");
+        };
+        let SorobanStmt::Expr(read) = &then_body[1] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            read,
+            &SorobanExpr::NamedLocal("var_3_2".into()),
+            "a read in the region: the shadow"
+        );
+        let SorobanStmt::Assign { target, value } = &then_body[2] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(target, "var_3", "the write: the home binding");
+        assert_eq!(
+            value,
+            &SorobanExpr::FieldAccess {
+                object: Box::new(SorobanExpr::NamedLocal("var_3_2".into())),
+                field: "f".into(),
+            }
+        );
+        let SorobanStmt::Expr(after) = &out[2] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(after, &SorobanExpr::Local(3), "after the block: the home");
+    }
+
+    /// A shadow that is the storage key of the read the slot is filled from is
+    /// the lost default arm, not a value: it is split even though the region
+    /// writes the slot from inside a block and then reads it.
+    #[test]
+    fn adopted_key_shadow_is_split_through_a_merge() {
+        let key = || SorobanExpr::EnumConstruct {
+            type_name: "CoreDataKeys".into(),
+            variant: "CoreData".into(),
+            fields: vec![],
+        };
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::UnknownVal,
+            },
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: key(),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::StorageHas {
+                    storage_type: StorageType::Instance,
+                    key: Box::new(key()),
+                },
+                then_body: vec![
+                    SorobanStmt::Let {
+                        name: "core_data".into(),
+                        mutable: false,
+                        value: SorobanExpr::StorageGet {
+                            storage_type: StorageType::Instance,
+                            key: Box::new(key()),
+                            unwrap: true,
+                            on_missing: None,
+                        },
+                    },
+                    SorobanStmt::Assign {
+                        target: "var_3".into(),
+                        value: SorobanExpr::FieldAccess {
+                            object: Box::new(SorobanExpr::NamedLocal("core_data".into())),
+                            field: "adm".into(),
+                        },
+                    },
+                ],
+                else_body: vec![],
+            },
+            SorobanStmt::Expr(SorobanExpr::Local(3)),
+        ];
+        let out = split_shadowed_bindings(stmts);
+        let SorobanStmt::Let { name, .. } = &out[1] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(name, "var_3_2", "the adopted key is split off");
+    }
+
+    /// A loop that assigns the slot reads the previous iteration's value, which
+    /// lives in the home binding. A shadow would be right on the first
+    /// iteration and wrong on every later one, so it is refused.
+    #[test]
+    fn shadow_refused_when_a_loop_assigns_the_slot() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(0),
+            },
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(1),
+            },
+            SorobanStmt::Loop {
+                body: vec![SorobanStmt::Assign {
+                    target: "var_3".into(),
+                    value: SorobanExpr::Local(3),
+                }],
+            },
+        ];
+        let out = split_shadowed_bindings(stmts.clone());
+        let SorobanStmt::Let { name, .. } = &out[1] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(name, "var_3", "the shadow is left alone");
+    }
+
+    /// soroswap `create_pair` builds the `PairWasmHash` key in slot 6, writes an
+    /// error sentinel over it when the key is absent, and then reads the slot as
+    /// the key of its read. That read wants the merge of the two values, which
+    /// only one mutable variable carries, so the shadow is refused.
+    #[test]
+    fn shadow_refused_when_the_region_writes_then_reads() {
+        let key =
+            || SorobanExpr::VecConstruct(vec![SorobanExpr::SymbolLiteral("PairWasmHash".into())]);
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_6".into(),
+                mutable: true,
+                value: SorobanExpr::I64Literal(201),
+            },
+            SorobanStmt::Let {
+                name: "var_6".into(),
+                mutable: true,
+                value: key(),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::BoolLiteral(true),
+                then_body: vec![SorobanStmt::Assign {
+                    target: "var_6".into(),
+                    value: SorobanExpr::I64Literal(201),
+                }],
+                else_body: vec![],
+            },
+            SorobanStmt::Expr(SorobanExpr::StorageGet {
+                storage_type: StorageType::Persistent,
+                key: Box::new(SorobanExpr::Local(6)),
+                unwrap: true,
+                on_missing: None,
+            }),
+        ];
+        let out = split_shadowed_bindings(stmts);
+        let SorobanStmt::Let { name, .. } = &out[1] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(name, "var_6", "the shadow is left alone");
+    }
+
+    /// A minted name never collides with one the lifter already uses, and a
+    /// second run changes nothing.
+    #[test]
+    fn split_is_idempotent_and_collision_free() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(0),
+            },
+            SorobanStmt::Let {
+                name: "var_3_2".into(),
+                mutable: false,
+                value: SorobanExpr::I32Literal(1),
+            },
+            SorobanStmt::Block(vec![
+                SorobanStmt::Let {
+                    name: "var_3".into(),
+                    mutable: false,
+                    value: SorobanExpr::I32Literal(2),
+                },
+                SorobanStmt::Expr(SorobanExpr::Local(3)),
+            ]),
+        ];
+        let once = split_shadowed_bindings(stmts);
+        let SorobanStmt::Block(body) = &once[2] else {
+            panic!("{once:?}");
+        };
+        let SorobanStmt::Let { name, .. } = &body[0] else {
+            panic!("{once:?}");
+        };
+        assert_eq!(name, "var_3_3", "var_3_2 is taken");
+        let SorobanStmt::Expr(read) = &body[1] else {
+            panic!("{once:?}");
+        };
+        assert_eq!(read, &SorobanExpr::NamedLocal("var_3_3".into()));
+        let twice = split_shadowed_bindings(once.clone());
+        assert_eq!(format!("{once:?}"), format!("{twice:?}"));
+    }
+
+    /// A match arm's payload binding is not a slot: a read of that name inside
+    /// the arm is the payload, and no shadow is minted for it.
+    #[test]
+    fn match_arm_bindings_are_not_slots() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3".into(),
+                mutable: true,
+                value: SorobanExpr::I32Literal(0),
+            },
+            SorobanStmt::Match {
+                scrutinee: SorobanExpr::Param("p".into()),
+                arms: vec![MatchArm {
+                    pattern: crate::ir::soroban_ir::MatchPattern::EnumVariant {
+                        type_name: "E".into(),
+                        variant: "V".into(),
+                        bindings: vec!["var_3".into()],
+                    },
+                    body: vec![SorobanStmt::Expr(SorobanExpr::NamedLocal("var_3".into()))],
+                }],
+            },
+        ];
+        let out = split_shadowed_bindings(stmts);
+        let SorobanStmt::Match { arms, .. } = &out[1] else {
+            panic!("{out:?}");
+        };
+        let SorobanStmt::Expr(read) = &arms[0].body[0] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(read, &SorobanExpr::NamedLocal("var_3".into()));
     }
 }
