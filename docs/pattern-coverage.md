@@ -207,7 +207,7 @@ functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
 
-The headline restoration figure this produces — **89.4 %**
+The headline restoration figure this produces — **89.0 %**
 (`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
 mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
 **correctness-blind**: it grades how much of each function lifted to concrete
@@ -278,7 +278,7 @@ every mainnet corpus contract and `cargo check`s the result for
 lifter emitted: output that *looks* like code but does not type-check. The
 metric is "wrong output", not "incomplete output".
 
-Current status: **358 hard errors across 24 contracts** (ceiling 358), with
+Current status: **330 hard errors across 24 contracts** (ceiling 330), with
 **2 contracts compiling cleanly** — `digicus` and `unknown-oracle`.
 Down from 1042 at the start of the v0.0.4 cycle, and up from 303: the
 equivalence gate showed that `fxdao-oracle` and `soroswap-CA4HEQTL` compiled
@@ -295,8 +295,18 @@ name: one slot carries the storage key, the struct read under it and one field
 of that struct, and rendering them under one name wrote the immutable inner
 binding across types and took the wrong value at later reads. A slot whose
 two values meet at a merge is split only when both are holes; otherwise the
-single-name rendering stands, and the type error it raises is the honest
-diagnosis of a live-range split the decompiler does not yet do. Every intermediate *rise* in
+single-name rendering stands. The step to 330 took the slots a rename cannot
+fix, because their values have different types in one scope. A census proved
+each of the 23 such sites at IR level and found the class dominated by a slot
+that carries a storage KEY and then the value read under it, so the repair is
+the key-adopted-default hole, widened to the shapes it was missing (a read
+bound in two sibling branches of one key, a `String` key); on top of that, a
+returned local every value of which is a literal the return type cannot hold
+is wholly fabricated and holes, and a slot every live range of which has become
+a hole loses its name, since there is no value in it to read. The general
+live-range split was **refused**: every slot whose key is read through the slot
+has more than one write, so no range's end can be bounded without a store the
+lifter dropped. Every intermediate *rise* in
 this ratchet has been an audited, deliberate unmask (fixing a type error
 un-suppresses pre-existing brokenness rustc's error recovery was hiding); see
 the running commentary in the `ERROR_CEILING` docstring, which is the

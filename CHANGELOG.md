@@ -113,6 +113,94 @@ Gates: compile-back 37/38 non-skipped (97%, `test_liquidity_pool` as on main),
 corpus ratchet 358 unchanged, equivalence 0 divergences (150/152 functions,
 3824 cases), 714 lib + 78 integration tests, no snapshot drift.
 
+### Fixed — a slot whose values do not fit one name (campaign stage 3d)
+
+Stage 3c gave every value of a reused wasm local its own name where a rename was
+enough. It cannot rename a slot whose two values sit in the same scope with
+incompatible types: one Rust variable has one type, and rendering both values
+under it is an `E0308` that names the two.
+
+A census of the corpus measured the class before anything was built. 124 of the
+358 hard errors were `E0308`, and **23 of those sit on a local that is both
+bound and written** — the slot class. Every one was proven at IR level, and the
+class turned out to be dominated not by two real values of different types but
+by **a slot that carries a storage KEY and then the value read under that key**
+(15 of the 23). That is not a live-range problem; it is the key-adopted default
+the lifter already knows how to hole, in the shapes it was missing.
+
+- **A read bound to a local of its own in several places still proves the
+  adoption**, as long as every one of them reads the same key. soroban-domains'
+  `update_tlds` and `set_node_rate` inline the `CoreData` read into two sibling
+  branches, each binding a `core_data`; the earlier "a name bound twice is
+  ambiguous" rule dropped them both, so three slots kept the read's own key as
+  their value:
+
+  ```rust
+  let mut vp = CoreDataKeys::CoreData;              // the KEY, as a value
+  if env.storage().instance().has(&CoreDataKeys::CoreData) {
+      let core_data = ...get::<_, CoreData>(&CoreDataKeys::CoreData).unwrap();
+      vp = core_data.adm;                           // an Address — E0308
+  }
+  ```
+
+  Both branches name the same key, so the init is the lost default arm either
+  way, and it is an honest `todo!()`.
+- **A `String` key is adopted exactly as a symbol one is.** reflector keys its
+  instance storage with `String::from_str(&env, "cache")`.
+- **A returned local every value of which is a literal the return type cannot
+  hold is wholly fabricated**, so each of those values is a hole
+  (`ir::correctness::husk_wholly_fabricated_returned_locals`). reflector's
+  `base()` fills one slot with the key `"base_asset"` and then a `1`, and
+  returns it as an `Asset` — which holds neither. What makes this provable
+  without a live-range analysis is that the slot's **whole** value set is wrong:
+  no range of it carries the real value, so which range a given read belongs to
+  stops mattering. One real value anywhere — a matching literal, an expression,
+  a read — and the pass does nothing. Numeric against numeric never fires, so a
+  recovered constant return is never touched.
+- **A slot every live range of which has become a hole needs no name at all.**
+  The husk that collapses reads of an all-`!` local now runs again at the end of
+  the pipeline, after the passes that hole a union read's decode fragments, a
+  key-adopted default and a literal a proven type contradicts. soroban-domains
+  read one such slot as the `BytesN<32>` key of `RecordKeys::SubRecord` and then
+  for the `Record` fields `.node`, `.owner`, `.collateral`, `.exp_date`,
+  `.snapshot` — an `E0609` on whichever of the two types rustc picked. There was
+  no value in the slot to name, so each read is the hole it is.
+
+| wrong value | contract | was | now |
+|---|---|---|---|
+| the read's own key, as the lost default of the read that fills the slot | soroban-domains `update_tlds`, `set_node_rate` | `let mut vp = CoreDataKeys::CoreData` | `let mut vp = todo!("unknown value")` |
+| the read's own `String` key, same adoption | reflector ×2 `price` | `let mut var_3_2 = String::from_str(&env, "cache")` | `let mut var_3_2 = todo!("unknown value")` |
+| a key and a `1` returned as an `Asset` | reflector ×2 `base` | `String::from_str(&env, "base_asset")` / `var_2 = 1` | both `todo!("unknown value")` |
+| a `Symbol` event topic returned as the declared type | blend-fixed-pool, blend-yieldblox-pool `set_status`; aqua-amm | `Symbol::new(&env, "set_status")` as a `u32` | `todo!("unknown value")` |
+| `Record` fields read off an all-hole slot rustc had typed `BytesN<32>` | soroban-domains ×5 functions | `var_3_4.node`, `var_3_4.owner`, … | `todo!("unknown value")` |
+
+Corpus hard errors 358 → 330: soroban-domains 56→35 (E0609 −20, E0308 −2, and
+the one rise, E0277 +1 — with the field reads collapsed rustc can see that
+`owner` carries a hole and a `u64` `min_duration` and is compared against an
+`Address`, a slot conflict the E0609 had hidden), reflector ×2 10→8 each
+(E0308 −3, E0282 +1 each: the fabricated `String` key init had been pinning the
+`V` of an un-inferable read, which is honestly un-inferable now), aqua-amm
+62→61, blend-fixed-pool and blend-yieldblox-pool 15→14 each. Clean contracts
+still 2 of 24.
+
+Not addressed: **the general live-range split has no provable target in this
+corpus, and is refused rather than forced.** Every slot whose key is read
+*through* the slot has more than one write — aqua-amm and aqua-rewards have two
+`if has(&vp) { vp = get(&vp) }` blocks and the second reads the slot after the
+first write, and soroswap's `create_pair` writes a key, an error sentinel and a
+lost value — so no range's end can be bounded without a store the lifter
+dropped. The cheap alternative was measured as well: rendering a hole-valued
+shadow that stage 3c's merge guard refuses as a write to the **home** binding
+instead of a second binding, which is strictly closer to the wasm (a binding's
+scope ends with its block, a slot's write does not). It costs +1 error — it
+moves soroban-domains' `E0609`s onto the other of the slot's two types without
+recovering anything — so it is not taken. Also untouched: a slot pinned by a
+consumer rather than by its return type (xycloans writes `0` into the local it
+later passes as a `try_invoke_contract` function name), and soroban-domains'
+`vp = vp.adm` followed by `node = vp.col_asset`, where the read after the write
+wants the struct the slot held before it — provable only against the spec
+registry, which the optimizer does not have.
+
 
 ### Fixed — every value of a reused wasm local gets its own name (campaign stage 3c)
 

@@ -931,10 +931,20 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
     for func in &mut contract_module.functions {
         let returns_value = !matches!(&func.return_type, None | Some(ScSpecTypeDef::Void));
         let body = std::mem::take(&mut func.body);
+        // Campaign stage 3d: a returned local every value of which is a
+        // literal the return type cannot hold is wholly fabricated — each of
+        // those values is a hole. Runs before Detector 4 below, so that pass
+        // sees a local whose every binding has become `!`-rooted and collapses
+        // its reads too.
+        let body = crate::ir::correctness::husk_wholly_fabricated_returned_locals(
+            body,
+            func.return_type.as_ref(),
+        );
         // Detector 4: uses of unbound locals (E0425 — lost-loop self-reference
         // residue, cross-scope uses) and of locals every binding of which is
-        // `!`-rooted → honest `UnknownVal`. Runs first so every later pass sees
-        // the husked shapes.
+        // `!`-rooted → honest `UnknownVal`. Runs before the husks below so they
+        // all see the husked shapes; it runs a second time at the end of this
+        // loop, on the holes those husks themselves make (stage 3d).
         let body = husk_unbound_local_uses(body, &func.params);
         // A `try_invoke_contract` used as a value: keep the call, hole the
         // unrecovered mapping of its result.
@@ -976,6 +986,17 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // (`oracle = 10` where `oracle` is an `Address`) is a fabricated value
         // and a guaranteed E0308 → an honest hole.
         let body = crate::ir::correctness::husk_type_mismatched_assignments(body);
+        // Campaign stage 3d: a slot EVERY live range of which has become a hole
+        // needs no name at all. The passes above hole values this one could not
+        // see on its first run (a union read's decode fragments, a key-adopted
+        // default, a literal a proven type contradicts), and a local left with
+        // nothing but holes is read in positions one variable cannot type —
+        // soroban-domains reads the same all-hole slot as the `BytesN<32>` key
+        // of `RecordKeys::SubRecord` and then for the `Record` fields `.node`,
+        // `.owner`, `.collateral`, which is an E0609 on whichever of the two
+        // rustc picks. Collapsing each read to the hole it is drops the conflict
+        // and loses nothing: there was no value in the slot to name.
+        let body = husk_unbound_local_uses(body, &func.params);
         func.body = clone_reused_move_params(body, &func.params);
     }
 
@@ -3727,6 +3748,18 @@ fn fold_option_void_compares_in(stmts: &mut [SorobanStmt], use_counts: &HashMap<
 /// is the same adoption as the direct form: the init is the KEY of the read the
 /// local is filled from, so it is the lost default arm, not a value. The key
 /// itself loses nothing by becoming a hole — every use of it renders inline.
+///
+/// Stage 3d widens the signature twice, without widening what it proves:
+///
+/// - the read may be bound to a local of its own in SEVERAL places, as long as
+///   every one of them reads the same key. soroban-domains' `update_tlds` and
+///   `set_node_rate` inline the `CoreData` read into two sibling branches, each
+///   binding a `core_data` of its own; the earlier "a name bound twice is
+///   ambiguous" rule dropped them both, so three slots kept the key as a value.
+/// - a `String` key is adopted exactly as a symbol one is. reflector keys its
+///   instance storage with `String::from_str(&env, "cache")`, and its `base()`
+///   and `price()` slots take that key as the default of the read that fills
+///   them.
 fn repair_key_adopted_defaults(stmts: &mut [SorobanStmt]) {
     /// The key of the `StorageGet` an expression is rooted at: through the
     /// projections that carry a read's value (a field of the struct read, a
@@ -3759,8 +3792,19 @@ fn repair_key_adopted_defaults(stmts: &mut [SorobanStmt]) {
             match stmt {
                 SorobanStmt::Let { name, value, .. } => {
                     let key = read_key(value, &HashMap::new()).cloned();
+                    // A name bound twice is ambiguous ONLY when the two
+                    // bindings read different keys. soroban-domains reads the
+                    // same `CoreDataKeys::CoreData` into a `core_data` of its
+                    // own in two sibling branches of one function, and which
+                    // branch a later `vp = core_data.adm` belongs to does not
+                    // matter: both name the same key, so the adoption the key
+                    // proves is the same either way.
                     out.entry(name.clone())
-                        .and_modify(|slot| *slot = None)
+                        .and_modify(|slot| {
+                            if slot.as_ref() != key.as_ref() {
+                                *slot = None;
+                            }
+                        })
                         .or_insert(key);
                 }
                 SorobanStmt::If {
@@ -3844,10 +3888,14 @@ fn repair_key_adopted_defaults(stmts: &mut [SorobanStmt]) {
                     // 3b: once the read is typed `Address`, the `Symbol` init
                     // no longer type-checks; before, the read was inferred as
                     // `Symbol` and decoded the stored admin as one).
+                    // A `String` key (`String::from_str(&env, "cache")`, how
+                    // reflector keys its instance storage) is adopted exactly as
+                    // a symbol one is.
                     if matches!(
                         value,
                         SorobanExpr::EnumConstruct { .. }
                             | SorobanExpr::SymbolLiteral(_)
+                            | SorobanExpr::StringLiteral(_)
                             | SorobanExpr::VecConstruct(_)
                     ) && let_counts.get(name).copied().unwrap_or(0) == 1
                         && get_keys
@@ -11283,6 +11331,163 @@ mod tests {
                 }
             ),
             "a key that is not the read's own key stays: {stmts:?}"
+        );
+    }
+
+    /// Stage 3d: the read may be bound to a local of its own in SEVERAL places,
+    /// as long as every one of them reads the same key — soroban-domains'
+    /// `update_tlds` inlines the `CoreData` read into two sibling branches.
+    #[test]
+    fn key_adopted_default_through_a_read_bound_twice_to_one_key_holes() {
+        let key = |variant: &str| SorobanExpr::EnumConstruct {
+            type_name: "CoreDataKeys".into(),
+            variant: variant.into(),
+            fields: vec![],
+        };
+        let read = |variant: &str| SorobanExpr::StorageGet {
+            storage_type: crate::ir::soroban_ir::StorageType::Instance,
+            key: Box::new(key(variant)),
+            unwrap: true,
+            on_missing: None,
+        };
+        let branch = |variant: &str| SorobanStmt::If {
+            condition: SorobanExpr::StorageHas {
+                storage_type: crate::ir::soroban_ir::StorageType::Instance,
+                key: Box::new(key(variant)),
+            },
+            then_body: vec![
+                SorobanStmt::Let {
+                    name: "core_data".into(),
+                    mutable: false,
+                    value: read(variant),
+                },
+                SorobanStmt::Assign {
+                    target: "vp".into(),
+                    value: SorobanExpr::FieldAccess {
+                        object: Box::new(SorobanExpr::NamedLocal("core_data".into())),
+                        field: "adm".into(),
+                    },
+                },
+            ],
+            else_body: vec![],
+        };
+        let mut stmts = vec![
+            SorobanStmt::Let {
+                name: "vp".into(),
+                mutable: true,
+                value: key("CoreData"),
+            },
+            branch("CoreData"),
+            branch("CoreData"),
+        ];
+        repair_key_adopted_defaults(&mut stmts);
+        assert!(
+            matches!(
+                &stmts[0],
+                SorobanStmt::Let {
+                    value: SorobanExpr::UnknownVal,
+                    ..
+                }
+            ),
+            "{stmts:?}"
+        );
+    }
+
+    /// The refusal: two bindings of one name reading DIFFERENT keys say nothing
+    /// about which key the write adopted, so the init stays.
+    #[test]
+    fn key_adopted_default_refused_when_the_bound_read_names_two_keys() {
+        let key = |variant: &str| SorobanExpr::EnumConstruct {
+            type_name: "CoreDataKeys".into(),
+            variant: variant.into(),
+            fields: vec![],
+        };
+        let read = |variant: &str| SorobanExpr::StorageGet {
+            storage_type: crate::ir::soroban_ir::StorageType::Instance,
+            key: Box::new(key(variant)),
+            unwrap: true,
+            on_missing: None,
+        };
+        let branch = |variant: &str| SorobanStmt::If {
+            condition: SorobanExpr::StorageHas {
+                storage_type: crate::ir::soroban_ir::StorageType::Instance,
+                key: Box::new(key(variant)),
+            },
+            then_body: vec![
+                SorobanStmt::Let {
+                    name: "core_data".into(),
+                    mutable: false,
+                    value: read(variant),
+                },
+                SorobanStmt::Assign {
+                    target: "vp".into(),
+                    value: SorobanExpr::FieldAccess {
+                        object: Box::new(SorobanExpr::NamedLocal("core_data".into())),
+                        field: "adm".into(),
+                    },
+                },
+            ],
+            else_body: vec![],
+        };
+        let mut stmts = vec![
+            SorobanStmt::Let {
+                name: "vp".into(),
+                mutable: true,
+                value: key("CoreData"),
+            },
+            branch("CoreData"),
+            branch("OffersConfig"),
+        ];
+        repair_key_adopted_defaults(&mut stmts);
+        assert!(
+            matches!(
+                &stmts[0],
+                SorobanStmt::Let {
+                    value: SorobanExpr::EnumConstruct { .. },
+                    ..
+                }
+            ),
+            "two keys under one name prove nothing: {stmts:?}"
+        );
+    }
+
+    /// Stage 3d: a `String` key is adopted exactly as a symbol or enum one is
+    /// (reflector's `price()` keys instance storage with `"cache"`).
+    #[test]
+    fn key_adopted_default_holes_a_string_key_init() {
+        let mut stmts = vec![
+            SorobanStmt::Let {
+                name: "var_3_2".into(),
+                mutable: true,
+                value: SorobanExpr::StringLiteral("cache".into()),
+            },
+            SorobanStmt::If {
+                condition: SorobanExpr::StorageHas {
+                    storage_type: crate::ir::soroban_ir::StorageType::Instance,
+                    key: Box::new(SorobanExpr::StringLiteral("cache".into())),
+                },
+                then_body: vec![SorobanStmt::Assign {
+                    target: "var_3_2".into(),
+                    value: SorobanExpr::StorageGet {
+                        storage_type: crate::ir::soroban_ir::StorageType::Instance,
+                        key: Box::new(SorobanExpr::StringLiteral("cache".into())),
+                        unwrap: false,
+                        on_missing: None,
+                    },
+                }],
+                else_body: vec![],
+            },
+        ];
+        repair_key_adopted_defaults(&mut stmts);
+        assert!(
+            matches!(
+                &stmts[0],
+                SorobanStmt::Let {
+                    value: SorobanExpr::UnknownVal,
+                    ..
+                }
+            ),
+            "{stmts:?}"
         );
     }
 
