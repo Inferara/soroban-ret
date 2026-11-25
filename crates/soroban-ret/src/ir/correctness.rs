@@ -3811,6 +3811,58 @@ mod tests {
         );
     }
 
+    /// Every nested body the IR has carries the walk: a `return` inside a match
+    /// arm inside a loop names the local, and a write inside a block is one of
+    /// its values. A walker that stopped at any of those would silently miss
+    /// both the name and the value — the fault the stage 3c review found in
+    /// `rename_in_expr`.
+    #[test]
+    fn wholly_fabricated_returned_local_reaches_every_nested_body() {
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_2".into(),
+                mutable: true,
+                value: SorobanExpr::UnknownVal,
+            },
+            SorobanStmt::Block(vec![SorobanStmt::For {
+                var: "i".into(),
+                start: SorobanExpr::U32Literal(0),
+                end: SorobanExpr::U32Literal(3),
+                step: 1,
+                body: vec![SorobanStmt::Assign {
+                    target: "var_2".into(),
+                    value: SorobanExpr::SymbolLiteral("transfer".into()),
+                }],
+            }]),
+            SorobanStmt::Loop {
+                body: vec![SorobanStmt::Match {
+                    scrutinee: SorobanExpr::UnknownVal,
+                    arms: vec![crate::ir::soroban_ir::MatchArm {
+                        pattern: crate::ir::soroban_ir::MatchPattern::Wildcard,
+                        body: vec![SorobanStmt::Return(Some(SorobanExpr::NamedLocal(
+                            "var_2".into(),
+                        )))],
+                    }],
+                }],
+            },
+        ];
+        let out = husk_wholly_fabricated_returned_locals(stmts, Some(&ScSpecTypeDef::Address));
+        let SorobanStmt::Block(block) = &out[1] else {
+            panic!("{out:?}")
+        };
+        let SorobanStmt::For { body, .. } = &block[0] else {
+            panic!("{block:?}")
+        };
+        assert_eq!(
+            match &body[0] {
+                SorobanStmt::Assign { value, .. } => value,
+                other => panic!("{other:?}"),
+            },
+            &SorobanExpr::UnknownVal,
+            "an Address holds no symbol, and the walk must reach a for inside a block: {out:?}"
+        );
+    }
+
     /// The refusal: ONE real value anywhere in the slot and the pass does
     /// nothing. Holing the other value would claim a live range this pass does
     /// not analyse — the slot may genuinely carry the real value at the return.

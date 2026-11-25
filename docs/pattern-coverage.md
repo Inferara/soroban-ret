@@ -207,7 +207,7 @@ functions, or more decompilation artifacts). Improvements pass; an intentional
 change refreshes the baseline (`scripts/rebuild-benchmark-baseline.sh`). Runs in
 the default `cargo test`.
 
-The headline restoration figure this produces — **89.4 %**
+The headline restoration figure this produces — **89.0 %**
 (`benchmark-data/baseline.json` → `overall_restoration`) — is the equal-weight
 mean of per-contract `restoration_pct` across the 24 corpus contracts. It is
 **correctness-blind**: it grades how much of each function lifted to concrete
