@@ -54,19 +54,43 @@ and raise each `MAX_TAIL_LEN` from 6 to 8. All of it is still gated on reaching
   now keeps that mask exactly as a `.len()` result does, and
   `decode_masked_len_compare` decodes it. A wrong value is as unfaithful as a
   dropped guard.
-- **A multi-guard constructor recovers too.** Three guards and a storage write
-  had collapsed into two panics with mismatched errors and no write; all three
-  guards, their correct errors, and the write are now restored. Two defects
-  that mangling had hidden remain open under issue #80: the optimizer's
-  readability pass flips a bare `Le`/`Ge` panic guard without proof
-  (`ir::optimizer::is_inverted_comparison`), and one inlined error tail
-  survives as a stray `panic_with_error!` after the body.
-- **New fixture** `tests/fixtures/test_guard_panic.wasm`
+- **A multi-guard constructor recovers too.** Several guards before a storage
+  write, each a `br_if` to a different block depth, had collapsed into two
+  panics with mismatched errors and no write. All the guards, their correct
+  errors, and the write are now restored. Fixing the tail recognizers exposed
+  two further defects that the mangling had hidden; both are fixed here.
+- **A panic guard keeps the contract's own polarity.** `invert_guard_clauses`
+  used to "restore" a guard whose condition read `Le`/`Ge`, on the theory that
+  the lifter had emitted `if Not(Gt) { panic }` and the constant folder had
+  degraded it. It had not: `Not(Gt)` IS `Le`, so the fold was exact and
+  flipping it back negated the guard — `if name.len() <= 0 { panic }` rendered
+  as `if name.len() > 0 { panic }`, firing on the complement of the contract's
+  own check. Stripping an explicit `Not` wrapper was wrong for the same reason.
+  The panic-guard inversion is gone; the sound early-return inversion stays.
+- **An inlined error tail no longer survives as an unconditional panic.**
+  Layer B inlines a tail at each branch site and leaves the original in place
+  for downstream passes, which only drop a stray panic that still has live work
+  after it. A tail at the END of a level therefore survived and rendered as a
+  `panic_with_error!` after the recovered body, making the function always
+  fail. New `pattern::lifter::drop_unreachable_fail_tails` removes it as the
+  dead code it is: the tail is reachable only by a branch to the block's exit
+  depth (`branch_targets_depth` scans for any surviving `br`/`br_if`/`br_table`
+  with WASM depth bookkeeping) or by falling out of the block's end
+  (`diverges_at_end` requires `return` or a dead end). With both ruled out the
+  tail is unreachable in the original wasm too.
+- **New fixtures** `tests/fixtures/test_guard_panic.wasm`
   (`tests/fixtures-src/guard_panic`), covering the guarded value both returned
-  and unused.
+  and unused, and `tests/fixtures/test_guard_multi.wasm`
+  (`tests/fixtures-src/guard_multi`), covering guards at different branch
+  depths followed by a storage write. Kept as separate contracts so both stay
+  small enough that the SDK has nothing to inline the error paths into.
 
-Gates: compile-back 36/37 non-skipped (97%, `test_liquidity_pool` as on main),
-corpus ratchet 358 unchanged, equivalence 0 divergences, 714 lib + 77
+Still open for this contract shape: an `i128` `<= 0` sign test lifts as
+`== 0`, losing the negative case. Unrelated to the guard recovery and tracked
+under issue #80.
+
+Gates: compile-back 37/38 non-skipped (97%, `test_liquidity_pool` as on main),
+corpus ratchet 358 unchanged, equivalence 0 divergences, 714 lib + 78
 integration tests, no snapshot drift.
 
 

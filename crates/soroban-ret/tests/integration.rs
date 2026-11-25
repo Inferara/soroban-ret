@@ -210,6 +210,46 @@ fn test_decompile_guard_panic_small_contract() {
 }
 
 #[test]
+fn test_decompile_guard_multi_small_contract() {
+    // Issue #80: several `panic_with_error!` guards before a storage write,
+    // each a `br_if` to a different block depth. The guards used to be paired
+    // with the wrong errors, the write was dropped, and one inlined error tail
+    // survived as an unconditional panic after the body.
+    let wasm = include_bytes!("../../../tests/fixtures/test_guard_multi.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    // Each guard keeps its OWN error.
+    let name_guard = source
+        .find("Error::BadName")
+        .expect(&format!("BadName guard lost: {source}"));
+    let dec_guard = source
+        .find("Error::BadDecimals")
+        .expect(&format!("BadDecimals guard lost: {source}"));
+    assert!(
+        name_guard < dec_guard,
+        "guards paired with the wrong errors: {source}"
+    );
+    // The length guard keeps the contract's own polarity: the original fails on
+    // an EMPTY name, so the condition must not read `> 0`.
+    assert!(
+        source.contains("if name.len() <= 0 {") || source.contains("if name.len() == 0 {"),
+        "length guard inverted: {source}"
+    );
+    // The body after the guards survives.
+    assert!(
+        source.contains(".instance().set("),
+        "storage write dropped: {source}"
+    );
+    // No inlined error tail left over as an unconditional panic: every
+    // `panic_with_error!` sits inside a guard, so each is preceded by an `if`.
+    assert_eq!(
+        source.matches("panic_with_error!").count(),
+        2,
+        "an inlined error tail survived as a stray panic: {source}"
+    );
+    assert!(!source.contains("todo!("), "unexpected todo! artifact: {source}");
+}
+
+#[test]
 fn test_decompile_unknown_oracle_fallible_gets() {
     // A mainnet oracle whose getters were lifting to a lossy
     // `if has(k){extend_ttl} todo!()` husk — dropping the value AND the
@@ -1159,6 +1199,10 @@ const ALL_FIXTURES: &[(&str, &[u8])] = &[
     (
         "test_guard_panic",
         include_bytes!("../../../tests/fixtures/test_guard_panic.wasm"),
+    ),
+    (
+        "test_guard_multi",
+        include_bytes!("../../../tests/fixtures/test_guard_multi.wasm"),
     ),
     (
         "test_add_u128",

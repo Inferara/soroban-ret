@@ -27,6 +27,7 @@ run `soroban-ret --info <fixture>` to read it back.
 | `test_auth.wasm` | rs-soroban-sdk | `require_auth` / `require_auth_for_args` |
 | `test_bls.wasm` | rs-soroban-sdk | BLS12-381 host calls (g1/g2/msm/pairing) |
 | `test_guard_panic.wasm` | this repo (`tests/fixtures-src/guard_panic`) | `panic_with_error!` validation guard in a small contract (issue #80) |
+| `test_guard_multi.wasm` | this repo (`tests/fixtures-src/guard_multi`) | several `panic_with_error!` guards at different branch depths, then a storage write (issue #80) |
 | `test_bn254.wasm` | rs-soroban-sdk | BN254 host calls (g1/g2/pairing_check) |
 | `test_constructor.wasm` | rs-soroban-sdk | `__constructor` with state setup |
 | `test_contract_data.wasm` | rs-soroban-sdk | persistent/temporary/instance storage |

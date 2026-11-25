@@ -10234,6 +10234,10 @@ fn lift_function_body(
     // `recover_fail_with_error_branches`).
     recover_fail_with_error_branches(&mut structured, wasm_module);
     recover_skipped_fail_with_error(&mut structured, wasm_module);
+    // Layer B leaves each inlined tail in place; drop the ones nothing can
+    // reach any more, so they do not render as an unconditional panic after
+    // the recovered body (issue #80).
+    drop_unreachable_fail_tails(&mut structured, wasm_module);
     if let Ok(want) = std::env::var("DBG_STRUCT")
         && (want.is_empty() || want == func_index.to_string())
     {
@@ -10817,6 +10821,10 @@ fn lift_inline_call(
     // `recover_fail_with_error_branches`).
     recover_fail_with_error_branches(&mut structured, wasm_module);
     recover_skipped_fail_with_error(&mut structured, wasm_module);
+    // Layer B leaves each inlined tail in place; drop the ones nothing can
+    // reach any more, so they do not render as an unconditional panic after
+    // the recovered body (issue #80).
+    drop_unreachable_fail_tails(&mut structured, wasm_module);
     // Debug affordance: dump the structured body of an *inlined* (non-exported)
     // function by index. `DBG_STRUCT` only reaches lifted entrypoints; the big
     // contracts degrade values inside 3-4 levels of inlined helpers, so tracing
@@ -20954,6 +20962,125 @@ fn recover_skipped_fail_with_error(
         then_body: tail,
         else_body: vec![StructuredBlock::Instruction(WasmInstr::Br(depth + 1))],
     });
+}
+
+/// Drop a block's continuation when nothing can reach it any more.
+///
+/// ```text
+///   block                 ;; its branch target is the tail below
+///     <guards; br_if 0>   ;; rewritten to an inline guard by Layer B
+///     <body>; return
+///   end
+///   i64.const <err>; call $fail_with_error; drop; unreachable   ;; the tail
+/// ```
+///
+/// [`recover_fail_with_error_branches`] inlines such a tail at each branch
+/// site and deliberately leaves the original in place, relying on downstream
+/// passes to drop it. They only drop a stray panic that still has live work
+/// after it, so a tail at the END of a level survives and renders as an
+/// unconditional `panic_with_error!` after the recovered body — which makes
+/// the function always fail (issue #80).
+///
+/// This is plain dead-code elimination, not a heuristic. The tail is reachable
+/// only two ways, and both are checked:
+///
+/// 1. a branch to the block's own exit depth — [`branch_targets_depth`] scans
+///    the whole body with WASM depth bookkeeping, so any surviving `br`,
+///    `br_if` or `br_table` (including the `br depth + 1` that
+///    [`recover_skipped_fail_with_error`] introduces) keeps the tail;
+/// 2. falling out of the block's end — [`diverges_at_end`] requires the last
+///    node to be `return` or a dead end.
+///
+/// With both ruled out the tail is unreachable in the original wasm too, so
+/// removing it cannot change behaviour.
+fn drop_unreachable_fail_tails(
+    blocks: &mut Vec<super::structurize::StructuredBlock>,
+    module: &WasmModule,
+) {
+    use super::structurize::StructuredBlock;
+
+    // Innermost levels first: proving an inner tail dead is what lets the
+    // enclosing level see the inner block as diverging at its end.
+    for b in blocks.iter_mut() {
+        match b {
+            StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+                drop_unreachable_fail_tails(body, module);
+            }
+            StructuredBlock::IfElse {
+                then_body,
+                else_body,
+                ..
+            } => {
+                drop_unreachable_fail_tails(then_body, module);
+                drop_unreachable_fail_tails(else_body, module);
+            }
+            _ => {}
+        }
+    }
+
+    // A `Loop`'s continuation is its exit, but `br 0` inside a loop is the
+    // back-edge, so only a `Block` is considered here. At most one index can
+    // match: the tail is the ENTIRE suffix and holds no nested block, so no
+    // shorter suffix is a tail as well.
+    for i in 0..blocks.len() {
+        let StructuredBlock::Block { body, .. } = &blocks[i] else {
+            continue;
+        };
+        if !is_fail_with_error_tail(&blocks[i + 1..], module)
+            || branch_targets_depth(body, 0)
+            || !diverges_at_end(body)
+        {
+            continue;
+        }
+        cov_mark::hit!(unreachable_fail_tail_dropped);
+        blocks.truncate(i + 1);
+        return;
+    }
+}
+
+/// Does any branch inside `blocks` target `depth`, counted the way WASM counts
+/// it — every enclosing block, loop and `if` adds one level?
+fn branch_targets_depth(blocks: &[super::structurize::StructuredBlock], depth: u32) -> bool {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr;
+
+    blocks.iter().any(|b| match b {
+        StructuredBlock::Instruction(WasmInstr::Br(k) | WasmInstr::BrIf(k)) => *k == depth,
+        StructuredBlock::Instruction(WasmInstr::BrTable { targets, default }) => {
+            *default == depth || targets.contains(&depth)
+        }
+        StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+            branch_targets_depth(body, depth + 1)
+        }
+        StructuredBlock::IfElse {
+            then_body,
+            else_body,
+            ..
+        } => {
+            branch_targets_depth(then_body, depth + 1) || branch_targets_depth(else_body, depth + 1)
+        }
+        _ => false,
+    })
+}
+
+/// Can control fall off the end of `blocks`? False only when the last node
+/// provably diverges: `return`, `unreachable` (raw or the issue-#11 safety-net
+/// reclassification), or a nested block that itself diverges at its end with
+/// nothing branching to its exit. A trailing `br` is NOT accepted — `br 0`
+/// leaves a block exactly by its continuation, which is what we are trying to
+/// prove unreachable.
+fn diverges_at_end(blocks: &[super::structurize::StructuredBlock]) -> bool {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr;
+
+    match blocks.last() {
+        Some(StructuredBlock::Instruction(WasmInstr::Unreachable | WasmInstr::Return))
+        | Some(StructuredBlock::SafetyNetUnreachable) => true,
+        Some(StructuredBlock::Block { body, .. }) => {
+            !branch_targets_depth(body, 0) && diverges_at_end(body)
+        }
+        _ => false,
+    }
 }
 
 fn is_guard_error_path(remaining: &[super::structurize::StructuredBlock]) -> bool {
