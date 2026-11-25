@@ -555,7 +555,59 @@ use std::process::Command;
 /// E0308 that names the slot's two types, which is the honest diagnosis of the
 /// live-range split stage 3d owes). Clean contracts stay 2. `x = x.field`
 /// 19 → 1, the one left being the merge the guard protects.
-const ERROR_CEILING: u32 = 358;
+/// → 330 (−28; campaign stage 3d). The slot model of stage 3c, carried to the
+/// slots whose values do NOT fit one name because their types differ. A census
+/// of the 124 corpus `E0308`s found 23 of them on a local that is both bound and
+/// written, and proved every one at IR level: the class is dominated not by two
+/// real values of different types, but by a slot that carries a storage KEY and
+/// then the value read under that key (15 of the 23). Four mechanisms, each
+/// gated on what it can prove:
+/// (1) stage 4m6's key-adopted default now accepts the read bound to a local of
+/// its own in SEVERAL places, as long as every one of them reads the same key.
+/// soroban-domains inlines the `CoreData` read into two sibling branches, each
+/// binding a `core_data`; the old "a name bound twice is ambiguous" rule dropped
+/// them both, so three slots kept the read's own key as their value and the
+/// admin `Address` written over it was the E0308 that named the two types.
+/// (2) 4m6 also accepts a `String` key, as it already did a symbol one
+/// (reflector keys instance storage with `String::from_str(&env, "cache")`).
+/// (3) a returned local EVERY value of which is a literal the return type cannot
+/// hold is wholly fabricated, so each of those values is a hole
+/// (`ir::correctness::husk_wholly_fabricated_returned_locals`). reflector's
+/// `base()` fills one slot with the key `"base_asset"` and then a `1` and
+/// returns it as an `Asset`, which holds neither. What makes this provable
+/// without a live-range analysis is that the slot's whole value set is wrong:
+/// no range of it carries the real value, so which range a read belongs to
+/// stops mattering. One real value anywhere — a matching literal, an
+/// expression, a read — and the pass does nothing.
+/// (4) a slot every live range of which has become a hole needs no name at all:
+/// the husk that collapses reads of an all-`!` local runs again at the end of
+/// the pipeline, after the passes that hole a union read's decode fragments, a
+/// key-adopted default and a literal a proven type contradicts. soroban-domains
+/// read one such slot as the `BytesN<32>` key of `RecordKeys::SubRecord` and
+/// then for the `Record` fields `.node`, `.owner`, `.collateral`, `.exp_date`,
+/// `.snapshot` — an E0609 on whichever of the two types rustc picked. There was
+/// no value in the slot to name, so each read is the hole it is.
+/// Per contract: soroban-domains 56→35 (E0609 −20, E0308 −2, and the one rise,
+/// E0277 +1: with the field reads collapsed rustc can see that `owner` carries
+/// a hole and a `u64` `min_duration` and is compared against an `Address` —
+/// a slot conflict that was hidden behind the E0609, faithfully unmasked),
+/// reflector ×2 10→8 each (E0308 −3, E0282 +1 each: the fabricated `String` key
+/// init had been pinning the `V` of an un-inferable read, which is honestly
+/// un-inferable now), aqua-amm 62→61, blend-fixed-pool and blend-yieldblox-pool
+/// 15→14 each (a `Symbol` event topic returned as the function's `u32` /
+/// `Vec<Address>`). Clean contracts stay 2.
+/// Not fixed, and refused on purpose: the general live-range split has no
+/// provable target in this corpus. Every slot whose key is read THROUGH the
+/// slot has more than one write (aqua-amm and aqua-rewards have two
+/// `if has(&vp) { vp = get(&vp) }` blocks, and the second reads the slot after
+/// the first write; soroswap's `create_pair` writes a key, an error sentinel
+/// and a lost value), so no range's end can be bounded without a store the
+/// lifter dropped. The cheap alternative was measured too — rendering a
+/// hole-valued shadow the merge guard refuses as a write to the home binding
+/// instead of a second binding, which is strictly closer to the wasm — and it
+/// costs +1 error: it moves soroban-domains' E0609s onto the other of the
+/// slot's two types without recovering anything, so it is not taken.
+const ERROR_CEILING: u32 = 330;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

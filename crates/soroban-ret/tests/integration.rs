@@ -2867,3 +2867,56 @@ fn unencoded_wrapper_constant_stays_an_integer() {
         "{source}"
     );
 }
+
+#[test]
+fn test_decompile_soroban_domains_slot_type_conflicts() {
+    // Campaign stage 3d. One wasm local is a slot that carries several values,
+    // and soroban-domains reuses one for values of different types inside a
+    // single scope. Two of those slots are fixed here.
+    let wasm = include_bytes!("../../../benchmark-data/mainnet/soroban-domains-CATRNPHY.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+
+    let body_of = |name: &str| {
+        let sig = source
+            .find(&format!("pub fn {name}("))
+            .unwrap_or_else(|| panic!("{name} not found"));
+        let end = sig
+            + source[sig..]
+                .find("\n    pub fn ")
+                .unwrap_or(source.len() - sig);
+        source[sig..end].to_string()
+    };
+
+    // `update_tlds` reads `CoreData` into a `core_data` of its own in two
+    // sibling branches, which the "a name bound twice is ambiguous" rule used
+    // to drop — so the slot kept the read's own KEY as its value and the write
+    // of the admin `Address` over it was an E0308 naming the slot's two types.
+    // Both branches read the SAME key, so the adoption is proven either way and
+    // the lost default arm is an honest hole.
+    let body = body_of("update_tlds");
+    assert!(
+        body.contains("let mut vp = todo!(\"unknown value\");"),
+        "update_tlds' key-adopted default must be a hole, not `CoreDataKeys::CoreData`:\n{body}"
+    );
+    assert!(
+        body.contains("vp = core_data.adm;"),
+        "the admin write must survive the hole:\n{body}"
+    );
+
+    // `update_address` holds a slot whose BOTH live ranges are holes: it is
+    // read as the `BytesN<32>` key of `RecordKeys::SubRecord` and then for the
+    // `Record` fields `.node` / `.owner` / `.collateral`, which one variable
+    // cannot type (E0609 on whichever rustc picks). A slot with no value in it
+    // needs no name: each read is the hole it is.
+    let body = body_of("update_address");
+    for field in [".node", ".owner", ".collateral", ".exp_date", ".snapshot"] {
+        assert!(
+            !body.contains(&format!("var_3_4{field}")),
+            "an all-hole slot must not be read for `{field}`:\n{body}"
+        );
+    }
+    assert!(
+        body.contains("let mut var_3_4 = todo!(\"unknown value\");"),
+        "the slot's own binding stays — only its reads collapse:\n{body}"
+    );
+}
