@@ -97,21 +97,22 @@ Six mainnet contracts change, all of them toward honesty:
   phoenix-amm each duplicated the error of the guard right above them and made
   the enclosing body always fail. Removing them also surfaces host calls the
   truncation had hidden (fxdao-oracle's quota read).
-- **Restoration drops 89.4% -> 89.1%, which is the real number.** reflector's
+- **Restoration drops 89.0% -> 88.8%, which is the real number.** reflector's
   `expires` rendered as `panic_with_error!(&env, Error::AssetMissing)` — a body
   that claimed the function always fails. The claim was the leftover tail, and
   it was the whole body, so removing it leaves `todo!("decompiled function
-  body")`: one function moves from partial to logic-lost and the contract reads
-  90.5% -> 87.6%. A visible hole is worth more than a confident wrong answer.
+  body")`: one function moves from partial to logic-lost. A visible hole is
+  worth more than a confident wrong answer.
 
 Still open for this contract shape: an `i128` `<= 0` sign test lifts as `== 0`,
 losing the negative case, and an ordered compare against `N << 32` keeps its
 raw Val-space constant. Both unrelated to the guard recovery and tracked under
 issue #80.
 
-Gates: compile-back 37/38 non-skipped (97%, `test_liquidity_pool` as on main),
-corpus ratchet 358 unchanged, equivalence 0 divergences (150/152 functions,
-3824 cases), 714 lib + 78 integration tests, no snapshot drift.
+Gates, measured after merging stage 3d (which lowered the ratchet to 330):
+compile-back 37/38 non-skipped (97%, `test_liquidity_pool` as on main), corpus
+ratchet 330 unchanged, equivalence 0 divergences (150/152 functions, 3824
+cases), 722 lib + 79 integration tests, no snapshot drift.
 
 ### Fixed — a slot whose values do not fit one name (campaign stage 3d)
 
