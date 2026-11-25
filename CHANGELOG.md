@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a validation guard no longer disappears from a small contract (issue #80)
+
+A user-written `panic_with_error!` guard vanished from the decompiled output,
+leaving no `todo!()` marker — the output simply did not have the check:
+
+```rust
+// source                              // decompiled, before
+pub fn check(env: Env, decimals: u32)   pub fn check(decimals: u32) -> u32 {
+    -> u32 {                                7
+    if decimals != 7 {                  }
+        panic_with_error!(
+            &env, Error::BadDecimals);
+    }
+    decimals
+}
+```
+
+`check(8)` fails in the original and returns `7` in the recompiled output, so
+this is a silent-wrong of the worst kind: the guard is user logic, not SDK
+marshalling the host re-inserts.
+
+The cause is not the guard classifiers but the two recognizers that decide
+whether a branch target is a contract-error tail. Both were written against the
+shape a LARGE contract emits, where the SDK's error path is inlined flat. A
+small contract has nothing to inline into, so the same `panic_with_error!`
+lowers to a longer chain:
+
+- `Env::fail_with_error` survives as a two-level wrapper
+  (`Env::fail_with_error` -> `Guest::fail_with_error` -> the import), and both
+  recognizers tested only ONE level with `function_calls_host`.
+- It takes `&self`, so the receiver operand is frame-pointer arithmetic
+  (`local.get <fp>; i32.const <off>; i32.add`), and its `Val` return is
+  `drop`ped — making the tail seven nodes of shapes neither allowlist admitted.
+
+Fixed in both (`pattern::lifter`): follow the wrapper chain
+(`function_calls_host_in_chain`, new `FAIL_WRAPPER_CHAIN_DEPTH`), accept
+`i32.add`/`i32.sub` over the operand leaves, accept the `drop` after the call,
+and raise each `MAX_TAIL_LEN` from 6 to 8. All of it is still gated on reaching
+`fail_with_error`, which remains the load-bearing test.
+
+- **The guarded value reads as a number, not a raw `Val`.** With the guard back,
+  `if decimals != 7` would have printed as `if decimals != 30064771072` (`7 <<
+  32`): the `I64And` arm dropped the proven tag-clearing mask for a parameter,
+  so the compare arm could no longer decode it. A spec-declared `u32` parameter
+  now keeps that mask exactly as a `.len()` result does, and
+  `decode_masked_len_compare` decodes it. A wrong value is as unfaithful as a
+  dropped guard.
+- **A multi-guard constructor recovers too.** Three guards and a storage write
+  had collapsed into two panics with mismatched errors and no write; all three
+  guards, their correct errors, and the write are now restored. Two defects
+  that mangling had hidden remain open under issue #80: the optimizer's
+  readability pass flips a bare `Le`/`Ge` panic guard without proof
+  (`ir::optimizer::is_inverted_comparison`), and one inlined error tail
+  survives as a stray `panic_with_error!` after the body.
+- **New fixture** `tests/fixtures/test_guard_panic.wasm`
+  (`tests/fixtures-src/guard_panic`), covering the guarded value both returned
+  and unused.
+
+Gates: compile-back 36/37 non-skipped (97%, `test_liquidity_pool` as on main),
+corpus ratchet 358 unchanged, equivalence 0 divergences, 714 lib + 77
+integration tests, no snapshot drift.
+
+
 ### Fixed — every value of a reused wasm local gets its own name (campaign stage 3c)
 
 A wasm local is a slot, not a variable: it carries several values over a

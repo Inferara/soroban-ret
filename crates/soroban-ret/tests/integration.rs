@@ -171,6 +171,45 @@ fn test_decompile_sub_u64() {
 }
 
 #[test]
+fn test_decompile_guard_panic_small_contract() {
+    // Issue #80 silent-wrong: a `panic_with_error!` validation guard vanished
+    // from a SMALL contract with no `todo!()` marker. With nothing to inline
+    // into, the SDK leaves `Env::fail_with_error` as a two-level wrapper chain
+    // and passes `&self` as frame-pointer arithmetic whose `Val` result is
+    // dropped — so the error tail is a 7-node sequence reached through two
+    // wrappers, and both `fail_with_error` tail recognizers missed it.
+    let wasm = include_bytes!("../../../tests/fixtures/test_guard_panic.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    assert_eq!(
+        source
+            .matches("panic_with_error!(&env, Error::BadDecimals)")
+            .count(),
+        2,
+        "guard dropped from one or both entrypoints: {source}"
+    );
+    // The guarded value must read as `7`, not its raw `U32Val` constant
+    // (`7 << 32`): a wrong value is as unfaithful as a dropped guard.
+    assert!(
+        source.contains("if decimals != 7 {"),
+        "guard condition not decoded to the u32 domain: {source}"
+    );
+    assert!(
+        !source.contains("30064771072"),
+        "raw Val-space constant leaked into the guard: {source}"
+    );
+    // `check_other` returns an unrelated parameter, so no constant fold can
+    // stand in for the guard there.
+    assert!(
+        source.contains("amount\n") || source.contains("        amount"),
+        "check_other lost its returned parameter: {source}"
+    );
+    assert!(
+        !source.contains("todo!("),
+        "unexpected todo! artifact: {source}"
+    );
+}
+
+#[test]
 fn test_decompile_unknown_oracle_fallible_gets() {
     // A mainnet oracle whose getters were lifting to a lossy
     // `if has(k){extend_ttl} todo!()` husk — dropping the value AND the
@@ -1116,6 +1155,10 @@ const ALL_FIXTURES: &[(&str, &[u8])] = &[
     (
         "test_sub_u64",
         include_bytes!("../../../tests/fixtures/test_sub_u64.wasm"),
+    ),
+    (
+        "test_guard_panic",
+        include_bytes!("../../../tests/fixtures/test_guard_panic.wasm"),
     ),
     (
         "test_add_u128",

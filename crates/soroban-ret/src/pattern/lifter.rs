@@ -5918,14 +5918,23 @@ impl<'a> LiftContext<'a> {
                     // `N << 32` means `len == N` only WITH the mask — unmasked,
                     // the tag bits make it constant false — so the compare
                     // arms need to see it (PR #84 review).
-                    (_, Some(LEN_VAL_MASK)) if is_len_call(&a) => {
+                    //
+                    // A spec-declared `u32` PARAMETER under the same exact mask
+                    // is the same situation and needs the same treatment: the
+                    // pass-through arm below would drop the mask, and the
+                    // compare arms would then read `(decimals & MASK) != 7 << 32`
+                    // as `decimals != 30064771072` — the raw Val constant
+                    // instead of `7`. Only the exact tag-clearing mask
+                    // qualifies; the wider val-preserving masks keep falling
+                    // through below.
+                    (_, Some(LEN_VAL_MASK)) if is_len_call(&a) || is_u32_param(&a, self.params) => {
                         self.stack.push(StackVal::BinOp(
                             Box::new(a),
                             BinOper::And,
                             Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
                         ));
                     }
-                    (Some(LEN_VAL_MASK), _) if is_len_call(&b) => {
+                    (Some(LEN_VAL_MASK), _) if is_len_call(&b) || is_u32_param(&b, self.params) => {
                         self.stack.push(StackVal::BinOp(
                             Box::new(b),
                             BinOper::And,
@@ -11564,22 +11573,42 @@ fn is_len_call(v: &StackVal) -> bool {
             if method == "len" && args.is_empty()))
 }
 
+/// A parameter declared `u32` in the contract spec. Its `Val` encoding is
+/// `U32Val`, whose payload is exactly the high 32 bits, so masking with
+/// [`LEN_VAL_MASK`] puts it in the same decodable domain as a `.len()` result.
+fn is_u32_param(v: &StackVal, params: &[FnParam]) -> bool {
+    let StackVal::Param(name) = v else {
+        return false;
+    };
+    params
+        .iter()
+        .any(|p| &p.name == name && matches!(p.type_def, ScSpecTypeDef::U32))
+}
+
 /// `(len_val & LEN_VAL_MASK) ==/!= (N << 32)` is exactly `len ==/!= N`: with
 /// the mask PROVEN present (the marked value from the `I64And` arm), decode
 /// both sides to the u32 length domain. Anything else is returned untouched
 /// — in particular an UNMASKED length against `N << 32`, which is constant
 /// (the tag bits never match) and must not be read as `len == N`.
-fn decode_masked_len_compare(a: StackVal, b: StackVal) -> (StackVal, StackVal) {
-    fn parts(m: &StackVal, k: &StackVal) -> Option<(StackVal, StackVal)> {
+///
+/// A `u32` PARAMETER under the same proven mask decodes identically
+/// ([`is_u32_param`]): the predicate is `high32(v) ==/!= N` either way, and for
+/// a spec-declared `u32` the high word IS the value the parameter renders as.
+/// Without this a recovered `panic_with_error!` guard on a `u32` argument would
+/// print its raw Val-space constant (`decimals != 30064771072` for
+/// `decimals != 7`) — a wrong value, which the faithful-first rule forbids as
+/// firmly as a dropped guard.
+fn decode_masked_len_compare(a: StackVal, b: StackVal, params: &[FnParam]) -> (StackVal, StackVal) {
+    let parts = |m: &StackVal, k: &StackVal| -> Option<(StackVal, StackVal)> {
         let StackVal::BinOp(len, BinOper::And, mask) = m else {
             return None;
         };
-        if to_u64(mask) != Some(LEN_VAL_MASK) || !is_len_call(len) {
+        if to_u64(mask) != Some(LEN_VAL_MASK) || !(is_len_call(len) || is_u32_param(len, params)) {
             return None;
         }
         let k = to_u64(k)?;
         (k & 0xFFFF_FFFF == 0).then(|| ((**len).clone(), StackVal::I64((k >> 32) as i64)))
-    }
+    };
     if let Some((len, n)) = parts(&a, &b) {
         cov_mark::hit!(masked_len_compare_decoded);
         return (len, n);
@@ -20634,10 +20663,10 @@ enum BranchExitTarget {
 /// branching to it is semantically `if cond { panic_with_error!(…) }`.
 ///
 /// Gated tightly: no nested control flow, ends in `unreachable` (raw or the
-/// issue-#11 safety-net reclassification), short (a real tail is 1–4 nodes),
-/// and contains a direct `fail_with_error` wrapper call. The `fail_with_error`
-/// requirement is the load-bearing gate — it fires only on genuine contract
-/// error reporting, never on SDK dispatch preambles or compiler safety nets.
+/// issue-#11 safety-net reclassification), short, and reaches a
+/// `fail_with_error` wrapper. The `fail_with_error` requirement is the
+/// load-bearing gate — it fires only on genuine contract error reporting,
+/// never on SDK dispatch preambles or compiler safety nets.
 fn is_fail_with_error_tail(
     tail: &[super::structurize::StructuredBlock],
     module: &WasmModule,
@@ -20645,7 +20674,12 @@ fn is_fail_with_error_tail(
     use super::structurize::StructuredBlock;
     use crate::wasm::ir::WasmInstr;
 
-    const MAX_TAIL_LEN: usize = 6;
+    // `local.get <fp>; i32.const <off>; i32.add; i64.const <err>; call; drop;
+    // unreachable` is seven nodes: `Env::fail_with_error` takes `&self`, so the
+    // receiver is frame-pointer arithmetic, and its `Val` return is dropped.
+    // That is the shape a small contract emits, where there is nothing for the
+    // SDK wrappers to be inlined into (issue #80).
+    const MAX_TAIL_LEN: usize = 8;
     if tail.is_empty() || tail.len() > MAX_TAIL_LEN {
         return false;
     }
@@ -20663,8 +20697,17 @@ fn is_fail_with_error_tail(
     for sb in tail {
         match sb {
             StructuredBlock::SafetyNetUnreachable => {}
+            // Followed through the wrapper CHAIN, not just one level: the SDK
+            // routes `panic_with_error!` through `Env::fail_with_error` ->
+            // `Guest::fail_with_error` -> the import.
             StructuredBlock::Instruction(WasmInstr::Call(idx))
-                if function_calls_host(module, *idx, HostModule::Context, "fail_with_error") =>
+                if function_calls_host_in_chain(
+                    module,
+                    *idx,
+                    HostModule::Context,
+                    "fail_with_error",
+                    FAIL_WRAPPER_CHAIN_DEPTH,
+                ) =>
             {
                 has_fail_with_error = true;
             }
@@ -20776,6 +20819,11 @@ fn rewrite_branch_seq(
     }
 }
 
+/// Wrapper levels followed when deciding whether a tail call reaches the
+/// `fail_with_error` host import: `Env::fail_with_error` ->
+/// `Guest::fail_with_error` -> import is three, so allow a little slack.
+const FAIL_WRAPPER_CHAIN_DEPTH: u32 = 4;
+
 /// The other lowering of `if cond { panic_with_error!(..) }`: the error path
 /// is the fall-through and a `br_if k` SKIPS it.
 ///
@@ -20832,7 +20880,9 @@ fn recover_skipped_fail_with_error(
         }
     }
 
-    const MAX_TAIL_LEN: usize = 6;
+    // `local.get <fp>; i32.const <off>; i32.add; i64.const <err>; call; drop;
+    // unreachable` is the longest shape the gate below accepts.
+    const MAX_TAIL_LEN: usize = 8;
     let Some(pos) = blocks
         .iter()
         .rposition(|b| matches!(b, StructuredBlock::Instruction(WasmInstr::BrIf(_))))
@@ -20849,23 +20899,44 @@ fn recover_skipped_fail_with_error(
     let mut fails = false;
     for sb in tail {
         match sb {
+            // After the call: the dead end, plus the `drop` of the error
+            // helper's own result. `Env::fail_with_error` is typed to return a
+            // `Val`, so a caller that ignores it emits a `drop` before the
+            // `unreachable` — which is what `panic_with_error!` lowers to in a
+            // value-returning entrypoint. Dropping a value the helper never
+            // actually produces is neither control flow nor an effect.
             StructuredBlock::SafetyNetUnreachable
-            | StructuredBlock::Instruction(WasmInstr::Unreachable)
+            | StructuredBlock::Instruction(WasmInstr::Unreachable | WasmInstr::Drop)
                 if fails => {}
+            // The call that reaches `fail_with_error`. Followed through the
+            // wrapper CHAIN, not just one level: the SDK routes
+            // `panic_with_error!` through `Env::fail_with_error` ->
+            // `Guest::fail_with_error` -> the import, so a one-level test
+            // misses every case the SDK did not inline flat — small contracts,
+            // where there is nothing to inline into.
             StructuredBlock::Instruction(WasmInstr::Call(idx))
                 if !fails
-                    && function_calls_host(
+                    && function_calls_host_in_chain(
                         module,
                         *idx,
                         HostModule::Context,
                         "fail_with_error",
+                        FAIL_WRAPPER_CHAIN_DEPTH,
                     ) =>
             {
                 fails = true;
             }
-            // Operands of the error call.
+            // Operands of the error call. `i32.add` / `i32.sub` over those
+            // leaves is frame-pointer arithmetic: `Env::fail_with_error` takes
+            // `&self`, so the receiver operand is computed as
+            // `local.get <fp>; i32.const <off>; i32.add`. Pure integer
+            // arithmetic — no memory access, no call, no control flow.
             StructuredBlock::Instruction(
-                WasmInstr::I64Const(_) | WasmInstr::I32Const(_) | WasmInstr::LocalGet(_),
+                WasmInstr::I64Const(_)
+                | WasmInstr::I32Const(_)
+                | WasmInstr::LocalGet(_)
+                | WasmInstr::I32Add
+                | WasmInstr::I32Sub,
             ) if !fails => {}
             _ => return,
         }
@@ -21760,7 +21831,7 @@ fn stack_val_to_expr_inner(
             // recognize and drop it exactly as before.
             let decoded: (Box<StackVal>, Box<StackVal>);
             let (a, b) = if matches!(op, CmpOp::Eq | CmpOp::Ne) {
-                let (da, db) = decode_masked_len_compare((**a).clone(), (**b).clone());
+                let (da, db) = decode_masked_len_compare((**a).clone(), (**b).clone(), params);
                 decoded = (Box::new(da), Box::new(db));
                 (&decoded.0, &decoded.1)
             } else {
@@ -27401,22 +27472,22 @@ mod tests {
         let k = StackVal::I64(32 << 32);
         // Masked, either operand order.
         assert_eq!(
-            decode_masked_len_compare(masked(), k.clone()),
+            decode_masked_len_compare(masked(), k.clone(), &[]),
             (len(), StackVal::I64(32))
         );
         assert_eq!(
-            decode_masked_len_compare(k.clone(), masked()),
+            decode_masked_len_compare(k.clone(), masked(), &[]),
             (StackVal::I64(32), len())
         );
         // Unmasked: untouched.
         assert_eq!(
-            decode_masked_len_compare(len(), k.clone()),
+            decode_masked_len_compare(len(), k.clone(), &[]),
             (len(), k.clone())
         );
         // Masked, but the constant has low bits set: untouched.
         let odd = StackVal::I64((32 << 32) | 4);
         assert_eq!(
-            decode_masked_len_compare(masked(), odd.clone()),
+            decode_masked_len_compare(masked(), odd.clone(), &[]),
             (masked(), odd)
         );
         // Outside a compare the marked value still reads as the length.
