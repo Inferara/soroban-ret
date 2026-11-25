@@ -49,11 +49,12 @@ and raise each `MAX_TAIL_LEN` from 6 to 8. All of it is still gated on reaching
 
 - **The guarded value reads as a number, not a raw `Val`.** With the guard back,
   `if decimals != 7` would have printed as `if decimals != 30064771072` (`7 <<
-  32`): the `I64And` arm dropped the proven tag-clearing mask for a parameter,
-  so the compare arm could no longer decode it. A spec-declared `u32` parameter
-  now keeps that mask exactly as a `.len()` result does, and
-  `decode_masked_len_compare` decodes it. A wrong value is as unfaithful as a
-  dropped guard.
+  32`), because the `I64And` arm dropped the proven tag-clearing mask for a
+  parameter and the compare arm could then not decode it. That part is no longer
+  this entry's: the masked-`u32`-argument decode landed separately on main
+  (`is_masked_u32_operand`), and this change now just depends on it. A wrong
+  value is as unfaithful as a dropped guard, so the guard recovery is only worth
+  having with that decode in place.
 - **A multi-guard constructor recovers too.** Several guards before a storage
   write, each a `br_if` to a different block depth, had collapsed into two
   panics with mismatched errors and no write. All the guards, their correct
@@ -109,10 +110,11 @@ losing the negative case, and an ordered compare against `N << 32` keeps its
 raw Val-space constant. Both unrelated to the guard recovery and tracked under
 issue #80.
 
-Gates, measured after merging stage 3d (which lowered the ratchet to 330):
-compile-back 37/38 non-skipped (97%, `test_liquidity_pool` as on main), corpus
-ratchet 330 unchanged, equivalence 0 divergences (150/152 functions, 3824
-cases), 722 lib + 79 integration tests, no snapshot drift.
+Gates, measured after merging stage 3d (which lowered the ratchet to 330) and
+the masked-`u32`-argument decode: compile-back 37/38 non-skipped (97%,
+`test_liquidity_pool` as on main), corpus ratchet 330 unchanged, equivalence 0
+divergences (150/152 functions, 3824 cases), 724 lib + 79 integration tests, no
+snapshot drift.
 
 ### Fixed — a slot whose values do not fit one name (campaign stage 3d)
 
