@@ -1608,9 +1608,14 @@ pub fn husk_type_mismatched_ok_literal(
 ///   own last statement. A tail that codegen propagates INTO an `if` or a
 ///   `match` arm is deliberately not followed: missing one only withholds the
 ///   husk, and the error it leaves stays visible in the soundness ratchet,
-/// - it must be bound at most once. A name bound twice may be two separate Rust
+/// - it must be bound EXACTLY once. A name bound twice may be two separate Rust
 ///   variables, since a `let` inside a block shadows rather than writes, and the
-///   inner one carries a type of its own that the literal may genuinely hold,
+///   inner one carries a type of its own that the literal may genuinely hold. A
+///   name bound no times at all is a function PARAMETER — wasm parameters are
+///   locals 0..n and are reused as slots like any other, so a write to one is
+///   an ordinary shape here. Its type is the one the parameter declares, not
+///   the one the function returns, so this pass has nothing to judge a literal
+///   written to it by, and leaves it alone,
 /// - every `let` and every write of it must be either a hole or a literal of a
 ///   class the return type cannot hold. One real value anywhere — a matching
 ///   literal, an expression, a read — and the pass does nothing: the slot may
@@ -1772,9 +1777,7 @@ pub fn husk_wholly_fabricated_returned_locals(
     scan(&stmts, ok_class, &mut real, &mut lets);
     let wholly: HashSet<String> = names
         .into_iter()
-        .filter(|name| {
-            real.get(name) == Some(&false) && lets.get(name).copied().unwrap_or(0) <= 1
-        })
+        .filter(|name| real.get(name) == Some(&false) && lets.get(name).copied() == Some(1))
         .collect();
     if wholly.is_empty() {
         return stmts;
@@ -3896,7 +3899,11 @@ mod tests {
                 name: "Asset".try_into().unwrap(),
             })),
         );
-        assert_eq!(format!("{out:?}"), format!("{stmts:?}"), "one real value disqualifies the whole slot");
+        assert_eq!(
+            format!("{out:?}"),
+            format!("{stmts:?}"),
+            "one real value disqualifies the whole slot"
+        );
     }
 
     /// A numeric literal in a numeric-returning function is a recovered
@@ -3912,11 +3919,12 @@ mod tests {
             },
             SorobanStmt::Return(Some(SorobanExpr::Local(2))),
         ];
-        let out = husk_wholly_fabricated_returned_locals(
-            stmts.clone(),
-            Some(&ScSpecTypeDef::U64),
+        let out = husk_wholly_fabricated_returned_locals(stmts.clone(), Some(&ScSpecTypeDef::U64));
+        assert_eq!(
+            format!("{out:?}"),
+            format!("{stmts:?}"),
+            "numeric into numeric coerces"
         );
-        assert_eq!(format!("{out:?}"), format!("{stmts:?}"), "numeric into numeric coerces");
     }
 
     /// A return type that holds more than one literal class (`Option`, `Val`,
@@ -3939,6 +3947,10 @@ mod tests {
                 },
             ))),
         );
-        assert_eq!(format!("{out:?}"), format!("{stmts:?}"), "an Option holds a literal of any class");
+        assert_eq!(
+            format!("{out:?}"),
+            format!("{stmts:?}"),
+            "an Option holds a literal of any class"
+        );
     }
 }

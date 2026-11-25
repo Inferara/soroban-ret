@@ -931,19 +931,20 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
     for func in &mut contract_module.functions {
         let returns_value = !matches!(&func.return_type, None | Some(ScSpecTypeDef::Void));
         let body = std::mem::take(&mut func.body);
-        // Detector 4: uses of unbound locals (E0425 — lost-loop self-reference
-        // residue, cross-scope uses) and of locals every binding of which is
-        // `!`-rooted → honest `UnknownVal`. Runs first so every later pass sees
-        // the husked shapes.
         // Campaign stage 3d: a returned local every value of which is a
         // literal the return type cannot hold is wholly fabricated — each of
-        // those values is a hole. Runs before the unbound-local husk, so that
-        // pass sees a local whose every binding has become `!`-rooted and
-        // collapses its reads too.
+        // those values is a hole. Runs before Detector 4 below, so that pass
+        // sees a local whose every binding has become `!`-rooted and collapses
+        // its reads too.
         let body = crate::ir::correctness::husk_wholly_fabricated_returned_locals(
             body,
             func.return_type.as_ref(),
         );
+        // Detector 4: uses of unbound locals (E0425 — lost-loop self-reference
+        // residue, cross-scope uses) and of locals every binding of which is
+        // `!`-rooted → honest `UnknownVal`. Runs before the husks below so they
+        // all see the husked shapes; it runs a second time at the end of this
+        // loop, on the holes those husks themselves make (stage 3d).
         let body = husk_unbound_local_uses(body, &func.params);
         // A `try_invoke_contract` used as a value: keep the call, hole the
         // unrecovered mapping of its result.

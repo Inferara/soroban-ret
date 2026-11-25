@@ -594,7 +594,7 @@ use std::process::Command;
 /// reflector ×2 10→8 each (E0308 −3, E0282 +1 each: the fabricated `String` key
 /// init had been pinning the `V` of an un-inferable read, which is honestly
 /// un-inferable now), aqua-amm 62→61, blend-fixed-pool and blend-yieldblox-pool
-/// 15→14 each (a `Symbol` event topic returned as the function's `u32` / 
+/// 15→14 each (a `Symbol` event topic returned as the function's `u32` /
 /// `Vec<Address>`). Clean contracts stay 2.
 /// Not fixed, and refused on purpose: the general live-range split has no
 /// provable target in this corpus. Every slot whose key is read THROUGH the
