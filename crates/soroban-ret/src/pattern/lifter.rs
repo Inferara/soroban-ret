@@ -5912,29 +5912,22 @@ impl<'a> LiftContext<'a> {
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
                 match (to_u64(&a), to_u64(&b)) {
                     (Some(av), Some(bv)) => self.stack.push(StackVal::I64((av & bv) as i64)),
-                    // `<x>.len() & 0xFFFF_FFFF_0000_0000`: the tag-clearing mask
-                    // on a raw `U32Val` length. KEEP it (as a marked value that
-                    // still renders as the bare `.len()`): an equality against
-                    // `N << 32` means `len == N` only WITH the mask — unmasked,
-                    // the tag bits make it constant false — so the compare
-                    // arms need to see it (PR #84 review).
-                    //
-                    // A spec-declared `u32` PARAMETER under the same exact mask
-                    // is the same situation and needs the same treatment: the
-                    // pass-through arm below would drop the mask, and the
-                    // compare arms would then read `(decimals & MASK) != 7 << 32`
-                    // as `decimals != 30064771072` — the raw Val constant
-                    // instead of `7`. Only the exact tag-clearing mask
-                    // qualifies; the wider val-preserving masks keep falling
-                    // through below.
-                    (_, Some(LEN_VAL_MASK)) if is_len_call(&a) || is_u32_param(&a, self.params) => {
+                    // `<x>.len() & 0xFFFF_FFFF_0000_0000`, or the same mask on
+                    // a declared `u32` parameter: the tag-clearing mask on a raw
+                    // `U32Val`. KEEP it (as a marked value that still renders as
+                    // the bare operand): an equality against `N << 32` means
+                    // `x == N` only WITH the mask — unmasked, the tag bits make
+                    // it constant false — so the compare arms need to see it
+                    // (PR #84 review). Without the mark the generic
+                    // val-preserving-mask arm below would erase the proof.
+                    (_, Some(LEN_VAL_MASK)) if is_masked_u32_operand(&a, self.params) => {
                         self.stack.push(StackVal::BinOp(
                             Box::new(a),
                             BinOper::And,
                             Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
                         ));
                     }
-                    (Some(LEN_VAL_MASK), _) if is_len_call(&b) || is_u32_param(&b, self.params) => {
+                    (Some(LEN_VAL_MASK), _) if is_masked_u32_operand(&b, self.params) => {
                         self.stack.push(StackVal::BinOp(
                             Box::new(b),
                             BinOper::And,
@@ -11581,16 +11574,31 @@ fn is_len_call(v: &StackVal) -> bool {
             if method == "len" && args.is_empty()))
 }
 
-/// A parameter declared `u32` in the contract spec. Its `Val` encoding is
-/// `U32Val`, whose payload is exactly the high 32 bits, so masking with
-/// [`LEN_VAL_MASK`] puts it in the same decodable domain as a `.len()` result.
+/// A declared `u32` contract parameter. Its `Val` encoding admits exactly one
+/// tag (`U32Val`, the lifter's [`unique_numeric_val_tag`]) and the payload
+/// occupies the high half, so clearing the tag byte leaves exactly `p << 32`.
+/// `i32` is deliberately excluded: its payload is signed and the `>> 32`
+/// decode below is not.
 fn is_u32_param(v: &StackVal, params: &[FnParam]) -> bool {
     let StackVal::Param(name) = v else {
         return false;
     };
     params
         .iter()
-        .any(|p| &p.name == name && matches!(p.type_def, ScSpecTypeDef::U32))
+        .any(|p| p.name == *name && matches!(p.type_def, ScSpecTypeDef::U32))
+}
+
+/// An operand for which `x & LEN_VAL_MASK` is exactly `x << 32` in the u32
+/// domain: a `*_len` host-call result, or a declared `u32` parameter the SDK
+/// decoded in place (`decimals != 7`, contract `CA35B5JS...`).
+///
+/// Every arm that reads a value the `I64And` arm marked must gate on THIS, not
+/// on one of its halves. Mark a value and then fail to admit it, and keeping
+/// the mask turns an operand the old pass-through used to render into
+/// `UnknownVal` — the decode below is reached only for `Eq`/`Ne`, so an ordered
+/// compare would print `todo!("unknown value") >= K` for `d >= K`.
+fn is_masked_u32_operand(v: &StackVal, params: &[FnParam]) -> bool {
+    is_len_call(v) || is_u32_param(v, params)
 }
 
 /// `(len_val & LEN_VAL_MASK) ==/!= (N << 32)` is exactly `len ==/!= N`: with
@@ -11598,30 +11606,22 @@ fn is_u32_param(v: &StackVal, params: &[FnParam]) -> bool {
 /// both sides to the u32 length domain. Anything else is returned untouched
 /// — in particular an UNMASKED length against `N << 32`, which is constant
 /// (the tag bits never match) and must not be read as `len == N`.
-///
-/// A `u32` PARAMETER under the same proven mask decodes identically
-/// ([`is_u32_param`]): the predicate is `high32(v) ==/!= N` either way, and for
-/// a spec-declared `u32` the high word IS the value the parameter renders as.
-/// Without this a recovered `panic_with_error!` guard on a `u32` argument would
-/// print its raw Val-space constant (`decimals != 30064771072` for
-/// `decimals != 7`) — a wrong value, which the faithful-first rule forbids as
-/// firmly as a dropped guard.
 fn decode_masked_len_compare(a: StackVal, b: StackVal, params: &[FnParam]) -> (StackVal, StackVal) {
-    let parts = |m: &StackVal, k: &StackVal| -> Option<(StackVal, StackVal)> {
+    fn parts(m: &StackVal, k: &StackVal, params: &[FnParam]) -> Option<(StackVal, StackVal)> {
         let StackVal::BinOp(len, BinOper::And, mask) = m else {
             return None;
         };
-        if to_u64(mask) != Some(LEN_VAL_MASK) || !(is_len_call(len) || is_u32_param(len, params)) {
+        if to_u64(mask) != Some(LEN_VAL_MASK) || !is_masked_u32_operand(len, params) {
             return None;
         }
         let k = to_u64(k)?;
         (k & 0xFFFF_FFFF == 0).then(|| ((**len).clone(), StackVal::I64((k >> 32) as i64)))
-    };
-    if let Some((len, n)) = parts(&a, &b) {
+    }
+    if let Some((len, n)) = parts(&a, &b, params) {
         cov_mark::hit!(masked_len_compare_decoded);
         return (len, n);
     }
-    if let Some((len, n)) = parts(&b, &a) {
+    if let Some((len, n)) = parts(&b, &a, params) {
         cov_mark::hit!(masked_len_compare_decoded);
         return (n, len);
     }
@@ -19584,6 +19584,16 @@ fn strip_val_encode(val: StackVal) -> StackVal {
         // A `| tag` shape that wasn't a strippable small-value construction
         // (object tag, non-Shl inner, …) decodes to nothing recoverable here.
         StackVal::BinOp(_, BinOper::Or, _) => StackVal::Unknown,
+        // The tag-clearing mask the `I64And` arm keeps as proof. `x & MASK`
+        // followed by `>> 32` is the plain `U32Val` decode, so the mark must
+        // not make the payload opaque: peel it and decode `x` itself. Without
+        // this, a `u32` parameter the contract USES (rather than compares)
+        // degrades to `Unknown` and renders as a hole.
+        StackVal::BinOp(inner, BinOper::And, mask)
+            if to_u64(mask.as_ref()) == Some(LEN_VAL_MASK) =>
+        {
+            strip_val_encode(*inner)
+        }
         // Param + (N << 32): inline Val arithmetic. The SDK adds N directly
         // in Val encoding space. Low 32 bits == 0 confirms this is a shifted
         // constant, not a raw value. Decode to Param + N.
@@ -21937,17 +21947,12 @@ fn stack_val_to_expr_inner(
                 // Tag extraction `v & 0xFF` → `v.get_tag()`. Anything else AND-shaped
                 // wasn't a recognized Val pattern, so it stays unknown.
                 // The tag-cleared length or `u32` parameter (see the `I64And`
-                // arm, which keeps the mask for both): outside an equality
-                // compare it reads as the value itself, exactly what the mask
-                // pass-through rendered before. The arm must admit whatever
-                // that one marks, or keeping the mask turns a value the
-                // pass-through used to render into `UnknownVal`: the decode is
-                // reached only for `Eq`/`Ne` (see the `Compare` arm), so an
-                // ordered compare on a masked `u32` parameter would print
-                // `todo!("unknown value") >= K` for `d >= K`.
+                // arm): outside an equality compare it reads as the operand
+                // itself, exactly what the mask pass-through rendered before.
+                // Gated on the same predicate the `I64And` arm marks with, for
+                // the reason [`is_masked_u32_operand`] gives.
                 BinOper::And
-                    if to_u64(b) == Some(LEN_VAL_MASK)
-                        && (is_len_call(a) || is_u32_param(a, params)) =>
+                    if to_u64(b) == Some(LEN_VAL_MASK) && is_masked_u32_operand(a, params) =>
                 {
                     stack_val_to_expr_inner(a, params, registry, frame_slots, visiting)
                 }
@@ -27639,6 +27644,83 @@ mod tests {
             stack_val_to_expr(&masked(), &[], &reg, None),
             stack_val_to_expr(&len(), &[], &reg, None)
         );
+    }
+
+    /// The same proven-mask decode for a declared `u32` PARAMETER, not only a
+    /// `*_len` result: the SDK's `if decimals != 7` lowers to
+    /// `(p & 0xFFFF_FFFF_0000_0000) != (7 << 32)`, which rendered as the raw
+    /// `decimals != 30064771072` before (contract `CA35B5JS...`). A parameter
+    /// of any other declared type keeps the raw form: its `Val` tag is not
+    /// uniquely fixed, so the mask proves nothing about the payload position.
+    #[test]
+    fn masked_u32_param_equality_decodes_to_the_declared_parameter() {
+        let p = |name: &str, td: ScSpecTypeDef| FnParam {
+            name: name.to_string(),
+            type_def: td,
+        };
+        let params = vec![
+            p("decimals", ScSpecTypeDef::U32),
+            p("supply", ScSpecTypeDef::I128),
+        ];
+        let masked = |name: &str| {
+            StackVal::BinOp(
+                Box::new(StackVal::Param(name.to_string())),
+                BinOper::And,
+                Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+            )
+        };
+        let k = StackVal::I64(7 << 32);
+
+        // Declared `u32`, either operand order.
+        assert_eq!(
+            decode_masked_len_compare(masked("decimals"), k.clone(), &params),
+            (StackVal::Param("decimals".to_string()), StackVal::I64(7))
+        );
+        assert_eq!(
+            decode_masked_len_compare(k.clone(), masked("decimals"), &params),
+            (StackVal::I64(7), StackVal::Param("decimals".to_string()))
+        );
+        // Declared `i128`: the payload is not a high-half u32 — untouched.
+        assert_eq!(
+            decode_masked_len_compare(masked("supply"), k.clone(), &params),
+            (masked("supply"), k.clone())
+        );
+        // Unmasked `u32` param: constant in the raw form — untouched.
+        let bare = StackVal::Param("decimals".to_string());
+        assert_eq!(
+            decode_masked_len_compare(bare.clone(), k.clone(), &params),
+            (bare.clone(), k.clone())
+        );
+        // Outside a compare the marked value still reads as the parameter.
+        let reg = empty_registry();
+        assert_eq!(
+            stack_val_to_expr(&masked("decimals"), &params, &reg, None),
+            stack_val_to_expr(&bare, &params, &reg, None)
+        );
+    }
+
+    /// The mask mark must stay transparent to the `U32Val` decode. A `u32`
+    /// argument the contract USES rather than compares reaches the lifter as
+    /// `(p & 0xFFFF_FFFF_0000_0000) >> 32`, and the `I64ShrU` arm decodes a
+    /// shift of 32 through `strip_val_encode`. If the mark stopped there the
+    /// argument would degrade to `Unknown` and render as a hole.
+    #[test]
+    fn strip_val_encode_peels_the_tag_clearing_mask() {
+        let bare = StackVal::Param("decimals".to_string());
+        let masked = StackVal::BinOp(
+            Box::new(bare.clone()),
+            BinOper::And,
+            Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+        );
+        assert_eq!(strip_val_encode(masked), bare);
+
+        // Any other mask is not the tag-clearing mark and decodes to nothing.
+        let other = StackVal::BinOp(
+            Box::new(bare.clone()),
+            BinOper::And,
+            Box::new(StackVal::I64(0xFF)),
+        );
+        assert_eq!(strip_val_encode(other), StackVal::Unknown);
     }
 
     /// Fixture for the issue-#69 shapes (digicus): string-keyed storage via
