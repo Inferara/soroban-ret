@@ -92,7 +92,7 @@ Six mainnet contracts change, all of them toward honesty:
   FeeOutOfBounds }`, the exact inverse of the contract's own bound (that
   constant is `10001 << 32`). It now reads `>=`. Its `token_a` relay recovers
   too, once a stray panic stops truncating the body.
-- **Fabricated unconditional failures are gone.** 13 leftover tails across
+- **Fabricated unconditional failures are gone.** Leftover tails across
   aqua-amm, aqua-rewards, fxdao-liquidity-locking-pool, fxdao-oracle and
   phoenix-amm each duplicated the error of the guard right above them and made
   the enclosing body always fail. Removing them also surfaces host calls the

@@ -21936,10 +21936,19 @@ fn stack_val_to_expr_inner(
                 }
                 // Tag extraction `v & 0xFF` → `v.get_tag()`. Anything else AND-shaped
                 // wasn't a recognized Val pattern, so it stays unknown.
-                // The tag-cleared length (see the `I64And` arm): outside an
-                // equality compare it reads as the length itself, exactly
-                // what the mask pass-through rendered before.
-                BinOper::And if to_u64(b) == Some(LEN_VAL_MASK) && is_len_call(a) => {
+                // The tag-cleared length or `u32` parameter (see the `I64And`
+                // arm, which keeps the mask for both): outside an equality
+                // compare it reads as the value itself, exactly what the mask
+                // pass-through rendered before. The arm must admit whatever
+                // that one marks, or keeping the mask turns a value the
+                // pass-through used to render into `UnknownVal`: the decode is
+                // reached only for `Eq`/`Ne` (see the `Compare` arm), so an
+                // ordered compare on a masked `u32` parameter would print
+                // `todo!("unknown value") >= K` for `d >= K`.
+                BinOper::And
+                    if to_u64(b) == Some(LEN_VAL_MASK)
+                        && (is_len_call(a) || is_u32_param(a, params)) =>
+                {
                     stack_val_to_expr_inner(a, params, registry, frame_slots, visiting)
                 }
                 BinOper::And => {
