@@ -1,28 +1,28 @@
 {
   "corpus": "benchmark-data/mainnet",
-  "overall_restoration": 89.4,
+  "overall_restoration": 89.1,
   "contracts": [
     {
       "file": "aqua-amm-CBQDHNBF.wasm",
       "entity": "Aqua AMM",
-      "restoration_pct": 91.9,
+      "restoration_pct": 91.8,
       "spec_functions": 75,
       "fn_clean": 15,
       "fn_partial": 59,
       "fn_logic_lost": 1,
-      "artifacts_total": 314,
+      "artifacts_total": 315,
       "wasm_size": 44514,
       "error": null
     },
     {
       "file": "aqua-rewards-CCY2PXGM.wasm",
       "entity": "Aqua Rewards",
-      "restoration_pct": 91.2,
+      "restoration_pct": 91.1,
       "spec_functions": 76,
       "fn_clean": 19,
       "fn_partial": 51,
       "fn_logic_lost": 6,
-      "artifacts_total": 383,
+      "artifacts_total": 387,
       "wasm_size": 54833,
       "error": null
     },
@@ -137,7 +137,7 @@
     {
       "file": "fxdao-liquidity-locking-pool-CDCART6W.wasm",
       "entity": "FxDAO Liquidity locking pool",
-      "restoration_pct": 91.5,
+      "restoration_pct": 91.3,
       "spec_functions": 12,
       "fn_clean": 1,
       "fn_partial": 11,
@@ -149,7 +149,7 @@
     {
       "file": "fxdao-oracle-CB5OTV4G.wasm",
       "entity": "FxDAO Oracle",
-      "restoration_pct": 91.4,
+      "restoration_pct": 91.5,
       "spec_functions": 14,
       "fn_clean": 6,
       "fn_partial": 8,
@@ -185,7 +185,7 @@
     {
       "file": "phoenix-amm-CCLZRD4E.wasm",
       "entity": "Phoenix AMM",
-      "restoration_pct": 89.2,
+      "restoration_pct": 89.0,
       "spec_functions": 12,
       "fn_clean": 3,
       "fn_partial": 9,
@@ -197,24 +197,24 @@
     {
       "file": "reflector-CAFJZQWS.wasm",
       "entity": "Reflector",
-      "restoration_pct": 90.5,
+      "restoration_pct": 87.6,
       "spec_functions": 23,
       "fn_clean": 12,
-      "fn_partial": 10,
-      "fn_logic_lost": 1,
-      "artifacts_total": 74,
+      "fn_partial": 9,
+      "fn_logic_lost": 2,
+      "artifacts_total": 75,
       "wasm_size": 19418,
       "error": null
     },
     {
       "file": "reflector-CALI2BYU.wasm",
       "entity": "Reflector",
-      "restoration_pct": 90.5,
+      "restoration_pct": 87.6,
       "spec_functions": 23,
       "fn_clean": 12,
-      "fn_partial": 10,
-      "fn_logic_lost": 1,
-      "artifacts_total": 74,
+      "fn_partial": 9,
+      "fn_logic_lost": 2,
+      "artifacts_total": 75,
       "wasm_size": 19418,
       "error": null
     },

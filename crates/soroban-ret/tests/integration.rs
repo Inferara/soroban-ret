@@ -220,10 +220,10 @@ fn test_decompile_guard_multi_small_contract() {
     // Each guard keeps its OWN error.
     let name_guard = source
         .find("Error::BadName")
-        .expect(&format!("BadName guard lost: {source}"));
+        .unwrap_or_else(|| panic!("BadName guard lost: {source}"));
     let dec_guard = source
         .find("Error::BadDecimals")
-        .expect(&format!("BadDecimals guard lost: {source}"));
+        .unwrap_or_else(|| panic!("BadDecimals guard lost: {source}"));
     assert!(
         name_guard < dec_guard,
         "guards paired with the wrong errors: {source}"
@@ -246,7 +246,10 @@ fn test_decompile_guard_multi_small_contract() {
         2,
         "an inlined error tail survived as a stray panic: {source}"
     );
-    assert!(!source.contains("todo!("), "unexpected todo! artifact: {source}");
+    assert!(
+        !source.contains("todo!("),
+        "unexpected todo! artifact: {source}"
+    );
 }
 
 #[test]

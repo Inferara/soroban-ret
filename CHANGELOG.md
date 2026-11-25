@@ -85,13 +85,33 @@ and raise each `MAX_TAIL_LEN` from 6 to 8. All of it is still gated on reaching
   depths followed by a storage write. Kept as separate contracts so both stay
   small enough that the SDK has nothing to inline the error paths into.
 
-Still open for this contract shape: an `i128` `<= 0` sign test lifts as
-`== 0`, losing the negative case. Unrelated to the guard recovery and tracked
-under issue #80.
+Six mainnet contracts change, all of them toward honesty:
+
+- **A mainnet fee guard was inverted.** aqua-rewards'
+  `set_protocol_fee_fraction` read `if new_fraction < 42953967927296 { panic
+  FeeOutOfBounds }`, the exact inverse of the contract's own bound (that
+  constant is `10001 << 32`). It now reads `>=`. Its `token_a` relay recovers
+  too, once a stray panic stops truncating the body.
+- **Fabricated unconditional failures are gone.** 13 leftover tails across
+  aqua-amm, aqua-rewards, fxdao-liquidity-locking-pool, fxdao-oracle and
+  phoenix-amm each duplicated the error of the guard right above them and made
+  the enclosing body always fail. Removing them also surfaces host calls the
+  truncation had hidden (fxdao-oracle's quota read).
+- **Restoration drops 89.4% -> 89.1%, which is the real number.** reflector's
+  `expires` rendered as `panic_with_error!(&env, Error::AssetMissing)` — a body
+  that claimed the function always fails. The claim was the leftover tail, and
+  it was the whole body, so removing it leaves `todo!("decompiled function
+  body")`: one function moves from partial to logic-lost and the contract reads
+  90.5% -> 87.6%. A visible hole is worth more than a confident wrong answer.
+
+Still open for this contract shape: an `i128` `<= 0` sign test lifts as `== 0`,
+losing the negative case, and an ordered compare against `N << 32` keeps its
+raw Val-space constant. Both unrelated to the guard recovery and tracked under
+issue #80.
 
 Gates: compile-back 37/38 non-skipped (97%, `test_liquidity_pool` as on main),
-corpus ratchet 358 unchanged, equivalence 0 divergences, 714 lib + 78
-integration tests, no snapshot drift.
+corpus ratchet 358 unchanged, equivalence 0 divergences (150/152 functions,
+3824 cases), 714 lib + 78 integration tests, no snapshot drift.
 
 
 ### Fixed — every value of a reused wasm local gets its own name (campaign stage 3c)

@@ -21059,6 +21059,13 @@ fn branch_targets_depth(blocks: &[super::structurize::StructuredBlock], depth: u
         } => {
             branch_targets_depth(then_body, depth + 1) || branch_targets_depth(else_body, depth + 1)
         }
+        // A RAW control-flow marker, which `structurize` only leaves behind
+        // when it truncated at `MAX_RECURSION_DEPTH`. The depth bookkeeping
+        // past it is then unknown, so answer "a branch may target this" and
+        // let the caller keep the tail.
+        StructuredBlock::Instruction(
+            WasmInstr::Block { .. } | WasmInstr::Loop { .. } | WasmInstr::If { .. },
+        ) => true,
         _ => false,
     })
 }
