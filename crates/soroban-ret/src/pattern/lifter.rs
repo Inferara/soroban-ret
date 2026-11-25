@@ -19570,6 +19570,16 @@ fn strip_val_encode(val: StackVal) -> StackVal {
         // A `| tag` shape that wasn't a strippable small-value construction
         // (object tag, non-Shl inner, …) decodes to nothing recoverable here.
         StackVal::BinOp(_, BinOper::Or, _) => StackVal::Unknown,
+        // The tag-clearing mask the `I64And` arm keeps as proof. `x & MASK`
+        // followed by `>> 32` is the plain `U32Val` decode, so the mark must
+        // not make the payload opaque: peel it and decode `x` itself. Without
+        // this, a `u32` parameter the contract USES (rather than compares)
+        // degrades to `Unknown` and renders as a hole.
+        StackVal::BinOp(inner, BinOper::And, mask)
+            if to_u64(mask.as_ref()) == Some(LEN_VAL_MASK) =>
+        {
+            strip_val_encode(*inner)
+        }
         // Param + (N << 32): inline Val arithmetic. The SDK adds N directly
         // in Val encoding space. Low 32 bits == 0 confirms this is a shifted
         // constant, not a raw value. Decode to Param + N.
@@ -27503,6 +27513,30 @@ mod tests {
             stack_val_to_expr(&masked("decimals"), &params, &reg, None),
             stack_val_to_expr(&bare, &params, &reg, None)
         );
+    }
+
+    /// The mask mark must stay transparent to the `U32Val` decode. A `u32`
+    /// argument the contract USES rather than compares reaches the lifter as
+    /// `(p & 0xFFFF_FFFF_0000_0000) >> 32`, and the `I64ShrU` arm decodes a
+    /// shift of 32 through `strip_val_encode`. If the mark stopped there the
+    /// argument would degrade to `Unknown` and render as a hole.
+    #[test]
+    fn strip_val_encode_peels_the_tag_clearing_mask() {
+        let bare = StackVal::Param("decimals".to_string());
+        let masked = StackVal::BinOp(
+            Box::new(bare.clone()),
+            BinOper::And,
+            Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+        );
+        assert_eq!(strip_val_encode(masked), bare);
+
+        // Any other mask is not the tag-clearing mark and decodes to nothing.
+        let other = StackVal::BinOp(
+            Box::new(bare.clone()),
+            BinOper::And,
+            Box::new(StackVal::I64(0xFF)),
+        );
+        assert_eq!(strip_val_encode(other), StackVal::Unknown);
     }
 
     /// Fixture for the issue-#69 shapes (digicus): string-keyed storage via
