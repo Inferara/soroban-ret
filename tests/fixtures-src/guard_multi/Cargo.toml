@@ -1,0 +1,30 @@
+# Source for the `tests/fixtures/test_guard_multi.wasm` fixture (issue #80).
+#
+# SEVERAL `panic_with_error!` guards before a storage write. Each guard is a
+# `br_if` to a DIFFERENT block depth, and each depth's continuation is its own
+# error tail. Three things went wrong at once: the guards were paired with the
+# wrong errors, the storage write was dropped, and one inlined error tail
+# survived as an unconditional panic after the body. Kept apart from
+# `test_guard_panic.wasm` so both stay small enough that the SDK has nothing to
+# inline the error paths into. Built once and the resulting wasm is committed
+# under tests/fixtures/; see tests/fixtures/README.md. Standalone
+# (`[workspace]`) so it is not pulled into the main cargo workspace.
+[package]
+name = "test_guard_multi"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "=26.0.1"
+
+# Match the canonical Soroban release profile (overflow-checks on), as the
+# equivalence harness recompiles with the same setting.
+[profile.release]
+overflow-checks = true
+
+[workspace]

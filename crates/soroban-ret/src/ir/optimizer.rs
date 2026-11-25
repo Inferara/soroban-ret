@@ -3266,6 +3266,16 @@ fn remove_dead_code_stmt(stmt: SorobanStmt) -> SorobanStmt {
 ///
 /// Eliminates early-return guards that obscure the actual conditional logic.
 /// This transforms `if a >= b { return }; panic!()` into `if a < b { panic!() }`.
+/// The rewrite is an identity: the tail runs exactly when `C` does not hold.
+///
+/// This pass used to also "restore" a panic guard whose condition read `Le`/`Ge`,
+/// on the theory that the lifter had emitted `if Not(Gt) { panic }` and the
+/// constant folder had degraded it. It had not: `Not(Gt)` IS `Le`, so the fold
+/// was exact and flipping it back negated the guard — `if name.len() <= 0 {
+/// panic }` rendered as `if name.len() > 0 { panic }`, firing on the complement
+/// of the contract's own check (issue #80). Stripping an explicit `Not` wrapper
+/// was wrong for the same reason. Readability is never worth a condition that
+/// does not hold, so there is no panic-guard inversion here any more.
 fn invert_guard_clauses(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
     // First recurse into nested bodies
     let stmts: Vec<SorobanStmt> = stmts.into_iter().map(invert_guard_clauses_nested).collect();
@@ -3278,76 +3288,24 @@ fn invert_guard_clauses(stmts: Vec<SorobanStmt>) -> Vec<SorobanStmt> {
             then_body,
             else_body,
         } = &stmts[i]
+            && else_body.is_empty()
+            && matches!(then_body.as_slice(), [SorobanStmt::Return(None)])
+            && i + 1 < stmts.len()
         {
-            if else_body.is_empty()
-                && matches!(then_body.as_slice(), [SorobanStmt::Return(None)])
-                && i + 1 < stmts.len()
-            {
-                cov_mark::hit!(guard_clause_inverted);
-                let tail: Vec<SorobanStmt> = stmts[i + 1..].to_vec();
-                let negated = fold_expr(SorobanExpr::Not(Box::new(condition.clone())));
-                result.push(SorobanStmt::If {
-                    condition: negated,
-                    then_body: tail,
-                    else_body: Vec::new(),
-                });
-                return result;
-            }
-
-            // Panic guard inversion: `if !(cond) { panic!() }` → `if cond { panic!() }`
-            // The lifter's BrIf handler creates `if Not(guard) { body }` which the
-            // constant folder simplifies to inverted comparisons (Gt → Le, Lt → Ge).
-            // When the body is just panic, invert the condition back for readability.
-            // Check if body starts with panic — the body may have dead code after
-            // the panic that hasn't been truncated yet (remove_dead_code runs later).
-            let is_panic_body = matches!(
-                then_body.first(),
-                Some(SorobanStmt::Expr(
-                    SorobanExpr::Panic | SorobanExpr::PanicWithError(_)
-                ))
-            );
-            if else_body.is_empty() && is_panic_body && is_inverted_comparison(condition) {
-                let inverted = invert_comparison(condition.clone());
-                result.push(SorobanStmt::If {
-                    condition: inverted,
-                    then_body: then_body.clone(),
-                    else_body: Vec::new(),
-                });
-                i += 1;
-                continue;
-            }
+            cov_mark::hit!(guard_clause_inverted);
+            let tail: Vec<SorobanStmt> = stmts[i + 1..].to_vec();
+            let negated = fold_expr(SorobanExpr::Not(Box::new(condition.clone())));
+            result.push(SorobanStmt::If {
+                condition: negated,
+                then_body: tail,
+                else_body: Vec::new(),
+            });
+            return result;
         }
         result.push(stmts[i].clone());
         i += 1;
     }
     result
-}
-
-/// Check if a comparison is the "inverted" form from the BrIf handler's negation.
-/// Le/Ge are less natural than Gt/Lt for panic guards (e.g., `len <= 10` vs `len > 10`).
-/// Not(Gt/Lt/Ge/Le) is an explicit negation wrapper.
-fn is_inverted_comparison(expr: &SorobanExpr) -> bool {
-    match expr {
-        SorobanExpr::Le(_, _) | SorobanExpr::Ge(_, _) => true,
-        SorobanExpr::Not(inner) => matches!(
-            inner.as_ref(),
-            SorobanExpr::Gt(_, _)
-                | SorobanExpr::Lt(_, _)
-                | SorobanExpr::Ge(_, _)
-                | SorobanExpr::Le(_, _)
-        ),
-        _ => false,
-    }
-}
-
-/// Invert a comparison: Le ↔ Gt, Ge ↔ Lt, Not(X) → X.
-fn invert_comparison(expr: SorobanExpr) -> SorobanExpr {
-    match expr {
-        SorobanExpr::Le(a, b) => SorobanExpr::Gt(a, b),
-        SorobanExpr::Ge(a, b) => SorobanExpr::Lt(a, b),
-        SorobanExpr::Not(inner) => *inner,
-        other => other,
-    }
 }
 
 fn invert_guard_clauses_nested(stmt: SorobanStmt) -> SorobanStmt {

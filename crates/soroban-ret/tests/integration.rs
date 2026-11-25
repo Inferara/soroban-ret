@@ -170,6 +170,96 @@ fn test_decompile_sub_u64() {
     assert!(!source.contains("todo!("), "unexpected todo! artifact");
 }
 
+/// Collapse every run of whitespace to a single space, so an assertion about a
+/// whole statement does not depend on the renderer's indentation or line
+/// breaks. Asserting the guard as one contiguous unit is what makes the
+/// issue-#80 tests below fail for a guard whose condition and error were paired
+/// up wrongly — checking for the two halves separately passes either way.
+fn squashed(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn test_decompile_guard_panic_small_contract() {
+    // Issue #80 silent-wrong: a `panic_with_error!` validation guard vanished
+    // from a SMALL contract with no `todo!()` marker. With nothing to inline
+    // into, the SDK leaves `Env::fail_with_error` as a two-level wrapper chain
+    // and passes `&self` as frame-pointer arithmetic whose `Val` result is
+    // dropped — so the error tail is a 7-node sequence reached through two
+    // wrappers, and both `fail_with_error` tail recognizers missed it.
+    let wasm = include_bytes!("../../../tests/fixtures/test_guard_panic.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    let flat = squashed(&source);
+    // The WHOLE guard, in both entrypoints: the condition decoded to the u32
+    // domain (`7`, not the raw `U32Val` constant `7 << 32`), holding just its
+    // own error. A wrong value is as unfaithful as a dropped guard.
+    assert_eq!(
+        flat.matches("if decimals != 7 { panic_with_error!(&env, Error::BadDecimals); }")
+            .count(),
+        2,
+        "guard dropped, mispaired or left in Val space in one or both entrypoints: {source}"
+    );
+    assert!(
+        !source.contains("30064771072"),
+        "raw Val-space constant leaked into the guard: {source}"
+    );
+    // `check_other` returns an unrelated parameter, so no constant fold can
+    // stand in for the guard there. Anchoring the return to the guard before it
+    // also proves no stray error tail sits between them.
+    assert!(
+        flat.contains("Error::BadDecimals); } amount }"),
+        "check_other lost its returned parameter, or a stray tail precedes it: {source}"
+    );
+    assert!(
+        !source.contains("todo!("),
+        "unexpected todo! artifact: {source}"
+    );
+}
+
+#[test]
+fn test_decompile_guard_multi_small_contract() {
+    // Issue #80: several `panic_with_error!` guards before a storage write,
+    // each a `br_if` to a different block depth. The guards used to be paired
+    // with the wrong errors, the write was dropped, and one inlined error tail
+    // survived as an unconditional panic after the body.
+    let wasm = include_bytes!("../../../tests/fixtures/test_guard_multi.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    let flat = squashed(&source);
+    // Each guard as ONE unit, so its own condition and its own error have to
+    // sit together. The length guard also keeps the contract's own polarity:
+    // the original fails on an EMPTY name, so it must not read `> 0`.
+    assert!(
+        flat.contains("if name.len() <= 0 { panic_with_error!(&env, Error::BadName); }")
+            || flat.contains("if name.len() == 0 { panic_with_error!(&env, Error::BadName); }"),
+        "length guard lost, inverted or mispaired: {source}"
+    );
+    assert!(
+        flat.contains("if decimals != 7 { panic_with_error!(&env, Error::BadDecimals); }"),
+        "decimals guard lost or mispaired: {source}"
+    );
+    // The body after the guards survives, and no inlined error tail is left
+    // over behind it — that leftover is what made the function always fail.
+    let set_at = flat
+        .find(".instance().set(")
+        .unwrap_or_else(|| panic!("storage write dropped: {source}"));
+    let last_panic = flat
+        .rfind("panic_with_error!")
+        .unwrap_or_else(|| panic!("every guard lost: {source}"));
+    assert!(
+        last_panic < set_at,
+        "an inlined error tail survived after the body: {source}"
+    );
+    assert_eq!(
+        flat.matches("panic_with_error!").count(),
+        2,
+        "a guard was duplicated or an error tail survived: {source}"
+    );
+    assert!(
+        !source.contains("todo!("),
+        "unexpected todo! artifact: {source}"
+    );
+}
+
 #[test]
 fn test_decompile_unknown_oracle_fallible_gets() {
     // A mainnet oracle whose getters were lifting to a lossy
@@ -1116,6 +1206,14 @@ const ALL_FIXTURES: &[(&str, &[u8])] = &[
     (
         "test_sub_u64",
         include_bytes!("../../../tests/fixtures/test_sub_u64.wasm"),
+    ),
+    (
+        "test_guard_panic",
+        include_bytes!("../../../tests/fixtures/test_guard_panic.wasm"),
+    ),
+    (
+        "test_guard_multi",
+        include_bytes!("../../../tests/fixtures/test_guard_multi.wasm"),
     ),
     (
         "test_add_u128",

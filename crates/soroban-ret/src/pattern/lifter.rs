@@ -10227,6 +10227,10 @@ fn lift_function_body(
     // `recover_fail_with_error_branches`).
     recover_fail_with_error_branches(&mut structured, wasm_module);
     recover_skipped_fail_with_error(&mut structured, wasm_module);
+    // Layer B leaves each inlined tail in place; drop the ones nothing can
+    // reach any more, so they do not render as an unconditional panic after
+    // the recovered body (issue #80).
+    drop_unreachable_fail_tails(&mut structured, wasm_module);
     if let Ok(want) = std::env::var("DBG_STRUCT")
         && (want.is_empty() || want == func_index.to_string())
     {
@@ -10810,6 +10814,10 @@ fn lift_inline_call(
     // `recover_fail_with_error_branches`).
     recover_fail_with_error_branches(&mut structured, wasm_module);
     recover_skipped_fail_with_error(&mut structured, wasm_module);
+    // Layer B leaves each inlined tail in place; drop the ones nothing can
+    // reach any more, so they do not render as an unconditional panic after
+    // the recovered body (issue #80).
+    drop_unreachable_fail_tails(&mut structured, wasm_module);
     // Debug affordance: dump the structured body of an *inlined* (non-exported)
     // function by index. `DBG_STRUCT` only reaches lifted entrypoints; the big
     // contracts degrade values inside 3-4 levels of inlined helpers, so tracing
@@ -11583,6 +11591,12 @@ fn is_u32_param(v: &StackVal, params: &[FnParam]) -> bool {
 /// An operand for which `x & LEN_VAL_MASK` is exactly `x << 32` in the u32
 /// domain: a `*_len` host-call result, or a declared `u32` parameter the SDK
 /// decoded in place (`decimals != 7`, contract `CA35B5JS...`).
+///
+/// Every arm that reads a value the `I64And` arm marked must gate on THIS, not
+/// on one of its halves. Mark a value and then fail to admit it, and keeping
+/// the mask turns an operand the old pass-through used to render into
+/// `UnknownVal` — the decode below is reached only for `Eq`/`Ne`, so an ordered
+/// compare would print `todo!("unknown value") >= K` for `d >= K`.
 fn is_masked_u32_operand(v: &StackVal, params: &[FnParam]) -> bool {
     is_len_call(v) || is_u32_param(v, params)
 }
@@ -20667,10 +20681,10 @@ enum BranchExitTarget {
 /// branching to it is semantically `if cond { panic_with_error!(…) }`.
 ///
 /// Gated tightly: no nested control flow, ends in `unreachable` (raw or the
-/// issue-#11 safety-net reclassification), short (a real tail is 1–4 nodes),
-/// and contains a direct `fail_with_error` wrapper call. The `fail_with_error`
-/// requirement is the load-bearing gate — it fires only on genuine contract
-/// error reporting, never on SDK dispatch preambles or compiler safety nets.
+/// issue-#11 safety-net reclassification), short, and reaches a
+/// `fail_with_error` wrapper. The `fail_with_error` requirement is the
+/// load-bearing gate — it fires only on genuine contract error reporting,
+/// never on SDK dispatch preambles or compiler safety nets.
 fn is_fail_with_error_tail(
     tail: &[super::structurize::StructuredBlock],
     module: &WasmModule,
@@ -20678,7 +20692,12 @@ fn is_fail_with_error_tail(
     use super::structurize::StructuredBlock;
     use crate::wasm::ir::WasmInstr;
 
-    const MAX_TAIL_LEN: usize = 6;
+    // `local.get <fp>; i32.const <off>; i32.add; i64.const <err>; call; drop;
+    // unreachable` is seven nodes: `Env::fail_with_error` takes `&self`, so the
+    // receiver is frame-pointer arithmetic, and its `Val` return is dropped.
+    // That is the shape a small contract emits, where there is nothing for the
+    // SDK wrappers to be inlined into (issue #80).
+    const MAX_TAIL_LEN: usize = 8;
     if tail.is_empty() || tail.len() > MAX_TAIL_LEN {
         return false;
     }
@@ -20696,8 +20715,17 @@ fn is_fail_with_error_tail(
     for sb in tail {
         match sb {
             StructuredBlock::SafetyNetUnreachable => {}
+            // Followed through the wrapper CHAIN, not just one level: the SDK
+            // routes `panic_with_error!` through `Env::fail_with_error` ->
+            // `Guest::fail_with_error` -> the import.
             StructuredBlock::Instruction(WasmInstr::Call(idx))
-                if function_calls_host(module, *idx, HostModule::Context, "fail_with_error") =>
+                if function_calls_host_in_chain(
+                    module,
+                    *idx,
+                    HostModule::Context,
+                    "fail_with_error",
+                    FAIL_WRAPPER_CHAIN_DEPTH,
+                ) =>
             {
                 has_fail_with_error = true;
             }
@@ -20809,6 +20837,11 @@ fn rewrite_branch_seq(
     }
 }
 
+/// Wrapper levels followed when deciding whether a tail call reaches the
+/// `fail_with_error` host import: `Env::fail_with_error` ->
+/// `Guest::fail_with_error` -> import is three, so allow a little slack.
+const FAIL_WRAPPER_CHAIN_DEPTH: u32 = 4;
+
 /// The other lowering of `if cond { panic_with_error!(..) }`: the error path
 /// is the fall-through and a `br_if k` SKIPS it.
 ///
@@ -20865,7 +20898,9 @@ fn recover_skipped_fail_with_error(
         }
     }
 
-    const MAX_TAIL_LEN: usize = 6;
+    // `local.get <fp>; i32.const <off>; i32.add; i64.const <err>; call; drop;
+    // unreachable` is the longest shape the gate below accepts.
+    const MAX_TAIL_LEN: usize = 8;
     let Some(pos) = blocks
         .iter()
         .rposition(|b| matches!(b, StructuredBlock::Instruction(WasmInstr::BrIf(_))))
@@ -20882,23 +20917,44 @@ fn recover_skipped_fail_with_error(
     let mut fails = false;
     for sb in tail {
         match sb {
+            // After the call: the dead end, plus the `drop` of the error
+            // helper's own result. `Env::fail_with_error` is typed to return a
+            // `Val`, so a caller that ignores it emits a `drop` before the
+            // `unreachable` — which is what `panic_with_error!` lowers to in a
+            // value-returning entrypoint. Dropping a value the helper never
+            // actually produces is neither control flow nor an effect.
             StructuredBlock::SafetyNetUnreachable
-            | StructuredBlock::Instruction(WasmInstr::Unreachable)
+            | StructuredBlock::Instruction(WasmInstr::Unreachable | WasmInstr::Drop)
                 if fails => {}
+            // The call that reaches `fail_with_error`. Followed through the
+            // wrapper CHAIN, not just one level: the SDK routes
+            // `panic_with_error!` through `Env::fail_with_error` ->
+            // `Guest::fail_with_error` -> the import, so a one-level test
+            // misses every case the SDK did not inline flat — small contracts,
+            // where there is nothing to inline into.
             StructuredBlock::Instruction(WasmInstr::Call(idx))
                 if !fails
-                    && function_calls_host(
+                    && function_calls_host_in_chain(
                         module,
                         *idx,
                         HostModule::Context,
                         "fail_with_error",
+                        FAIL_WRAPPER_CHAIN_DEPTH,
                     ) =>
             {
                 fails = true;
             }
-            // Operands of the error call.
+            // Operands of the error call. `i32.add` / `i32.sub` over those
+            // leaves is frame-pointer arithmetic: `Env::fail_with_error` takes
+            // `&self`, so the receiver operand is computed as
+            // `local.get <fp>; i32.const <off>; i32.add`. Pure integer
+            // arithmetic — no memory access, no call, no control flow.
             StructuredBlock::Instruction(
-                WasmInstr::I64Const(_) | WasmInstr::I32Const(_) | WasmInstr::LocalGet(_),
+                WasmInstr::I64Const(_)
+                | WasmInstr::I32Const(_)
+                | WasmInstr::LocalGet(_)
+                | WasmInstr::I32Add
+                | WasmInstr::I32Sub,
             ) if !fails => {}
             _ => return,
         }
@@ -20916,6 +20972,132 @@ fn recover_skipped_fail_with_error(
         then_body: tail,
         else_body: vec![StructuredBlock::Instruction(WasmInstr::Br(depth + 1))],
     });
+}
+
+/// Drop a block's continuation when nothing can reach it any more.
+///
+/// ```text
+///   block                 ;; its branch target is the tail below
+///     <guards; br_if 0>   ;; rewritten to an inline guard by Layer B
+///     <body>; return
+///   end
+///   i64.const <err>; call $fail_with_error; drop; unreachable   ;; the tail
+/// ```
+///
+/// [`recover_fail_with_error_branches`] inlines such a tail at each branch
+/// site and deliberately leaves the original in place, relying on downstream
+/// passes to drop it. They only drop a stray panic that still has live work
+/// after it, so a tail at the END of a level survives and renders as an
+/// unconditional `panic_with_error!` after the recovered body — which makes
+/// the function always fail (issue #80).
+///
+/// This is plain dead-code elimination, not a heuristic. The tail is reachable
+/// only two ways, and both are checked:
+///
+/// 1. a branch to the block's own exit depth — [`branch_targets_depth`] scans
+///    the whole body with WASM depth bookkeeping, so any surviving `br`,
+///    `br_if` or `br_table` (including the `br depth + 1` that
+///    [`recover_skipped_fail_with_error`] introduces) keeps the tail;
+/// 2. falling out of the block's end — [`diverges_at_end`] requires the last
+///    node to be `return` or a dead end.
+///
+/// With both ruled out the tail is unreachable in the original wasm too, so
+/// removing it cannot change behaviour.
+fn drop_unreachable_fail_tails(
+    blocks: &mut Vec<super::structurize::StructuredBlock>,
+    module: &WasmModule,
+) {
+    use super::structurize::StructuredBlock;
+
+    // Innermost levels first: proving an inner tail dead is what lets the
+    // enclosing level see the inner block as diverging at its end.
+    for b in blocks.iter_mut() {
+        match b {
+            StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+                drop_unreachable_fail_tails(body, module);
+            }
+            StructuredBlock::IfElse {
+                then_body,
+                else_body,
+                ..
+            } => {
+                drop_unreachable_fail_tails(then_body, module);
+                drop_unreachable_fail_tails(else_body, module);
+            }
+            _ => {}
+        }
+    }
+
+    // A `Loop`'s continuation is its exit, but `br 0` inside a loop is the
+    // back-edge, so only a `Block` is considered here. At most one index can
+    // match: the tail is the ENTIRE suffix and holds no nested block, so no
+    // shorter suffix is a tail as well.
+    for i in 0..blocks.len() {
+        let StructuredBlock::Block { body, .. } = &blocks[i] else {
+            continue;
+        };
+        if !is_fail_with_error_tail(&blocks[i + 1..], module)
+            || branch_targets_depth(body, 0)
+            || !diverges_at_end(body)
+        {
+            continue;
+        }
+        cov_mark::hit!(unreachable_fail_tail_dropped);
+        blocks.truncate(i + 1);
+        return;
+    }
+}
+
+/// Does any branch inside `blocks` target `depth`, counted the way WASM counts
+/// it — every enclosing block, loop and `if` adds one level?
+fn branch_targets_depth(blocks: &[super::structurize::StructuredBlock], depth: u32) -> bool {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr;
+
+    blocks.iter().any(|b| match b {
+        StructuredBlock::Instruction(WasmInstr::Br(k) | WasmInstr::BrIf(k)) => *k == depth,
+        StructuredBlock::Instruction(WasmInstr::BrTable { targets, default }) => {
+            *default == depth || targets.contains(&depth)
+        }
+        StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+            branch_targets_depth(body, depth + 1)
+        }
+        StructuredBlock::IfElse {
+            then_body,
+            else_body,
+            ..
+        } => {
+            branch_targets_depth(then_body, depth + 1) || branch_targets_depth(else_body, depth + 1)
+        }
+        // A RAW control-flow marker, which `structurize` only leaves behind
+        // when it truncated at `MAX_RECURSION_DEPTH`. The depth bookkeeping
+        // past it is then unknown, so answer "a branch may target this" and
+        // let the caller keep the tail.
+        StructuredBlock::Instruction(
+            WasmInstr::Block { .. } | WasmInstr::Loop { .. } | WasmInstr::If { .. },
+        ) => true,
+        _ => false,
+    })
+}
+
+/// Can control fall off the end of `blocks`? False only when the last node
+/// provably diverges: `return`, `unreachable` (raw or the issue-#11 safety-net
+/// reclassification), or a nested block that itself diverges at its end with
+/// nothing branching to its exit. A trailing `br` is NOT accepted — `br 0`
+/// leaves a block exactly by its continuation, which is what we are trying to
+/// prove unreachable.
+fn diverges_at_end(blocks: &[super::structurize::StructuredBlock]) -> bool {
+    use super::structurize::StructuredBlock;
+    use crate::wasm::ir::WasmInstr;
+
+    match blocks.last() {
+        Some(StructuredBlock::Instruction(WasmInstr::Unreachable | WasmInstr::Return))
+        | Some(StructuredBlock::SafetyNetUnreachable) => true,
+        Some(StructuredBlock::Block { body, .. }) => {
+            !branch_targets_depth(body, 0) && diverges_at_end(body)
+        }
+        _ => false,
+    }
 }
 
 fn is_guard_error_path(remaining: &[super::structurize::StructuredBlock]) -> bool {
@@ -21764,9 +21946,11 @@ fn stack_val_to_expr_inner(
                 }
                 // Tag extraction `v & 0xFF` → `v.get_tag()`. Anything else AND-shaped
                 // wasn't a recognized Val pattern, so it stays unknown.
-                // The tag-cleared length (see the `I64And` arm): outside an
-                // equality compare it reads as the length itself, exactly
-                // what the mask pass-through rendered before.
+                // The tag-cleared length or `u32` parameter (see the `I64And`
+                // arm): outside an equality compare it reads as the operand
+                // itself, exactly what the mask pass-through rendered before.
+                // Gated on the same predicate the `I64And` arm marks with, for
+                // the reason [`is_masked_u32_operand`] gives.
                 BinOper::And
                     if to_u64(b) == Some(LEN_VAL_MASK) && is_masked_u32_operand(a, params) =>
                 {
