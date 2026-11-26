@@ -22204,7 +22204,7 @@ fn stack_val_to_expr_inner(
             let cond_e = stack_val_to_expr_inner(cond, params, registry, frame_slots, visiting);
             let then_e = stack_val_to_expr_inner(then_val, params, registry, frame_slots, visiting);
             let else_e = stack_val_to_expr_inner(else_val, params, registry, frame_slots, visiting);
-            select_expr(cond_e, then_e, else_e)
+            select_expr(cond_e, then_e, else_e, params)
         }
         StackVal::LetBinding(idx) => SorobanExpr::Local(*idx),
         StackVal::LoopPhi(idx) => SorobanExpr::Local(*idx),
@@ -22303,7 +22303,7 @@ fn stack_val_to_arith_expr_inner(
                 stack_val_to_arith_expr_inner(then_val, params, registry, frame_slots, visiting);
             let else_e =
                 stack_val_to_arith_expr_inner(else_val, params, registry, frame_slots, visiting);
-            select_expr(cond_e, then_e, else_e)
+            select_expr(cond_e, then_e, else_e, params)
         }
         _ => stack_val_to_expr_inner(val, params, registry, frame_slots, visiting),
     }
@@ -22444,8 +22444,9 @@ fn fold_bool_tag_clamp(
 
 /// The whole 128-bit value a `(lo, hi)` pair carries: both limbs of one tracked
 /// value, two constant words, or an open-coded add / subtract of such values.
-/// The flag is true for a tracked value.
-fn whole_i128_of_limbs(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bool)> {
+/// The flag is true for a tracked value. `signed` is the signedness of the
+/// compare the value feeds, and types a constant pair (`i128` or `u128`).
+fn whole_i128_of_limbs(lo: &StackVal, hi: &StackVal, signed: bool) -> Option<(StackVal, bool)> {
     match (lo, hi) {
         (
             StackVal::I128Limb {
@@ -22458,11 +22459,15 @@ fn whole_i128_of_limbs(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bool)>
             },
         ) if lv == hv => Some(((**lv).clone(), true)),
         (StackVal::I64(l), StackVal::I64(h)) => {
-            let v = ((*h as i128) << 64) | (*l as u64 as i128);
-            Some((
-                StackVal::HostCallResult(Box::new(SorobanExpr::I128Literal(v))),
-                false,
-            ))
+            // The compare's signedness types the constant: the same two
+            // words are a negative `i128` or a `u128` above `i128::MAX`.
+            let bits = ((*h as u64 as u128) << 64) | (*l as u64 as u128);
+            let literal = if signed {
+                SorobanExpr::I128Literal(bits as i128)
+            } else {
+                SorobanExpr::U128Literal(bits)
+            };
+            Some((StackVal::HostCallResult(Box::new(literal)), false))
         }
         // An open-coded 128-bit add or subtract (carry / borrow limb chains).
         _ => reconstruct_i128_addsub(lo, hi),
@@ -22531,13 +22536,13 @@ fn fold_wide_compare(
     };
     // Find which low operand belongs to `a`.
     let (a, a_tracked, b, b_tracked, l_op) = match (
-        whole_i128_of_limbs(l_lhs, a_hi),
-        whole_i128_of_limbs(l_rhs, b_hi),
+        whole_i128_of_limbs(l_lhs, a_hi, signed),
+        whole_i128_of_limbs(l_rhs, b_hi, signed),
     ) {
         (Some((a, at)), Some((b, bt))) => (a, at, b, bt, l_op),
         _ => {
-            let (a, at) = whole_i128_of_limbs(l_rhs, a_hi)?;
-            let (b, bt) = whole_i128_of_limbs(l_lhs, b_hi)?;
+            let (a, at) = whole_i128_of_limbs(l_rhs, a_hi, signed)?;
+            let (b, bt) = whole_i128_of_limbs(l_lhs, b_hi, signed)?;
             (a, at, b, bt, flip(l_op))
         }
     };
@@ -22590,7 +22595,12 @@ fn fold_limb_select(cond: &StackVal, then_val: &StackVal, else_val: &StackVal) -
 /// condition exactly the same way. Two arms that convert to the same
 /// expression need no condition. Where one arm is a `bool` and the other the
 /// wasm truth value `0` / `1`, the constant is that `bool`.
-fn select_expr(cond: SorobanExpr, then_val: SorobanExpr, else_val: SorobanExpr) -> SorobanExpr {
+fn select_expr(
+    cond: SorobanExpr,
+    then_val: SorobanExpr,
+    else_val: SorobanExpr,
+    params: &[FnParam],
+) -> SorobanExpr {
     // A condition with a lost operand selects nothing: which arm holds is as
     // unknown as the operand, so the value is one hole, not a conditional
     // around holes.
@@ -22608,6 +22618,24 @@ fn select_expr(cond: SorobanExpr, then_val: SorobanExpr, else_val: SorobanExpr) 
         }
     }
     use crate::ir::optimizer::is_bool_typed;
+    // A wasm condition is an integer tested against zero; a Rust `if` takes a
+    // `bool`. Keep a condition proven `bool`, and test any other for nonzero.
+    fn is_bool(e: &SorobanExpr, params: &[FnParam]) -> bool {
+        match e {
+            SorobanExpr::Param(name) => params
+                .iter()
+                .any(|p| p.name == *name && matches!(p.type_def, ScSpecTypeDef::Bool)),
+            SorobanExpr::Select {
+                then_val, else_val, ..
+            } => is_bool(then_val, params) && is_bool(else_val, params),
+            other => is_bool_typed(other),
+        }
+    }
+    let cond = if is_bool(&cond, params) {
+        cond
+    } else {
+        SorobanExpr::Ne(Box::new(cond), Box::new(SorobanExpr::I32Literal(0)))
+    };
     let (then_val, else_val) = match (truth(&then_val), truth(&else_val)) {
         (Some(t), None) if is_bool_typed(&else_val) => (SorobanExpr::BoolLiteral(t), else_val),
         (None, Some(e)) if is_bool_typed(&then_val) => (then_val, SorobanExpr::BoolLiteral(e)),
@@ -28809,7 +28837,26 @@ mod tests {
             stack_val_to_expr(&sel(StackVal::Unknown), &[], &registry, None),
             SorobanExpr::UnknownVal
         ));
-        let kept = stack_val_to_expr(&sel(StackVal::Param("flag".into())), &[], &registry, None);
+        let params = [FnParam {
+            name: "flag".into(),
+            type_def: ScSpecTypeDef::Bool,
+        }];
+        let kept = stack_val_to_expr(
+            &sel(StackVal::Param("flag".into())),
+            &params,
+            &registry,
+            None,
+        );
+        // An integer condition is a test against zero, as in the wasm.
+        let int_cond =
+            stack_val_to_expr(&sel(StackVal::Param("n".into())), &params, &registry, None);
+        assert!(matches!(
+            int_cond,
+            SorobanExpr::Select { ref cond, .. }
+                if matches!(**cond, SorobanExpr::Ne(ref n, ref z)
+                    if matches!(**n, SorobanExpr::Param(ref p) if p == "n")
+                        && matches!(**z, SorobanExpr::I32Literal(0)))
+        ));
         let SorobanExpr::Select {
             cond,
             then_val,
@@ -28826,6 +28873,7 @@ mod tests {
             SorobanExpr::Param("flag".into()),
             SorobanExpr::I32Literal(1),
             SorobanExpr::Not(Box::new(SorobanExpr::Param("x".into()))),
+            &params,
         );
         assert!(matches!(
             mixed,
@@ -28878,6 +28926,21 @@ mod tests {
             &cmp(limb("x", true), CmpOp::GtS, StackVal::I64(0)),
         );
         assert_eq!(gt_zero, Some(cmp(whole("x"), CmpOp::GtS, zero())));
+        // An unsigned compare types its constant `u128`: the high word
+        // `1 << 63` is above `i128::MAX`, not a negative number.
+        let big = fold_wide_compare(
+            &cmp(limb("a", true), CmpOp::Eq, StackVal::I64(i64::MIN)),
+            &cmp(limb("a", false), CmpOp::GtU, StackVal::I64(1)),
+            &cmp(limb("a", true), CmpOp::GtU, StackVal::I64(i64::MIN)),
+        );
+        assert_eq!(
+            big,
+            Some(cmp(
+                whole("a"),
+                CmpOp::GtU,
+                StackVal::HostCallResult(Box::new(SorobanExpr::U128Literal((1u128 << 127) + 1)))
+            ))
+        );
         // A high compare written `b_hi > a_hi` is the same `a < b`.
         let flipped = fold_wide_compare(
             &cmp(limb("a", true), CmpOp::Eq, limb("b", true)),
@@ -28935,7 +28998,7 @@ mod tests {
         let cond = StackVal::Param("c".into());
         let lo = fold_limb_select(&cond, &limb("a", false), &limb("b", false)).unwrap();
         let hi = fold_limb_select(&cond, &limb("a", true), &limb("b", true)).unwrap();
-        let (whole, tracked) = whole_i128_of_limbs(&lo, &hi).unwrap();
+        let (whole, tracked) = whole_i128_of_limbs(&lo, &hi, true).unwrap();
         assert!(tracked);
         assert_eq!(
             whole,

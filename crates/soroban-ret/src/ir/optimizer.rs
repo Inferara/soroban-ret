@@ -5831,13 +5831,40 @@ fn count_local_in_stmt(stmt: &SorobanStmt, idx: u32, inside_loop: bool) -> (u32,
 /// bodies or loop bounds do not count.
 fn count_unconditional_uses(stmt: &SorobanStmt, idx: u32) -> u32 {
     match stmt {
-        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => count_local_in_expr(e, idx),
+        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => count_unconditional_in_expr(e, idx),
         SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
-            count_local_in_expr(value, idx)
+            count_unconditional_in_expr(value, idx)
         }
-        SorobanStmt::If { condition, .. } => count_local_in_expr(condition, idx),
-        SorobanStmt::Match { scrutinee, .. } => count_local_in_expr(scrutinee, idx),
+        SorobanStmt::If { condition, .. } => count_unconditional_in_expr(condition, idx),
+        SorobanStmt::Match { scrutinee, .. } => count_unconditional_in_expr(scrutinee, idx),
         _ => 0,
+    }
+}
+
+/// Reads of `Local(idx)` that run whenever `expr` is evaluated. An arm of a
+/// [`SorobanExpr::Select`] runs only when its condition picks it, so a read
+/// there is not one of them: moving a trapping value into an arm would skip
+/// the trap on the other path. Only the condition counts.
+fn count_unconditional_in_expr(expr: &SorobanExpr, idx: u32) -> u32 {
+    count_local_in_expr(expr, idx) - count_local_in_select_arms(expr, idx)
+}
+
+/// Reads of `Local(idx)` inside the arms of any `Select` in `expr`.
+fn count_local_in_select_arms(expr: &SorobanExpr, idx: u32) -> u32 {
+    match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            count_local_in_select_arms(cond, idx)
+                + count_local_in_expr(then_val, idx)
+                + count_local_in_expr(else_val, idx)
+        }
+        other => expr_children(other)
+            .into_iter()
+            .map(|c| count_local_in_select_arms(c, idx))
+            .sum(),
     }
 }
 
@@ -11202,6 +11229,28 @@ mod tests {
             fold_expr(sel(SorobanExpr::Param("flag".into()))),
             SorobanExpr::Select { .. }
         ));
+    }
+
+    /// A read in an arm of a `Select` runs only on that arm's path, so it is
+    /// not an unconditional use: a trapping value must not move into it.
+    #[test]
+    fn a_read_in_a_select_arm_is_not_unconditional() {
+        let sel = SorobanExpr::Select {
+            cond: Box::new(SorobanExpr::Local(1)),
+            then_val: Box::new(SorobanExpr::Local(2)),
+            else_val: Box::new(SorobanExpr::Add(
+                Box::new(SorobanExpr::Local(3)),
+                Box::new(SorobanExpr::I64Literal(1)),
+            )),
+        };
+        let stmt = SorobanStmt::Return(Some(SorobanExpr::Add(
+            Box::new(sel),
+            Box::new(SorobanExpr::Local(4)),
+        )));
+        assert_eq!(count_unconditional_uses(&stmt, 1), 1);
+        assert_eq!(count_unconditional_uses(&stmt, 2), 0);
+        assert_eq!(count_unconditional_uses(&stmt, 3), 0);
+        assert_eq!(count_unconditional_uses(&stmt, 4), 1);
     }
 
     /// A code picked by a check and compared with one of its two values is
