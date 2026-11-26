@@ -1388,6 +1388,15 @@ fn repair_unknown_invoke_functions_in_expr(expr: &mut SorobanExpr, replacement: 
                 repair_unknown_invoke_functions_in_expr(arg, replacement);
             }
         }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            repair_unknown_invoke_functions_in_expr(cond, replacement);
+            repair_unknown_invoke_functions_in_expr(then_val, replacement);
+            repair_unknown_invoke_functions_in_expr(else_val, replacement);
+        }
         SorobanExpr::VecTryIterFold { vec, init } => {
             repair_unknown_invoke_functions_in_expr(vec, replacement);
             repair_unknown_invoke_functions_in_expr(init, replacement);
@@ -1628,6 +1637,15 @@ fn repair_unknown_event_values_in_expr(expr: &mut SorobanExpr, hint: &EventRepai
             for arg in args {
                 repair_unknown_event_values_in_expr(arg, hint);
             }
+        }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            repair_unknown_event_values_in_expr(cond, hint);
+            repair_unknown_event_values_in_expr(then_val, hint);
+            repair_unknown_event_values_in_expr(else_val, hint);
         }
         SorobanExpr::VecTryIterFold { vec, init } => {
             repair_unknown_event_values_in_expr(vec, hint);
@@ -1886,6 +1904,15 @@ fn repair_weak_auth_in_expr(expr: &mut SorobanExpr, hint: &AuthRepairHint) {
                 repair_weak_auth_in_expr(arg, hint);
             }
         }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            repair_weak_auth_in_expr(cond, hint);
+            repair_weak_auth_in_expr(then_val, hint);
+            repair_weak_auth_in_expr(else_val, hint);
+        }
         SorobanExpr::VecTryIterFold { vec, init } => {
             repair_weak_auth_in_expr(vec, hint);
             repair_weak_auth_in_expr(init, hint);
@@ -2126,6 +2153,15 @@ fn repair_unknown_storage_keys_in_expr(expr: &mut SorobanExpr, replacement: &Sor
             for arg in args {
                 repair_unknown_storage_keys_in_expr(arg, replacement);
             }
+        }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            repair_unknown_storage_keys_in_expr(cond, replacement);
+            repair_unknown_storage_keys_in_expr(then_val, replacement);
+            repair_unknown_storage_keys_in_expr(else_val, replacement);
         }
         SorobanExpr::VecTryIterFold { vec, init } => {
             repair_unknown_storage_keys_in_expr(vec, replacement);
@@ -2969,6 +3005,11 @@ pub(crate) fn child_exprs(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
             recovery_id.as_ref(),
         ],
         SorobanExpr::PrngU64InRange { low, high } => vec![low.as_ref(), high.as_ref()],
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => vec![cond.as_ref(), then_val.as_ref(), else_val.as_ref()],
         SorobanExpr::VecTryIterFold { vec, init } => vec![vec.as_ref(), init.as_ref()],
         SorobanExpr::FieldAccess { object, .. } => vec![object.as_ref()],
         SorobanExpr::TupleConstruct(fields) | SorobanExpr::VecConstruct(fields) => {
@@ -3073,6 +3114,11 @@ pub(crate) fn child_exprs_mut(expr: &mut SorobanExpr) -> Vec<&mut SorobanExpr> {
             recovery_id.as_mut(),
         ],
         SorobanExpr::PrngU64InRange { low, high } => vec![low.as_mut(), high.as_mut()],
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => vec![cond.as_mut(), then_val.as_mut(), else_val.as_mut()],
         SorobanExpr::VecTryIterFold { vec, init } => vec![vec.as_mut(), init.as_mut()],
         SorobanExpr::FieldAccess { object, .. } => vec![object.as_mut()],
         SorobanExpr::TupleConstruct(fields) | SorobanExpr::VecConstruct(fields) => {
@@ -4964,6 +5010,23 @@ fn score_param_local_base_in_expr(
             }
             score
         }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            let mut score =
+                score_param_local_base_in_expr(cond, param_count, param_local_base, rebound);
+            for e in [then_val, else_val] {
+                score.merge(score_param_local_base_in_expr(
+                    e,
+                    param_count,
+                    param_local_base,
+                    rebound,
+                ));
+            }
+            score
+        }
         SorobanExpr::VecTryIterFold { vec, init } => {
             let mut score =
                 score_param_local_base_in_expr(vec, param_count, param_local_base, rebound);
@@ -5439,6 +5502,11 @@ fn expr_uses_env(expr: &SorobanExpr) -> bool {
         SorobanExpr::MethodCall { object, args, .. } => {
             expr_uses_env(object) || args.iter().any(expr_uses_env)
         }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => expr_uses_env(cond) || expr_uses_env(then_val) || expr_uses_env(else_val),
         SorobanExpr::VecTryIterFold { vec, init } => expr_uses_env(vec) || expr_uses_env(init),
         SorobanExpr::StructConstruct { fields, .. } => fields.iter().any(|(_, v)| expr_uses_env(v)),
         SorobanExpr::EnumConstruct { fields, .. } => fields.iter().any(expr_uses_env),
@@ -5480,6 +5548,15 @@ fn replace_local_with_param_in_expr(
     map: &std::collections::HashMap<u32, &str>,
 ) {
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            replace_local_with_param_in_expr(cond, map);
+            replace_local_with_param_in_expr(then_val, map);
+            replace_local_with_param_in_expr(else_val, map);
+        }
         SorobanExpr::Local(idx) => {
             if let Some(name) = map.get(idx) {
                 *expr = SorobanExpr::Param(name.to_string());
@@ -5905,6 +5982,15 @@ fn collect_used_param_names_stmt(stmt: &SorobanStmt, used: &mut std::collections
 
 fn collect_used_param_names_expr(expr: &SorobanExpr, used: &mut std::collections::HashSet<String>) {
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            collect_used_param_names_expr(cond, used);
+            collect_used_param_names_expr(then_val, used);
+            collect_used_param_names_expr(else_val, used);
+        }
         SorobanExpr::Param(name) => {
             used.insert(name.clone());
         }
@@ -6101,6 +6187,15 @@ fn replace_invoke_artifact_literals_in_stmt(stmt: &mut SorobanStmt, unused_param
 
 fn replace_invoke_artifact_literals_in_expr(expr: &mut SorobanExpr, unused_params: &[&FnParam]) {
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            replace_invoke_artifact_literals_in_expr(cond, unused_params);
+            replace_invoke_artifact_literals_in_expr(then_val, unused_params);
+            replace_invoke_artifact_literals_in_expr(else_val, unused_params);
+        }
         SorobanExpr::InvokeContract { args, .. } | SorobanExpr::TryInvokeContract { args, .. } => {
             // Count artifact literals/expressions in the args.
             // Artifact expressions include UnknownVal wrapped in arithmetic
@@ -6860,6 +6955,15 @@ fn stmt_references_local(stmt: &SorobanStmt, name: &str, idx: Option<u32>) -> bo
 
 fn expr_references_local(expr: &SorobanExpr, name: &str, idx: Option<u32>) -> bool {
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            expr_references_local(cond, name, idx)
+                || expr_references_local(then_val, name, idx)
+                || expr_references_local(else_val, name, idx)
+        }
         SorobanExpr::NamedLocal(n) => n == name,
         SorobanExpr::Local(i) => idx == Some(*i),
         SorobanExpr::Add(a, b)
@@ -7414,6 +7518,15 @@ fn recover_enum_key_in_expr(expr: &mut SorobanExpr, registry: &TypeRegistry) {
 
     // Recurse into sub-expressions
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            recover_enum_key_in_expr(cond, registry);
+            recover_enum_key_in_expr(then_val, registry);
+            recover_enum_key_in_expr(else_val, registry);
+        }
         SorobanExpr::StorageGet { key, .. }
         | SorobanExpr::StorageHas { key, .. }
         | SorobanExpr::StorageRemove { key, .. } => {
@@ -8127,6 +8240,15 @@ fn replace_incomplete_struct_in_expr(
 
     // Recurse into sub-expressions
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            replace_incomplete_struct_in_expr(cond, params, registry);
+            replace_incomplete_struct_in_expr(then_val, params, registry);
+            replace_incomplete_struct_in_expr(else_val, params, registry);
+        }
         SorobanExpr::StructConstruct { fields, .. } => {
             for (_, v) in fields.iter_mut() {
                 replace_incomplete_struct_in_expr(v, params, registry);
@@ -8838,6 +8960,15 @@ fn replace_unknown_get_in_expr(expr: &mut SorobanExpr, bindings: &[(String, Stor
 
     // Recurse into other expression types
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            replace_unknown_get_in_expr(cond, bindings);
+            replace_unknown_get_in_expr(then_val, bindings);
+            replace_unknown_get_in_expr(else_val, bindings);
+        }
         SorobanExpr::MethodCall { object, args, .. } => {
             replace_unknown_get_in_expr(object, bindings);
             for arg in args.iter_mut() {

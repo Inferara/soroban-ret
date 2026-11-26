@@ -872,6 +872,15 @@ pub(super) fn for_each_subexpr(expr: &SorobanExpr, f: &mut dyn FnMut(&SorobanExp
             f(vec);
             f(init);
         }
+        E::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            f(cond);
+            f(then_val);
+            f(else_val);
+        }
         // Leaves (literals, vars, ledger/contract constants, tag names, …).
         _ => {}
     }
@@ -1521,6 +1530,15 @@ pub(super) fn map_subexprs(
         E::VecTryIterFold { vec, init } => E::VecTryIterFold {
             vec: b(vec, f),
             init: b(init, f),
+        },
+        E::Select {
+            cond,
+            then_val,
+            else_val,
+        } => E::Select {
+            cond: b(cond, f),
+            then_val: b(then_val, f),
+            else_val: b(else_val, f),
         },
         // Leaves (literals, vars, ledger/contract constants, tag names, …) and
         // already-terminal nodes have no sub-expressions to rewrite.

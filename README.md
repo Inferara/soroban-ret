@@ -216,10 +216,10 @@ Note the CLI binary is built from `soroban-ret-cli`, not `soroban-ret` —
 Three heavier gates compile decompiled output back for `wasm32v1-none` and are opt-in via env var (also run in CI):
 
 ```bash
-# ≥95% of fixtures recompile (cargo check) — currently 38/39 = 97%
+# ≥95% of fixtures recompile (cargo check) — currently 38/38 = 100% (4 with holes skipped)
 SOROBAN_RET_COMPILE_BACK=1 cargo test -p soroban-ret --test compile_back
 
-# mainnet corpus hard-error ratchet — currently 330 errors, 2 of 24 clean
+# mainnet corpus hard-error ratchet — currently 332 errors, 2 of 24 clean
 SOROBAN_RET_CORPUS_SOUNDNESS=1 cargo test -p soroban-ret --test corpus_soundness
 
 # functional equivalence: recompile to wasm, run BOTH the original and

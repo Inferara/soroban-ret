@@ -293,6 +293,15 @@ fn scan_stmt(stmt: &SorobanStmt, needs: &mut ImportNeeds) {
 
 fn scan_expr(expr: &SorobanExpr, needs: &mut ImportNeeds) {
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            scan_expr(cond, needs);
+            scan_expr(then_val, needs);
+            scan_expr(else_val, needs);
+        }
         SorobanExpr::SymbolLiteral(s) => {
             if s.len() <= 9 {
                 needs.symbol_short = true;

@@ -168,6 +168,11 @@ pub fn walk_expr(expr: &SorobanExpr, pred: &dyn Fn(&SorobanExpr) -> bool) -> boo
             walk_expr(object, pred) || args.iter().any(|a| walk_expr(a, pred))
         }
         SorobanExpr::VecTryIterFold { vec, init } => walk_expr(vec, pred) || walk_expr(init, pred),
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => walk_expr(cond, pred) || walk_expr(then_val, pred) || walk_expr(else_val, pred),
 
         // Crypto (multi-arg)
         SorobanExpr::CryptoEd25519Verify {
@@ -324,6 +329,15 @@ fn collect_expr_recursive<'a>(expr: &'a SorobanExpr, out: &mut Vec<&'a SorobanEx
     out.push(expr);
     // Recurse into sub-expressions (simplified — covers main compound variants)
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            collect_expr_recursive(cond, out);
+            collect_expr_recursive(then_val, out);
+            collect_expr_recursive(else_val, out);
+        }
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)

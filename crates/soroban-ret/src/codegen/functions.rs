@@ -142,6 +142,28 @@ fn needs_parens(own_prec: u8, parent_prec: u8, is_right: bool, is_cmp: bool) -> 
 /// `is_right` is true when this is the right operand of a left-associative operator.
 /// Non-operator expressions delegate to `generate_expr_base`.
 fn generate_expr_prec(expr: &SorobanExpr, parent_prec: u8, is_right: bool) -> TokenStream {
+    // A value chosen by a condition (a wasm `select`). An `if` expression is
+    // an operand only inside parentheses.
+    if let SorobanExpr::Select {
+        cond,
+        then_val,
+        else_val,
+    } = expr
+    {
+        if is_never_rooted(expr) {
+            return quote! { todo!("unknown value") };
+        }
+        let c = generate_expr_prec(cond, 0, false);
+        let a = generate_expr_prec(then_val, 0, false);
+        let b = generate_expr_prec(else_val, 0, false);
+        let inner = quote! { if #c { #a } else { #b } };
+        return if parent_prec > 0 {
+            quote! { (#inner) }
+        } else {
+            inner
+        };
+    }
+
     let Some(own_prec) = expr_precedence(expr) else {
         return generate_expr_base(expr);
     };
@@ -321,6 +343,7 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
         }
         SorobanExpr::Env => quote! { env },
 
+        SorobanExpr::Select { .. } => generate_expr(expr),
         // Operators — handled by generate_expr_prec via generate_expr
         SorobanExpr::Add(..)
         | SorobanExpr::Sub(..)
@@ -3918,6 +3941,30 @@ mod generate_stmt_tests {
         assert!(
             cast_out.contains("get :: < _ , u128 >") && cast_out.contains("unwrap_or"),
             "got: {cast_out}"
+        );
+    }
+    /// A wasm `select` renders as the conditional it computes, in parentheses
+    /// wherever it is an operand, and as one hole when its condition is lost.
+    #[test]
+    fn a_select_renders_as_a_conditional_value() {
+        let sel = |cond: SorobanExpr| SorobanExpr::Select {
+            cond: Box::new(cond),
+            then_val: Box::new(SorobanExpr::Param("a".into())),
+            else_val: Box::new(SorobanExpr::Param("b".into())),
+        };
+        let flag = || SorobanExpr::Param("flag".into());
+        assert_eq!(
+            generate_expr_prec(&sel(flag()), 0, false).to_string(),
+            "if flag { a } else { b }"
+        );
+        let sum = SorobanExpr::Add(Box::new(sel(flag())), Box::new(SorobanExpr::I64Literal(1)));
+        assert_eq!(
+            generate_expr_prec(&sum, 0, false).to_string(),
+            "(if flag { a } else { b }) + 1"
+        );
+        assert_eq!(
+            generate_expr(&sel(SorobanExpr::UnknownVal)).to_string(),
+            "todo ! (\"unknown value\")"
         );
     }
 }
