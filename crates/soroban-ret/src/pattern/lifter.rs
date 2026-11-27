@@ -794,10 +794,23 @@ struct LiftContext<'a> {
     /// [`StackVal::RelayBufPtr`] reads it; unset, the load stays `Unknown`
     /// (today's honest `todo!()`).
     relay_index: Option<u32>,
+    /// Caller frame slots the call just lifted stores to (by a static scan
+    /// of the callee), with what each held before it — checked at the next
+    /// instruction (see `check_call_stores`).
+    pending_store_check: Option<Vec<StoreCheck>>,
+    /// The function's multi-level branches were rewritten into exact `if`s
+    /// (issue #74). The `i128` limb-test folds apply only here for now: the
+    /// sequential walk's guard handlers treat a condition they cannot read
+    /// as always passing, and a condition the folds make readable routes
+    /// such a guard to merge paths that are not yet exact.
+    exact_function: bool,
 }
 
 /// `(slot key, write-log length at read time)` — see `slot_read_log`.
 type SlotReadLog = Vec<((u32, i32), usize)>;
+
+/// A caller frame slot a call may store to, and what it held before.
+type StoreCheck = ((u32, i32), Option<StackVal>);
 
 impl<'a> LiftContext<'a> {
     fn new(
@@ -841,6 +854,8 @@ impl<'a> LiftContext<'a> {
             in_analysis_sim: false,
             relay: Rc::new(RefCell::new(None)),
             relay_index: None,
+            pending_store_check: None,
+            exact_function: false,
         }
     }
 
@@ -882,6 +897,8 @@ impl<'a> LiftContext<'a> {
             // NOT inherited: only the verified consume loop's body context is
             // armed, explicitly, by the Loop arm.
             relay_index: None,
+            pending_store_check: None,
+            exact_function: self.exact_function,
         }
     }
 
@@ -1909,6 +1926,18 @@ impl<'a> LiftContext<'a> {
         intr: &I128Intrinsic,
         args: &[StackVal],
     ) -> Option<bool> {
+        let lowered = self.try_lower_i128_intrinsic_inner(intr, args);
+        if lowered.is_none() && self.inline_depth == 0 {
+            I128_LOWER_FAILURES.with(|c| c.set(c.get() + 1));
+        }
+        lowered
+    }
+
+    fn try_lower_i128_intrinsic_inner(
+        &mut self,
+        intr: &I128Intrinsic,
+        args: &[StackVal],
+    ) -> Option<bool> {
         let (a, a_clean) = reconstruct_i128_operand(args.get(intr.a_lo)?, args.get(intr.a_hi)?)?;
         let (b, b_clean) = reconstruct_i128_operand(args.get(intr.b_lo)?, args.get(intr.b_hi)?)?;
         // Require at least one genuinely limb-tracked operand: this confirms we are
@@ -1953,7 +1982,56 @@ impl<'a> LiftContext<'a> {
                 }),
             ),
         };
+        let overflow = intr.overflow_flag_arg.map(|_| {
+            // `a.checked_mul(b).is_none()`: exactly when the helper sets its
+            // flag (issue #74 — the flag used to hold the product's low limb,
+            // so `if overflowed { panic }` read `if a * b { panic }`).
+            let (a_expr, b_expr) = match &result_expr {
+                SorobanExpr::Mul(a, b) => ((**a).clone(), (**b).clone()),
+                _ => unreachable!("overflow flag only on Mul"),
+            };
+            // A literal receiver has no type of its own (`1000.checked_mul`
+            // does not compile). Overflow of a product does not depend on
+            // the operand order, so the other operand takes that position.
+            let is_lit = |e: &SorobanExpr| {
+                let mut e = e;
+                while let SorobanExpr::ValConvert { value, .. }
+                | SorobanExpr::CastAs { value, .. } = e
+                {
+                    e = value;
+                }
+                matches!(
+                    e,
+                    SorobanExpr::I32Literal(_)
+                        | SorobanExpr::I64Literal(_)
+                        | SorobanExpr::I128Literal(_)
+                        | SorobanExpr::U32Literal(_)
+                        | SorobanExpr::U64Literal(_)
+                        | SorobanExpr::U128Literal(_)
+                )
+            };
+            let (a_expr, b_expr) = if is_lit(&a_expr) && !is_lit(&b_expr) {
+                (b_expr, a_expr)
+            } else {
+                (a_expr, b_expr)
+            };
+            StackVal::HostCallResult(Box::new(SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::MethodCall {
+                    object: Box::new(a_expr),
+                    method: "checked_mul".to_string(),
+                    args: vec![b_expr],
+                }),
+                method: "is_none".to_string(),
+                args: Vec::new(),
+            }))
+        });
         let result = StackVal::HostCallResult(Box::new(result_expr));
+        if let (Some(i), Some(flag)) = (intr.overflow_flag_arg, overflow)
+            && let Some(StackVal::FrameSlot(id, base)) = args.get(i)
+            && base.is_static()
+        {
+            self.frame_slots.borrow_mut().insert((*id, base.base), flag);
+        }
         // Write the result back to every result-pointer frame slot, as a limb pair,
         // at the helper's own result layout (`intr.res_*_off`): unchecked helpers
         // write `{lo@0, hi@8}`; checked `Result<i128,E>` helpers write `{lo@8, hi@16}`
@@ -1962,7 +2040,10 @@ impl<'a> LiftContext<'a> {
         // across helpers (some write `0` on Ok, some `1`); an Unknown branch
         // condition is resolved by `fold_checked_result_branch` selecting the
         // value-producing arm, so we recover the value without guessing the polarity.
-        for arg in args {
+        for (i, arg) in args.iter().enumerate() {
+            if Some(i) == intr.overflow_flag_arg {
+                continue;
+            }
             if let StackVal::FrameSlot(id, base) = arg
                 && base.is_static()
             {
@@ -3864,6 +3945,7 @@ impl<'a> LiftContext<'a> {
     }
 
     fn lift_instruction(&mut self, instr: &crate::wasm::ir::WasmInstr) {
+        self.check_call_stores();
         use crate::wasm::ir::WasmInstr;
 
         match instr {
@@ -3982,6 +4064,7 @@ impl<'a> LiftContext<'a> {
 
             // Call instructions - the core of lifting
             WasmInstr::Call(target_idx) => {
+                self.arm_call_store_check(*target_idx);
                 // Issue #38 t23: a call that could write linear memory
                 // invalidates an armed relay — any local function (its
                 // stores may or may not be simulated) and the
@@ -5003,11 +5086,26 @@ impl<'a> LiftContext<'a> {
                                         let mut fs = self.frame_slots.borrow_mut();
                                         // Status = 1 (success) at offset 0
                                         fs.insert((*frame_id, base.base), StackVal::I64(1));
-                                        // Value at offsets 8, 16, 24 (covers both single
-                                        // value and i128 lo/hi patterns)
+                                        // Value at offset 8 (a single value), and as the
+                                        // `(lo, hi)` limbs of an `i128` at 16 / 24: a
+                                        // lone limb still renders as the value, and a
+                                        // limb pair re-joins (issue #74 — a `== 0` test
+                                        // of a stored reserve ORs its two limbs).
                                         fs.insert((*frame_id, base.base + 8), result_val.clone());
-                                        fs.insert((*frame_id, base.base + 16), result_val.clone());
-                                        fs.insert((*frame_id, base.base + 24), result_val);
+                                        fs.insert(
+                                            (*frame_id, base.base + 16),
+                                            StackVal::I128Limb {
+                                                value: Box::new(result_val.clone()),
+                                                hi: false,
+                                            },
+                                        );
+                                        fs.insert(
+                                            (*frame_id, base.base + 24),
+                                            StackVal::I128Limb {
+                                                value: Box::new(result_val),
+                                                hi: true,
+                                            },
+                                        );
                                     }
                                     self.found_host_calls = true;
                                     true
@@ -5774,12 +5872,22 @@ impl<'a> LiftContext<'a> {
             WasmInstr::I64Eq => {
                 let b = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                let (a, b) = if self.exact_function {
+                    fold_limb_all_ones_test(a, b)
+                } else {
+                    (a, b)
+                };
                 self.stack
                     .push(StackVal::Compare(Box::new(a), CmpOp::Eq, Box::new(b)));
             }
             WasmInstr::I32Ne | WasmInstr::I64Ne => {
                 let b = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                let (a, b) = if self.exact_function && matches!(instr, WasmInstr::I64Ne) {
+                    fold_limb_all_ones_test(a, b)
+                } else {
+                    (a, b)
+                };
                 self.stack
                     .push(StackVal::Compare(Box::new(a), CmpOp::Ne, Box::new(b)));
             }
@@ -5843,6 +5951,10 @@ impl<'a> LiftContext<'a> {
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
                 if let Some(v) = to_u64(&a) {
                     self.stack.push(StackVal::I32(if v == 0 { 1 } else { 0 }));
+                } else if self.exact_function
+                    && let Some(f) = self.fold_limb_zero_test(&a)
+                {
+                    self.stack.push(f);
                 } else {
                     self.stack.push(StackVal::Eqz(Box::new(a)));
                 }
@@ -5912,6 +6024,12 @@ impl<'a> LiftContext<'a> {
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
                 match (to_u64(&a), to_u64(&b)) {
                     (Some(av), Some(bv)) => self.stack.push(StackVal::I64((av & bv) as i64)),
+                    // `lo & hi` of one `i128`: kept for the `== -1` test
+                    // (`fold_limb_all_ones_test`); anything else renders it
+                    // as unknown, as before.
+                    _ if self.exact_function && limb_pair_value(&a, &b).is_some() => self
+                        .stack
+                        .push(StackVal::BinOp(Box::new(a), BinOper::And, Box::new(b))),
                     // `<x>.len() & 0xFFFF_FFFF_0000_0000`, or the same mask on
                     // a declared `u32` parameter: the tag-clearing mask on a raw
                     // `U32Val`. KEEP it (as a marked value that still renders as
@@ -6623,6 +6741,178 @@ impl<'a> LiftContext<'a> {
     }
 
     /// Lift a structured tree of WASM blocks into Soroban IR.
+    /// An exact `if` arm (issue #74) that ends in the function's `return`
+    /// leaves its result on the arm's stack, which the join discards — at
+    /// depth 0 a `return` emits no statement and the function's result is
+    /// read off the final stack. Make that arm's result an explicit
+    /// `return <value>`.
+    fn make_arm_return_explicit(
+        &self,
+        arm: &[super::structurize::StructuredBlock],
+        arm_ctx: &LiftContext<'a>,
+        arm_stmts: &mut Vec<SorobanStmt>,
+    ) {
+        if self.inline_depth != 0
+            || self.return_type.is_none()
+            || !matches!(
+                arm.last(),
+                Some(super::structurize::StructuredBlock::Instruction(
+                    crate::wasm::ir::WasmInstr::Return
+                ))
+            )
+            || matches!(arm_stmts.last(), Some(SorobanStmt::Return(_)))
+        {
+            return;
+        }
+        let Some(top) = arm_ctx.stack.last() else {
+            return;
+        };
+        let value = if stack_val_contains_unknown(top) {
+            SorobanExpr::UnknownVal
+        } else {
+            let e = stack_val_to_expr(
+                top,
+                self.params,
+                self.registry,
+                Some(&self.frame_slots.borrow()),
+            );
+            narrow_to_bool(host_get_unwrapped(e), self.return_type)
+        };
+        if matches!(value, SorobanExpr::Void) {
+            return;
+        }
+        cov_mark::hit!(exact_arm_return_made_explicit);
+        arm_stmts.push(SorobanStmt::Return(Some(value)));
+    }
+
+    /// `eqz(l1 | l2 | …)` where the OR-ed leaves are exactly the `(lo, hi)`
+    /// limbs of one or more `i128`s: every one of those values is zero
+    /// (issue #74 — the liquidity pool's `reserve_a == 0 && reserve_b == 0`,
+    /// and every `divisor == 0` check of its divide helper). Exact: an OR of
+    /// 64-bit words is zero iff each word is, and a 128-bit value is zero
+    /// iff both its limbs are.
+    fn fold_limb_zero_test(&self, a: &StackVal) -> Option<StackVal> {
+        let mut leaves = Vec::new();
+        fn collect<'v>(v: &'v StackVal, out: &mut Vec<&'v StackVal>) {
+            match v {
+                StackVal::BinOp(x, BinOper::Or, y) => {
+                    collect(x, out);
+                    collect(y, out);
+                }
+                other => out.push(other),
+            }
+        }
+        collect(a, &mut leaves);
+        if leaves.len() < 2 {
+            return None;
+        }
+        let mut values: Vec<(&StackVal, bool, bool)> = Vec::new();
+        for leaf in leaves {
+            let StackVal::I128Limb { value, hi } = leaf else {
+                return None;
+            };
+            match values.iter_mut().find(|(v, _, _)| **v == **value) {
+                Some(entry) => {
+                    let seen = if *hi { &mut entry.2 } else { &mut entry.1 };
+                    if *seen {
+                        return None;
+                    }
+                    *seen = true;
+                }
+                None => values.push((value, !*hi, *hi)),
+            }
+        }
+        if values
+            .iter()
+            .any(|(v, lo, hi)| !(*lo && *hi) || stack_val_contains_unknown(v))
+        {
+            return None;
+        }
+        cov_mark::hit!(i128_limb_zero_test_folded);
+        if let [(v, _, _)] = values[..] {
+            return Some(StackVal::Compare(
+                Box::new(v.clone()),
+                CmpOp::Eq,
+                Box::new(StackVal::I64(0)),
+            ));
+        }
+        let slots = self.frame_slots.borrow();
+        let zero = |v: &StackVal| {
+            SorobanExpr::Eq(
+                Box::new(force_i128_type(stack_val_to_expr(
+                    v,
+                    self.params,
+                    self.registry,
+                    Some(&slots),
+                ))),
+                Box::new(SorobanExpr::I128Literal(0)),
+            )
+        };
+        let mut it = values.iter().map(|(v, _, _)| zero(v));
+        let first = it.next()?;
+        Some(StackVal::HostCallResult(Box::new(
+            it.fold(first, |acc, e| SorobanExpr::And(Box::new(acc), Box::new(e))),
+        )))
+    }
+
+    /// Before a call into a local helper: note the caller frame slots the
+    /// helper stores to through its pointer parameters (a static scan of its
+    /// body), with what each holds now.
+    fn arm_call_store_check(&mut self, target_idx: u32) {
+        self.check_call_stores();
+        if target_idx < self.wasm_module.num_imported_functions {
+            return;
+        }
+        let Some(ft) = self.wasm_module.get_func_type(target_idx) else {
+            return;
+        };
+        let n = ft.params.len();
+        if n == 0 || self.stack.len() < n {
+            return;
+        }
+        let args = &self.stack[self.stack.len() - n..];
+        let stores = helper_param_stores(self.wasm_module, target_idx);
+        if stores.is_empty() {
+            return;
+        }
+        let slots = self.frame_slots.borrow();
+        let mut check = Vec::new();
+        for (p, off) in stores {
+            if let Some(StackVal::FrameSlot(id, base)) = args.get(p as usize)
+                && base.is_static()
+                && let Some(key) = frame_slot_key(base.base, off)
+            {
+                check.push(((*id, key), slots.get(&(*id, key)).cloned()));
+            }
+        }
+        drop(slots);
+        if !check.is_empty() {
+            self.pending_store_check = Some(check);
+        }
+    }
+
+    /// After a call armed by [`Self::arm_call_store_check`]: a slot the
+    /// helper stores to that still holds the `i128` limb an EARLIER call
+    /// left there was not written by whatever handled this call, so the
+    /// limb is stale (issue #74: liquidity-pool `deposit` read the
+    /// total-share count where its share-balance getter writes the user's
+    /// balance). It becomes unknown.
+    fn check_call_stores(&mut self) {
+        let Some(check) = self.pending_store_check.take() else {
+            return;
+        };
+        let mut slots = self.frame_slots.borrow_mut();
+        for (key, old) in check {
+            // Only a stale `i128` result (a limb an earlier call wrote): a
+            // helper that re-stores what a slot already holds (a key buffer
+            // it fills in place) leaves a value that is still right.
+            if matches!(old, Some(StackVal::I128Limb { .. })) && slots.get(&key) == old.as_ref() {
+                cov_mark::hit!(stale_slot_after_unmodelled_store_forgotten);
+                slots.insert(key, StackVal::Unknown);
+            }
+        }
+    }
+
     fn lift_structured(&mut self, blocks: &[super::structurize::StructuredBlock]) {
         use super::structurize::StructuredBlock;
         let mut i = 0;
@@ -7624,7 +7914,10 @@ impl<'a> LiftContext<'a> {
                     // Lift then branch with child context
                     let mut then_ctx = self.child_context();
                     then_ctx.lift_structured(then_body);
-                    let mut then_stmts = then_ctx.stmts;
+                    let mut then_stmts = std::mem::take(&mut then_ctx.stmts);
+                    if super::restructure::is_exact_if(block_type) {
+                        self.make_arm_return_explicit(then_body, &then_ctx, &mut then_stmts);
+                    }
 
                     let then_slots = DBG_SLOTJOIN.then(|| self.frame_slots.borrow().clone());
 
@@ -7680,7 +7973,10 @@ impl<'a> LiftContext<'a> {
                     // Lift else branch with child context
                     let mut else_ctx = self.child_context();
                     else_ctx.lift_structured(else_body);
-                    let mut else_stmts = else_ctx.stmts;
+                    let mut else_stmts = std::mem::take(&mut else_ctx.stmts);
+                    if super::restructure::is_exact_if(block_type) {
+                        self.make_arm_return_explicit(else_body, &else_ctx, &mut else_stmts);
+                    }
 
                     // Reclassify surviving `CrossArm` taints at the join. A
                     // taint an else-arm store already cleared stays cleared
@@ -7752,9 +8048,21 @@ impl<'a> LiftContext<'a> {
                     self.memory_stores = else_ctx.memory_stores;
                     self.found_host_calls |= then_ctx.found_host_calls | else_ctx.found_host_calls;
 
-                    // GLR: reconcile locals modified in either branch
-                    let then_terminates = then_stmts.iter().any(is_terminator_stmt);
-                    let else_terminates = else_stmts.iter().any(is_terminator_stmt);
+                    // GLR: reconcile locals modified in either branch.
+                    // An exact `if` (issue #74) knows from its structure
+                    // whether an arm can fall through; a lifted arm may hold a
+                    // stray terminator an inlined helper left behind.
+                    let exact_if = super::restructure::is_exact_if(block_type);
+                    let then_terminates = if exact_if {
+                        super::restructure::arm_terminates(then_body)
+                    } else {
+                        then_stmts.iter().any(is_terminator_stmt)
+                    };
+                    let else_terminates = if exact_if {
+                        super::restructure::arm_terminates(else_body)
+                    } else {
+                        else_stmts.iter().any(is_terminator_stmt)
+                    };
                     if !(then_terminates && else_terminates) {
                         reconcile_branch_locals(
                             &mut self.locals,
@@ -7771,6 +8079,7 @@ impl<'a> LiftContext<'a> {
                             self.params,
                             self.registry,
                             Some(&self.frame_slots.borrow()),
+                            super::restructure::is_exact_if(block_type),
                         );
                     }
 
@@ -7871,6 +8180,32 @@ impl<'a> LiftContext<'a> {
                         }
                     }
 
+                    // An exact `if` with one arm that never falls through:
+                    // the other arm's statements run after it, at this
+                    // level, so the bindings they make stay in scope for
+                    // the values that flow out of the join (issue #74).
+                    if super::restructure::is_exact_if(block_type)
+                        && (then_terminates != else_terminates)
+                    {
+                        let (cond, dead, live) = if then_terminates {
+                            (condition, then_stmts, else_stmts)
+                        } else {
+                            (
+                                SorobanExpr::Not(Box::new(condition)),
+                                else_stmts,
+                                then_stmts,
+                            )
+                        };
+                        self.stmts.push(SorobanStmt::If {
+                            condition: cond,
+                            then_body: dead,
+                            else_body: Vec::new(),
+                        });
+                        self.stmts.extend(live);
+                        i += 1;
+                        continue;
+                    }
+
                     // Only emit If when there's meaningful content
                     if !then_stmts.is_empty() || !else_stmts.is_empty() {
                         self.stmts.push(SorobanStmt::If {
@@ -7883,6 +8218,7 @@ impl<'a> LiftContext<'a> {
             }
             i += 1;
         }
+        self.check_call_stores();
         self.settle_value_block_join(&mut pending_join);
     }
 
@@ -10213,6 +10549,7 @@ fn lift_function_body(
         };
     }
 
+    JOIN_BINDING_CTR.with(|c| c.set(0));
     // Initialize locals: WASM params first, then declared locals
     let mut locals: Vec<StackVal> = Vec::new();
     for i in 0..num_wasm_params {
@@ -10226,6 +10563,7 @@ fn lift_function_body(
         locals.push(StackVal::Unknown);
     }
 
+    let fresh_locals = locals.clone();
     let mut ctx = LiftContext::new(
         wasm_module,
         registry,
@@ -10249,12 +10587,71 @@ fn lift_function_body(
     // reach any more, so they do not render as an unconditional panic after
     // the recovered body (issue #80).
     drop_unreachable_fail_tails(&mut structured, wasm_module);
+    // Multi-level branches the walk below has no model for (issue #74).
+    let mut restructured = false;
+    let unrewritten = structured.clone();
+    if std::env::var("DBG_NORESTRUCT").is_err() {
+        // Only regions doing user `i128` arithmetic (a soft-arith helper
+        // call): every other join a multi-level branch makes in this corpus
+        // is an SDK idiom (a `Val` encode/decode split, a bounds or
+        // overflow check, the `Option` front-of-vec) that dedicated
+        // recognizers read off its original shape.
+        let o = super::restructure::restructure_regions(&mut structured, &|f| {
+            detect_i128_intrinsic(wasm_module, f).is_some()
+        });
+        restructured = o.regions > 0;
+        if std::env::var("DBG_RESTRUCT").is_ok() && (o.regions > 0 || !o.refused.is_empty()) {
+            eprintln!("[RESTRUCT] func {func_index} {o:?}");
+        }
+    }
     if let Ok(want) = std::env::var("DBG_STRUCT")
         && (want.is_empty() || want == func_index.to_string())
     {
         eprintln!("[DBG_STRUCT] func {func_index} structured:\n{structured:#?}");
     }
+    I128_LOWER_FAILURES.with(|c| c.set(0));
+    ctx.exact_function = restructured;
     ctx.lift_structured(&structured);
+    let unlowered = I128_LOWER_FAILURES.with(|c| c.get());
+    // The rewrite is an exact control-flow transformation, so it can only
+    // ADD paths the sequential walk flattened away — never lose an effect.
+    // Where the lift of the rewritten body loses one anyway (the lifter's
+    // recognizers misread a shape they were not written for, and the rest of
+    // the body is cut), keep the walk of the original body instead.
+    if restructured {
+        let mut plain = LiftContext::new(
+            wasm_module,
+            registry,
+            params,
+            return_type,
+            fresh_locals,
+            num_wasm_params,
+        );
+        plain.lift_structured(&unrewritten);
+        let (kept, lost) = (effect_census(&ctx.stmts), effect_census(&plain.stmts));
+        // A terminator with statements after it is cut there by dead-code
+        // removal: an inlined helper's stray `panic!` that the guard
+        // contexts of the original shape strip, but a rewritten arm keeps.
+        let cut = nonfinal_terminators(&ctx.stmts) > nonfinal_terminators(&plain.stmts);
+        // A function with no host call is pure arithmetic, which the
+        // dedicated arithmetic recovery below reads off the original shape.
+        let pure = !ctx.found_host_calls;
+        // The rewrite is for `i128` arithmetic the lifter models. Where a
+        // helper call could not be lowered its inlined body leaves guesses
+        // in the frame slots, which the original shape's joins degrade to
+        // unknown and a rewritten straight path would not.
+        let guessed = unlowered > 0;
+        if pure || guessed || cut || kept.iter().zip(&lost).any(|(k, l)| k < l) {
+            cov_mark::hit!(restructure_declined_effect_lost);
+            if std::env::var("DBG_RESTRUCT").is_ok() {
+                eprintln!(
+                    "[RESTRUCT] func {func_index} declined: pure={pure} guessed={guessed} cut={cut} effects {kept:?} vs {lost:?}"
+                );
+            }
+            ctx = plain;
+            restructured = false;
+        }
+    }
 
     // An inlined helper's `return` is spliced in as a bare `return`. Where
     // state-changing code follows it, it cannot be this function's exit.
@@ -10395,6 +10792,7 @@ fn lift_function_body(
     // If we found no meaningful host calls, try pattern detection
     if !ctx.found_host_calls
         && return_type.is_some()
+        && !restructured
         && has_arithmetic_pattern(&func.body)
         // The arithmetic shortcut reduces a function to a single `return <expr>`
         // built from the stack top, discarding any emitted statements. That is
@@ -10857,7 +11255,31 @@ fn lift_inline_call(
             "[DBG_INLINE_STRUCT] inlined func {target_idx} ({num_wasm_params} params):\n{structured:#?}"
         );
     }
+    let log_start = ctx.slot_write_log.borrow().len();
+    let fid_start = *ctx.next_frame_id.borrow();
     ctx.lift_structured(&structured);
+    // A self-recursive helper is inlined only to a fixed depth, so what its
+    // lift wrote into the CALLER's frame slots is one unrolled guess, not
+    // its result (issue #74: the liquidity pool's integer square root
+    // "returned" `0`). Forget those values.
+    if func
+        .body
+        .iter()
+        .any(|i| matches!(i, crate::wasm::ir::WasmInstr::Call(t) if *t == target_idx))
+    {
+        let keys: Vec<(u32, i32)> = ctx.slot_write_log.borrow()[log_start..]
+            .iter()
+            .filter(|w| w.key.0 < fid_start)
+            .map(|w| w.key)
+            .collect();
+        if !keys.is_empty() {
+            cov_mark::hit!(recursive_inline_slot_writes_forgotten);
+        }
+        let mut slots = ctx.frame_slots.borrow_mut();
+        for k in keys {
+            slots.insert(k, StackVal::Unknown);
+        }
+    }
 
     if !ctx.found_host_calls {
         // No host calls — not worth inlining as statements, but return
@@ -11305,6 +11727,9 @@ struct I128Intrinsic {
     /// helpers reserve `+0` for the status discriminant (`lo@8, hi@16`).
     res_lo_off: i32,
     res_hi_off: i32,
+    /// The arg that points at an `i32` overflow flag the helper writes (a
+    /// multiply-with-overflow, `__muloti4`-style), if any.
+    overflow_flag_arg: Option<usize>,
 }
 
 /// Count occurrences of selected opcodes in a function body (a coarse fingerprint).
@@ -12427,6 +12852,19 @@ enum ProtoEnd {
 /// Base of the binding-index range used for getters recovered by execution
 /// (see `try_lower_proto_fallible_getter`): far above any WASM local index.
 const PROTO_BINDING_BASE: u32 = 1 << 20;
+/// Base of the binding-index range for the merge variables of exact joins
+/// (see `fresh_join_binding`): above both the WASM locals and
+/// [`PROTO_BINDING_BASE`]'s range, so a merge never takes a local's name.
+const JOIN_BINDING_BASE: u32 = 1 << 21;
+thread_local! {
+    /// Per-function counter for [`JOIN_BINDING_BASE`] ids; reset by
+    /// `lift_function_body`.
+    static JOIN_BINDING_CTR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// `i128` soft-arith helper calls in the function being lifted (not in
+    /// inlined helpers) whose operands were too degraded to lower; reset by
+    /// `lift_function_body`.
+    static I128_LOWER_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Max symbolic decisions on one path / max paths per evaluated call.
 const PROTO_MAX_DECISIONS: usize = 6;
 const PROTO_MAX_PATHS: usize = 8;
@@ -14482,6 +14920,18 @@ fn detect_i128_intrinsic_inner(
     let func = module.get_function(func_idx)?;
     let fp = opcode_counts(func);
     let (res_lo_off, res_hi_off) = i128_result_offsets(func);
+    // A 6-param multiply that stores an `i32` through its last param reports
+    // overflow there (`*flag = overflowed`), not a second result.
+    let flag_store = func.body.windows(3).any(|w| {
+        matches!(
+            w,
+            [
+                crate::wasm::ir::WasmInstr::LocalGet(5),
+                crate::wasm::ir::WasmInstr::LocalGet(_),
+                crate::wasm::ir::WasmInstr::I32Store(0)
+            ]
+        )
+    });
     let layout = |op: I128Op| I128Intrinsic {
         op,
         a_lo: 1,
@@ -14490,6 +14940,7 @@ fn detect_i128_intrinsic_inner(
         b_hi: 4,
         res_lo_off,
         res_hi_off,
+        overflow_flag_arg: (op == I128Op::Mul && flag_store).then_some(5),
     };
 
     // Leaf unsigned multiply: schoolbook 32-bit limb products, two stores, no calls.
@@ -20423,12 +20874,31 @@ fn reconcile_branch_locals(
     params: &[FnParam],
     registry: &TypeRegistry,
     frame_slots: Option<&FrameSlotMap>,
+    exact: bool,
 ) {
     let limit = pre_branch
         .len()
         .min(branch_a_locals.len())
         .min(branch_b_locals.len())
         .min(parent_locals.len());
+
+    if exact {
+        reconcile_exact_branch_locals(
+            parent_locals,
+            parent_stmts,
+            &pre_branch[..limit],
+            &branch_a_locals[..limit],
+            &branch_b_locals[..limit],
+            a_terminates,
+            b_terminates,
+            branch_a_stmts,
+            branch_b_stmts,
+            params,
+            registry,
+            frame_slots,
+        );
+        return;
+    }
 
     for idx in (num_wasm_params as usize)..limit {
         let pre = &pre_branch[idx];
@@ -20494,6 +20964,228 @@ fn reconcile_branch_locals(
 
         parent_locals[idx] = StackVal::LetBinding(idx as u32);
         phi_protected.push(idx as u32);
+    }
+}
+
+/// The join of an `IfElse` whose arms are exact paths (issue #74; the body was
+/// rewritten by `restructure::restructure_regions`). Unlike the generic merge
+/// it guesses nothing:
+///
+/// - every local is merged, parameters included — LLVM reuses a parameter's
+///   local once the parameter is decoded (liquidity-pool `deposit` keeps the
+///   high limb of its chosen amount in parameter local 3);
+/// - two arms that leave values rendering to the same pure expression agree
+///   (the SDK's small/object `i128` decode is two arms that both yield the
+///   parameter);
+/// - an `i128` held as a `(lo, hi)` limb pair in two locals is merged as ONE
+///   value, so it is still a whole `i128` after the join;
+/// - any other divergence becomes a `let mut` assigned in each arm, whatever
+///   the values are — constants included;
+/// - an arm value that is not known makes the merged value not known.
+///
+/// The merged locals are NOT write-protected afterwards (unlike a `br_table`
+/// merge): LLVM reuses a local for an unrelated value once the merged one is
+/// dead, and that write must land.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_exact_branch_locals(
+    parent_locals: &mut [StackVal],
+    parent_stmts: &mut Vec<SorobanStmt>,
+    pre: &[StackVal],
+    a: &[StackVal],
+    b: &[StackVal],
+    a_terminates: bool,
+    b_terminates: bool,
+    a_stmts: &mut Vec<SorobanStmt>,
+    b_stmts: &mut Vec<SorobanStmt>,
+    params: &[FnParam],
+    registry: &TypeRegistry,
+    frame_slots: Option<&FrameSlotMap>,
+) {
+    if a_terminates && b_terminates {
+        return;
+    }
+    let n = pre.len();
+    // One arm never reaches the join: the other arm's values flow out (the
+    // caller emits that arm's statements after the `if`, so its bindings
+    // stay in scope).
+    if a_terminates || b_terminates {
+        let live = if a_terminates { b } else { a };
+        parent_locals[..n].clone_from_slice(live);
+        return;
+    }
+    let expr = |v: &StackVal| stack_val_to_arith_expr(v, params, registry, frame_slots);
+    // Immutable `let`s each arm binds: out of scope after the `if`.
+    let a_lets = arm_let_values(a_stmts);
+    let b_lets = arm_let_values(b_stmts);
+    let resolved = |v: &StackVal, lets: &HashMap<u32, SorobanExpr>| -> SorobanExpr {
+        let mut e = expr(v);
+        for _ in 0..4 {
+            let next = substitute_locals(e.clone(), lets);
+            if next == e {
+                break;
+            }
+            e = next;
+        }
+        e
+    };
+    // Every binding an arm makes (any depth, mutable or not): out of scope
+    // after the `if`. A binding is named after the WASM local it fills, so
+    // an arm that rebinds a local leaves a value EQUAL to the pre-branch
+    // `LetBinding` of that local but naming a different binding.
+    let a_ids = arm_bound_ids(a_stmts);
+    let b_ids = arm_bound_ids(b_stmts);
+    let in_scope = |v: &StackVal, ids: &[u32]| -> bool {
+        !ids.iter().any(|n| stack_val_mentions_binding(v, *n))
+    };
+    let agree = |x: &StackVal, y: &StackVal| -> bool {
+        if x == y {
+            return in_scope(x, &a_ids) && in_scope(y, &b_ids);
+        }
+        if stack_val_contains_unknown(x) || stack_val_contains_unknown(y) {
+            return false;
+        }
+        let (ex, ey) = (resolved(x, &a_lets), resolved(y, &b_lets));
+        ex == ey && !crate::ir::optimizer::expr_has_side_effects_pub(&ex) && !ex.is_never_rooted()
+    };
+    // Of two agreeing values, the one to keep: in scope after the `if`,
+    // limb-tracked if either is (an `i128` limb pair re-joins only from
+    // `I128Limb`s), else the plainer.
+    let pick = |x: &StackVal, y: &StackVal| -> Option<StackVal> {
+        let cands: Vec<&StackVal> = [(x, &a_ids), (y, &b_ids)]
+            .into_iter()
+            .filter(|(v, ids)| in_scope(v, ids))
+            .map(|(v, _)| v)
+            .collect();
+        cands
+            .into_iter()
+            .min_by_key(|v| (!matches!(v, StackVal::I128Limb { .. }), stack_val_size(v)))
+            .cloned()
+    };
+    let limb_of = |v: &StackVal, hi: bool| -> Option<StackVal> {
+        match v {
+            StackVal::I128Limb { value, hi: h } if *h == hi => Some((**value).clone()),
+            _ => None,
+        }
+    };
+    let mut done = vec![false; n];
+
+    // `i128` limb pairs.
+    for lo in 0..n {
+        if done[lo] {
+            continue;
+        }
+        let (Some(xa), Some(xb)) = (limb_of(&a[lo], false), limb_of(&b[lo], false)) else {
+            continue;
+        };
+        let Some(hi) = (0..n).find(|&h| {
+            h != lo
+                && !done[h]
+                && limb_of(&a[h], true).as_ref() == Some(&xa)
+                && limb_of(&b[h], true).as_ref() == Some(&xb)
+        }) else {
+            continue;
+        };
+        done[lo] = true;
+        done[hi] = true;
+        if agree(&xa, &xb) && in_scope(&xa, &a_ids) {
+            parent_locals[lo] = a[lo].clone();
+            parent_locals[hi] = a[hi].clone();
+            continue;
+        }
+        if agree(&xa, &xb) && in_scope(&xb, &b_ids) {
+            parent_locals[lo] = b[lo].clone();
+            parent_locals[hi] = b[hi].clone();
+            continue;
+        }
+        let id = fresh_join_binding();
+        let name = format!("var_{id}");
+        let init = match (limb_of(&pre[lo], false), limb_of(&pre[hi], true)) {
+            (Some(p), Some(q)) if p == q => expr(&p),
+            _ => SorobanExpr::UnknownVal,
+        };
+        cov_mark::hit!(exact_join_i128_pair_merged);
+        parent_stmts.push(SorobanStmt::Let {
+            name: name.clone(),
+            mutable: true,
+            value: init,
+        });
+        let assign = |x: &StackVal| SorobanStmt::Assign {
+            target: name.clone(),
+            value: if stack_val_contains_unknown(x) {
+                SorobanExpr::UnknownVal
+            } else {
+                expr(x)
+            },
+        };
+        a_stmts.push(assign(&xa));
+        b_stmts.push(assign(&xb));
+        let joined = Box::new(StackVal::LetBinding(id));
+        parent_locals[lo] = StackVal::I128Limb {
+            value: joined.clone(),
+            hi: false,
+        };
+        parent_locals[hi] = StackVal::I128Limb {
+            value: joined,
+            hi: true,
+        };
+    }
+
+    for idx in 0..n {
+        if done[idx] {
+            continue;
+        }
+        let (p, x, y) = (&pre[idx], &a[idx], &b[idx]);
+        // An arm changed the local if it holds another value, or the same
+        // `LetBinding` id of a binding the arm itself made.
+        let a_changed = x != p || !in_scope(x, &a_ids);
+        let b_changed = y != p || !in_scope(y, &b_ids);
+        if !a_changed && !b_changed {
+            continue;
+        }
+        if agree(x, y)
+            && let Some(v) = pick(x, y)
+        {
+            // Same value either way (the SDK's small arm re-encodes
+            // `(v << 8) | tag` what the object arm holds as the value).
+            parent_locals[idx] = v;
+            continue;
+        }
+        // Frame addresses and the like are not values a variable can hold.
+        if matches!(
+            x,
+            StackVal::FrameSlot(..) | StackVal::FrameBase(_) | StackVal::StackPtrRef
+        ) || matches!(
+            y,
+            StackVal::FrameSlot(..) | StackVal::FrameBase(_) | StackVal::StackPtrRef
+        ) {
+            parent_locals[idx] = StackVal::Unknown;
+            continue;
+        }
+        let id = fresh_join_binding();
+        let name = format!("var_{id}");
+        cov_mark::hit!(exact_join_local_merged);
+        parent_stmts.push(SorobanStmt::Let {
+            name: name.clone(),
+            mutable: true,
+            value: if stack_val_contains_unknown(p) {
+                SorobanExpr::UnknownVal
+            } else {
+                expr(p)
+            },
+        });
+        for (arm, v, changed) in [(&mut *a_stmts, x, a_changed), (&mut *b_stmts, y, b_changed)] {
+            if changed {
+                arm.push(SorobanStmt::Assign {
+                    target: name.clone(),
+                    value: if stack_val_contains_unknown(v) {
+                        SorobanExpr::UnknownVal
+                    } else {
+                        expr(v)
+                    },
+                });
+            }
+        }
+        parent_locals[idx] = StackVal::LetBinding(id);
     }
 }
 
@@ -21552,6 +22244,358 @@ fn stack_result_references_binding(v: &StackVal) -> bool {
 }
 
 /// Collect every `Let` binding name in `stmts`, at any nesting depth.
+/// The ids of every `let var_N` in `stmts`, at any depth, mutable or not.
+fn arm_bound_ids(stmts: &[SorobanStmt]) -> Vec<u32> {
+    let mut out = Vec::new();
+    collect_let_names(stmts, &mut |name: &str| {
+        if let Some(n) = name
+            .strip_prefix("var_")
+            .and_then(|n| n.parse::<u32>().ok())
+            && !out.contains(&n)
+        {
+            out.push(n);
+        }
+    });
+    out
+}
+
+/// `var_N` → value of every immutable `let` in `stmts` (top level and nested).
+fn arm_let_values(stmts: &[SorobanStmt]) -> HashMap<u32, SorobanExpr> {
+    let mut mutable = Vec::new();
+    collect_mutable_names(stmts, &mut mutable);
+    let mut out = HashMap::new();
+    fn walk(stmts: &[SorobanStmt], mutable: &[String], out: &mut HashMap<u32, SorobanExpr>) {
+        for s in stmts {
+            match s {
+                SorobanStmt::Let {
+                    name,
+                    mutable: false,
+                    value,
+                } if !mutable.contains(name) => {
+                    if let Some(n) = name
+                        .strip_prefix("var_")
+                        .and_then(|n| n.parse::<u32>().ok())
+                    {
+                        out.insert(n, value.clone());
+                    }
+                }
+                SorobanStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, mutable, out);
+                    walk(else_body, mutable, out);
+                }
+                SorobanStmt::Block(b) => walk(b, mutable, out),
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, &mutable, &mut out);
+    out
+}
+
+/// `Local(n)` → `lets[n]` throughout `e`.
+fn substitute_locals(e: SorobanExpr, lets: &HashMap<u32, SorobanExpr>) -> SorobanExpr {
+    if let SorobanExpr::Local(i) = e {
+        return lets.get(&i).cloned().unwrap_or(SorobanExpr::Local(i));
+    }
+    crate::ir::correctness::map_subexprs(e, &|x| substitute_locals(x, lets))
+}
+
+/// How many of each observable effect `stmts` performs, by kind: storage
+/// writes/removals, lifetime extensions, contract calls, events, auth
+/// checks, and panics with a contract error.
+fn effect_census(stmts: &[SorobanStmt]) -> [usize; 6] {
+    fn expr(e: &SorobanExpr, out: &std::cell::RefCell<[usize; 6]>) {
+        let k = match e {
+            SorobanExpr::StorageSet { .. } | SorobanExpr::StorageRemove { .. } => Some(0),
+            SorobanExpr::StorageExtendTtl { .. } | SorobanExpr::ExtendInstanceAndCodeTtl { .. } => {
+                Some(1)
+            }
+            SorobanExpr::InvokeContract { .. } | SorobanExpr::TryInvokeContract { .. } => Some(2),
+            SorobanExpr::PublishEvent { .. } => Some(3),
+            SorobanExpr::RequireAuth(_) | SorobanExpr::RequireAuthForArgs { .. } => Some(4),
+            SorobanExpr::PanicWithError(_) => Some(5),
+            _ => None,
+        };
+        if let Some(k) = k {
+            out.borrow_mut()[k] += 1;
+        }
+        let _ = crate::ir::correctness::map_subexprs(e.clone(), &|x| {
+            expr(&x, out);
+            x
+        });
+    }
+    let out = std::cell::RefCell::new([0usize; 6]);
+    let _ = crate::ir::correctness::map_exprs_in_stmts(stmts.to_vec(), &|e| {
+        expr(&e, &out);
+        e
+    });
+    out.into_inner()
+}
+
+/// Statement lists (at any depth) in which a terminator is followed by
+/// further statements.
+fn nonfinal_terminators(stmts: &[SorobanStmt]) -> usize {
+    let here = stmts
+        .iter()
+        .position(is_terminator_stmt)
+        .is_some_and(|p| p + 1 < stmts.len()) as usize;
+    here + stmts
+        .iter()
+        .map(|s| match s {
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => nonfinal_terminators(then_body) + nonfinal_terminators(else_body),
+            SorobanStmt::Match { arms, .. } => {
+                arms.iter().map(|a| nonfinal_terminators(&a.body)).sum()
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => nonfinal_terminators(body),
+            _ => 0,
+        })
+        .sum::<usize>()
+}
+
+/// The `i128` whose two limbs `a` and `b` are (in either order).
+fn limb_pair_value<'v>(a: &'v StackVal, b: &'v StackVal) -> Option<&'v StackVal> {
+    match (a, b) {
+        (StackVal::I128Limb { value: x, hi: h1 }, StackVal::I128Limb { value: y, hi: h2 })
+            if x == y && h1 != h2 =>
+        {
+            Some(x)
+        }
+        _ => None,
+    }
+}
+
+/// `(lo & hi) == -1` of one `i128` is `value == -1` (both limbs all ones).
+/// Returns the compare operands, folded when the shape matches.
+fn fold_limb_all_ones_test(a: StackVal, b: StackVal) -> (StackVal, StackVal) {
+    let ones = |v: &StackVal| matches!(v, StackVal::I64(-1));
+    let pair = |v: &StackVal| match v {
+        StackVal::BinOp(x, BinOper::And, y) => limb_pair_value(x, y).cloned(),
+        _ => None,
+    };
+    if ones(&b)
+        && let Some(v) = pair(&a)
+    {
+        cov_mark::hit!(i128_limb_all_ones_test_folded);
+        return (v, StackVal::I64(-1));
+    }
+    if ones(&a)
+        && let Some(v) = pair(&b)
+    {
+        cov_mark::hit!(i128_limb_all_ones_test_folded);
+        return (v, StackVal::I64(-1));
+    }
+    (a, b)
+}
+
+/// A fresh binding id for an exact join's merge variable (shares the
+/// per-function [`JOIN_BINDING_BASE`] range).
+fn fresh_join_binding() -> u32 {
+    JOIN_BINDING_CTR.with(|c| {
+        c.set(c.get() + 1);
+        JOIN_BINDING_BASE + c.get()
+    })
+}
+
+/// `(param, offset)` of every store a helper makes through one of its own
+/// parameters: the store's address operand is `local.get p` (found by
+/// walking back over the straight-line stack effects before the store), so
+/// it writes `p + offset`.
+fn helper_param_stores(module: &WasmModule, func_idx: u32) -> Vec<(u32, u32)> {
+    use crate::wasm::ir::WasmInstr as W;
+    let Some(func) = module.get_function(func_idx) else {
+        return Vec::new();
+    };
+    let n = module
+        .get_func_type(func_idx)
+        .map_or(0, |ft| ft.params.len() as u32);
+    // (pops, pushes), or `None` where the walk must stop.
+    let effect = |i: &W| -> Option<(usize, usize)> {
+        Some(match i {
+            W::I32Const(_) | W::I64Const(_) | W::LocalGet(_) | W::GlobalGet(_) | W::MemorySize => {
+                (0, 1)
+            }
+            W::LocalSet(_) | W::GlobalSet(_) | W::Drop => (1, 0),
+            W::LocalTee(_)
+            | W::I32Eqz
+            | W::I64Eqz
+            | W::I32WrapI64
+            | W::I64ExtendI32S
+            | W::I64ExtendI32U
+            | W::MemoryGrow
+            | W::I32Load(_)
+            | W::I64Load(_)
+            | W::I32Load8S(_)
+            | W::I32Load8U(_)
+            | W::I32Load16S(_)
+            | W::I32Load16U(_)
+            | W::I64Load8S(_)
+            | W::I64Load8U(_)
+            | W::I64Load16S(_)
+            | W::I64Load16U(_)
+            | W::I64Load32S(_)
+            | W::I64Load32U(_) => (1, 1),
+            W::I32Store(_)
+            | W::I64Store(_)
+            | W::I32Store8(_)
+            | W::I32Store16(_)
+            | W::I64Store8(_)
+            | W::I64Store16(_)
+            | W::I64Store32(_) => (2, 0),
+            W::Select => (3, 1),
+            W::Nop => (0, 0),
+            W::Call(f) => {
+                let ft = module.get_func_type(*f)?;
+                (ft.params.len(), ft.results.len())
+            }
+            W::Block { .. }
+            | W::Loop { .. }
+            | W::If { .. }
+            | W::Else
+            | W::End
+            | W::Br(_)
+            | W::BrIf(_)
+            | W::BrTable { .. }
+            | W::Return
+            | W::Unreachable
+            | W::CallIndirect(_)
+            | W::Unknown(_) => return None,
+            // Every remaining variant is a binary arithmetic/compare op.
+            _ => (2, 1),
+        })
+    };
+    let body = &func.body;
+    let mut out = Vec::new();
+    for (i, ins) in body.iter().enumerate() {
+        let off = match ins {
+            W::I32Store(o)
+            | W::I64Store(o)
+            | W::I32Store8(o)
+            | W::I32Store16(o)
+            | W::I64Store8(o)
+            | W::I64Store16(o)
+            | W::I64Store32(o) => *o,
+            _ => continue,
+        };
+        // Depth of the address operand below the top of the stack, just
+        // before instruction `j` runs (the value is at depth 0).
+        let mut depth = 1usize;
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            let Some((pops, pushes)) = effect(&body[j]) else {
+                break;
+            };
+            if depth < pushes {
+                if let W::LocalGet(p) = body[j]
+                    && p < n
+                    && !out.contains(&(p, off))
+                {
+                    out.push((p, off));
+                }
+                break;
+            }
+            depth = depth - pushes + pops;
+        }
+    }
+    out
+}
+
+/// Node count of a stack value (a host-call expression counts as one).
+fn stack_val_size(v: &StackVal) -> usize {
+    match v {
+        StackVal::BinOp(a, _, b) | StackVal::Compare(a, _, b) => {
+            1 + stack_val_size(a) + stack_val_size(b)
+        }
+        StackVal::Eqz(a) => 1 + stack_val_size(a),
+        StackVal::I128Limb { value, .. } => 1 + stack_val_size(value),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => 1 + stack_val_size(cond) + stack_val_size(then_val) + stack_val_size(else_val),
+        _ => 1,
+    }
+}
+
+/// True when `v` reads binding `n` (a `LetBinding`, or a `Local` inside a
+/// host-call expression).
+fn stack_val_mentions_binding(v: &StackVal, n: u32) -> bool {
+    match v {
+        StackVal::LetBinding(i) => *i == n,
+        StackVal::HostCallResult(e) => expr_mentions_local(e, n),
+        StackVal::BinOp(a, _, b) | StackVal::Compare(a, _, b) => {
+            stack_val_mentions_binding(a, n) || stack_val_mentions_binding(b, n)
+        }
+        StackVal::Eqz(a) => stack_val_mentions_binding(a, n),
+        StackVal::I128Limb { value, .. } => stack_val_mentions_binding(value, n),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stack_val_mentions_binding(cond, n)
+                || stack_val_mentions_binding(then_val, n)
+                || stack_val_mentions_binding(else_val, n)
+        }
+        _ => false,
+    }
+}
+
+/// True when `e` contains `Local(n)`.
+fn expr_mentions_local(e: &SorobanExpr, n: u32) -> bool {
+    fn walk(e: SorobanExpr, n: u32, found: &std::cell::Cell<bool>) -> SorobanExpr {
+        if matches!(e, SorobanExpr::Local(i) if i == n) {
+            found.set(true);
+            return e;
+        }
+        crate::ir::correctness::map_subexprs(e, &|x| walk(x, n, found))
+    }
+    let found = std::cell::Cell::new(false);
+    walk(e.clone(), n, &found);
+    found.get()
+}
+
+/// Names bound by a `let mut` or assigned anywhere in `stmts`.
+fn collect_mutable_names(stmts: &[SorobanStmt], out: &mut Vec<String>) {
+    for s in stmts {
+        match s {
+            SorobanStmt::Let {
+                name,
+                mutable: true,
+                ..
+            }
+            | SorobanStmt::Assign { target: name, .. } => out.push(name.clone()),
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_mutable_names(then_body, out);
+                collect_mutable_names(else_body, out);
+            }
+            SorobanStmt::Match { arms, .. } => {
+                for a in arms {
+                    collect_mutable_names(&a.body, out);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => collect_mutable_names(body, out),
+            _ => {}
+        }
+    }
+}
+
 fn collect_let_names(stmts: &[SorobanStmt], f: &mut impl FnMut(&str)) {
     for s in stmts {
         match s {
@@ -22192,7 +23236,10 @@ fn stack_val_to_expr_inner(
                 | SorobanExpr::Lt(_, _)
                 | SorobanExpr::Le(_, _)
                 | SorobanExpr::Gt(_, _)
-                | SorobanExpr::Ge(_, _) => SorobanExpr::Not(Box::new(a_expr)),
+                | SorobanExpr::Ge(_, _)
+                | SorobanExpr::And(_, _)
+                | SorobanExpr::Or(_, _)
+                | SorobanExpr::Not(_) => SorobanExpr::Not(Box::new(a_expr)),
                 _ => SorobanExpr::Eq(Box::new(a_expr), Box::new(SorobanExpr::I32Literal(0))),
             }
         }
@@ -23173,6 +24220,59 @@ mod tests {
     }
 
     // ----- stack_val_to_expr frame-slot cycle guard --------------------
+
+    /// PR #101 review: an arm that rebinds a local leaves the same
+    /// `LetBinding` id as the outer binding of that local, but names a
+    /// different binding. The join must merge it, not keep the outer one.
+    #[test]
+    fn exact_join_merges_a_local_an_arm_rebinds() {
+        let registry = empty_registry();
+        let pre = vec![StackVal::LetBinding(5)];
+        let mut parent = pre.clone();
+        let mut parent_stmts = Vec::new();
+        let mut a_stmts = vec![SorobanStmt::Let {
+            name: "var_5".to_string(),
+            mutable: false,
+            value: SorobanExpr::LedgerSequence,
+        }];
+        let mut b_stmts = Vec::new();
+        reconcile_exact_branch_locals(
+            &mut parent,
+            &mut parent_stmts,
+            &pre,
+            &[StackVal::LetBinding(5)],
+            &[StackVal::LetBinding(5)],
+            false,
+            false,
+            &mut a_stmts,
+            &mut b_stmts,
+            &[],
+            &registry,
+            None,
+        );
+        let StackVal::LetBinding(id) = parent[0] else {
+            panic!("{parent:?}")
+        };
+        assert_ne!(id, 5, "the outer binding must not survive the join");
+        assert!(
+            matches!(&parent_stmts[..], [SorobanStmt::Let { mutable: true, .. }]),
+            "{parent_stmts:?}"
+        );
+        assert!(
+            matches!(
+                a_stmts.last(),
+                Some(SorobanStmt::Assign {
+                    value: SorobanExpr::Local(5),
+                    ..
+                })
+            ),
+            "{a_stmts:?}"
+        );
+        assert!(
+            b_stmts.is_empty(),
+            "the other arm keeps the outer value: {b_stmts:?}"
+        );
+    }
 
     fn empty_registry() -> crate::spec::registry::TypeRegistry {
         crate::spec::registry::TypeRegistry {

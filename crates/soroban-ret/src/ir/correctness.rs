@@ -1274,7 +1274,7 @@ pub fn lifetime_extensions_under_has(
 /// Apply `f` to every expression that appears directly in `stmts`, recursing
 /// into nested statement bodies. `f` is responsible for its own sub-expression
 /// recursion (it receives whole expressions).
-pub(super) fn map_exprs_in_stmts(
+pub(crate) fn map_exprs_in_stmts(
     stmts: Vec<SorobanStmt>,
     f: &dyn Fn(SorobanExpr) -> SorobanExpr,
 ) -> Vec<SorobanStmt> {
@@ -1340,7 +1340,7 @@ pub(super) fn map_exprs_in_stmts(
 /// Apply `f` to the *direct* sub-expressions of `expr`, rebuilding it. Used as
 /// the recursion fall-through for expression rewriters that only special-case a
 /// few node kinds. Leaf nodes are returned unchanged.
-pub(super) fn map_subexprs(
+pub(crate) fn map_subexprs(
     expr: SorobanExpr,
     f: &dyn Fn(SorobanExpr) -> SorobanExpr,
 ) -> SorobanExpr {

@@ -22,7 +22,7 @@
       "fn_clean": 19,
       "fn_partial": 51,
       "fn_logic_lost": 6,
-      "artifacts_total": 387,
+      "artifacts_total": 386,
       "wasm_size": 54833,
       "error": null
     },
