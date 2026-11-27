@@ -913,13 +913,22 @@ fn liquidity_pool_deposit_paths_and_reserves() {
         ),
         "{deposit}"
     );
-    // The minted share balance is not the total-share count left in the
-    // slot by an earlier read: the balance read is not modelled, so the
-    // stored value is a hole.
+    // The minted share balance is the user's own balance, read with its
+    // default (`get_shares` is `get(&Shares(user)).unwrap_or(0)`), not the
+    // total-share count an earlier read left in the result slot.
     assert!(
-        deposit
-            .contains(".set::<_,soroban_sdk::Val>(&DataKey::Shares(to),todo!(\"unknownvalue\"))"),
+        deposit.contains(".set(&DataKey::Shares(to.clone()),&(env.storage().persistent().get::<_,i128>(&DataKey::Shares(to.clone())).unwrap_or(0)+"),
         "{deposit}"
+    );
+    let withdraw = body_of("withdraw");
+    assert!(
+        withdraw.contains(".set(&DataKey::Shares(to.clone()),&(env.storage().persistent().get::<_,i128>(&DataKey::Shares(to.clone())).unwrap_or(0)-share_amount)"),
+        "{withdraw}"
+    );
+    let balance = body_of("balance_shares");
+    assert!(
+        balance.ends_with(".get::<_,i128>(&DataKey::Shares(user.clone())).unwrap_or(0)}"),
+        "{balance}"
     );
 }
 
@@ -1470,14 +1479,11 @@ fn test_all_fixtures_decompile() {
 // Fixtures with a known, tracked `todo!("unknown value")` gap that is NOT a
 // truncation artifact.
 //
-// `test_liquidity_pool`: `deposit` mints `min(shares_a, shares_b)`. The i128
-// share-math itself is reconstructed (the soft-arith multiply/divide helpers
-// lower to clean `Mul`/`Div`), but the divisor of `shares_a` reaches its
-// divide helper as a stale limb pair, so one operand of the `min` is lost.
-// The output had no hole only because a `select` rendered its first operand
-// whatever the condition (issue #80): it minted `shares_b` and dropped the
-// `min`. The two stored share values are honest holes until that operand is
-// recovered (issue #74).
+// `test_liquidity_pool` (issue #74): `deposit`'s branches, guards, amounts and
+// share balances are recovered, but its integer square root (a self-recursive
+// helper, for the first deposit's shares) and the `dividend == i128::MIN` half
+// of its division guards are holes, and `swap` still loses values in branches
+// no `i128` join region covers.
 //
 // `import_contract`: `safe_add_with` / `safe_add_with_two` map a `try_call`
 // result by hand (callee error 1 → `Err(Overflow)`, anything else →

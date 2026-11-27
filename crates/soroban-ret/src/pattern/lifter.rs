@@ -3248,6 +3248,7 @@ impl<'a> LiftContext<'a> {
         id: u32,
         base: i32,
         stmts: &mut Vec<SorobanStmt>,
+        ty: Int128Type,
     ) -> bool {
         // NOTE: no "slot still unmodeled" gate here, deliberately. The inline
         // of this very call just wrote both slots, and its branch-sequential
@@ -3289,21 +3290,44 @@ impl<'a> LiftContext<'a> {
         // protocol walk proved the husk contains no writes), so it observes
         // the same value; if no consumer resolves to the binding, dead-store
         // and orphan-call passes clean it up.
-        let var_idx = self.locals.len() as u32;
-        self.locals.push(StackVal::LetBinding(var_idx));
-        stmts.push(SorobanStmt::Let {
-            name: format!("var_{var_idx}"),
-            mutable: false,
-            value: SorobanExpr::CastAs {
-                value: Box::new(SorobanExpr::StorageGet {
-                    storage_type,
-                    key: Box::new(key),
-                    unwrap: false,
-                    on_missing: Some(Box::new(SorobanExpr::U128Literal(0))),
-                }),
-                target_type: "u128".to_string(),
+        // A binding id from the function-wide range, not `self.locals.len()`:
+        // that is per-context, so the caller's own later binding under the
+        // same index would shadow this read (issue #74: the liquidity pool
+        // burned shares against the total-share count bound afterwards).
+        let var_idx = {
+            let mut ctr = self.next_frame_id.borrow_mut();
+            *ctr += 1;
+            PROTO_BINDING_BASE + *ctr
+        };
+        // The helper's own trailing void `return` is only the call
+        // completing; spliced into the caller it would make the binding, and
+        // everything after the call, dead code.
+        if matches!(stmts.last(), Some(SorobanStmt::Return(None))) {
+            stmts.pop();
+        }
+        stmts.insert(
+            stmts.len(),
+            SorobanStmt::Let {
+                name: format!("var_{var_idx}"),
+                mutable: false,
+                value: SorobanExpr::CastAs {
+                    value: Box::new(SorobanExpr::StorageGet {
+                        storage_type,
+                        key: Box::new(key),
+                        unwrap: false,
+                        on_missing: Some(Box::new(match ty {
+                            Int128Type::U128 => SorobanExpr::U128Literal(0),
+                            Int128Type::I128 => SorobanExpr::I128Literal(0),
+                        })),
+                    }),
+                    target_type: match ty {
+                        Int128Type::U128 => "u128",
+                        Int128Type::I128 => "i128",
+                    }
+                    .to_string(),
+                },
             },
-        });
+        );
         let limb_source = StackVal::LetBinding(var_idx);
         let mut slots = self.frame_slots.borrow_mut();
         slots.insert(
@@ -5020,7 +5044,10 @@ impl<'a> LiftContext<'a> {
                             self.wasm_module,
                             self.registry,
                             *target_idx,
-                        ) {
+                        ) && (keyed_get_variant_known(&keyed_get_info, &args)
+                            || detect_defaulting_int128_getter(self.wasm_module, *target_idx)
+                                .is_none())
+                        {
                             // Detected a keyed storage GET wrapper.
                             // Same logic as keyed SET: resolve variant from key index
                             // arg, emit StorageGet with the correct enum key.
@@ -5570,6 +5597,9 @@ impl<'a> LiftContext<'a> {
                             // so a later `i32.load; br_table` reconstructs
                             // `match <call> { Ok(..) => .., Err(..) => .. }` and its
                             // return path instead of dropping the whole dispatch.
+                            // The defaulting-getter seed binds the read in the helper's
+                            // statements, which must then be kept.
+                            let mut defaulting_getter_seeded = false;
                             if num_results == 0
                                 && let Some((id, base)) = output_frame_slot
                             {
@@ -5583,20 +5613,17 @@ impl<'a> LiftContext<'a> {
                                 // discriminant, so it must be recognized BEFORE
                                 // the option-decode seed would stamp `+0` with a
                                 // disc marker that is really the lo limb.
-                                let defaulting_seeded =
-                                    detect_defaulting_u128_getter(self.wasm_module, *target_idx)
-                                        && match inline_result.content.as_mut() {
-                                            Some((inlined_stmts, _)) => self
-                                                .seed_defaulting_u128_getter(
-                                                    id,
-                                                    base,
-                                                    inlined_stmts,
-                                                ),
-                                            None => false,
-                                        };
+                                defaulting_getter_seeded = match (
+                                    detect_defaulting_int128_getter(self.wasm_module, *target_idx),
+                                    inline_result.content.as_mut(),
+                                ) {
+                                    (Some(ty), Some((inlined_stmts, _))) => self
+                                        .seed_defaulting_u128_getter(id, base, inlined_stmts, ty),
+                                    _ => false,
+                                };
                                 // …then the pure TryFromVal decode-helper seed
                                 // (issue #34 t2): payload slots = decode(operand).
-                                if !defaulting_seeded
+                                if !defaulting_getter_seeded
                                     && let Some(class) = detect_tryfromval_decode_helper(
                                         self.wasm_module,
                                         *target_idx,
@@ -5608,7 +5635,7 @@ impl<'a> LiftContext<'a> {
                                 // …then the storage-decode Option seed (issue #35),
                                 // for the fallible has+get wrapper class (again only
                                 // when the slot is still unmodeled).
-                                let option_seeded = !defaulting_seeded
+                                let option_seeded = !defaulting_getter_seeded
                                     && self.seed_option_decode_status(id, base, *target_idx);
                                 // A freshly-recognized option-decode wrapper also
                                 // left the loaded value at `+8` — link it to the
@@ -5653,7 +5680,8 @@ impl<'a> LiftContext<'a> {
                                 let result_layout = output_frame_slot
                                     .filter(|_| num_results == 0)
                                     .and_then(|(id, base)| self.clean_i128_result_layout(id, base));
-                                let dropped_husks = result_layout.is_some()
+                                let dropped_husks = !defaulting_getter_seeded
+                                    && result_layout.is_some()
                                     && stmts_are_pure_arith_husks(&inlined_stmts);
                                 if dropped_husks {
                                     // For the checked `Result<i128,E>` layout, seed the
@@ -17268,6 +17296,26 @@ fn detect_keyed_storage_set_wrapper(
     })
 }
 
+/// The keyed GET wrapper arm can lower the call: the variant is fixed in the
+/// wrapper, or the call passes it as a constant `i64` index in range. When it
+/// cannot (a key built from a payload the caller passes) the arm emits
+/// nothing, so the read vanishes. A proven defaulting 128-bit getter
+/// ([`detect_defaulting_int128_getter`], e.g. the liquidity pool's
+/// `get(&DataKey::Shares(user)).unwrap_or(0)`) then falls through to the
+/// inline and its seed instead (issue #74). Other helpers keep the arm:
+/// inlined, a keyed getter leaves its KEY in the value slot at the has-join
+/// (`CoreDataKeys::Admin.require_auth()`), which is worse than the missing
+/// read.
+fn keyed_get_variant_known(info: &KeyedStorageSetWrapperInfo, args: &[StackVal]) -> bool {
+    let idx = info.hardcoded_variant_idx.or_else(|| {
+        args.iter().find_map(|a| match a {
+            StackVal::I64(v) => Some(*v as usize),
+            _ => None,
+        })
+    });
+    idx.is_some_and(|i| i < info.variants.len())
+}
+
 /// Detect a "keyed storage get" wrapper function — the GET equivalent of
 /// `detect_keyed_storage_set_wrapper`.
 ///
@@ -17689,8 +17737,10 @@ fn walk_getter_protocol(
     gets: &mut Vec<(StorageType, SorobanExpr)>,
     bindings: &mut Vec<(String, SorobanExpr)>,
 ) -> bool {
-    for stmt in stmts {
+    for (pos, stmt) in stmts.iter().enumerate() {
         match stmt {
+            // The helper's own void exit, as its last statement.
+            SorobanStmt::Return(None) if pos + 1 == stmts.len() => {}
             SorobanStmt::Expr(e) => match e {
                 SorobanExpr::ExtendInstanceAndCodeTtl { .. }
                 | SorobanExpr::StorageExtendTtl { .. } => {}
@@ -18707,6 +18757,154 @@ fn collect_proven_instance_ttl_bumps(
 ///   (an extra store would mean a layout this detector does not prove).
 ///
 /// Any deviation → `false` → the caller leaves today's output byte-identical.
+/// The value type of a defaulting 128-bit getter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Int128Type {
+    U128,
+    I128,
+}
+
+/// A `get(&key).unwrap_or(0)` helper for a 128-bit integer, writing the value
+/// as `[lo@0, hi@8]` through its result pointer: the original key-less `u128`
+/// form ([`detect_defaulting_u128_getter`]), or one whose key is built from
+/// `i64` payload parameters and whose decode is delegated to a helper
+/// (issue #74: the liquidity pool's `get_shares(user)`).
+///
+/// The delegated form is accepted only when its proof is in the bytecode: it
+/// only reads storage (`has` + `get`, no write, no contract call), exactly one
+/// 128-bit decode width is reachable, it stores exactly `[0, 8]`, and both
+/// stored values are locals whose first write is `i64.const 0` ahead of any
+/// block and which are written exactly once more — from the delegated decode's
+/// result, its `lo` limb (`+16`) into the local stored at `+0` and its `hi`
+/// limb (`+24`) into the one stored at `+8`. Every path therefore stores
+/// either the zero default or the decoded value, halves in order.
+fn detect_defaulting_int128_getter(module: &WasmModule, func_idx: u32) -> Option<Int128Type> {
+    use crate::wasm::ir::{WasmInstr, WasmType};
+    if detect_defaulting_u128_getter(module, func_idx) {
+        return Some(Int128Type::U128);
+    }
+    let func_type = module.get_func_type(func_idx)?;
+    let [WasmType::I32, payload @ ..] = func_type.params.as_slice() else {
+        return None;
+    };
+    if !func_type.results.is_empty() || payload.iter().any(|t| *t != WasmType::I64) {
+        return None;
+    }
+    let ledger =
+        |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Ledger, name, 3);
+    if !ledger("get_contract_data") || !ledger("has_contract_data") || ledger("put_contract_data") {
+        return None;
+    }
+    if function_calls_module_in_chain(module, func_idx, HostModule::Call, 3) {
+        return None;
+    }
+    let int = |name: &str| function_calls_host_in_chain(module, func_idx, HostModule::Int, name, 3);
+    let i128 = int("obj_to_i128_lo64") && int("obj_to_i128_hi64");
+    let u128 = int("obj_to_u128_lo64") || int("obj_to_u128_hi64");
+    if int("obj_to_u64") || int("obj_to_i64") || i128 == u128 {
+        return None;
+    }
+    let func = module.get_function(func_idx)?;
+    if i64_store_offsets(func)? != [0, 8] {
+        return None;
+    }
+    let n_params = func_type.params.len() as u32;
+    let mut stored_at: Vec<(u32, u32)> = Vec::new();
+    for w in func.body.windows(3) {
+        if let [
+            WasmInstr::LocalGet(0),
+            WasmInstr::LocalGet(l),
+            WasmInstr::I64Store(o),
+        ] = w
+            && !stored_at.contains(&(*l, *o))
+        {
+            stored_at.push((*l, *o));
+        }
+    }
+    stored_at.sort_unstable_by_key(|(_, o)| *o);
+    if stored_at.iter().map(|(_, o)| *o).collect::<Vec<_>>() != [0, 8]
+        || stored_at[0].0 == stored_at[1].0
+        || stored_at.iter().any(|(l, _)| *l < n_params)
+    {
+        return None;
+    }
+    let first_block = func.body.iter().position(|i| {
+        matches!(
+            i,
+            WasmInstr::Block { .. } | WasmInstr::Loop { .. } | WasmInstr::If { .. }
+        )
+    })?;
+    // The decode the helper delegates to, and the local it passes as that
+    // decode's result pointer (walking back over the stack effects to the
+    // call's first argument).
+    let want = if i128 {
+        DecodeHelperClass::I128
+    } else {
+        DecodeHelperClass::U128
+    };
+    let mut decode_ptrs = Vec::new();
+    for (pos, ins) in func.body.iter().enumerate() {
+        let WasmInstr::Call(d) = ins else { continue };
+        if detect_tryfromval_decode_helper(module, *d) != Some(want) {
+            continue;
+        }
+        // The first argument is the deepest operand.
+        let mut depth = module.get_func_type(*d)?.params.len() - 1;
+        let mut j = pos;
+        let mut ptr = None;
+        while j > 0 {
+            j -= 1;
+            let Some((pops, pushes)) = instr_stack_effect(module, &func.body[j]) else {
+                break;
+            };
+            if depth < pushes {
+                if let WasmInstr::LocalGet(p) = func.body[j] {
+                    ptr = Some(p);
+                }
+                break;
+            }
+            depth = depth - pushes + pops;
+        }
+        decode_ptrs.push(ptr?);
+    }
+    let [ptr] = decode_ptrs[..] else {
+        return None;
+    };
+    // Each stored local: `i64.const 0` first, ahead of any block, then
+    // exactly the decoded limb matching where it is stored — the decode's
+    // `lo` (`+16`) for the `+0` store, its `hi` (`+24`) for `+8`.
+    for (l, store_off) in &stored_at {
+        let limb = if *store_off == 0 { 16 } else { 24 };
+        let sets: Vec<usize> = func
+            .body
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| matches!(i, WasmInstr::LocalSet(x) | WasmInstr::LocalTee(x) if x == l))
+            .map(|(p, _)| p)
+            .collect();
+        let [first, decoded] = sets[..] else {
+            return None;
+        };
+        if first == 0
+            || first > first_block
+            || !matches!(func.body[first - 1], WasmInstr::I64Const(0))
+            || decoded < 2
+            || !matches!(
+                func.body[decoded - 2..decoded],
+                [WasmInstr::LocalGet(p), WasmInstr::I64Load(o)] if p == ptr && o == limb
+            )
+        {
+            return None;
+        }
+    }
+    cov_mark::hit!(defaulting_keyed_int128_getter_detected);
+    Some(if i128 {
+        Int128Type::I128
+    } else {
+        Int128Type::U128
+    })
+}
+
 fn detect_defaulting_u128_getter(module: &WasmModule, func_idx: u32) -> bool {
     use crate::wasm::ir::{BlockType, WasmInstr, WasmType};
     let Some(func_type) = module.get_func_type(func_idx) else {
@@ -22406,6 +22604,67 @@ fn fresh_join_binding() -> u32 {
     })
 }
 
+/// `(pops, pushes)` of a straight-line instruction, or `None` for control
+/// flow and anything else a backward stack walk must stop at.
+fn instr_stack_effect(
+    module: &WasmModule,
+    i: &crate::wasm::ir::WasmInstr,
+) -> Option<(usize, usize)> {
+    use crate::wasm::ir::WasmInstr as W;
+    Some(match i {
+        W::I32Const(_) | W::I64Const(_) | W::LocalGet(_) | W::GlobalGet(_) | W::MemorySize => {
+            (0, 1)
+        }
+        W::LocalSet(_) | W::GlobalSet(_) | W::Drop => (1, 0),
+        W::LocalTee(_)
+        | W::I32Eqz
+        | W::I64Eqz
+        | W::I32WrapI64
+        | W::I64ExtendI32S
+        | W::I64ExtendI32U
+        | W::MemoryGrow
+        | W::I32Load(_)
+        | W::I64Load(_)
+        | W::I32Load8S(_)
+        | W::I32Load8U(_)
+        | W::I32Load16S(_)
+        | W::I32Load16U(_)
+        | W::I64Load8S(_)
+        | W::I64Load8U(_)
+        | W::I64Load16S(_)
+        | W::I64Load16U(_)
+        | W::I64Load32S(_)
+        | W::I64Load32U(_) => (1, 1),
+        W::I32Store(_)
+        | W::I64Store(_)
+        | W::I32Store8(_)
+        | W::I32Store16(_)
+        | W::I64Store8(_)
+        | W::I64Store16(_)
+        | W::I64Store32(_) => (2, 0),
+        W::Select => (3, 1),
+        W::Nop => (0, 0),
+        W::Call(f) => {
+            let ft = module.get_func_type(*f)?;
+            (ft.params.len(), ft.results.len())
+        }
+        W::Block { .. }
+        | W::Loop { .. }
+        | W::If { .. }
+        | W::Else
+        | W::End
+        | W::Br(_)
+        | W::BrIf(_)
+        | W::BrTable { .. }
+        | W::Return
+        | W::Unreachable
+        | W::CallIndirect(_)
+        | W::Unknown(_) => return None,
+        // Every remaining variant is a binary arithmetic/compare op.
+        _ => (2, 1),
+    })
+}
+
 /// `(param, offset)` of every store a helper makes through one of its own
 /// parameters: the store's address operand is `local.get p` (found by
 /// walking back over the straight-line stack effects before the store), so
@@ -22418,61 +22677,7 @@ fn helper_param_stores(module: &WasmModule, func_idx: u32) -> Vec<(u32, u32)> {
     let n = module
         .get_func_type(func_idx)
         .map_or(0, |ft| ft.params.len() as u32);
-    // (pops, pushes), or `None` where the walk must stop.
-    let effect = |i: &W| -> Option<(usize, usize)> {
-        Some(match i {
-            W::I32Const(_) | W::I64Const(_) | W::LocalGet(_) | W::GlobalGet(_) | W::MemorySize => {
-                (0, 1)
-            }
-            W::LocalSet(_) | W::GlobalSet(_) | W::Drop => (1, 0),
-            W::LocalTee(_)
-            | W::I32Eqz
-            | W::I64Eqz
-            | W::I32WrapI64
-            | W::I64ExtendI32S
-            | W::I64ExtendI32U
-            | W::MemoryGrow
-            | W::I32Load(_)
-            | W::I64Load(_)
-            | W::I32Load8S(_)
-            | W::I32Load8U(_)
-            | W::I32Load16S(_)
-            | W::I32Load16U(_)
-            | W::I64Load8S(_)
-            | W::I64Load8U(_)
-            | W::I64Load16S(_)
-            | W::I64Load16U(_)
-            | W::I64Load32S(_)
-            | W::I64Load32U(_) => (1, 1),
-            W::I32Store(_)
-            | W::I64Store(_)
-            | W::I32Store8(_)
-            | W::I32Store16(_)
-            | W::I64Store8(_)
-            | W::I64Store16(_)
-            | W::I64Store32(_) => (2, 0),
-            W::Select => (3, 1),
-            W::Nop => (0, 0),
-            W::Call(f) => {
-                let ft = module.get_func_type(*f)?;
-                (ft.params.len(), ft.results.len())
-            }
-            W::Block { .. }
-            | W::Loop { .. }
-            | W::If { .. }
-            | W::Else
-            | W::End
-            | W::Br(_)
-            | W::BrIf(_)
-            | W::BrTable { .. }
-            | W::Return
-            | W::Unreachable
-            | W::CallIndirect(_)
-            | W::Unknown(_) => return None,
-            // Every remaining variant is a binary arithmetic/compare op.
-            _ => (2, 1),
-        })
-    };
+    let effect = |i: &W| instr_stack_effect(module, i);
     let body = &func.body;
     let mut out = Vec::new();
     for (i, ins) in body.iter().enumerate() {
@@ -25656,6 +25861,64 @@ mod tests {
     /// ALSO puts (negative); 10 = a decode of BOTH widths (negative);
     /// 13 = u64 decode that REUSES the val local for its result after the
     /// decode window (aqua's real decoder shape — must still classify).
+    /// PR #102 review: a keyed defaulting `i128` getter is recognized only
+    /// when each stored half is the matching half of its decode; one that
+    /// stores the halves swapped is left alone.
+    #[test]
+    fn defaulting_keyed_i128_getter_needs_halves_in_order() {
+        let getter = |lo_off: u32, hi_off: u32| {
+            format!(
+                r#"(func (param i32 i64)
+                    (local i32 i64 i64)
+                    i64.const 0 local.set 3
+                    i64.const 0 local.set 4
+                    block
+                        local.get 1 i64.const 1 call 0
+                        i64.eqz br_if 0
+                        i32.const 64 local.set 2
+                        local.get 2 local.get 1 i64.const 1 call 1 call 4
+                        local.get 2 i64.load offset={lo_off} local.set 3
+                        local.get 2 i64.load offset={hi_off} local.set 4
+                    end
+                    local.get 0 local.get 3 i64.store
+                    local.get 0 local.get 4 i64.store offset=8)"#
+            )
+        };
+        let wasm = wat::parse_str(format!(
+            r#"(module
+                (import "l" "0" (func (param i64 i64) (result i64)))
+                (import "l" "1" (func (param i64 i64) (result i64)))
+                (import "i" "7" (func (param i64) (result i64)))
+                (import "i" "8" (func (param i64) (result i64)))
+                (memory 1)
+                (func (param i32 i64)
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 call 2 i64.store offset=16
+                    local.get 0 local.get 1 call 3 i64.store offset=24)
+                {}
+                {}
+            )"#,
+            getter(16, 24),
+            getter(24, 16)
+        ))
+        .expect("wat parses");
+        let m = WasmModule::parse(&wasm).expect("module parses");
+        assert_eq!(
+            detect_tryfromval_decode_helper(&m, 4),
+            Some(DecodeHelperClass::I128),
+            "the decode helper classifies"
+        );
+        assert_eq!(
+            detect_defaulting_int128_getter(&m, 5),
+            Some(Int128Type::I128)
+        );
+        assert_eq!(
+            detect_defaulting_int128_getter(&m, 6),
+            None,
+            "halves swapped"
+        );
+    }
+
     fn tranche2_module() -> WasmModule {
         let wasm = wat::parse_str(
             r#"(module
@@ -26960,7 +27223,7 @@ mod tests {
             }),
         ];
         let n_before = stmts.len();
-        assert!(ctx.seed_defaulting_u128_getter(0, 16, &mut stmts));
+        assert!(ctx.seed_defaulting_u128_getter(0, 16, &mut stmts, Int128Type::U128));
         // The husk is untouched; the defaulting binding is APPENDED.
         assert_eq!(stmts.len(), n_before + 1);
         let SorobanStmt::Let { value, .. } = stmts.last().unwrap() else {
