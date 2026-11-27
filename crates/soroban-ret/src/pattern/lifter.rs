@@ -12108,6 +12108,50 @@ fn decode_masked_len_compare(a: StackVal, b: StackVal, params: &[FnParam]) -> (S
     (a, b)
 }
 
+/// An UNSIGNED order compare of a raw `u32` `Val` against `N << 32`, decoded
+/// to the u32 domain (issue #80 C4). aqua-rewards' `set_protocol_fee_fraction`
+/// checks `new_fraction >= 10001` as `p >=u (10001 << 32)` on the raw `Val`,
+/// which rendered as `new_fraction >= 42953967927296`.
+///
+/// Only the two directions whose answer is decided by the high half alone are
+/// decoded: `v >=u N << 32` and `v <u N << 32` (written either way round, so
+/// also `K <=u v` and `K >u v`). For a 64-bit `v` and `K` with zero low bits
+/// those are exactly `v >> 32 >= N` / `< N`, whatever the tag bits hold and
+/// whether or not they were masked off. `v >u K` and `v <=u K` are not: at
+/// `v >> 32 == N` the tag bits decide them. A signed compare is not decoded
+/// either: a payload at or above `2^31` makes the raw `Val` negative.
+///
+/// The operand is a declared `u32` parameter or a `*_len` result
+/// ([`is_masked_u32_operand`]), raw or under the payload mask, so `v >> 32` is
+/// the value the operand renders as. Returns `None` for anything else.
+fn decode_val_order_compare(
+    a: &StackVal,
+    op: CmpOp,
+    b: &StackVal,
+    params: &[FnParam],
+) -> Option<(StackVal, StackVal)> {
+    fn payload(v: &StackVal, params: &[FnParam]) -> Option<StackVal> {
+        let inner = match v {
+            StackVal::BinOp(x, BinOper::And, mask) if to_u64(mask) == Some(LEN_VAL_MASK) => {
+                x.as_ref()
+            }
+            other => other,
+        };
+        is_masked_u32_operand(inner, params).then(|| inner.clone())
+    }
+    fn high(k: &StackVal) -> Option<StackVal> {
+        let k = to_u64(k)?;
+        (k & 0xFFFF_FFFF == 0).then_some(StackVal::I64((k >> 32) as i64))
+    }
+    match op {
+        // `v >= K`, `v < K`.
+        CmpOp::GeU | CmpOp::LtU => Some((payload(a, params)?, high(b)?)),
+        // `K <= v`, `K > v`.
+        CmpOp::LeU | CmpOp::GtU => Some((high(a)?, payload(b, params)?)),
+        _ => None,
+    }
+}
+
 /// A zero-parameter export whose body is a pure computation over constants
 /// and static data — digicus's `version()` parses a `"0.1.0"`-style string
 /// literal with nested loops — returns the same value on every invocation.
@@ -23372,6 +23416,10 @@ fn stack_val_to_expr_inner(
                 let (da, db) = decode_masked_len_compare((**a).clone(), (**b).clone(), params);
                 decoded = (Box::new(da), Box::new(db));
                 (&decoded.0, &decoded.1)
+            } else if let Some((da, db)) = decode_val_order_compare(a, *op, b, params) {
+                cov_mark::hit!(val_order_compare_decoded);
+                decoded = (Box::new(da), Box::new(db));
+                (&decoded.0, &decoded.1)
             } else {
                 (a, b)
             };
@@ -29564,6 +29612,81 @@ mod tests {
             stack_val_to_expr(&masked("decimals"), &params, &reg, None),
             stack_val_to_expr(&bare, &params, &reg, None)
         );
+    }
+
+    /// Issue #80 C4: aqua-rewards checks `new_fraction >= 10001` as an
+    /// UNSIGNED compare of the raw `Val` against `10001 << 32`. Exactly the
+    /// two directions the high half decides on its own are decoded, raw or
+    /// masked, written either way round; `>` / `<=` (decided by the tag bits
+    /// at equality), signed compares (a payload of `2^31` or more is a negative
+    /// `Val`), a non-`u32` parameter and a constant with low bits set stay raw.
+    #[test]
+    fn unsigned_order_compare_of_raw_u32_val_decodes_to_the_payload() {
+        cov_mark::check_count!(val_order_compare_decoded, 4);
+        let params = vec![
+            FnParam {
+                name: "new_fraction".to_string(),
+                type_def: ScSpecTypeDef::U32,
+            },
+            FnParam {
+                name: "amount".to_string(),
+                type_def: ScSpecTypeDef::I128,
+            },
+        ];
+        let reg = empty_registry();
+        let raw = |name: &str| StackVal::Param(name.to_string());
+        let masked = StackVal::BinOp(
+            Box::new(raw("new_fraction")),
+            BinOper::And,
+            Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+        );
+        let k = || StackVal::I64(10001 << 32);
+        let render = |a: StackVal, op: CmpOp, b: StackVal| {
+            stack_val_to_expr(
+                &StackVal::Compare(Box::new(a), op, Box::new(b)),
+                &params,
+                &reg,
+                None,
+            )
+        };
+        let fraction = || Box::new(SorobanExpr::Param("new_fraction".to_string()));
+        let n = || Box::new(SorobanExpr::I64Literal(10001));
+
+        assert_eq!(
+            render(raw("new_fraction"), CmpOp::GeU, k()),
+            SorobanExpr::Ge(fraction(), n())
+        );
+        assert_eq!(
+            render(masked.clone(), CmpOp::LtU, k()),
+            SorobanExpr::Lt(fraction(), n())
+        );
+        assert_eq!(
+            render(k(), CmpOp::LeU, raw("new_fraction")),
+            SorobanExpr::Le(n(), fraction())
+        );
+        assert_eq!(
+            render(k(), CmpOp::GtU, masked),
+            SorobanExpr::Gt(n(), fraction())
+        );
+
+        for (a, op, b) in [
+            (raw("new_fraction"), CmpOp::GtU, k()),
+            (raw("new_fraction"), CmpOp::LeU, k()),
+            (raw("new_fraction"), CmpOp::GeS, k()),
+            (raw("new_fraction"), CmpOp::LtS, k()),
+            (raw("amount"), CmpOp::GeU, k()),
+            (
+                raw("new_fraction"),
+                CmpOp::GeU,
+                StackVal::I64((10001 << 32) | 4),
+            ),
+        ] {
+            assert_eq!(
+                decode_val_order_compare(&a, op, &b, &params),
+                None,
+                "{op:?}"
+            );
+        }
     }
 
     /// The mask mark must stay transparent to the `U32Val` decode. A `u32`
