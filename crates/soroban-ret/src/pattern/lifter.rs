@@ -18774,8 +18774,10 @@ enum Int128Type {
 /// only reads storage (`has` + `get`, no write, no contract call), exactly one
 /// 128-bit decode width is reachable, it stores exactly `[0, 8]`, and both
 /// stored values are locals whose first write is `i64.const 0` ahead of any
-/// block and which are written exactly once more (the decoded limb). Every
-/// path therefore stores either the zero default or the decoded value.
+/// block and which are written exactly once more — from the delegated decode's
+/// result, its `lo` limb (`+16`) into the local stored at `+0` and its `hi`
+/// limb (`+24`) into the one stored at `+8`. Every path therefore stores
+/// either the zero default or the decoded value, halves in order.
 fn detect_defaulting_int128_getter(module: &WasmModule, func_idx: u32) -> Option<Int128Type> {
     use crate::wasm::ir::{WasmInstr, WasmType};
     if detect_defaulting_u128_getter(module, func_idx) {
@@ -18807,20 +18809,23 @@ fn detect_defaulting_int128_getter(module: &WasmModule, func_idx: u32) -> Option
         return None;
     }
     let n_params = func_type.params.len() as u32;
-    let mut stored = Vec::new();
+    let mut stored_at: Vec<(u32, u32)> = Vec::new();
     for w in func.body.windows(3) {
         if let [
             WasmInstr::LocalGet(0),
             WasmInstr::LocalGet(l),
-            WasmInstr::I64Store(_),
+            WasmInstr::I64Store(o),
         ] = w
+            && !stored_at.contains(&(*l, *o))
         {
-            stored.push(*l);
+            stored_at.push((*l, *o));
         }
     }
-    stored.sort_unstable();
-    stored.dedup();
-    if stored.len() != 2 || stored.iter().any(|l| *l < n_params) {
+    stored_at.sort_unstable_by_key(|(_, o)| *o);
+    if stored_at.iter().map(|(_, o)| *o).collect::<Vec<_>>() != [0, 8]
+        || stored_at[0].0 == stored_at[1].0
+        || stored_at.iter().any(|(l, _)| *l < n_params)
+    {
         return None;
     }
     let first_block = func.body.iter().position(|i| {
@@ -18829,7 +18834,47 @@ fn detect_defaulting_int128_getter(module: &WasmModule, func_idx: u32) -> Option
             WasmInstr::Block { .. } | WasmInstr::Loop { .. } | WasmInstr::If { .. }
         )
     })?;
-    for l in &stored {
+    // The decode the helper delegates to, and the local it passes as that
+    // decode's result pointer (walking back over the stack effects to the
+    // call's first argument).
+    let want = if i128 {
+        DecodeHelperClass::I128
+    } else {
+        DecodeHelperClass::U128
+    };
+    let mut decode_ptrs = Vec::new();
+    for (pos, ins) in func.body.iter().enumerate() {
+        let WasmInstr::Call(d) = ins else { continue };
+        if detect_tryfromval_decode_helper(module, *d) != Some(want) {
+            continue;
+        }
+        // The first argument is the deepest operand.
+        let mut depth = module.get_func_type(*d)?.params.len() - 1;
+        let mut j = pos;
+        let mut ptr = None;
+        while j > 0 {
+            j -= 1;
+            let Some((pops, pushes)) = instr_stack_effect(module, &func.body[j]) else {
+                break;
+            };
+            if depth < pushes {
+                if let WasmInstr::LocalGet(p) = func.body[j] {
+                    ptr = Some(p);
+                }
+                break;
+            }
+            depth = depth - pushes + pops;
+        }
+        decode_ptrs.push(ptr?);
+    }
+    let [ptr] = decode_ptrs[..] else {
+        return None;
+    };
+    // Each stored local: `i64.const 0` first, ahead of any block, then
+    // exactly the decoded limb matching where it is stored — the decode's
+    // `lo` (`+16`) for the `+0` store, its `hi` (`+24`) for `+8`.
+    for (l, store_off) in &stored_at {
+        let limb = if *store_off == 0 { 16 } else { 24 };
         let sets: Vec<usize> = func
             .body
             .iter()
@@ -18837,12 +18882,17 @@ fn detect_defaulting_int128_getter(module: &WasmModule, func_idx: u32) -> Option
             .filter(|(_, i)| matches!(i, WasmInstr::LocalSet(x) | WasmInstr::LocalTee(x) if x == l))
             .map(|(p, _)| p)
             .collect();
-        let [first, _decoded] = sets[..] else {
+        let [first, decoded] = sets[..] else {
             return None;
         };
         if first == 0
             || first > first_block
             || !matches!(func.body[first - 1], WasmInstr::I64Const(0))
+            || decoded < 2
+            || !matches!(
+                func.body[decoded - 2..decoded],
+                [WasmInstr::LocalGet(p), WasmInstr::I64Load(o)] if p == ptr && o == limb
+            )
         {
             return None;
         }
@@ -22554,6 +22604,67 @@ fn fresh_join_binding() -> u32 {
     })
 }
 
+/// `(pops, pushes)` of a straight-line instruction, or `None` for control
+/// flow and anything else a backward stack walk must stop at.
+fn instr_stack_effect(
+    module: &WasmModule,
+    i: &crate::wasm::ir::WasmInstr,
+) -> Option<(usize, usize)> {
+    use crate::wasm::ir::WasmInstr as W;
+    Some(match i {
+        W::I32Const(_) | W::I64Const(_) | W::LocalGet(_) | W::GlobalGet(_) | W::MemorySize => {
+            (0, 1)
+        }
+        W::LocalSet(_) | W::GlobalSet(_) | W::Drop => (1, 0),
+        W::LocalTee(_)
+        | W::I32Eqz
+        | W::I64Eqz
+        | W::I32WrapI64
+        | W::I64ExtendI32S
+        | W::I64ExtendI32U
+        | W::MemoryGrow
+        | W::I32Load(_)
+        | W::I64Load(_)
+        | W::I32Load8S(_)
+        | W::I32Load8U(_)
+        | W::I32Load16S(_)
+        | W::I32Load16U(_)
+        | W::I64Load8S(_)
+        | W::I64Load8U(_)
+        | W::I64Load16S(_)
+        | W::I64Load16U(_)
+        | W::I64Load32S(_)
+        | W::I64Load32U(_) => (1, 1),
+        W::I32Store(_)
+        | W::I64Store(_)
+        | W::I32Store8(_)
+        | W::I32Store16(_)
+        | W::I64Store8(_)
+        | W::I64Store16(_)
+        | W::I64Store32(_) => (2, 0),
+        W::Select => (3, 1),
+        W::Nop => (0, 0),
+        W::Call(f) => {
+            let ft = module.get_func_type(*f)?;
+            (ft.params.len(), ft.results.len())
+        }
+        W::Block { .. }
+        | W::Loop { .. }
+        | W::If { .. }
+        | W::Else
+        | W::End
+        | W::Br(_)
+        | W::BrIf(_)
+        | W::BrTable { .. }
+        | W::Return
+        | W::Unreachable
+        | W::CallIndirect(_)
+        | W::Unknown(_) => return None,
+        // Every remaining variant is a binary arithmetic/compare op.
+        _ => (2, 1),
+    })
+}
+
 /// `(param, offset)` of every store a helper makes through one of its own
 /// parameters: the store's address operand is `local.get p` (found by
 /// walking back over the straight-line stack effects before the store), so
@@ -22566,61 +22677,7 @@ fn helper_param_stores(module: &WasmModule, func_idx: u32) -> Vec<(u32, u32)> {
     let n = module
         .get_func_type(func_idx)
         .map_or(0, |ft| ft.params.len() as u32);
-    // (pops, pushes), or `None` where the walk must stop.
-    let effect = |i: &W| -> Option<(usize, usize)> {
-        Some(match i {
-            W::I32Const(_) | W::I64Const(_) | W::LocalGet(_) | W::GlobalGet(_) | W::MemorySize => {
-                (0, 1)
-            }
-            W::LocalSet(_) | W::GlobalSet(_) | W::Drop => (1, 0),
-            W::LocalTee(_)
-            | W::I32Eqz
-            | W::I64Eqz
-            | W::I32WrapI64
-            | W::I64ExtendI32S
-            | W::I64ExtendI32U
-            | W::MemoryGrow
-            | W::I32Load(_)
-            | W::I64Load(_)
-            | W::I32Load8S(_)
-            | W::I32Load8U(_)
-            | W::I32Load16S(_)
-            | W::I32Load16U(_)
-            | W::I64Load8S(_)
-            | W::I64Load8U(_)
-            | W::I64Load16S(_)
-            | W::I64Load16U(_)
-            | W::I64Load32S(_)
-            | W::I64Load32U(_) => (1, 1),
-            W::I32Store(_)
-            | W::I64Store(_)
-            | W::I32Store8(_)
-            | W::I32Store16(_)
-            | W::I64Store8(_)
-            | W::I64Store16(_)
-            | W::I64Store32(_) => (2, 0),
-            W::Select => (3, 1),
-            W::Nop => (0, 0),
-            W::Call(f) => {
-                let ft = module.get_func_type(*f)?;
-                (ft.params.len(), ft.results.len())
-            }
-            W::Block { .. }
-            | W::Loop { .. }
-            | W::If { .. }
-            | W::Else
-            | W::End
-            | W::Br(_)
-            | W::BrIf(_)
-            | W::BrTable { .. }
-            | W::Return
-            | W::Unreachable
-            | W::CallIndirect(_)
-            | W::Unknown(_) => return None,
-            // Every remaining variant is a binary arithmetic/compare op.
-            _ => (2, 1),
-        })
-    };
+    let effect = |i: &W| instr_stack_effect(module, i);
     let body = &func.body;
     let mut out = Vec::new();
     for (i, ins) in body.iter().enumerate() {
@@ -25804,6 +25861,64 @@ mod tests {
     /// ALSO puts (negative); 10 = a decode of BOTH widths (negative);
     /// 13 = u64 decode that REUSES the val local for its result after the
     /// decode window (aqua's real decoder shape — must still classify).
+    /// PR #102 review: a keyed defaulting `i128` getter is recognized only
+    /// when each stored half is the matching half of its decode; one that
+    /// stores the halves swapped is left alone.
+    #[test]
+    fn defaulting_keyed_i128_getter_needs_halves_in_order() {
+        let getter = |lo_off: u32, hi_off: u32| {
+            format!(
+                r#"(func (param i32 i64)
+                    (local i32 i64 i64)
+                    i64.const 0 local.set 3
+                    i64.const 0 local.set 4
+                    block
+                        local.get 1 i64.const 1 call 0
+                        i64.eqz br_if 0
+                        i32.const 64 local.set 2
+                        local.get 2 local.get 1 i64.const 1 call 1 call 4
+                        local.get 2 i64.load offset={lo_off} local.set 3
+                        local.get 2 i64.load offset={hi_off} local.set 4
+                    end
+                    local.get 0 local.get 3 i64.store
+                    local.get 0 local.get 4 i64.store offset=8)"#
+            )
+        };
+        let wasm = wat::parse_str(format!(
+            r#"(module
+                (import "l" "0" (func (param i64 i64) (result i64)))
+                (import "l" "1" (func (param i64 i64) (result i64)))
+                (import "i" "7" (func (param i64) (result i64)))
+                (import "i" "8" (func (param i64) (result i64)))
+                (memory 1)
+                (func (param i32 i64)
+                    local.get 0 i64.const 0 i64.store
+                    local.get 0 local.get 1 call 2 i64.store offset=16
+                    local.get 0 local.get 1 call 3 i64.store offset=24)
+                {}
+                {}
+            )"#,
+            getter(16, 24),
+            getter(24, 16)
+        ))
+        .expect("wat parses");
+        let m = WasmModule::parse(&wasm).expect("module parses");
+        assert_eq!(
+            detect_tryfromval_decode_helper(&m, 4),
+            Some(DecodeHelperClass::I128),
+            "the decode helper classifies"
+        );
+        assert_eq!(
+            detect_defaulting_int128_getter(&m, 5),
+            Some(Int128Type::I128)
+        );
+        assert_eq!(
+            detect_defaulting_int128_getter(&m, 6),
+            None,
+            "halves swapped"
+        );
+    }
+
     fn tranche2_module() -> WasmModule {
         let wasm = wat::parse_str(
             r#"(module
