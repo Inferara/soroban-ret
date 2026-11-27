@@ -4193,7 +4193,7 @@ impl<'a> LiftContext<'a> {
                                 // `(q_lo + 1, q_hi + (lo == 0))`) is the
                                 // whole value it computes.
                                 if let [hi, lo] = raw_args.as_slice() {
-                                    if let Some((v, true)) = reconstruct_i128_operand(lo, hi) {
+                                    if let Some(v) = exact_i128_pair(lo, hi) {
                                         cov_mark::hit!(i128_pieces_reconstructed);
                                         self.stack.push(v);
                                         return;
@@ -8312,12 +8312,16 @@ impl<'a> LiftContext<'a> {
                     // (the token client's `transfer` result check): the same
                     // stray the optimizer drops before live code at the top
                     // level of a function.
+                    // Only where every local function the arm calls can
+                    // return: a call to a `-> !` wrapper with no `unreachable`
+                    // after it would also read as falling through, and its
+                    // panic is real.
                     if exact_if {
-                        for (terminates, stmts) in [
-                            (then_terminates, &mut then_stmts),
-                            (else_terminates, &mut else_stmts),
+                        for (terminates, arm, stmts) in [
+                            (then_terminates, then_body, &mut then_stmts),
+                            (else_terminates, else_body, &mut else_stmts),
                         ] {
-                            if !terminates {
+                            if !terminates && arm_local_calls_return(self.wasm_module, arm) {
                                 drop_exact_arm_stray_panics(stmts);
                             }
                         }
@@ -15649,14 +15653,26 @@ fn reconstruct_i128_operand(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, b
 /// `0 - x` negations the signed mul/div wrappers emit (whose hi limb is
 /// `0 - (x_hi + (x_lo != 0))`, matching neither shape).
 fn reconstruct_i128_addsub(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bool)> {
+    reconstruct_i128_addsub_with(lo, hi, &reconstruct_i128_operand)
+}
+
+/// Rebuilds one `(lo, hi)` operand: the value and whether it is clean.
+type I128OperandFn = dyn Fn(&StackVal, &StackVal) -> Option<(StackVal, bool)>;
+
+/// [`reconstruct_i128_addsub`] with `rec` rebuilding each operand.
+fn reconstruct_i128_addsub_with(
+    lo: &StackVal,
+    hi: &StackVal,
+    rec: &I128OperandFn,
+) -> Option<(StackVal, bool)> {
     // --- Borrow-subtract: lo = A_lo - B_lo, hi = (A_hi - B_hi) - (A_lo <u B_lo) ---
     if let StackVal::BinOp(a_lo, BinOper::Sub, b_lo) = lo
         && let StackVal::BinOp(hi_diff, BinOper::Sub, borrow) = hi
         && let StackVal::BinOp(a_hi, BinOper::Sub, b_hi) = &**hi_diff
         && is_unsigned_lt(borrow, a_lo, b_lo)
     {
-        let (a, a_clean) = reconstruct_i128_operand(a_lo, a_hi)?;
-        let (b, b_clean) = reconstruct_i128_operand(b_lo, b_hi)?;
+        let (a, a_clean) = rec(a_lo, a_hi)?;
+        let (b, b_clean) = rec(b_lo, b_hi)?;
         return (a_clean && b_clean).then(|| {
             (
                 StackVal::BinOp(Box::new(a), BinOper::Sub, Box::new(b)),
@@ -15685,7 +15701,7 @@ fn reconstruct_i128_addsub(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bo
             None
         };
         if let Some(a_hi) = a_hi {
-            let (a, a_clean) = reconstruct_i128_operand(a_lo, a_hi)?;
+            let (a, a_clean) = rec(a_lo, a_hi)?;
             return a_clean.then(|| {
                 (
                     StackVal::BinOp(
@@ -15721,10 +15737,8 @@ fn reconstruct_i128_addsub(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bo
         // Pair each low limb with its matching high limb (addition is commutative,
         // so try both pairings and accept the one where both operands reconstruct).
         for (xh, yh) in [(p_hi, q_hi), (q_hi, p_hi)] {
-            if let (Some((a, a_clean)), Some((b, b_clean))) = (
-                reconstruct_i128_operand(x_lo, xh),
-                reconstruct_i128_operand(y_lo, yh),
-            ) && a_clean
+            if let (Some((a, a_clean)), Some((b, b_clean))) = (rec(x_lo, xh), rec(y_lo, yh))
+                && a_clean
                 && b_clean
             {
                 return Some((
@@ -15736,6 +15750,46 @@ fn reconstruct_i128_addsub(lo: &StackVal, hi: &StackVal) -> Option<(StackVal, bo
         return None;
     }
     None
+}
+
+/// The whole `i128` a `(lo, hi)` pair holds, only where both halves are
+/// accounted for: the two limbs of one value, two constants, or an
+/// open-coded add/sub whose operands are limb pairs or such add/subs. Unlike
+/// [`reconstruct_i128_operand`] it never pairs a tracked low limb with an
+/// unrelated high half, so it is safe where the pair IS the value (the
+/// `obj_from_i128_pieces` argument): `(0, low64(x))` is not `x`. A constant
+/// is accepted only as the whole pair: as an add/sub operand it is as
+/// likely a slot's stale contents (and a "limb" of a constant is a
+/// degraded track), so those answer nothing.
+fn exact_i128_pair(lo: &StackVal, hi: &StackVal) -> Option<StackVal> {
+    if let (StackVal::I64(l), StackVal::I64(h)) = (lo, hi) {
+        return Some(StackVal::HostCallResult(Box::new(
+            SorobanExpr::I128Literal(((*h as i128) << 64) | (*l as u64 as i128)),
+        )));
+    }
+    exact_i128_operand(lo, hi)
+}
+
+/// [`exact_i128_pair`] without the constant pair.
+fn exact_i128_operand(lo: &StackVal, hi: &StackVal) -> Option<StackVal> {
+    match (lo, hi) {
+        (
+            StackVal::I128Limb {
+                value: lv,
+                hi: false,
+            },
+            StackVal::I128Limb {
+                value: hv,
+                hi: true,
+            },
+        ) if lv == hv => {
+            (!matches!(**lv, StackVal::I64(_) | StackVal::I32(_))).then(|| (**lv).clone())
+        }
+        _ => reconstruct_i128_addsub_with(lo, hi, &|l, h| {
+            exact_i128_operand(l, h).map(|v| (v, true))
+        })
+        .and_then(|(v, clean)| clean.then_some(v)),
+    }
 }
 
 /// True if `e` computes the unsigned comparison `x <u y`. The compiler emits this
@@ -21555,6 +21609,62 @@ fn reconcile_branch_locals(
         parent_locals[idx] = StackVal::LetBinding(idx as u32);
         phi_protected.push(idx as u32);
     }
+}
+
+/// True when `arm` calls at least one local function and every local
+/// function it calls (at any depth of the arm) can return normally (see
+/// [`fn_can_return`]). Then a standalone panic the lift leaves at the arm's
+/// top level is one path inside such a callee, not where the arm ends.
+fn arm_local_calls_return(
+    module: &WasmModule,
+    arm: &[super::structurize::StructuredBlock],
+) -> bool {
+    use super::structurize::StructuredBlock as SB;
+    use crate::wasm::ir::WasmInstr;
+    fn walk(module: &WasmModule, seq: &[SB], any: &mut bool) -> bool {
+        seq.iter().all(|b| match b {
+            SB::Instruction(WasmInstr::Call(f)) if module.get_function(*f).is_some() => {
+                *any = true;
+                fn_can_return(module, *f, 0)
+            }
+            SB::Block { body, .. } | SB::Loop { body, .. } => walk(module, body, any),
+            SB::IfElse {
+                then_body,
+                else_body,
+                ..
+            } => walk(module, then_body, any) && walk(module, else_body, any),
+            _ => true,
+        })
+    }
+    let mut any = false;
+    walk(module, arm, &mut any) && any
+}
+
+/// True when local function `f` provably has a path that returns to its
+/// caller: it contains a `return`, or its top level runs to the end — no
+/// trap or branch there, every local call there can return, and it does not
+/// end in a nested construct (not analysed: answered `false`). Imports
+/// return. Conservative: an unproven function answers `false`.
+fn fn_can_return(module: &WasmModule, f: u32, depth: u32) -> bool {
+    use super::structurize::StructuredBlock as SB;
+    use crate::wasm::ir::WasmInstr;
+    let Some(func) = module.get_function(f) else {
+        return true;
+    };
+    if depth > 8 {
+        return false;
+    }
+    if func.body.iter().any(|i| matches!(i, WasmInstr::Return)) {
+        return true;
+    }
+    let body = super::structurize::structurize(&func.body);
+    let top_ok = body.iter().all(|b| match b {
+        SB::Instruction(WasmInstr::Unreachable | WasmInstr::Br(_) | WasmInstr::BrTable { .. })
+        | SB::SafetyNetUnreachable => false,
+        SB::Instruction(WasmInstr::Call(g)) => fn_can_return(module, *g, depth + 1),
+        _ => true,
+    });
+    top_ok && matches!(body.last(), None | Some(SB::Instruction(_)))
 }
 
 /// Drop the standalone top-level panics of an exact `if` arm that falls
@@ -27923,6 +28033,122 @@ mod tests {
                 false
             ))
         );
+    }
+
+    /// `exact_i128_pair` accounts for both halves or answers nothing: a
+    /// tracked low limb with an unrelated (here zero) high half is not the
+    /// whole value — `(0, low64(x))` is not `x`.
+    #[test]
+    fn exact_i128_pair_needs_both_halves() {
+        let x = StackVal::Param("x".to_string());
+        let limb = |hi| StackVal::I128Limb {
+            value: Box::new(x.clone()),
+            hi,
+        };
+        assert_eq!(exact_i128_pair(&limb(false), &limb(true)), Some(x.clone()));
+        assert_eq!(exact_i128_pair(&limb(false), &StackVal::I64(0)), None);
+        assert_eq!(
+            exact_i128_pair(&limb(false), &StackVal::LetBinding(3)),
+            None
+        );
+        // `x + 1`: lo = x_lo + 1, hi = x_hi + (lo == 0).
+        let lo = StackVal::BinOp(
+            Box::new(limb(false)),
+            BinOper::Add,
+            Box::new(StackVal::I64(1)),
+        );
+        let hi = StackVal::BinOp(
+            Box::new(limb(true)),
+            BinOper::Add,
+            Box::new(StackVal::Eqz(Box::new(lo.clone()))),
+        );
+        assert_eq!(
+            exact_i128_pair(&lo, &hi),
+            Some(StackVal::BinOp(
+                Box::new(x.clone()),
+                BinOper::Add,
+                Box::new(StackVal::HostCallResult(Box::new(
+                    SorobanExpr::I128Literal(1)
+                ))),
+            ))
+        );
+        // The same `+ 1` on a low limb whose high half is not accounted for.
+        let bad_hi = StackVal::BinOp(
+            Box::new(StackVal::I64(0)),
+            BinOper::Add,
+            Box::new(StackVal::Eqz(Box::new(lo.clone()))),
+        );
+        assert_eq!(exact_i128_pair(&lo, &bad_hi), None);
+        // A constant pair is a whole value, but not an add/sub operand (a
+        // slot's stale contents), and a "limb" of a constant is no track.
+        assert_eq!(
+            exact_i128_pair(&StackVal::I64(5), &StackVal::I64(0)),
+            Some(StackVal::HostCallResult(Box::new(
+                SorobanExpr::I128Literal(5)
+            )))
+        );
+        let c = |hi| StackVal::I128Limb {
+            value: Box::new(StackVal::I64(1)),
+            hi,
+        };
+        assert_eq!(exact_i128_pair(&c(false), &c(true)), None);
+        let sum_lo = StackVal::BinOp(
+            Box::new(StackVal::I64(0)),
+            BinOper::Add,
+            Box::new(limb(false)),
+        );
+        let sum_hi = StackVal::BinOp(
+            Box::new(StackVal::BinOp(
+                Box::new(StackVal::I64(0)),
+                BinOper::Add,
+                Box::new(limb(true)),
+            )),
+            BinOper::Add,
+            Box::new(StackVal::Compare(
+                Box::new(sum_lo.clone()),
+                CmpOp::LtU,
+                Box::new(StackVal::I64(0)),
+            )),
+        );
+        assert_eq!(exact_i128_pair(&sum_lo, &sum_hi), None);
+    }
+
+    /// A stray panic in an exact arm is dropped only when every local
+    /// function the arm calls provably returns.
+    #[test]
+    fn arm_local_calls_return_needs_proof() {
+        use super::super::structurize::StructuredBlock as SB;
+        use crate::wasm::ir::WasmInstr as WI;
+        let wasm = wat::parse_str(
+            r#"(module
+                (func $trap unreachable)
+                (func $wrap call $trap)
+                (func $ret (param i32)
+                    (block (br_if 0 (local.get 0)) (return))
+                    unreachable)
+                (func $plain nop)
+                (func $calls_plain call $plain)
+                (func $ends_in_block (block nop)))
+            "#,
+        )
+        .expect("wat parses");
+        let m = crate::wasm::WasmModule::parse(&wasm).expect("module parses");
+        assert!(!fn_can_return(&m, 0, 0), "a trap");
+        assert!(
+            !fn_can_return(&m, 1, 0),
+            "a `-> !` wrapper with no trailing trap"
+        );
+        assert!(fn_can_return(&m, 2, 0), "has a `return`");
+        assert!(fn_can_return(&m, 3, 0));
+        assert!(fn_can_return(&m, 4, 0));
+        assert!(!fn_can_return(&m, 5, 0), "ends in a block: not analysed");
+        let call = |f| vec![SB::Instruction(WI::Call(f))];
+        assert!(arm_local_calls_return(&m, &call(4)));
+        assert!(!arm_local_calls_return(&m, &call(1)));
+        assert!(!arm_local_calls_return(&m, &[]), "no call: nothing inlined");
+        let mut both = call(4);
+        both.extend(call(1));
+        assert!(!arm_local_calls_return(&m, &both));
     }
 
     #[test]

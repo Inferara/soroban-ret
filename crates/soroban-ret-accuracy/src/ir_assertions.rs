@@ -230,6 +230,7 @@ pub fn walk_expr(expr: &SorobanExpr, pred: &dyn Fn(&SorobanExpr) -> bool) -> boo
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::CyclicSlot { .. }
         | SorobanExpr::ValTagName(_)
