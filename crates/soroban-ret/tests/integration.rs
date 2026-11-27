@@ -901,6 +901,18 @@ fn liquidity_pool_deposit_paths_and_reserves() {
         "{deposit}"
     );
     assert!(!deposit.contains("unwrap(){panic!();}"), "{deposit}");
+    // The signed divide's overflow guard, `dividend == i128::MIN` (read off
+    // `eqz(lo | (hi ^ i64::MIN))`) and `divisor == -1`, in both of the forms
+    // the compiler emits. `1 << 127` is `i128::MIN`.
+    assert!(
+        deposit.contains("==1<<127{panic!();}"),
+        "dividend == MIN guard:\n{deposit}"
+    );
+    assert!(
+        deposit.contains("!=1<<127{}else{ifenv.storage().instance().get::<_,i128>(&DataKey::ReserveB).unwrap()==-1{panic!();}}"),
+        "dividend != MIN, else divisor == -1:\n{deposit}"
+    );
+    assert_eq!(deposit.matches("1<<127").count(), 2, "{deposit}");
     // Token B is sent the merged amount, not `desired_a * reserve_b /
     // reserve_a` on every path.
     let transfer_b = deposit
@@ -1479,10 +1491,10 @@ fn test_all_fixtures_decompile() {
 // Fixtures with a known, tracked `todo!("unknown value")` gap that is NOT a
 // truncation artifact.
 //
-// `test_liquidity_pool` (issue #74): `deposit`'s branches, guards, amounts and
-// share balances are recovered, but its integer square root (a self-recursive
-// helper, for the first deposit's shares) and the `dividend == i128::MIN` half
-// of its division guards are holes, and `swap` still loses values in branches
+// `test_liquidity_pool` (issue #74): `deposit`'s branches, guards (the
+// division overflow guards included), amounts and share balances are
+// recovered, but its integer square root (a self-recursive helper, for the
+// first deposit's shares) is a hole, and `swap` still loses values in branches
 // no `i128` join region covers.
 //
 // `import_contract`: `safe_add_with` / `safe_add_with_two` map a `try_call`
