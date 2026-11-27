@@ -856,6 +856,73 @@ fn test_decompile_liquidity_pool_keys() {
     );
 }
 
+/// Issue #74: the liquidity pool's `deposit` and `get_rsrvs`.
+#[test]
+fn liquidity_pool_deposit_paths_and_reserves() {
+    let wasm = include_bytes!("../../../tests/fixtures/test_liquidity_pool.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    let compact = |s: &str| s.split_whitespace().collect::<String>();
+    let body_of = |name: &str| {
+        let start = source
+            .find(&format!("pub fn {name}("))
+            .unwrap_or_else(|| panic!("{name} not found"));
+        let end = source[start..]
+            .find("\n    pub fn ")
+            .unwrap_or(source.len() - start);
+        compact(&source[start..start + end])
+    };
+
+    // The reserve getters' `let`s escape through the caller's frame slots;
+    // named after the helper's own local they collided, and the pair came
+    // back swapped.
+    let reserves = body_of("get_rsrvs");
+    let a = reserves.find("DataKey::ReserveA").expect("ReserveA");
+    let b = reserves.find("DataKey::ReserveB").expect("ReserveB");
+    assert!(
+        a < b,
+        "get_rsrvs returns (reserve_a, reserve_b):\n{reserves}"
+    );
+
+    let deposit = body_of("deposit");
+    // Both reserves zero: the desired amounts. Otherwise one of two computed
+    // pairs. The choice is a branch, not the first path's value.
+    assert!(
+        deposit.contains("if!(env.storage().instance().get::<_,i128>(&DataKey::ReserveA).unwrap()==0&&env.storage().instance().get::<_,i128>(&DataKey::ReserveB).unwrap()==0)"),
+        "deposit branches on both reserves being zero:\n{deposit}"
+    );
+    // `amount_b < min_b` / `amount_a > desired_a` / `amount_a < min_a`: the
+    // guards are there.
+    assert!(deposit.contains("<min_b{panic!();}"), "{deposit}");
+    assert!(deposit.contains(">desired_a{panic!();}"), "{deposit}");
+    assert!(deposit.contains("<min_a{panic!();}"), "{deposit}");
+    // The multiply helper's overflow flag is not the product.
+    assert!(
+        deposit.contains(".checked_mul(") && deposit.contains(".is_none(){panic!();}"),
+        "{deposit}"
+    );
+    assert!(!deposit.contains("unwrap(){panic!();}"), "{deposit}");
+    // Token B is sent the merged amount, not `desired_a * reserve_b /
+    // reserve_a` on every path.
+    let transfer_b = deposit
+        .split("&symbol_short!(\"transfer\")")
+        .nth(2)
+        .expect("second transfer");
+    assert!(
+        !transfer_b.starts_with(
+            ",vec![&env,to.into_val(&env),env.current_contract_address().into_val(&env),(desired_a*"
+        ),
+        "{deposit}"
+    );
+    // The minted share balance is not the total-share count left in the
+    // slot by an earlier read: the balance read is not modelled, so the
+    // stored value is a hole.
+    assert!(
+        deposit
+            .contains(".set::<_,soroban_sdk::Val>(&DataKey::Shares(to),todo!(\"unknownvalue\"))"),
+        "{deposit}"
+    );
+}
+
 #[test]
 fn test_decompile_import_contract() {
     let wasm = include_bytes!("../../../tests/fixtures/test_import_contract.wasm");

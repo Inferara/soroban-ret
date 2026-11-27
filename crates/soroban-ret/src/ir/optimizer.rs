@@ -6249,6 +6249,11 @@ fn substitute_local_in_expr(expr: &mut SorobanExpr, idx: u32, value: &SorobanExp
 /// observable side effects.  Such lets are never inlined (even with one use)
 /// because moving the call from a guaranteed-execute position into a
 /// conditional branch would change semantics.
+/// Crate-visible [`expr_has_side_effects`].
+pub(crate) fn expr_has_side_effects_pub(expr: &SorobanExpr) -> bool {
+    expr_has_side_effects(expr)
+}
+
 fn expr_has_side_effects(expr: &SorobanExpr) -> bool {
     // A type annotation around a TRAPPING storage read is still that read:
     // `CastAs { StorageGet { on_missing: panic_with_error!(..) } }` (the
@@ -7071,10 +7076,18 @@ pub fn propagate_variable_names(
                         // behavior: downstream passes (move-clone repair, type
                         // annotation) rely on the spill collapsing onto its
                         // param.
+                        // The init may carry its conversion (`desired_a` as
+                        // an `i128` merge seed, issue #74): look through it.
+                        let mut seed = value;
+                        while let SorobanExpr::ValConvert { value: v, .. }
+                        | SorobanExpr::CastAs { value: v, .. } = seed
+                        {
+                            seed = v;
+                        }
                         if *mutable
                             && mutated_names.contains(name)
                             && matches!(
-                                value,
+                                seed,
                                 SorobanExpr::Param(p) | SorobanExpr::NamedLocal(p)
                                     if *p == final_name
                             )

@@ -6,6 +6,7 @@ pub mod cfg_analysis;
 pub mod dispatch;
 pub mod host_calls;
 pub mod lifter;
+pub mod restructure;
 pub mod structurize;
 
 pub use lifter::lift_functions;
