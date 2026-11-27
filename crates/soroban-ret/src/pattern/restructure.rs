@@ -592,9 +592,19 @@ pub fn restructure_regions(
             if info.ancestors.iter().any(|a| rewritten.contains_key(a)) {
                 continue;
             }
-            let StructuredBlock::Block { body: rbody, .. } = info.item else {
+            let StructuredBlock::Block {
+                body: rbody,
+                block_type,
+            } = info.item
+            else {
                 continue;
             };
+            // The rewritten arms merge locals, not values left on the stack:
+            // a block that yields a result keeps its shape.
+            if !matches!(block_type, BlockType::Empty) {
+                out.refused.push(Refusal::ValueBlock);
+                continue;
+            }
             if !calls_user_code(rbody, user_call) {
                 continue;
             }
@@ -890,6 +900,35 @@ mod tests {
         let o = restructure_regions(&mut body, &|_| true);
         assert_eq!(o.regions, 0);
         assert!(has_forward_branch(&body));
+    }
+
+    /// A join region that yields a value is not rewritten: its arms' stack
+    /// results would not be merged.
+    #[test]
+    fn value_block_region_refuses() {
+        let mut body = structurize(&[
+            Block {
+                block_type: BlockType::Value(crate::wasm::WasmType::I64),
+            },
+            blk(),
+            Call(1),
+            LocalGet(0),
+            BrIf(0),
+            I64Const(1),
+            Br(1),
+            End,
+            I64Const(2),
+            End,
+            Drop,
+        ]);
+        let before = format!("{body:?}");
+        let o = restructure_regions(&mut body, &|_| true);
+        assert_eq!(
+            (o.regions, o.refused.clone()),
+            (0, vec![Refusal::ValueBlock]),
+            "{o:?}"
+        );
+        assert_eq!(format!("{body:?}"), before);
     }
 
     #[test]

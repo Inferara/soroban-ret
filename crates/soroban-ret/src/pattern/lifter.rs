@@ -21028,9 +21028,18 @@ fn reconcile_exact_branch_locals(
         }
         e
     };
+    // Every binding an arm makes (any depth, mutable or not): out of scope
+    // after the `if`. A binding is named after the WASM local it fills, so
+    // an arm that rebinds a local leaves a value EQUAL to the pre-branch
+    // `LetBinding` of that local but naming a different binding.
+    let a_ids = arm_bound_ids(a_stmts);
+    let b_ids = arm_bound_ids(b_stmts);
+    let in_scope = |v: &StackVal, ids: &[u32]| -> bool {
+        !ids.iter().any(|n| stack_val_mentions_binding(v, *n))
+    };
     let agree = |x: &StackVal, y: &StackVal| -> bool {
         if x == y {
-            return true;
+            return in_scope(x, &a_ids) && in_scope(y, &b_ids);
         }
         if stack_val_contains_unknown(x) || stack_val_contains_unknown(y) {
             return false;
@@ -21038,16 +21047,13 @@ fn reconcile_exact_branch_locals(
         let (ex, ey) = (resolved(x, &a_lets), resolved(y, &b_lets));
         ex == ey && !crate::ir::optimizer::expr_has_side_effects_pub(&ex) && !ex.is_never_rooted()
     };
-    let in_scope = |v: &StackVal, lets: &HashMap<u32, SorobanExpr>| -> bool {
-        !lets.keys().any(|n| stack_val_mentions_binding(v, *n))
-    };
     // Of two agreeing values, the one to keep: in scope after the `if`,
     // limb-tracked if either is (an `i128` limb pair re-joins only from
     // `I128Limb`s), else the plainer.
     let pick = |x: &StackVal, y: &StackVal| -> Option<StackVal> {
-        let cands: Vec<&StackVal> = [(x, &a_lets), (y, &b_lets)]
+        let cands: Vec<&StackVal> = [(x, &a_ids), (y, &b_ids)]
             .into_iter()
-            .filter(|(v, l)| in_scope(v, l))
+            .filter(|(v, ids)| in_scope(v, ids))
             .map(|(v, _)| v)
             .collect();
         cands
@@ -21081,12 +21087,12 @@ fn reconcile_exact_branch_locals(
         };
         done[lo] = true;
         done[hi] = true;
-        if agree(&xa, &xb) && in_scope(&xa, &a_lets) {
+        if agree(&xa, &xb) && in_scope(&xa, &a_ids) {
             parent_locals[lo] = a[lo].clone();
             parent_locals[hi] = a[hi].clone();
             continue;
         }
-        if agree(&xa, &xb) && in_scope(&xb, &b_lets) {
+        if agree(&xa, &xb) && in_scope(&xb, &b_ids) {
             parent_locals[lo] = b[lo].clone();
             parent_locals[hi] = b[hi].clone();
             continue;
@@ -21129,7 +21135,11 @@ fn reconcile_exact_branch_locals(
             continue;
         }
         let (p, x, y) = (&pre[idx], &a[idx], &b[idx]);
-        if x == p && y == p {
+        // An arm changed the local if it holds another value, or the same
+        // `LetBinding` id of a binding the arm itself made.
+        let a_changed = x != p || !in_scope(x, &a_ids);
+        let b_changed = y != p || !in_scope(y, &b_ids);
+        if !a_changed && !b_changed {
             continue;
         }
         if agree(x, y)
@@ -21163,8 +21173,8 @@ fn reconcile_exact_branch_locals(
                 expr(p)
             },
         });
-        for (arm, v) in [(&mut *a_stmts, x), (&mut *b_stmts, y)] {
-            if v != p {
+        for (arm, v, changed) in [(&mut *a_stmts, x, a_changed), (&mut *b_stmts, y, b_changed)] {
+            if changed {
                 arm.push(SorobanStmt::Assign {
                     target: name.clone(),
                     value: if stack_val_contains_unknown(v) {
@@ -22234,6 +22244,21 @@ fn stack_result_references_binding(v: &StackVal) -> bool {
 }
 
 /// Collect every `Let` binding name in `stmts`, at any nesting depth.
+/// The ids of every `let var_N` in `stmts`, at any depth, mutable or not.
+fn arm_bound_ids(stmts: &[SorobanStmt]) -> Vec<u32> {
+    let mut out = Vec::new();
+    collect_let_names(stmts, &mut |name: &str| {
+        if let Some(n) = name
+            .strip_prefix("var_")
+            .and_then(|n| n.parse::<u32>().ok())
+            && !out.contains(&n)
+        {
+            out.push(n);
+        }
+    });
+    out
+}
+
 /// `var_N` → value of every immutable `let` in `stmts` (top level and nested).
 fn arm_let_values(stmts: &[SorobanStmt]) -> HashMap<u32, SorobanExpr> {
     let mut mutable = Vec::new();
@@ -24195,6 +24220,59 @@ mod tests {
     }
 
     // ----- stack_val_to_expr frame-slot cycle guard --------------------
+
+    /// PR #101 review: an arm that rebinds a local leaves the same
+    /// `LetBinding` id as the outer binding of that local, but names a
+    /// different binding. The join must merge it, not keep the outer one.
+    #[test]
+    fn exact_join_merges_a_local_an_arm_rebinds() {
+        let registry = empty_registry();
+        let pre = vec![StackVal::LetBinding(5)];
+        let mut parent = pre.clone();
+        let mut parent_stmts = Vec::new();
+        let mut a_stmts = vec![SorobanStmt::Let {
+            name: "var_5".to_string(),
+            mutable: false,
+            value: SorobanExpr::LedgerSequence,
+        }];
+        let mut b_stmts = Vec::new();
+        reconcile_exact_branch_locals(
+            &mut parent,
+            &mut parent_stmts,
+            &pre,
+            &[StackVal::LetBinding(5)],
+            &[StackVal::LetBinding(5)],
+            false,
+            false,
+            &mut a_stmts,
+            &mut b_stmts,
+            &[],
+            &registry,
+            None,
+        );
+        let StackVal::LetBinding(id) = parent[0] else {
+            panic!("{parent:?}")
+        };
+        assert_ne!(id, 5, "the outer binding must not survive the join");
+        assert!(
+            matches!(&parent_stmts[..], [SorobanStmt::Let { mutable: true, .. }]),
+            "{parent_stmts:?}"
+        );
+        assert!(
+            matches!(
+                a_stmts.last(),
+                Some(SorobanStmt::Assign {
+                    value: SorobanExpr::Local(5),
+                    ..
+                })
+            ),
+            "{a_stmts:?}"
+        );
+        assert!(
+            b_stmts.is_empty(),
+            "the other arm keeps the outer value: {b_stmts:?}"
+        );
+    }
 
     fn empty_registry() -> crate::spec::registry::TypeRegistry {
         crate::spec::registry::TypeRegistry {
