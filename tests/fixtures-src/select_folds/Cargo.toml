@@ -1,0 +1,28 @@
+# Source for the `tests/fixtures/test_select_folds.wasm` fixture (issue #80).
+#
+# Two shapes the compiler lowers to a wasm `select` instead of a branch: a
+# two-limb `i128` compare against zero, and an `i128` `min`. The lifter used
+# to render the first operand of a `select` whatever the condition, so `<= 0`
+# read as `== 0` and the `min` returned one of its arguments. Built once and the
+# resulting wasm is committed under tests/fixtures/; see
+# tests/fixtures/README.md. Standalone (`[workspace]`) so it is not pulled into
+# the main cargo workspace.
+[package]
+name = "test_select_folds"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "=26.0.1"
+
+# Match the canonical Soroban release profile (overflow-checks on), as the
+# equivalence harness recompiles with the same setting.
+[profile.release]
+overflow-checks = true
+
+[workspace]

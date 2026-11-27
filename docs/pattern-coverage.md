@@ -152,20 +152,20 @@ output compiles. `scripts/check-compilable.sh` decompiles every fixture and runs
 `compile_back` test gate (`SOROBAN_RET_COMPILE_BACK=1`) wraps it with a 95 %
 floor.
 
-Current status: **38 pass / 1 fail / 0 skip of 39 fixtures — 97 %** (gate
-passes; floor is 95 %). The single failure is **`test_liquidity_pool`**, which
-does *not* currently compile back: it emits 3 hard errors (`E0282` un-inferable
-type, `E0369` an operator on a lost-typed value, `E0382` a use-after-move).
-This fixture has regressed since the earlier "38/38, 100 %" reading — its
-original `E0284 into_val` failure was fixed, but the deeper i128 share-math
-reconstruction now surfaces different type errors. It is also *skipped by the
-accuracy metric*, for lack of a reference source — an unrelated exclusion.
+Current status: **38 pass / 0 fail / 4 skip of 42 fixtures — 100 % of the
+non-skipped** (gate passes; floor is 95 %). A fixture whose output holds a
+`todo!()` hole is skipped, not counted as a pass. **`test_liquidity_pool`** is
+one of the four: `deposit` mints `min(shares_a, shares_b)`, and one operand of
+that `min` is not recovered, so the two stored share values are honest holes
+(issue #74). Before issue #80 its output had no hole only because a wasm
+`select` rendered its first operand whatever the condition, and it then failed
+to compile back with 3 hard errors.
 
 Note the difference in denominator between the two fixture gates: compile-back
-sweeps the 39 `test_*.wasm` fixtures, while `ALL_FIXTURES` (the artifact-sweep
-in `integration.rs`) covers 40. `check-compilable.sh` *skips* any output
-containing `todo!` as unscoreable; currently nothing is skipped, so the pass
-rate is over the full set.
+sweeps the 42 `test_*.wasm` fixtures, while `ALL_FIXTURES` (the artifact-sweep
+in `integration.rs`) covers 43. `check-compilable.sh` *skips* any output
+containing `todo!` as unscoreable; currently 4 are skipped, so the pass rate
+is over the other 38.
 
 Two earlier compile-fidelity codegen fixes landed in
 `crates/soroban-ret/src/ir/optimizer.rs`:
@@ -278,7 +278,7 @@ every mainnet corpus contract and `cargo check`s the result for
 lifter emitted: output that *looks* like code but does not type-check. The
 metric is "wrong output", not "incomplete output".
 
-Current status: **330 hard errors across 24 contracts** (ceiling 330), with
+Current status: **332 hard errors across 24 contracts** (ceiling 332), with
 **2 contracts compiling cleanly** — `digicus` and `unknown-oracle`.
 Down from 1042 at the start of the v0.0.4 cycle, and up from 303: the
 equivalence gate showed that `fxdao-oracle` and `soroswap-CA4HEQTL` compiled

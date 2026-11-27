@@ -607,7 +607,24 @@ use std::process::Command;
 /// instead of a second binding, which is strictly closer to the wasm — and it
 /// costs +1 error: it moves soroban-domains' E0609s onto the other of the
 /// slot's two types without recovering anything, so it is not taken.
-const ERROR_CEILING: u32 = 330;
+/// → 332 (issue #80, the wasm `select`: a RISE of 2, audited). The lifter used
+/// to render the FIRST operand of a `select` whenever its condition was not a
+/// constant — a guess printed as a value. A `select` now keeps all three
+/// operands, and five exact folds read the idioms back: a constant condition,
+/// the SDK's `bool` argument decode, the two-limb `i128`/`u128` compare, the
+/// limb select of a conditional 128-bit value, and a compare of a two-constant
+/// `select` with one of its constants. Seven contracts move:
+/// aqua-rewards 28→25, soroswap-CAG5LRYQ 49→47, comet 17→15, arb-bot 5→4
+/// (guards that read `== 0` / `!= 0` for `<= 0` / `> 0`, and constants stored
+/// for a `bool` argument, are the contract's own values again);
+/// band-protocol 11→19 (the guess made a relay condition constant, which cut
+/// the body after an unconditional `panic!()` — the body is back, with the
+/// lost-key holes and `Option` reads it always had); reflector ×2 8→9 each
+/// (an `Option<Vec<_>>` return that was the vec's `len()` is now the choice
+/// between `()` and the vec — one mismatch per arm instead of one for a wrong
+/// value). No rise is a new wrong construct: each is code the guess had hidden.
+/// Equivalence stays at 0 divergences with hole cases unchanged at 918.
+const ERROR_CEILING: u32 = 332;
 
 #[test]
 fn corpus_soundness_within_ceiling() {

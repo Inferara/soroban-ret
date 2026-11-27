@@ -563,6 +563,11 @@ fn expr_contains_matching_get(expr: &SorobanExpr, st: &StorageType, key: &Soroba
 /// Return references to direct child expressions of an expression node.
 fn expr_children(expr: &SorobanExpr) -> Vec<&SorobanExpr> {
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => vec![cond.as_ref(), then_val.as_ref(), else_val.as_ref()],
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
         | SorobanExpr::Mul(a, b)
@@ -2216,6 +2221,11 @@ fn expr_contains(haystack: &SorobanExpr, needle: &SorobanExpr) -> bool {
 
         // Object + args
         SorobanExpr::MethodCall { object, args, .. } => c(object) || cv(args),
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => c(cond) || c(then_val) || c(else_val),
         SorobanExpr::VecTryIterFold { vec, init } => c(vec) || c(init),
         SorobanExpr::InvokeContract {
             address,
@@ -2515,6 +2525,15 @@ fn stmt_contains_param(stmt: &SorobanStmt) -> bool {
 
 fn expr_contains_param(expr: &SorobanExpr) -> bool {
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            expr_contains_param(cond)
+                || expr_contains_param(then_val)
+                || expr_contains_param(else_val)
+        }
         SorobanExpr::Param(_) => true,
         SorobanExpr::Add(a, b)
         | SorobanExpr::Sub(a, b)
@@ -3998,6 +4017,57 @@ fn decode_raw_val_len_compare(expr: SorobanExpr) -> SorobanExpr {
     }
 }
 
+/// `(c ? K1 : K2) == K` / `!= K` for three integer constants with `K1 != K2`:
+/// the compare is `c` when `K` is the arm `c` picks, `!c` when it is the other
+/// arm, and a constant when it is neither. `c` must be a `bool` so it can
+/// stand as the result. A status code picked by a check and then compared
+/// with one of its two values reads back as the check itself.
+fn fold_select_const_compare(
+    lhs: &SorobanExpr,
+    rhs: &SorobanExpr,
+    equal: bool,
+) -> Option<SorobanExpr> {
+    fn int(e: &SorobanExpr) -> Option<i128> {
+        match e {
+            SorobanExpr::I32Literal(v) => Some(i128::from(*v)),
+            SorobanExpr::U32Literal(v) => Some(i128::from(*v)),
+            SorobanExpr::I64Literal(v) => Some(i128::from(*v)),
+            SorobanExpr::U64Literal(v) => Some(i128::from(*v)),
+            _ => None,
+        }
+    }
+    let (cond, then_val, else_val, k) = match (lhs, rhs) {
+        (
+            SorobanExpr::Select {
+                cond,
+                then_val,
+                else_val,
+            },
+            k,
+        )
+        | (
+            k,
+            SorobanExpr::Select {
+                cond,
+                then_val,
+                else_val,
+            },
+        ) => (cond, then_val, else_val, k),
+        _ => return None,
+    };
+    let (k1, k2, k) = (int(then_val)?, int(else_val)?, int(k)?);
+    if k1 == k2 || !is_bool_typed(cond) {
+        return None;
+    }
+    Some(if k != k1 && k != k2 {
+        SorobanExpr::BoolLiteral(!equal)
+    } else if (k == k1) == equal {
+        (**cond).clone()
+    } else {
+        fold_expr(SorobanExpr::Not(cond.clone()))
+    })
+}
+
 /// Constant/boolean-fold one expression (`bool == 1` → `bool`, …) — for
 /// lifter code that builds a condition outside the statement-level passes.
 pub(crate) fn fold_expr_standalone(expr: SorobanExpr) -> SorobanExpr {
@@ -4007,6 +4077,26 @@ pub(crate) fn fold_expr_standalone(expr: SorobanExpr) -> SorobanExpr {
 fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
     let expr = decode_raw_val_len_compare(expr);
     match expr {
+        // A value chosen by a condition (a wasm `select`): a condition that
+        // folds to a constant picks its arm.
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            let cond = fold_expr(*cond);
+            let then_val = fold_expr(*then_val);
+            let else_val = fold_expr(*else_val);
+            match &cond {
+                SorobanExpr::BoolLiteral(true) => then_val,
+                SorobanExpr::BoolLiteral(false) => else_val,
+                _ => SorobanExpr::Select {
+                    cond: Box::new(cond),
+                    then_val: Box::new(then_val),
+                    else_val: Box::new(else_val),
+                },
+            }
+        }
         SorobanExpr::Add(a, b) => {
             let a = fold_expr(*a);
             let b = fold_expr(*b);
@@ -4220,6 +4310,9 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
         SorobanExpr::Eq(lhs, rhs) => {
             let lhs = fold_expr(*lhs);
             let rhs = fold_expr(*rhs);
+            if let Some(folded) = fold_select_const_compare(&lhs, &rhs, true) {
+                return folded;
+            }
             if let Some((a, b)) = try_fold_obj_cmp(&lhs, &rhs) {
                 return match as_cmp_int(&rhs) {
                     Some(-1) => SorobanExpr::Lt(a, b), // == -1 → a < b
@@ -4286,6 +4379,9 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
         SorobanExpr::Ne(lhs, rhs) => {
             let lhs = fold_expr(*lhs);
             let rhs = fold_expr(*rhs);
+            if let Some(folded) = fold_select_const_compare(&lhs, &rhs, false) {
+                return folded;
+            }
             if let Some((a, b)) = try_fold_obj_cmp(&lhs, &rhs) {
                 return match as_cmp_int(&rhs) {
                     Some(-1) => SorobanExpr::Ge(a, b), // != -1 → a >= b
@@ -5074,6 +5170,15 @@ fn invalidate_seen_gets_for_expr(
                 invalidate_seen_gets_for_expr(a, seen_gets);
             }
         }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            invalidate_seen_gets_for_expr(cond, seen_gets);
+            invalidate_seen_gets_for_expr(then_val, seen_gets);
+            invalidate_seen_gets_for_expr(else_val, seen_gets);
+        }
         SorobanExpr::VecTryIterFold { vec, init } => {
             invalidate_seen_gets_for_expr(vec, seen_gets);
             invalidate_seen_gets_for_expr(init, seen_gets);
@@ -5726,18 +5831,54 @@ fn count_local_in_stmt(stmt: &SorobanStmt, idx: u32, inside_loop: bool) -> (u32,
 /// bodies or loop bounds do not count.
 fn count_unconditional_uses(stmt: &SorobanStmt, idx: u32) -> u32 {
     match stmt {
-        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => count_local_in_expr(e, idx),
+        SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => count_unconditional_in_expr(e, idx),
         SorobanStmt::Let { value, .. } | SorobanStmt::Assign { value, .. } => {
-            count_local_in_expr(value, idx)
+            count_unconditional_in_expr(value, idx)
         }
-        SorobanStmt::If { condition, .. } => count_local_in_expr(condition, idx),
-        SorobanStmt::Match { scrutinee, .. } => count_local_in_expr(scrutinee, idx),
+        SorobanStmt::If { condition, .. } => count_unconditional_in_expr(condition, idx),
+        SorobanStmt::Match { scrutinee, .. } => count_unconditional_in_expr(scrutinee, idx),
         _ => 0,
+    }
+}
+
+/// Reads of `Local(idx)` that run whenever `expr` is evaluated. An arm of a
+/// [`SorobanExpr::Select`] runs only when its condition picks it, so a read
+/// there is not one of them: moving a trapping value into an arm would skip
+/// the trap on the other path. Only the condition counts.
+fn count_unconditional_in_expr(expr: &SorobanExpr, idx: u32) -> u32 {
+    count_local_in_expr(expr, idx) - count_local_in_select_arms(expr, idx)
+}
+
+/// Reads of `Local(idx)` inside the arms of any `Select` in `expr`.
+fn count_local_in_select_arms(expr: &SorobanExpr, idx: u32) -> u32 {
+    match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            count_local_in_select_arms(cond, idx)
+                + count_local_in_expr(then_val, idx)
+                + count_local_in_expr(else_val, idx)
+        }
+        other => expr_children(other)
+            .into_iter()
+            .map(|c| count_local_in_select_arms(c, idx))
+            .sum(),
     }
 }
 
 fn count_local_in_expr(expr: &SorobanExpr, idx: u32) -> u32 {
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            count_local_in_expr(cond, idx)
+                + count_local_in_expr(then_val, idx)
+                + count_local_in_expr(else_val, idx)
+        }
         SorobanExpr::Local(i) => u32::from(*i == idx),
         // Binary
         SorobanExpr::Add(a, b)
@@ -5916,6 +6057,15 @@ fn substitute_local_in_stmt(stmt: &mut SorobanStmt, idx: u32, value: &SorobanExp
 
 fn substitute_local_in_expr(expr: &mut SorobanExpr, idx: u32, value: &SorobanExpr) -> bool {
     match expr {
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            substitute_local_in_expr(cond, idx, value)
+                || substitute_local_in_expr(then_val, idx, value)
+                || substitute_local_in_expr(else_val, idx, value)
+        }
         SorobanExpr::Local(i) if *i == idx => {
             *expr = value.clone();
             true
@@ -6628,6 +6778,15 @@ fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
         SorobanExpr::MethodCall { object, args, .. } => {
             expr_mentions_other_params(object, excluded)
                 || args.iter().any(|a| expr_mentions_other_params(a, excluded))
+        }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            expr_mentions_other_params(cond, excluded)
+                || expr_mentions_other_params(then_val, excluded)
+                || expr_mentions_other_params(else_val, excluded)
         }
         SorobanExpr::VecTryIterFold { vec, init } => {
             expr_mentions_other_params(vec, excluded) || expr_mentions_other_params(init, excluded)
@@ -8029,6 +8188,15 @@ fn rename_in_expr(
         SorobanExpr::Try(a) => SorobanExpr::Try(rb(a)),
         SorobanExpr::SretResult(a) => SorobanExpr::SretResult(rb(a)),
         SorobanExpr::ValTag(a) => SorobanExpr::ValTag(rb(a)),
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => SorobanExpr::Select {
+            cond: rb(cond),
+            then_val: rb(then_val),
+            else_val: rb(else_val),
+        },
         SorobanExpr::VecTryIterFold { vec, init } => SorobanExpr::VecTryIterFold {
             vec: rb(vec),
             init: rb(init),
@@ -11040,6 +11208,93 @@ mod tests {
         assert_eq!(after, &SorobanExpr::Local(3), "after the block: the home");
     }
 
+    /// A `select` whose condition folds to a constant is the arm that
+    /// constant picks; any other condition keeps all three operands.
+    #[test]
+    fn a_select_folds_only_on_a_constant_condition() {
+        let sel = |cond: SorobanExpr| SorobanExpr::Select {
+            cond: Box::new(cond),
+            then_val: Box::new(SorobanExpr::I64Literal(1)),
+            else_val: Box::new(SorobanExpr::I64Literal(2)),
+        };
+        assert!(matches!(
+            fold_expr(sel(SorobanExpr::BoolLiteral(true))),
+            SorobanExpr::I64Literal(1)
+        ));
+        assert!(matches!(
+            fold_expr(sel(SorobanExpr::BoolLiteral(false))),
+            SorobanExpr::I64Literal(2)
+        ));
+        assert!(matches!(
+            fold_expr(sel(SorobanExpr::Param("flag".into()))),
+            SorobanExpr::Select { .. }
+        ));
+    }
+
+    /// A read in an arm of a `Select` runs only on that arm's path, so it is
+    /// not an unconditional use: a trapping value must not move into it.
+    #[test]
+    fn a_read_in_a_select_arm_is_not_unconditional() {
+        let sel = SorobanExpr::Select {
+            cond: Box::new(SorobanExpr::Local(1)),
+            then_val: Box::new(SorobanExpr::Local(2)),
+            else_val: Box::new(SorobanExpr::Add(
+                Box::new(SorobanExpr::Local(3)),
+                Box::new(SorobanExpr::I64Literal(1)),
+            )),
+        };
+        let stmt = SorobanStmt::Return(Some(SorobanExpr::Add(
+            Box::new(sel),
+            Box::new(SorobanExpr::Local(4)),
+        )));
+        assert_eq!(count_unconditional_uses(&stmt, 1), 1);
+        assert_eq!(count_unconditional_uses(&stmt, 2), 0);
+        assert_eq!(count_unconditional_uses(&stmt, 3), 0);
+        assert_eq!(count_unconditional_uses(&stmt, 4), 1);
+    }
+
+    /// A code picked by a check and compared with one of its two values is
+    /// the check, its negation, or a constant.
+    #[test]
+    fn a_compare_of_a_two_constant_select_is_its_condition() {
+        let has = || {
+            SorobanExpr::Lt(
+                Box::new(SorobanExpr::Param("a".into())),
+                Box::new(SorobanExpr::Param("b".into())),
+            )
+        };
+        let code = |cond: SorobanExpr| SorobanExpr::Select {
+            cond: Box::new(cond),
+            then_val: Box::new(SorobanExpr::I32Literal(500)),
+            else_val: Box::new(SorobanExpr::I32Literal(501)),
+        };
+        let lit = |v: i32| Box::new(SorobanExpr::I32Literal(v));
+        assert!(matches!(
+            fold_expr(SorobanExpr::Eq(Box::new(code(has())), lit(500))),
+            SorobanExpr::Lt(..)
+        ));
+        assert!(matches!(
+            fold_expr(SorobanExpr::Eq(Box::new(code(has())), lit(501))),
+            SorobanExpr::Ge(..)
+        ));
+        assert!(matches!(
+            fold_expr(SorobanExpr::Ne(Box::new(code(has())), lit(500))),
+            SorobanExpr::Ge(..)
+        ));
+        assert!(matches!(
+            fold_expr(SorobanExpr::Eq(Box::new(code(has())), lit(7))),
+            SorobanExpr::BoolLiteral(false)
+        ));
+        // A condition that is not a `bool` cannot stand as the result.
+        assert!(matches!(
+            fold_expr(SorobanExpr::Eq(
+                Box::new(code(SorobanExpr::Param("n".into()))),
+                lit(500)
+            )),
+            SorobanExpr::Eq(..)
+        ));
+    }
+
     /// A read inside a `Shl`, a `Some`, a `Try` or a `VecTryIterFold` follows
     /// the rename like any other. `rename_in_expr` used to end in a catch-all
     /// that returned those variants unvisited, so the split renamed the binding
@@ -11061,6 +11316,16 @@ mod tests {
             SorobanExpr::VecTryIterFold {
                 vec: Box::new(read()),
                 init: Box::new(SorobanExpr::I64Literal(0)),
+            },
+            SorobanExpr::Select {
+                cond: Box::new(read()),
+                then_val: Box::new(SorobanExpr::I64Literal(1)),
+                else_val: Box::new(SorobanExpr::I64Literal(0)),
+            },
+            SorobanExpr::Select {
+                cond: Box::new(SorobanExpr::BoolLiteral(true)),
+                then_val: Box::new(SorobanExpr::I64Literal(1)),
+                else_val: Box::new(read()),
             },
         ];
         for case in cases {

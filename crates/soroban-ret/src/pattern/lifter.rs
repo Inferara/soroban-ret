@@ -6031,6 +6031,11 @@ impl<'a> LiftContext<'a> {
                     // pattern `(u32_val << 32 | tag) >> 31 = u32_val * 2`.
                     (_, Some(0xFFFFFFFE)) => self.stack.push(a),
                     (Some(0xFFFFFFFE), _) => self.stack.push(b),
+                    // The tag byte of a declared `bool` parameter. A valid
+                    // `bool` Val is exactly its tag (False = 0, True = 1), so
+                    // the byte IS the parameter; every other tag reaches the
+                    // decode trap the SDK inserts again on a rebuild.
+                    (_, Some(0xFF)) if is_bool_param(&a, self.params) => self.stack.push(a),
                     _ => self.stack.push(StackVal::Unknown),
                 }
             }
@@ -6476,7 +6481,20 @@ impl<'a> LiftContext<'a> {
                 match &cond {
                     StackVal::I32(0) | StackVal::I64(0) => self.stack.push(val2),
                     StackVal::I32(_) | StackVal::I64(_) => self.stack.push(val1),
-                    _ => self.stack.push(val1), // default to val1 (common path)
+                    // Both operands are the same value: the condition cannot
+                    // change the result.
+                    _ if val1 == val2 => self.stack.push(val1),
+                    // The condition is not known here, so neither operand
+                    // alone is the result. Keep all three (issue #80): the
+                    // old "default to val1" rendered a guess as a value.
+                    _ => {
+                        let folded = fold_select(&cond, &val1, &val2, self.params);
+                        self.stack.push(folded.unwrap_or(StackVal::Select {
+                            cond: Box::new(cond),
+                            then_val: Box::new(val1),
+                            else_val: Box::new(val2),
+                        }));
+                    }
                 }
             }
 
@@ -10618,6 +10636,15 @@ fn expr_contains_unknown(expr: &SorobanExpr) -> bool {
         | SorobanExpr::VecTryIterFold { vec: a, init: b } => {
             expr_contains_unknown(a) || expr_contains_unknown(b)
         }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            expr_contains_unknown(cond)
+                || expr_contains_unknown(then_val)
+                || expr_contains_unknown(else_val)
+        }
         SorobanExpr::StorageGet { key, .. }
         | SorobanExpr::StorageHas { key, .. }
         | SorobanExpr::StorageRemove { key, .. } => expr_contains_unknown(key),
@@ -12694,6 +12721,15 @@ fn stack_val_mentions_frame(v: &StackVal, fid: u32) -> bool {
             stack_val_mentions_frame(a, fid) || stack_val_mentions_frame(b, fid)
         }
         StackVal::I128Limb { value, .. } => stack_val_mentions_frame(value, fid),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stack_val_mentions_frame(cond, fid)
+                || stack_val_mentions_frame(then_val, fid)
+                || stack_val_mentions_frame(else_val, fid)
+        }
         _ => false,
     }
 }
@@ -12707,6 +12743,15 @@ fn stack_val_mentions_iter_marker(v: &StackVal) -> bool {
             stack_val_mentions_iter_marker(a) || stack_val_mentions_iter_marker(b)
         }
         StackVal::I128Limb { value, .. } => stack_val_mentions_iter_marker(value),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stack_val_mentions_iter_marker(cond)
+                || stack_val_mentions_iter_marker(then_val)
+                || stack_val_mentions_iter_marker(else_val)
+        }
         _ => false,
     }
 }
@@ -19526,6 +19571,11 @@ fn stack_val_is_pure(v: &StackVal) -> bool {
         }
         StackVal::Eqz(a) => stack_val_is_pure(a),
         StackVal::I128Limb { value, .. } => stack_val_is_pure(value),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => stack_val_is_pure(cond) && stack_val_is_pure(then_val) && stack_val_is_pure(else_val),
         StackVal::HostCallResult(e) => match e.as_ref() {
             SorobanExpr::ValConvert { value, .. } => expr_is_pure_source(value),
             // A bare reference the value-link seeds wrap (`var_N` from
@@ -19551,6 +19601,15 @@ fn stack_val_is_loop_invariant_pure(v: &StackVal) -> bool {
         }
         StackVal::Eqz(a) => stack_val_is_loop_invariant_pure(a),
         StackVal::I128Limb { value, .. } => stack_val_is_loop_invariant_pure(value),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stack_val_is_loop_invariant_pure(cond)
+                && stack_val_is_loop_invariant_pure(then_val)
+                && stack_val_is_loop_invariant_pure(else_val)
+        }
         _ => false,
     }
 }
@@ -19744,6 +19803,15 @@ enum StackVal {
     I128Limb {
         value: Box<StackVal>,
         hi: bool,
+    },
+    /// A wasm `select` whose condition is not a lift-time constant: `then_val`
+    /// when `cond` is non-zero, `else_val` otherwise (issue #80). Converts to
+    /// [`SorobanExpr::Select`]. A recognizer that wants one of the operands
+    /// must prove the condition; it never gets an operand by default.
+    Select {
+        cond: Box<StackVal>,
+        then_val: Box<StackVal>,
+        else_val: Box<StackVal>,
     },
     /// Unknown/untracked value
     Unknown,
@@ -20194,6 +20262,15 @@ fn stack_val_references_letbinding(v: &StackVal) -> bool {
             stack_val_references_letbinding(a) || stack_val_references_letbinding(b)
         }
         StackVal::Eqz(a) => stack_val_references_letbinding(a),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stack_val_references_letbinding(cond)
+                || stack_val_references_letbinding(then_val)
+                || stack_val_references_letbinding(else_val)
+        }
         _ => false,
     }
 }
@@ -21181,6 +21258,15 @@ fn is_static_condition(val: &StackVal) -> bool {
         StackVal::Compare(a, _, b) => is_static_condition(a) && is_static_condition(b),
         StackVal::Eqz(inner) => is_static_condition(inner),
         StackVal::BinOp(a, _, b) => is_static_condition(a) && is_static_condition(b),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            is_static_condition(cond)
+                && is_static_condition(then_val)
+                && is_static_condition(else_val)
+        }
         _ => false,
     }
 }
@@ -21199,6 +21285,15 @@ fn stack_val_has_val_constant(val: &StackVal) -> bool {
             stack_val_has_val_constant(a) || stack_val_has_val_constant(b)
         }
         StackVal::Eqz(inner) => stack_val_has_val_constant(inner),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stack_val_has_val_constant(cond)
+                || stack_val_has_val_constant(then_val)
+                || stack_val_has_val_constant(else_val)
+        }
         _ => false,
     }
 }
@@ -21217,6 +21312,15 @@ fn stackval_references_loop_phi(val: &StackVal, idx: u32) -> bool {
             stackval_references_loop_phi(a, idx) || stackval_references_loop_phi(b, idx)
         }
         StackVal::Eqz(a) => stackval_references_loop_phi(a, idx),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stackval_references_loop_phi(cond, idx)
+                || stackval_references_loop_phi(then_val, idx)
+                || stackval_references_loop_phi(else_val, idx)
+        }
         // A functional collection update (`v = vec_push_back(v, x)`, issue
         // #38 t21) materializes the phi as its expr rendering (`LoopPhi(i)`
         // → `Local(i)`, see `stack_val_to_expr`), so the self-reference
@@ -21282,6 +21386,15 @@ fn stackval_references_frame_slot_phi(val: &StackVal, id: u32, off: i32) -> bool
                 || stackval_references_frame_slot_phi(b, id, off)
         }
         StackVal::Eqz(a) => stackval_references_frame_slot_phi(a, id, off),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stackval_references_frame_slot_phi(cond, id, off)
+                || stackval_references_frame_slot_phi(then_val, id, off)
+                || stackval_references_frame_slot_phi(else_val, id, off)
+        }
         _ => false,
     }
 }
@@ -21487,6 +21600,15 @@ fn stackval_references_let_or_phi(val: &StackVal) -> bool {
             stackval_references_let_or_phi(a) || stackval_references_let_or_phi(b)
         }
         StackVal::Eqz(a) => stackval_references_let_or_phi(a),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stackval_references_let_or_phi(cond)
+                || stackval_references_let_or_phi(then_val)
+                || stackval_references_let_or_phi(else_val)
+        }
         _ => false,
     }
 }
@@ -21499,6 +21621,15 @@ fn stack_val_contains_unknown(val: &StackVal) -> bool {
         }
         StackVal::BinOp(a, _, b) => stack_val_contains_unknown(a) || stack_val_contains_unknown(b),
         StackVal::Eqz(a) => stack_val_contains_unknown(a),
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            stack_val_contains_unknown(cond)
+                || stack_val_contains_unknown(then_val)
+                || stack_val_contains_unknown(else_val)
+        }
         StackVal::FrameSlot(_, _) => false,
         _ => false,
     }
@@ -21971,6 +22102,16 @@ fn stack_val_to_expr_inner(
                 }
             }
         }
+        // A compare of a declared `bool` parameter with a constant: the
+        // parameter is `0` or `1` on every path that does not trap.
+        StackVal::Compare(a, op @ (CmpOp::Eq | CmpOp::Ne), b)
+            if bool_param_compare(a, *op, b, params).is_some() =>
+        {
+            bool_param_compare(a, *op, b, params).unwrap_or(SorobanExpr::UnknownVal)
+        }
+        StackVal::Eqz(a) if is_bool_param(a, params) => SorobanExpr::Not(Box::new(
+            stack_val_to_expr_inner(a, params, registry, frame_slots, visiting),
+        )),
         StackVal::Compare(a, op, b) => {
             // A masked length against `N << 32` decodes to the u32 length
             // domain at RENDER time only: the abstract value keeps its raw
@@ -22054,6 +22195,16 @@ fn stack_val_to_expr_inner(
                 | SorobanExpr::Ge(_, _) => SorobanExpr::Not(Box::new(a_expr)),
                 _ => SorobanExpr::Eq(Box::new(a_expr), Box::new(SorobanExpr::I32Literal(0))),
             }
+        }
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            let cond_e = stack_val_to_expr_inner(cond, params, registry, frame_slots, visiting);
+            let then_e = stack_val_to_expr_inner(then_val, params, registry, frame_slots, visiting);
+            let else_e = stack_val_to_expr_inner(else_val, params, registry, frame_slots, visiting);
+            select_expr(cond_e, then_e, else_e, params)
         }
         StackVal::LetBinding(idx) => SorobanExpr::Local(*idx),
         StackVal::LoopPhi(idx) => SorobanExpr::Local(*idx),
@@ -22140,7 +22291,360 @@ fn stack_val_to_arith_expr_inner(
             cov_mark::hit!(void_return_guard_in_arith);
             SorobanExpr::I64Literal(0)
         }
+        // The operands of a `select` in an arithmetic position are raw
+        // integers too.
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            let cond_e = stack_val_to_expr_inner(cond, params, registry, frame_slots, visiting);
+            let then_e =
+                stack_val_to_arith_expr_inner(then_val, params, registry, frame_slots, visiting);
+            let else_e =
+                stack_val_to_arith_expr_inner(else_val, params, registry, frame_slots, visiting);
+            select_expr(cond_e, then_e, else_e, params)
+        }
         _ => stack_val_to_expr_inner(val, params, registry, frame_slots, visiting),
+    }
+}
+
+/// `p == k` / `p != k` for a declared `bool` parameter `p` and a constant `k`.
+///
+/// The wasm reads the parameter as the integer `0` or `1` (the `Val` of a
+/// valid `bool` is its tag), so `k` picks the parameter, its negation, or —
+/// for a value no `bool` has — a constant.
+fn bool_param_compare(
+    a: &StackVal,
+    op: CmpOp,
+    b: &StackVal,
+    params: &[FnParam],
+) -> Option<SorobanExpr> {
+    let (param, k) = match (a, b) {
+        (p @ StackVal::Param(name), k) | (k, p @ StackVal::Param(name))
+            if is_bool_param(p, params) =>
+        {
+            (SorobanExpr::Param(name.clone()), to_u64(k)?)
+        }
+        _ => return None,
+    };
+    let equal = matches!(op, CmpOp::Eq);
+    Some(match k {
+        0 if equal => SorobanExpr::Not(Box::new(param)),
+        1 if !equal => SorobanExpr::Not(Box::new(param)),
+        0 | 1 => param,
+        _ => SorobanExpr::BoolLiteral(!equal),
+    })
+}
+
+/// A declared `bool` contract parameter.
+fn is_bool_param(v: &StackVal, params: &[FnParam]) -> bool {
+    let StackVal::Param(name) = v else {
+        return false;
+    };
+    params
+        .iter()
+        .any(|p| p.name == *name && matches!(p.type_def, ScSpecTypeDef::Bool))
+}
+
+/// The value of a wasm `select` whose three operands form an idiom with one
+/// exact meaning (issue #80). `None` leaves the `select` as it is.
+///
+/// Every fold here is an identity on the wasm semantics, not a preference
+/// between the two arms.
+fn fold_select(
+    cond: &StackVal,
+    then_val: &StackVal,
+    else_val: &StackVal,
+    params: &[FnParam],
+) -> Option<StackVal> {
+    if let Some(truth) = const_truth(cond) {
+        cov_mark::hit!(select_const_cond_folded);
+        return Some(if truth { then_val } else { else_val }.clone());
+    }
+    if let Some(v) = fold_bool_tag_clamp(cond, then_val, else_val, params) {
+        cov_mark::hit!(select_bool_decode_folded);
+        return Some(v);
+    }
+    if let Some(v) = fold_wide_compare(cond, then_val, else_val) {
+        cov_mark::hit!(select_wide_compare_folded);
+        return Some(v);
+    }
+    fold_limb_select(cond, then_val, else_val)
+}
+
+/// Truth of a condition both operands of which are constants of one width.
+fn const_truth(cond: &StackVal) -> Option<bool> {
+    let signed = |v: &StackVal| match v {
+        StackVal::I32(n) => Some(*n as i64),
+        StackVal::I64(n) => Some(*n),
+        _ => None,
+    };
+    let unsigned = |v: &StackVal| to_u64(v);
+    match cond {
+        StackVal::Eqz(v) => Some(unsigned(v)? == 0),
+        StackVal::Compare(a, op, b) => {
+            if std::mem::discriminant(&**a) != std::mem::discriminant(&**b) {
+                return None;
+            }
+            let (sa, ua) = (signed(a)?, unsigned(a)?);
+            let (sb, ub) = (signed(b)?, unsigned(b)?);
+            Some(match op {
+                CmpOp::Eq => ua == ub,
+                CmpOp::Ne => ua != ub,
+                CmpOp::LtS => sa < sb,
+                CmpOp::LtU => ua < ub,
+                CmpOp::GtS => sa > sb,
+                CmpOp::GtU => ua > ub,
+                CmpOp::LeS => sa <= sb,
+                CmpOp::LeU => ua <= ub,
+                CmpOp::GeS => sa >= sb,
+                CmpOp::GeU => ua >= ub,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The SDK's `bool` argument decode: `tag == 1 ? 1 : (tag != 0 ? 2 : 0)`, which
+/// maps the tag byte to `0`, `1` or the error value `2`. `tag` is the byte of a
+/// declared `bool` parameter, so on every path that does not trap the result
+/// is the parameter.
+fn fold_bool_tag_clamp(
+    cond: &StackVal,
+    then_val: &StackVal,
+    else_val: &StackVal,
+    params: &[FnParam],
+) -> Option<StackVal> {
+    let StackVal::Compare(tag, CmpOp::Eq, one) = cond else {
+        return None;
+    };
+    if to_u64(one) != Some(1) || to_u64(then_val) != Some(1) || !is_bool_param(tag, params) {
+        return None;
+    }
+    let is_nonzero = |v: &StackVal| match v {
+        StackVal::Compare(t, CmpOp::Ne, z) => t == tag && to_u64(z) == Some(0),
+        other => other == &**tag,
+    };
+    let clamps = match else_val {
+        // `tag != 0 ? 2 : 0`
+        StackVal::Select {
+            cond,
+            then_val,
+            else_val,
+        } => is_nonzero(cond) && to_u64(then_val) == Some(2) && to_u64(else_val) == Some(0),
+        // `(tag != 0) << 1`
+        StackVal::BinOp(nz, BinOper::Shl, by) => {
+            matches!(&**nz, StackVal::Compare(..)) && is_nonzero(nz) && to_u64(by) == Some(1)
+        }
+        _ => false,
+    };
+    clamps.then(|| (**tag).clone())
+}
+
+/// The whole 128-bit value a `(lo, hi)` pair carries: both limbs of one tracked
+/// value, two constant words, or an open-coded add / subtract of such values.
+/// The flag is true for a tracked value. `signed` is the signedness of the
+/// compare the value feeds, and types a constant pair (`i128` or `u128`).
+fn whole_i128_of_limbs(lo: &StackVal, hi: &StackVal, signed: bool) -> Option<(StackVal, bool)> {
+    match (lo, hi) {
+        (
+            StackVal::I128Limb {
+                value: lv,
+                hi: false,
+            },
+            StackVal::I128Limb {
+                value: hv,
+                hi: true,
+            },
+        ) if lv == hv => Some(((**lv).clone(), true)),
+        (StackVal::I64(l), StackVal::I64(h)) => {
+            // The compare's signedness types the constant: the same two
+            // words are a negative `i128` or a `u128` above `i128::MAX`.
+            let bits = ((*h as u64 as u128) << 64) | (*l as u64 as u128);
+            let literal = if signed {
+                SorobanExpr::I128Literal(bits as i128)
+            } else {
+                SorobanExpr::U128Literal(bits)
+            };
+            Some((StackVal::HostCallResult(Box::new(literal)), false))
+        }
+        // An open-coded 128-bit add or subtract (carry / borrow limb chains).
+        _ => reconstruct_i128_addsub(lo, hi),
+    }
+}
+
+/// The two-limb compare of 128-bit values:
+/// `a_hi == b_hi ? a_lo <op>u b_lo : a_hi <op> b_hi` is `a <op> b`.
+///
+/// The low words always compare unsigned; the high compare carries the
+/// signedness (`i128` or `u128`). Both arms must order the same way, and at
+/// least one side must be a tracked 128-bit value.
+fn fold_wide_compare(
+    cond: &StackVal,
+    then_val: &StackVal,
+    else_val: &StackVal,
+) -> Option<StackVal> {
+    let zero = StackVal::I64(0);
+    // The condition: the high words are equal.
+    let (a_hi, b_hi) = match cond {
+        StackVal::Compare(a, CmpOp::Eq, b) => (&**a, &**b),
+        StackVal::Eqz(a) => (&**a, &zero),
+        _ => return None,
+    };
+    // The low compare, as an unsigned order `a_lo <op> b_lo`.
+    let (l_lhs, l_op, l_rhs) = match then_val {
+        StackVal::Compare(a, op @ (CmpOp::LtU | CmpOp::LeU | CmpOp::GtU | CmpOp::GeU), b) => {
+            (&**a, *op, &**b)
+        }
+        // `lo == 0` is `lo <=u 0`; `lo != 0` is `lo >u 0`.
+        StackVal::Eqz(a) => (&**a, CmpOp::LeU, &zero),
+        StackVal::Compare(a, CmpOp::Eq, z) if **z == zero => (&**a, CmpOp::LeU, &zero),
+        StackVal::Compare(a, CmpOp::Ne, z) if **z == zero => (&**a, CmpOp::GtU, &zero),
+        _ => return None,
+    };
+    let StackVal::Compare(h_lhs, h_op, h_rhs) = else_val else {
+        return None;
+    };
+    let (h_lhs, h_rhs) = (&**h_lhs, &**h_rhs);
+    let flip = |op: CmpOp| match op {
+        CmpOp::LtS => CmpOp::GtS,
+        CmpOp::GtS => CmpOp::LtS,
+        CmpOp::LtU => CmpOp::GtU,
+        CmpOp::GtU => CmpOp::LtU,
+        CmpOp::LeS => CmpOp::GeS,
+        CmpOp::GeS => CmpOp::LeS,
+        CmpOp::LeU => CmpOp::GeU,
+        CmpOp::GeU => CmpOp::LeU,
+        other => other,
+    };
+    // Put both compares in the `a ? b` order the condition names.
+    let h_op = if h_lhs == a_hi && h_rhs == b_hi {
+        *h_op
+    } else if h_lhs == b_hi && h_rhs == a_hi {
+        flip(*h_op)
+    } else {
+        return None;
+    };
+    // The high words differ on this arm, so `<=` and `<` agree there.
+    let (less, signed) = match h_op {
+        CmpOp::LtS | CmpOp::LeS => (true, true),
+        CmpOp::GtS | CmpOp::GeS => (false, true),
+        CmpOp::LtU | CmpOp::LeU => (true, false),
+        CmpOp::GtU | CmpOp::GeU => (false, false),
+        CmpOp::Eq | CmpOp::Ne => return None,
+    };
+    // Find which low operand belongs to `a`.
+    let (a, a_tracked, b, b_tracked, l_op) = match (
+        whole_i128_of_limbs(l_lhs, a_hi, signed),
+        whole_i128_of_limbs(l_rhs, b_hi, signed),
+    ) {
+        (Some((a, at)), Some((b, bt))) => (a, at, b, bt, l_op),
+        _ => {
+            let (a, at) = whole_i128_of_limbs(l_rhs, a_hi, signed)?;
+            let (b, bt) = whole_i128_of_limbs(l_lhs, b_hi, signed)?;
+            (a, at, b, bt, flip(l_op))
+        }
+    };
+    if !a_tracked && !b_tracked {
+        return None;
+    }
+    let op = match (l_op, less, signed) {
+        (CmpOp::LtU, true, true) => CmpOp::LtS,
+        (CmpOp::LeU, true, true) => CmpOp::LeS,
+        (CmpOp::GtU, false, true) => CmpOp::GtS,
+        (CmpOp::GeU, false, true) => CmpOp::GeS,
+        (CmpOp::LtU, true, false) => CmpOp::LtU,
+        (CmpOp::LeU, true, false) => CmpOp::LeU,
+        (CmpOp::GtU, false, false) => CmpOp::GtU,
+        (CmpOp::GeU, false, false) => CmpOp::GeU,
+        // The two arms order in opposite directions: not one compare.
+        _ => return None,
+    };
+    Some(StackVal::Compare(Box::new(a), op, Box::new(b)))
+}
+
+/// A `select` between the same limb of two 128-bit values is that limb of the
+/// selected value: `c ? lo(a) : lo(b)` is `lo(c ? a : b)`. The two limb selects
+/// of one conditional value then pair again like any other limb pair.
+fn fold_limb_select(cond: &StackVal, then_val: &StackVal, else_val: &StackVal) -> Option<StackVal> {
+    let (StackVal::I128Limb { value: a, hi: a_hi }, StackVal::I128Limb { value: b, hi: b_hi }) =
+        (then_val, else_val)
+    else {
+        return None;
+    };
+    if a_hi != b_hi {
+        return None;
+    }
+    cov_mark::hit!(select_limb_pair_folded);
+    Some(StackVal::I128Limb {
+        value: Box::new(StackVal::Select {
+            cond: Box::new(cond.clone()),
+            then_val: a.clone(),
+            else_val: b.clone(),
+        }),
+        hi: *a_hi,
+    })
+}
+
+/// Build the conditional a wasm `select` computes from its three converted
+/// operands (issue #80).
+///
+/// A condition the lifter lost leaves nothing to choose with: the result is a
+/// hole, and it is one hole — `if todo!() { a } else { b }` would panic at the
+/// condition exactly the same way. Two arms that convert to the same
+/// expression need no condition. Where one arm is a `bool` and the other the
+/// wasm truth value `0` / `1`, the constant is that `bool`.
+fn select_expr(
+    cond: SorobanExpr,
+    then_val: SorobanExpr,
+    else_val: SorobanExpr,
+    params: &[FnParam],
+) -> SorobanExpr {
+    // A condition with a lost operand selects nothing: which arm holds is as
+    // unknown as the operand, so the value is one hole, not a conditional
+    // around holes.
+    if expr_contains_unknown(&cond) {
+        return SorobanExpr::UnknownVal;
+    }
+    if matches!(then_val, SorobanExpr::UnknownVal) && matches!(else_val, SorobanExpr::UnknownVal) {
+        return SorobanExpr::UnknownVal;
+    }
+    fn truth(e: &SorobanExpr) -> Option<bool> {
+        match e {
+            SorobanExpr::I32Literal(0) | SorobanExpr::I64Literal(0) => Some(false),
+            SorobanExpr::I32Literal(1) | SorobanExpr::I64Literal(1) => Some(true),
+            _ => None,
+        }
+    }
+    use crate::ir::optimizer::is_bool_typed;
+    // A wasm condition is an integer tested against zero; a Rust `if` takes a
+    // `bool`. Keep a condition proven `bool`, and test any other for nonzero.
+    fn is_bool(e: &SorobanExpr, params: &[FnParam]) -> bool {
+        match e {
+            SorobanExpr::Param(name) => params
+                .iter()
+                .any(|p| p.name == *name && matches!(p.type_def, ScSpecTypeDef::Bool)),
+            SorobanExpr::Select {
+                then_val, else_val, ..
+            } => is_bool(then_val, params) && is_bool(else_val, params),
+            other => is_bool_typed(other),
+        }
+    }
+    let cond = if is_bool(&cond, params) {
+        cond
+    } else {
+        SorobanExpr::Ne(Box::new(cond), Box::new(SorobanExpr::I32Literal(0)))
+    };
+    let (then_val, else_val) = match (truth(&then_val), truth(&else_val)) {
+        (Some(t), None) if is_bool_typed(&else_val) => (SorobanExpr::BoolLiteral(t), else_val),
+        (None, Some(e)) if is_bool_typed(&then_val) => (then_val, SorobanExpr::BoolLiteral(e)),
+        _ => (then_val, else_val),
+    };
+    SorobanExpr::Select {
+        cond: Box::new(cond),
+        then_val: Box::new(then_val),
+        else_val: Box::new(else_val),
     }
 }
 
@@ -28318,5 +28822,327 @@ mod tests {
             !reads_after_write,
             "`a = b; b = a;` is not a swap: {body:?}"
         );
+    }
+    /// A `select` with a lost condition is one hole, not a guess at an
+    /// operand; a kept one carries all three operands (issue #80).
+    #[test]
+    fn a_select_never_defaults_to_an_operand() {
+        let registry = empty_registry();
+        let sel = |cond: StackVal| StackVal::Select {
+            cond: Box::new(cond),
+            then_val: Box::new(StackVal::Param("a".into())),
+            else_val: Box::new(StackVal::Param("b".into())),
+        };
+        assert!(matches!(
+            stack_val_to_expr(&sel(StackVal::Unknown), &[], &registry, None),
+            SorobanExpr::UnknownVal
+        ));
+        let params = [FnParam {
+            name: "flag".into(),
+            type_def: ScSpecTypeDef::Bool,
+        }];
+        let kept = stack_val_to_expr(
+            &sel(StackVal::Param("flag".into())),
+            &params,
+            &registry,
+            None,
+        );
+        // An integer condition is a test against zero, as in the wasm.
+        let int_cond =
+            stack_val_to_expr(&sel(StackVal::Param("n".into())), &params, &registry, None);
+        assert!(matches!(
+            int_cond,
+            SorobanExpr::Select { ref cond, .. }
+                if matches!(**cond, SorobanExpr::Ne(ref n, ref z)
+                    if matches!(**n, SorobanExpr::Param(ref p) if p == "n")
+                        && matches!(**z, SorobanExpr::I32Literal(0)))
+        ));
+        let SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } = kept
+        else {
+            panic!("expected a conditional, got {kept:?}");
+        };
+        assert!(matches!(*cond, SorobanExpr::Param(ref n) if n == "flag"));
+        assert!(matches!(*then_val, SorobanExpr::Param(ref n) if n == "a"));
+        assert!(matches!(*else_val, SorobanExpr::Param(ref n) if n == "b"));
+        // The wasm truth value beside a `bool` arm is that `bool`.
+        let mixed = select_expr(
+            SorobanExpr::Param("flag".into()),
+            SorobanExpr::I32Literal(1),
+            SorobanExpr::Not(Box::new(SorobanExpr::Param("x".into()))),
+            &params,
+        );
+        assert!(matches!(
+            mixed,
+            SorobanExpr::Select { ref then_val, .. } if matches!(**then_val, SorobanExpr::BoolLiteral(true))
+        ));
+    }
+
+    fn limb(name: &str, hi: bool) -> StackVal {
+        StackVal::I128Limb {
+            value: Box::new(StackVal::Param(name.into())),
+            hi,
+        }
+    }
+
+    fn cmp(a: StackVal, op: CmpOp, b: StackVal) -> StackVal {
+        StackVal::Compare(Box::new(a), op, Box::new(b))
+    }
+
+    /// `a_hi == b_hi ? a_lo <u b_lo : a_hi <s b_hi` is the one compare
+    /// `a < b`; the zero forms are the same idiom against a constant.
+    #[test]
+    fn a_two_limb_compare_is_one_wide_compare() {
+        let whole = |n: &str| StackVal::Param(n.into());
+        let zero = || StackVal::HostCallResult(Box::new(SorobanExpr::I128Literal(0)));
+        // a < b, signed.
+        let lt = fold_wide_compare(
+            &cmp(limb("a", true), CmpOp::Eq, limb("b", true)),
+            &cmp(limb("a", false), CmpOp::LtU, limb("b", false)),
+            &cmp(limb("a", true), CmpOp::LtS, limb("b", true)),
+        );
+        assert_eq!(lt, Some(cmp(whole("a"), CmpOp::LtS, whole("b"))));
+        // An unsigned high compare keeps the unsigned order (u128).
+        let ge_u = fold_wide_compare(
+            &cmp(limb("a", true), CmpOp::Eq, limb("b", true)),
+            &cmp(limb("a", false), CmpOp::GeU, limb("b", false)),
+            &cmp(limb("a", true), CmpOp::GtU, limb("b", true)),
+        );
+        assert_eq!(ge_u, Some(cmp(whole("a"), CmpOp::GeU, whole("b"))));
+        // x <= 0: `hi == 0 ? lo == 0 : hi < 0` (issue #80 C3).
+        let le_zero = fold_wide_compare(
+            &StackVal::Eqz(Box::new(limb("x", true))),
+            &StackVal::Eqz(Box::new(limb("x", false))),
+            &cmp(limb("x", true), CmpOp::LtS, StackVal::I64(0)),
+        );
+        assert_eq!(le_zero, Some(cmp(whole("x"), CmpOp::LeS, zero())));
+        // x > 0: `hi == 0 ? lo != 0 : hi > 0`.
+        let gt_zero = fold_wide_compare(
+            &StackVal::Eqz(Box::new(limb("x", true))),
+            &cmp(limb("x", false), CmpOp::Ne, StackVal::I64(0)),
+            &cmp(limb("x", true), CmpOp::GtS, StackVal::I64(0)),
+        );
+        assert_eq!(gt_zero, Some(cmp(whole("x"), CmpOp::GtS, zero())));
+        // An unsigned compare types its constant `u128`: the high word
+        // `1 << 63` is above `i128::MAX`, not a negative number.
+        let big = fold_wide_compare(
+            &cmp(limb("a", true), CmpOp::Eq, StackVal::I64(i64::MIN)),
+            &cmp(limb("a", false), CmpOp::GtU, StackVal::I64(1)),
+            &cmp(limb("a", true), CmpOp::GtU, StackVal::I64(i64::MIN)),
+        );
+        assert_eq!(
+            big,
+            Some(cmp(
+                whole("a"),
+                CmpOp::GtU,
+                StackVal::HostCallResult(Box::new(SorobanExpr::U128Literal((1u128 << 127) + 1)))
+            ))
+        );
+        // A high compare written `b_hi > a_hi` is the same `a < b`.
+        let flipped = fold_wide_compare(
+            &cmp(limb("a", true), CmpOp::Eq, limb("b", true)),
+            &cmp(limb("a", false), CmpOp::LtU, limb("b", false)),
+            &cmp(limb("b", true), CmpOp::GtS, limb("a", true)),
+        );
+        assert_eq!(flipped, Some(cmp(whole("a"), CmpOp::LtS, whole("b"))));
+    }
+
+    /// Shapes that are not one compare stay a `select`.
+    #[test]
+    fn a_two_limb_compare_needs_matching_limbs() {
+        // The two arms order in opposite directions.
+        assert_eq!(
+            fold_wide_compare(
+                &cmp(limb("a", true), CmpOp::Eq, limb("b", true)),
+                &cmp(limb("a", false), CmpOp::LtU, limb("b", false)),
+                &cmp(limb("a", true), CmpOp::GtS, limb("b", true)),
+            ),
+            None
+        );
+        // The low word belongs to another value.
+        assert_eq!(
+            fold_wide_compare(
+                &cmp(limb("a", true), CmpOp::Eq, limb("b", true)),
+                &cmp(limb("c", false), CmpOp::LtU, limb("b", false)),
+                &cmp(limb("a", true), CmpOp::LtS, limb("b", true)),
+            ),
+            None
+        );
+        // No tracked 128-bit value on either side.
+        assert_eq!(
+            fold_wide_compare(
+                &cmp(StackVal::I64(1), CmpOp::Eq, StackVal::I64(2)),
+                &cmp(StackVal::I64(3), CmpOp::LtU, StackVal::I64(4)),
+                &cmp(StackVal::I64(1), CmpOp::LtS, StackVal::I64(2)),
+            ),
+            None
+        );
+        // A lost high word proves nothing.
+        assert_eq!(
+            fold_wide_compare(
+                &cmp(limb("a", true), CmpOp::Eq, StackVal::Unknown),
+                &cmp(limb("a", false), CmpOp::LtU, StackVal::Unknown),
+                &cmp(limb("a", true), CmpOp::LtS, StackVal::Unknown),
+            ),
+            None
+        );
+    }
+
+    /// The same limb of two values under one condition is that limb of the
+    /// conditional value, so the two limb selects pair again.
+    #[test]
+    fn a_limb_select_is_a_limb_of_the_selected_value() {
+        let cond = StackVal::Param("c".into());
+        let lo = fold_limb_select(&cond, &limb("a", false), &limb("b", false)).unwrap();
+        let hi = fold_limb_select(&cond, &limb("a", true), &limb("b", true)).unwrap();
+        let (whole, tracked) = whole_i128_of_limbs(&lo, &hi, true).unwrap();
+        assert!(tracked);
+        assert_eq!(
+            whole,
+            StackVal::Select {
+                cond: Box::new(cond.clone()),
+                then_val: Box::new(StackVal::Param("a".into())),
+                else_val: Box::new(StackVal::Param("b".into())),
+            }
+        );
+        // A low limb against a high limb is not a limb of one value.
+        assert_eq!(
+            fold_limb_select(&cond, &limb("a", false), &limb("b", true)),
+            None
+        );
+        assert_eq!(
+            fold_limb_select(&cond, &limb("a", false), &StackVal::I64(0)),
+            None
+        );
+    }
+
+    /// The SDK's `bool` argument decode is the parameter, and only for a
+    /// declared `bool`: any other tag carrier keeps its `select`.
+    #[test]
+    fn a_bool_argument_decode_is_the_parameter() {
+        let params = [
+            FnParam {
+                name: "flag".into(),
+                type_def: ScSpecTypeDef::Bool,
+            },
+            FnParam {
+                name: "n".into(),
+                type_def: ScSpecTypeDef::U32,
+            },
+        ];
+        let decode = |tag: &str, inner: StackVal| {
+            let tag = StackVal::Param(tag.into());
+            fold_select(
+                &cmp(tag.clone(), CmpOp::Eq, StackVal::I32(1)),
+                &StackVal::I32(1),
+                &inner,
+                &params,
+            )
+        };
+        let nested = |tag: &str| StackVal::Select {
+            cond: Box::new(StackVal::Param(tag.into())),
+            then_val: Box::new(StackVal::I32(2)),
+            else_val: Box::new(StackVal::I32(0)),
+        };
+        let shifted = |tag: &str| {
+            StackVal::BinOp(
+                Box::new(cmp(
+                    StackVal::Param(tag.into()),
+                    CmpOp::Ne,
+                    StackVal::I32(0),
+                )),
+                BinOper::Shl,
+                Box::new(StackVal::I32(1)),
+            )
+        };
+        assert_eq!(
+            decode("flag", nested("flag")),
+            Some(StackVal::Param("flag".into()))
+        );
+        assert_eq!(
+            decode("flag", shifted("flag")),
+            Some(StackVal::Param("flag".into()))
+        );
+        assert_eq!(decode("n", nested("n")), None);
+        assert_eq!(decode("flag", nested("n")), None);
+
+        // The decode's error value `2` is one no `bool` has.
+        let registry = empty_registry();
+        let flag = || StackVal::Param("flag".into());
+        let render = |v: StackVal| stack_val_to_expr(&v, &params, &registry, None);
+        assert!(matches!(
+            render(cmp(flag(), CmpOp::Ne, StackVal::I32(2))),
+            SorobanExpr::BoolLiteral(true)
+        ));
+        assert!(matches!(
+            render(cmp(flag(), CmpOp::Eq, StackVal::I32(2))),
+            SorobanExpr::BoolLiteral(false)
+        ));
+        assert!(matches!(
+            render(cmp(flag(), CmpOp::Ne, StackVal::I32(0))),
+            SorobanExpr::Param(ref n) if n == "flag"
+        ));
+        assert!(matches!(
+            render(cmp(flag(), CmpOp::Eq, StackVal::I32(0))),
+            SorobanExpr::Not(ref e) if matches!(**e, SorobanExpr::Param(ref n) if n == "flag")
+        ));
+        assert!(matches!(
+            render(StackVal::Eqz(Box::new(flag()))),
+            SorobanExpr::Not(_)
+        ));
+    }
+
+    /// A condition whose operands are constants picks its arm; a condition
+    /// with a lost operand makes the whole value a hole.
+    #[test]
+    fn a_select_condition_is_evaluated_or_lost_whole() {
+        let pick = |cond: StackVal| {
+            fold_select(
+                &cond,
+                &StackVal::Param("a".into()),
+                &StackVal::Param("b".into()),
+                &[],
+            )
+        };
+        assert_eq!(
+            pick(cmp(StackVal::I64(0), CmpOp::LtS, StackVal::I64(0))),
+            Some(StackVal::Param("b".into()))
+        );
+        assert_eq!(
+            pick(cmp(StackVal::I32(-1), CmpOp::LtS, StackVal::I32(0))),
+            Some(StackVal::Param("a".into()))
+        );
+        assert_eq!(
+            pick(cmp(StackVal::I32(-1), CmpOp::LtU, StackVal::I32(0))),
+            Some(StackVal::Param("b".into()))
+        );
+        assert_eq!(
+            pick(StackVal::Eqz(Box::new(StackVal::I32(0)))),
+            Some(StackVal::Param("a".into()))
+        );
+        // Constants of two widths are not one compare.
+        assert_eq!(
+            pick(cmp(StackVal::I32(0), CmpOp::Eq, StackVal::I64(0))),
+            None
+        );
+        assert_eq!(pick(StackVal::Param("c".into())), None);
+
+        let registry = empty_registry();
+        let lost = StackVal::Select {
+            cond: Box::new(cmp(
+                StackVal::Param("x".into()),
+                CmpOp::LtS,
+                StackVal::Unknown,
+            )),
+            then_val: Box::new(StackVal::Param("a".into())),
+            else_val: Box::new(StackVal::Param("b".into())),
+        };
+        assert!(matches!(
+            stack_val_to_expr(&lost, &[], &registry, None),
+            SorobanExpr::UnknownVal
+        ));
     }
 }

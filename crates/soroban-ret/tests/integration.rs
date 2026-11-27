@@ -217,6 +217,29 @@ fn test_decompile_guard_panic_small_contract() {
 }
 
 #[test]
+fn test_decompile_select_folds() {
+    // Issue #80: a wasm `select` used to render its first operand whatever
+    // the condition. An `i128` `<= 0` guard is a `select` over the two limbs
+    // (it read `== 0`), and `min` picks each limb with a `select` on one
+    // two-limb compare (it returned one argument).
+    let wasm = include_bytes!("../../../tests/fixtures/test_select_folds.wasm");
+    let source = decompile(wasm).expect("decompilation failed");
+    let flat = squashed(&source);
+    assert!(
+        flat.contains("if amount <= 0 { panic_with_error!(&env, Error::NotPositive); }"),
+        "the i128 sign guard lost its order: {source}"
+    );
+    assert!(
+        flat.contains("if b < a { b } else { a }") || flat.contains("if a < b { a } else { b }"),
+        "the i128 min is not a choice between both arguments: {source}"
+    );
+    assert!(
+        !source.contains("todo!("),
+        "unexpected todo! artifact: {source}"
+    );
+}
+
+#[test]
 fn test_decompile_guard_multi_small_contract() {
     // Issue #80: several `panic_with_error!` guards before a storage write,
     // each a `br_if` to a different block depth. The guards used to be paired
@@ -1216,6 +1239,10 @@ const ALL_FIXTURES: &[(&str, &[u8])] = &[
         include_bytes!("../../../tests/fixtures/test_guard_multi.wasm"),
     ),
     (
+        "test_select_folds",
+        include_bytes!("../../../tests/fixtures/test_select_folds.wasm"),
+    ),
+    (
         "test_add_u128",
         include_bytes!("../../../tests/fixtures/test_add_u128.wasm"),
     ),
@@ -1374,10 +1401,16 @@ fn test_all_fixtures_decompile() {
 }
 
 // Fixtures with a known, tracked `todo!("unknown value")` gap that is NOT a
-// truncation artifact. test_liquidity_pool's i128 share-math is now reconstructed
-// (the soft-arith multiply/divide helpers are classified and lowered to clean
-// `Mul`/`Div`, operands rebuilt from their limb pairs, and the carry/borrow-flag
-// leaks dropped), so it no longer needs an exemption.
+// truncation artifact.
+//
+// `test_liquidity_pool`: `deposit` mints `min(shares_a, shares_b)`. The i128
+// share-math itself is reconstructed (the soft-arith multiply/divide helpers
+// lower to clean `Mul`/`Div`), but the divisor of `shares_a` reaches its
+// divide helper as a stale limb pair, so one operand of the `min` is lost.
+// The output had no hole only because a `select` rendered its first operand
+// whatever the condition (issue #80): it minted `shares_b` and dropped the
+// `min`. The two stored share values are honest holes until that operand is
+// recovered (issue #74).
 //
 // `import_contract`: `safe_add_with` / `safe_add_with_two` map a `try_call`
 // result by hand (callee error 1 → `Err(Overflow)`, anything else →
@@ -1389,8 +1422,12 @@ fn test_all_fixtures_decompile() {
 // `events` / `events_ref`: the muxed id published by `transfer` (and, in the
 // by-reference variant, the optional id in both functions) is not recovered;
 // see `test_decompile_events` / `test_decompile_events_ref`.
-const KNOWN_I128_TODO_FIXTURES: &[&str] =
-    &["test_import_contract", "test_events", "test_events_ref"];
+const KNOWN_I128_TODO_FIXTURES: &[&str] = &[
+    "test_import_contract",
+    "test_events",
+    "test_events_ref",
+    "test_liquidity_pool",
+];
 
 #[test]
 fn test_all_fixtures_no_artifacts() {

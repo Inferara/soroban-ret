@@ -42,6 +42,17 @@ pub enum SorobanExpr {
     /// source-level multiply compiles to a guarded mul, never a bare shl).
     Shl(Box<SorobanExpr>, Box<SorobanExpr>),
 
+    /// A value chosen by a condition: `if cond { then_val } else { else_val }`.
+    /// The carrier of a wasm `select` whose condition is not a lift-time
+    /// constant (issue #80). `select` yields its first operand when the
+    /// condition is non-zero and its second otherwise, so the conditional is
+    /// what the instruction computes; picking either operand alone is a guess.
+    Select {
+        cond: Box<SorobanExpr>,
+        then_val: Box<SorobanExpr>,
+        else_val: Box<SorobanExpr>,
+    },
+
     // Comparison
     Eq(Box<SorobanExpr>, Box<SorobanExpr>),
     Ne(Box<SorobanExpr>, Box<SorobanExpr>),
@@ -304,6 +315,19 @@ impl SorobanExpr {
                 a.is_never_rooted() || (b.is_never_rooted() && a.is_effect_free())
             }
             SorobanExpr::Not(a) => a.is_never_rooted(),
+            // The condition evaluates first, so a `!` there ends the whole
+            // expression; so does a `!` in both arms behind a condition whose
+            // evaluation nobody can observe.
+            SorobanExpr::Select {
+                cond,
+                then_val,
+                else_val,
+            } => {
+                cond.is_never_rooted()
+                    || (then_val.is_never_rooted()
+                        && else_val.is_never_rooted()
+                        && cond.is_effect_free())
+            }
             _ => false,
         }
     }
@@ -349,6 +373,11 @@ impl SorobanExpr {
             | SorobanExpr::Le(a, b)
             | SorobanExpr::Gt(a, b)
             | SorobanExpr::Ge(a, b) => a.is_effect_free() && b.is_effect_free(),
+            SorobanExpr::Select {
+                cond,
+                then_val,
+                else_val,
+            } => cond.is_effect_free() && then_val.is_effect_free() && else_val.is_effect_free(),
             _ => false,
         }
     }

@@ -695,6 +695,15 @@ fn walk_expr(e: &SorobanExpr, s: &mut NodeStats) {
             walk_expr(a, s);
             walk_expr(b, s);
         }
+        SorobanExpr::Select {
+            cond,
+            then_val,
+            else_val,
+        } => {
+            walk_expr(cond, s);
+            walk_expr(then_val, s);
+            walk_expr(else_val, s);
+        }
 
         // Storage.
         SorobanExpr::StorageGet { key, .. }
