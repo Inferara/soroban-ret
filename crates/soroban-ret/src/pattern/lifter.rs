@@ -5922,6 +5922,10 @@ impl<'a> LiftContext<'a> {
             WasmInstr::I64Eq => {
                 let b = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                if let Some(f) = self.fold_limb_zero_compare(&a, &b) {
+                    self.stack.push(f);
+                    return;
+                }
                 let (a, b) = if self.exact_function {
                     fold_limb_all_ones_test(a, b)
                 } else {
@@ -5933,6 +5937,12 @@ impl<'a> LiftContext<'a> {
             WasmInstr::I32Ne | WasmInstr::I64Ne => {
                 let b = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                if matches!(instr, WasmInstr::I64Ne)
+                    && let Some(f) = self.fold_limb_zero_compare(&a, &b)
+                {
+                    self.stack.push(StackVal::Eqz(Box::new(f)));
+                    return;
+                }
                 let (a, b) = if self.exact_function && matches!(instr, WasmInstr::I64Ne) {
                     fold_limb_all_ones_test(a, b)
                 } else {
@@ -6299,6 +6309,15 @@ impl<'a> LiftContext<'a> {
                     }
                     (_, StackVal::I64(0)) => self.stack.push(a),
                     (StackVal::I64(0), _) => self.stack.push(b),
+                    // `limb ^ K`, kept for the limb zero-test fold (see
+                    // `BinOper::Xor`).
+                    (StackVal::I128Limb { .. }, StackVal::I64(_))
+                    | (StackVal::I64(_), StackVal::I128Limb { .. })
+                        if self.exact_function =>
+                    {
+                        self.stack
+                            .push(StackVal::BinOp(Box::new(a), BinOper::Xor, Box::new(b)));
+                    }
                     _ => self.stack.push(StackVal::Unknown),
                 }
             }
@@ -6837,6 +6856,13 @@ impl<'a> LiftContext<'a> {
     /// and every `divisor == 0` check of its divide helper). Exact: an OR of
     /// 64-bit words is zero iff each word is, and a 128-bit value is zero
     /// iff both its limbs are.
+    ///
+    /// A leaf may also be a limb XOR-ed with a constant, `limb ^ K`, which is
+    /// zero iff the limb is `K`. The signed divide helper's overflow guard
+    /// tests its dividend that way: `eqz(lo | (hi ^ i64::MIN))` is
+    /// `dividend == i128::MIN`. Only the constants every 128-bit type reads
+    /// the same way are folded: `0`, and `1 << 127` (`i128::MIN` as an
+    /// `i128`, `2^127` as a `u128` — the limbs do not say which).
     fn fold_limb_zero_test(&self, a: &StackVal) -> Option<StackVal> {
         let mut leaves = Vec::new();
         fn collect<'v>(v: &'v StackVal, out: &mut Vec<&'v StackVal>) {
@@ -6848,42 +6874,80 @@ impl<'a> LiftContext<'a> {
                 other => out.push(other),
             }
         }
+        /// A leaf as `(value, is_hi, K)`: the limb equals `K` iff the leaf
+        /// is zero.
+        fn limb_leaf(leaf: &StackVal) -> Option<(&StackVal, bool, i64)> {
+            match leaf {
+                StackVal::I128Limb { value, hi } => Some((value, *hi, 0)),
+                StackVal::BinOp(x, BinOper::Xor, y) => match (x.as_ref(), y.as_ref()) {
+                    (StackVal::I128Limb { value, hi }, k)
+                    | (k, StackVal::I128Limb { value, hi }) => {
+                        Some((value, *hi, to_u64(k)? as i64))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
         collect(a, &mut leaves);
         if leaves.len() < 2 {
             return None;
         }
-        let mut values: Vec<(&StackVal, bool, bool)> = Vec::new();
+        // Per value: the constant its lo and hi limb must equal.
+        let mut values: Vec<(&StackVal, Option<i64>, Option<i64>)> = Vec::new();
         for leaf in leaves {
-            let StackVal::I128Limb { value, hi } = leaf else {
+            let (value, hi, k) = limb_leaf(leaf)?;
+            let entry = match values.iter().position(|(v, _, _)| **v == *value) {
+                Some(i) => &mut values[i],
+                None => {
+                    values.push((value, None, None));
+                    values.last_mut()?
+                }
+            };
+            let seen = if hi { &mut entry.2 } else { &mut entry.1 };
+            if seen.is_some() {
+                return None;
+            }
+            *seen = Some(k);
+        }
+        // The value each one is compared with, when every 128-bit type reads
+        // it the same way.
+        let mut tests = Vec::new();
+        for (v, lo, hi) in &values {
+            let (Some(lo), Some(hi)) = (lo, hi) else {
                 return None;
             };
-            match values.iter_mut().find(|(v, _, _)| **v == **value) {
-                Some(entry) => {
-                    let seen = if *hi { &mut entry.2 } else { &mut entry.1 };
-                    if *seen {
-                        return None;
-                    }
-                    *seen = true;
-                }
-                None => values.push((value, !*hi, *hi)),
+            if stack_val_contains_unknown(v) {
+                return None;
             }
-        }
-        if values
-            .iter()
-            .any(|(v, lo, hi)| !(*lo && *hi) || stack_val_contains_unknown(v))
-        {
-            return None;
+            let min = match (*lo, *hi) {
+                (0, 0) => false,
+                (0, i64::MIN) => true,
+                _ => return None,
+            };
+            tests.push((*v, min));
         }
         cov_mark::hit!(i128_limb_zero_test_folded);
-        if let [(v, _, _)] = values[..] {
+        if let [(v, false)] = tests[..] {
             return Some(StackVal::Compare(
                 Box::new(v.clone()),
                 CmpOp::Eq,
                 Box::new(StackVal::I64(0)),
             ));
         }
+        if tests.iter().any(|(_, min)| *min) {
+            cov_mark::hit!(i128_limb_min_test_folded);
+        }
         let slots = self.frame_slots.borrow();
-        let zero = |v: &StackVal| {
+        let test = |v: &StackVal, min: bool| {
+            let k = if min {
+                SorobanExpr::Shl(
+                    Box::new(SorobanExpr::I128Literal(1)),
+                    Box::new(SorobanExpr::I32Literal(127)),
+                )
+            } else {
+                SorobanExpr::I128Literal(0)
+            };
             SorobanExpr::Eq(
                 Box::new(force_i128_type(stack_val_to_expr(
                     v,
@@ -6891,14 +6955,27 @@ impl<'a> LiftContext<'a> {
                     self.registry,
                     Some(&slots),
                 ))),
-                Box::new(SorobanExpr::I128Literal(0)),
+                Box::new(k),
             )
         };
-        let mut it = values.iter().map(|(v, _, _)| zero(v));
+        let mut it = tests.iter().map(|(v, min)| test(v, *min));
         let first = it.next()?;
         Some(StackVal::HostCallResult(Box::new(
             it.fold(first, |acc, e| SorobanExpr::And(Box::new(acc), Box::new(e))),
         )))
+    }
+
+    /// `x == 0` with `x` an OR-tree of complete `i128` limb pairs: the same
+    /// test as `eqz(x)` ([`fold_limb_zero_test`](Self::fold_limb_zero_test)),
+    /// in rewritten functions only. The `!= 0` form is its negation.
+    fn fold_limb_zero_compare(&self, a: &StackVal, b: &StackVal) -> Option<StackVal> {
+        if !self.exact_function {
+            return None;
+        }
+        match (a, b) {
+            (x, StackVal::I64(0)) | (StackVal::I64(0), x) => self.fold_limb_zero_test(x),
+            _ => None,
+        }
     }
 
     /// Before a call into a local helper: note the caller frame slots the
@@ -20627,6 +20704,12 @@ enum BinOper {
     /// Bitwise and — used for Val tag extraction (`v & 0xFF`), tracked so
     /// recognize_val_shape can lift it to a tag-of expression.
     And,
+    /// Bitwise xor of an `i128` limb with a constant, `limb ^ K` (issue #74).
+    /// Produced only in rewritten functions, and only so the limb zero-test
+    /// fold can read `eqz(lo | (hi ^ K))` as a compare with a 128-bit
+    /// constant. Anywhere else it is unknown: [`stack_val_contains_unknown`]
+    /// reports it and it renders as a hole.
+    Xor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -23017,6 +23100,7 @@ fn stack_val_contains_unknown(val: &StackVal) -> bool {
         StackVal::Compare(a, _, b) => {
             stack_val_contains_unknown(a) || stack_val_contains_unknown(b)
         }
+        StackVal::BinOp(_, BinOper::Xor, _) => true,
         StackVal::BinOp(a, _, b) => stack_val_contains_unknown(a) || stack_val_contains_unknown(b),
         StackVal::Eqz(a) => stack_val_contains_unknown(a),
         StackVal::Select {
@@ -23485,6 +23569,8 @@ fn stack_val_to_expr_inner(
                 {
                     stack_val_to_expr_inner(a, params, registry, frame_slots, visiting)
                 }
+                // Only the limb zero-test fold reads a `limb ^ K`.
+                BinOper::Xor => SorobanExpr::UnknownVal,
                 BinOper::And => {
                     if to_u64(b) == Some(0xFF) {
                         SorobanExpr::ValTag(Box::new(stack_val_to_expr_inner(
@@ -29818,6 +29904,102 @@ mod tests {
                 None,
                 "{a:?} {op:?} {b:?}"
             );
+        }
+    }
+
+    /// Issue #74: the signed divide's overflow guard tests its dividend as
+    /// `eqz(lo | (hi ^ i64::MIN))` — `dividend == i128::MIN` — or as
+    /// `(lo | (hi ^ i64::MIN)) != 0`. In a rewritten function both fold to a
+    /// compare with `1 << 127` (exact for `i128` and `u128` alike). A
+    /// constant any other than `0` / `i64::MIN` on the hi limb, a constant on
+    /// the lo limb, a half missing, or a function that was not rewritten
+    /// keeps the hole.
+    #[test]
+    fn i128_min_test_folds_from_xored_limbs() {
+        use crate::wasm::ir::WasmInstr as WI;
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let x = || Box::new(StackVal::Param("dividend".to_string()));
+        let lo = || StackVal::I128Limb {
+            value: x(),
+            hi: false,
+        };
+        let hi = || StackVal::I128Limb {
+            value: x(),
+            hi: true,
+        };
+        let k = |v: i64| StackVal::I64(v);
+        let mut ctx = LiftContext::new(&wasm, &reg, &[], &rt, vec![], 0);
+        let run =
+            |ctx: &mut LiftContext, lo_v: StackVal, hi_v: StackVal, hi_k: i64, tail: &[WI]| {
+                ctx.stack = vec![lo_v, hi_v, k(hi_k)];
+                ctx.lift_instruction(&WI::I64Xor);
+                ctx.lift_instruction(&WI::I64Or);
+                for i in tail {
+                    ctx.lift_instruction(i);
+                }
+                let top = ctx.stack.pop().expect("a value");
+                stack_val_to_expr(&top, &[], &reg, None)
+            };
+        let min = || {
+            Box::new(SorobanExpr::Shl(
+                Box::new(SorobanExpr::I128Literal(1)),
+                Box::new(SorobanExpr::I32Literal(127)),
+            ))
+        };
+        let is_min =
+            || SorobanExpr::Eq(Box::new(SorobanExpr::Param("dividend".to_string())), min());
+
+        // A hole: the test reads an unknown value and folds to no constant.
+        let hole = |e: &SorobanExpr| {
+            let d = format!("{e:?}");
+            d.contains("UnknownVal") && !d.contains("Shl")
+        };
+
+        // Not a rewritten function: the xor stays unknown.
+        let e = run(&mut ctx, lo(), hi(), i64::MIN, &[WI::I64Eqz]);
+        assert!(hole(&e), "{e:?}");
+
+        ctx.exact_function = true;
+        assert_eq!(run(&mut ctx, lo(), hi(), i64::MIN, &[WI::I64Eqz]), is_min());
+        assert_eq!(
+            run(
+                &mut ctx,
+                lo(),
+                hi(),
+                i64::MIN,
+                &[WI::I64Const(0), WI::I64Eq]
+            ),
+            is_min()
+        );
+        assert_eq!(
+            run(
+                &mut ctx,
+                lo(),
+                hi(),
+                i64::MIN,
+                &[WI::I64Const(0), WI::I64Ne]
+            ),
+            SorobanExpr::Not(Box::new(is_min()))
+        );
+        // `hi ^ 0` is the plain zero test.
+        assert_eq!(
+            run(&mut ctx, lo(), hi(), 0, &[WI::I64Eqz]),
+            SorobanExpr::Eq(
+                Box::new(SorobanExpr::Param("dividend".to_string())),
+                Box::new(SorobanExpr::I64Literal(0))
+            )
+        );
+        // Any other constant, or the constant on the lo limb, or one limb
+        // twice: no fold.
+        for (l, h, kk) in [
+            (lo(), hi(), 1),
+            (hi(), lo(), i64::MIN),
+            (lo(), lo(), i64::MIN),
+        ] {
+            let e = run(&mut ctx, l, h, kk, &[WI::I64Eqz]);
+            assert!(hole(&e), "{e:?}");
         }
     }
 
