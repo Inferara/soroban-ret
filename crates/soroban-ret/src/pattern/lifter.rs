@@ -804,6 +804,24 @@ struct LiftContext<'a> {
     /// as always passing, and a condition the folds make readable routes
     /// such a guard to merge paths that are not yet exact.
     exact_function: bool,
+    /// WASM locals of declared `u32` parameters that the function body never
+    /// writes: a read of one is the incoming raw `Val`. Set for the top-level
+    /// function only (empty in inlined callees, whose locals hold the caller's
+    /// arguments). See [`LiftContext::raw_param_operand`].
+    raw_u32_param_locals: Rc<Vec<u32>>,
+    /// Set by `lift_structured` for the one compare instruction it is about to
+    /// lift: which operand is proven to be such a raw parameter `Val`.
+    raw_param_compare: Option<RawSide>,
+}
+
+/// The operand of an unsigned order compare proven to be a raw `u32`
+/// parameter `Val` (see [`LiftContext::raw_param_operand`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RawSide {
+    /// `v >=u K` / `v <u K`.
+    Left,
+    /// `K <=u v` / `K >u v`.
+    Right,
 }
 
 /// `(slot key, write-log length at read time)` — see `slot_read_log`.
@@ -856,6 +874,8 @@ impl<'a> LiftContext<'a> {
             relay_index: None,
             pending_store_check: None,
             exact_function: false,
+            raw_u32_param_locals: Rc::new(Vec::new()),
+            raw_param_compare: None,
         }
     }
 
@@ -899,6 +919,8 @@ impl<'a> LiftContext<'a> {
             relay_index: None,
             pending_store_check: None,
             exact_function: self.exact_function,
+            raw_u32_param_locals: Rc::clone(&self.raw_u32_param_locals),
+            raw_param_compare: None,
         }
     }
 
@@ -5926,8 +5948,7 @@ impl<'a> LiftContext<'a> {
                     .push(StackVal::Compare(Box::new(a), CmpOp::LtS, Box::new(b)));
             }
             WasmInstr::I32LtU | WasmInstr::I64LtU => {
-                let b = self.stack.pop().unwrap_or(StackVal::Unknown);
-                let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                let (a, b) = self.pop_order_operands();
                 self.stack
                     .push(StackVal::Compare(Box::new(a), CmpOp::LtU, Box::new(b)));
             }
@@ -5938,8 +5959,7 @@ impl<'a> LiftContext<'a> {
                     .push(StackVal::Compare(Box::new(a), CmpOp::GtS, Box::new(b)));
             }
             WasmInstr::I32GtU | WasmInstr::I64GtU => {
-                let b = self.stack.pop().unwrap_or(StackVal::Unknown);
-                let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                let (a, b) = self.pop_order_operands();
                 // Constant-fold when both operands are known. This enables
                 // Val-encoding wrappers (e.g., u64-to-Val with threshold check)
                 // to fold their fast-path comparison to a constant, allowing the
@@ -5958,8 +5978,7 @@ impl<'a> LiftContext<'a> {
                     .push(StackVal::Compare(Box::new(a), CmpOp::LeS, Box::new(b)));
             }
             WasmInstr::I32LeU | WasmInstr::I64LeU => {
-                let b = self.stack.pop().unwrap_or(StackVal::Unknown);
-                let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                let (a, b) = self.pop_order_operands();
                 self.stack
                     .push(StackVal::Compare(Box::new(a), CmpOp::LeU, Box::new(b)));
             }
@@ -5970,8 +5989,7 @@ impl<'a> LiftContext<'a> {
                     .push(StackVal::Compare(Box::new(a), CmpOp::GeS, Box::new(b)));
             }
             WasmInstr::I32GeU | WasmInstr::I64GeU => {
-                let b = self.stack.pop().unwrap_or(StackVal::Unknown);
-                let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                let (a, b) = self.pop_order_operands();
                 self.stack
                     .push(StackVal::Compare(Box::new(a), CmpOp::GeU, Box::new(b)));
             }
@@ -6941,6 +6959,63 @@ impl<'a> LiftContext<'a> {
         }
     }
 
+    /// Which operand of the unsigned order compare `instr` (at `blocks[i]`) is
+    /// the raw `Val` of a `u32` parameter, if one provably is (issue #80 C4).
+    ///
+    /// The lifter tracks a local by its value, and `p >> 32` decodes back to
+    /// the same `Param` a raw read of `p` gives, so the operand's value cannot
+    /// say whether it still holds the raw `Val`. The bytecode can: the two
+    /// instructions right before the compare, at the same structured level,
+    /// push its operands, and one of them is a `local.get` of a parameter's
+    /// local that the function never writes. Only the directions
+    /// [`decode_val_order_compare`] decodes are reported, and only in the
+    /// function's own body.
+    fn raw_param_operand(
+        &self,
+        blocks: &[super::structurize::StructuredBlock],
+        i: usize,
+        instr: &crate::wasm::ir::WasmInstr,
+    ) -> Option<RawSide> {
+        use super::structurize::StructuredBlock::Instruction as I;
+        use crate::wasm::ir::WasmInstr as WI;
+        if self.inline_depth != 0 || i < 2 || self.raw_u32_param_locals.is_empty() {
+            return None;
+        }
+        let (I(x), I(y)) = (&blocks[i - 2], &blocks[i - 1]) else {
+            return None;
+        };
+        let (side, local) = match (instr, x, y) {
+            (WI::I64GeU | WI::I64LtU, WI::LocalGet(l), WI::I64Const(_)) => (RawSide::Left, *l),
+            (WI::I64LeU | WI::I64GtU, WI::I64Const(_), WI::LocalGet(l)) => (RawSide::Right, *l),
+            _ => return None,
+        };
+        self.raw_u32_param_locals.contains(&local).then_some(side)
+    }
+
+    /// Pop the two operands of an `I64` order compare. An operand
+    /// [`raw_param_operand`](Self::raw_param_operand) proved to be a raw
+    /// `u32` parameter `Val` is marked with the payload mask: for the two
+    /// directions it reports, `v & MASK` compares exactly as `v` does (the
+    /// answer is decided by the high half), and the mark is what lets the
+    /// render read the compare in the `u32` domain.
+    fn pop_order_operands(&mut self) -> (StackVal, StackVal) {
+        let b = self.stack.pop().unwrap_or(StackVal::Unknown);
+        let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+        let mark = |v: StackVal| match v {
+            StackVal::Param(_) => StackVal::BinOp(
+                Box::new(v),
+                BinOper::And,
+                Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+            ),
+            other => other,
+        };
+        match self.raw_param_compare.take() {
+            Some(RawSide::Left) => (mark(a), b),
+            Some(RawSide::Right) => (a, mark(b)),
+            None => (a, b),
+        }
+    }
+
     fn lift_structured(&mut self, blocks: &[super::structurize::StructuredBlock]) {
         use super::structurize::StructuredBlock;
         let mut i = 0;
@@ -7012,7 +7087,9 @@ impl<'a> LiftContext<'a> {
                     // remove_dead_code.
                 }
                 StructuredBlock::Instruction(instr) => {
+                    self.raw_param_compare = self.raw_param_operand(blocks, i, instr);
                     self.lift_instruction(instr);
+                    self.raw_param_compare = None;
                 }
                 StructuredBlock::Block { body, block_type } => {
                     // SDK `for x in vec.iter()` region (issue #69): rebuilt
@@ -10601,6 +10678,9 @@ fn lift_function_body(
         num_wasm_params,
     );
 
+    let raw_u32_param_locals = Rc::new(unwritten_u32_param_locals(func, params, num_wasm_params));
+    ctx.raw_u32_param_locals = Rc::clone(&raw_u32_param_locals);
+
     // Structurize flat WASM instructions into a tree, then lift. Reclassify
     // compiler-emitted safety-net `unreachable` traps before lifting so the
     // Unreachable handler only emits Panic for genuine user panics (issue #11).
@@ -10655,6 +10735,7 @@ fn lift_function_body(
             fresh_locals,
             num_wasm_params,
         );
+        plain.raw_u32_param_locals = Rc::clone(&raw_u32_param_locals);
         plain.lift_structured(&unrewritten);
         let (kept, lost) = (effect_census(&ctx.stmts), effect_census(&plain.stmts));
         // A terminator with statements after it is cut there by dead-code
@@ -12106,6 +12187,74 @@ fn decode_masked_len_compare(a: StackVal, b: StackVal, params: &[FnParam]) -> (S
         return (n, len);
     }
     (a, b)
+}
+
+/// The WASM locals of declared `u32` parameters that `func` never writes
+/// (`local.set` / `local.tee`): every read of one is the incoming raw `Val`.
+/// WASM local `i` is the `i`-th spec parameter, as `lift_function_body` binds
+/// them.
+fn unwritten_u32_param_locals(
+    func: &crate::wasm::ir::WasmFunction,
+    params: &[FnParam],
+    num_wasm_params: u32,
+) -> Vec<u32> {
+    use crate::wasm::ir::WasmInstr as WI;
+    (0..num_wasm_params.min(params.len() as u32))
+        .filter(|&l| matches!(params[l as usize].type_def, ScSpecTypeDef::U32))
+        .filter(|&l| {
+            !func
+                .body
+                .iter()
+                .any(|ins| matches!(ins, WI::LocalSet(x) | WI::LocalTee(x) if *x == l))
+        })
+        .collect()
+}
+
+/// An UNSIGNED order compare of a raw `u32` `Val` against `N << 32`, decoded
+/// to the u32 domain (issue #80 C4). aqua-rewards' `set_protocol_fee_fraction`
+/// checks `new_fraction >= 10001` as `p >=u (10001 << 32)` on the raw `Val`,
+/// which rendered as `new_fraction >= 42953967927296`.
+///
+/// Only the two directions whose answer is decided by the high half alone are
+/// decoded: `v >=u N << 32` and `v <u N << 32` (written either way round, so
+/// also `K <=u v` and `K >u v`). For a 64-bit `v` and `K` with zero low bits
+/// those are exactly `v >> 32 >= N` / `< N`, whatever the tag bits hold and
+/// whether or not they were masked off. `v >u K` and `v <=u K` are not: at
+/// `v >> 32 == N` the tag bits decide them. A signed compare is not decoded
+/// either: a payload at or above `2^31` makes the raw `Val` negative.
+///
+/// The operand must carry the payload mask ([`is_masked_u32_operand`] under
+/// `& LEN_VAL_MASK`): the `I64And` arm marks a real mask, and
+/// [`LiftContext::pop_order_operands`] marks a `u32` parameter read straight
+/// from its never-written local. That mark is the proof the operand is still
+/// the raw `Val`, so `v >> 32` is what it renders as. A bare `Param` proves
+/// nothing — `p >> 32` decodes back to the same `Param`, and reading a
+/// decoded `p < 1 << 32` as `p < 1` would be wrong. Returns `None` for
+/// anything else.
+fn decode_val_order_compare(
+    a: &StackVal,
+    op: CmpOp,
+    b: &StackVal,
+    params: &[FnParam],
+) -> Option<(StackVal, StackVal)> {
+    fn payload(v: &StackVal, params: &[FnParam]) -> Option<StackVal> {
+        let StackVal::BinOp(x, BinOper::And, mask) = v else {
+            return None;
+        };
+        (to_u64(mask) == Some(LEN_VAL_MASK) && is_masked_u32_operand(x, params))
+            .then(|| (**x).clone())
+    }
+    fn high(k: &StackVal) -> Option<StackVal> {
+        let k = to_u64(k)?;
+        (k & 0xFFFF_FFFF == 0).then_some(StackVal::I64((k >> 32) as i64))
+    }
+    match op {
+        // `v >= K`, `v < K`.
+        CmpOp::GeU | CmpOp::LtU => Some((payload(a, params)?, high(b)?)),
+        // `K <= v`, `K > v`.
+        CmpOp::LeU | CmpOp::GtU => Some((high(a)?, payload(b, params)?)),
+        _ => None,
+    }
 }
 
 /// A zero-parameter export whose body is a pure computation over constants
@@ -23367,13 +23516,23 @@ fn stack_val_to_expr_inner(
             // Val-space constant, so the guard-chain classifiers that drop
             // SDK marshalling checks (`stack_val_has_val_constant`) still
             // recognize and drop it exactly as before.
+            //
+            // Operands decoded here are already in the u32 domain and render
+            // as plain arithmetic: the tag and threshold decoders below read
+            // raw `Val` constants, and a decoded `u32::MAX` (`0xFFFF_FFFF`)
+            // looks like a threshold to them and would be shifted again to 0.
             let decoded: (Box<StackVal>, Box<StackVal>);
-            let (a, b) = if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+            let (a, b, is_decoded) = if matches!(op, CmpOp::Eq | CmpOp::Ne) {
                 let (da, db) = decode_masked_len_compare((**a).clone(), (**b).clone(), params);
+                let changed = da != **a || db != **b;
                 decoded = (Box::new(da), Box::new(db));
-                (&decoded.0, &decoded.1)
+                (&decoded.0, &decoded.1, changed)
+            } else if let Some((da, db)) = decode_val_order_compare(a, *op, b, params) {
+                cov_mark::hit!(val_order_compare_decoded);
+                decoded = (Box::new(da), Box::new(db));
+                (&decoded.0, &decoded.1, true)
             } else {
-                (a, b)
+                (a, b, false)
             };
             // Use arithmetic conversion for comparison operands: I64 constants
             // like 0 should stay as I64Literal(0), not decode to BoolLiteral(false)
@@ -23385,7 +23544,12 @@ fn stack_val_to_expr_inner(
             // "is the Val's upper 32 bits > n", which for U32 Vals equals "decoded > n".
             // Decode these threshold constants to produce readable comparisons.
             // Tag check: `(v & 0xFF) <cmp> TAG` → `v.get_tag() <cmp> Tag::Name`.
-            let (a_expr, b_expr) = if let Some(pair) =
+            let (a_expr, b_expr) = if is_decoded {
+                (
+                    stack_val_to_arith_expr_inner(a, params, registry, frame_slots, visiting),
+                    stack_val_to_arith_expr_inner(b, params, registry, frame_slots, visiting),
+                )
+            } else if let Some(pair) =
                 lower_tag_comparison(a, b, params, registry, frame_slots, visiting)
             {
                 pair
@@ -29564,6 +29728,205 @@ mod tests {
             stack_val_to_expr(&masked("decimals"), &params, &reg, None),
             stack_val_to_expr(&bare, &params, &reg, None)
         );
+    }
+
+    /// Issue #80 C4: aqua-rewards checks `new_fraction >= 10001` as an
+    /// UNSIGNED compare of the raw `Val` against `10001 << 32`. Exactly the
+    /// two directions the high half decides on its own are decoded, written
+    /// either way round, and only for an operand marked as the raw `Val` (the
+    /// payload mask); `>` / `<=` (decided by the tag bits at equality), signed
+    /// compares (a payload of `2^31` or more is a negative `Val`), a bare
+    /// `Param` (it may be the decoded `p >> 32`), a non-`u32` parameter and a
+    /// constant with low bits set stay raw.
+    #[test]
+    fn unsigned_order_compare_of_raw_u32_val_decodes_to_the_payload() {
+        cov_mark::check_count!(val_order_compare_decoded, 5);
+        let params = vec![
+            FnParam {
+                name: "new_fraction".to_string(),
+                type_def: ScSpecTypeDef::U32,
+            },
+            FnParam {
+                name: "amount".to_string(),
+                type_def: ScSpecTypeDef::I128,
+            },
+        ];
+        let reg = empty_registry();
+        let raw = |name: &str| StackVal::Param(name.to_string());
+        let masked = |name: &str| {
+            StackVal::BinOp(
+                Box::new(raw(name)),
+                BinOper::And,
+                Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+            )
+        };
+        let k = || StackVal::I64(10001 << 32);
+        let render = |a: StackVal, op: CmpOp, b: StackVal| {
+            stack_val_to_expr(
+                &StackVal::Compare(Box::new(a), op, Box::new(b)),
+                &params,
+                &reg,
+                None,
+            )
+        };
+        let fraction = || Box::new(SorobanExpr::Param("new_fraction".to_string()));
+        let lit = |n: i64| Box::new(SorobanExpr::I64Literal(n));
+
+        assert_eq!(
+            render(masked("new_fraction"), CmpOp::GeU, k()),
+            SorobanExpr::Ge(fraction(), lit(10001))
+        );
+        assert_eq!(
+            render(masked("new_fraction"), CmpOp::LtU, k()),
+            SorobanExpr::Lt(fraction(), lit(10001))
+        );
+        assert_eq!(
+            render(k(), CmpOp::LeU, masked("new_fraction")),
+            SorobanExpr::Le(lit(10001), fraction())
+        );
+        assert_eq!(
+            render(k(), CmpOp::GtU, masked("new_fraction")),
+            SorobanExpr::Gt(lit(10001), fraction())
+        );
+        // The largest bound decodes once: `0xFFFF_FFFF` must not be read again
+        // as a `(n << 32) | 0xFFFF_FFFF` threshold and shifted to `0`.
+        assert_eq!(
+            render(
+                masked("new_fraction"),
+                CmpOp::GeU,
+                StackVal::I64(LEN_VAL_MASK as i64)
+            ),
+            SorobanExpr::Ge(fraction(), lit(u32::MAX as i64))
+        );
+
+        for (a, op, b) in [
+            (masked("new_fraction"), CmpOp::GtU, k()),
+            (masked("new_fraction"), CmpOp::LeU, k()),
+            (masked("new_fraction"), CmpOp::GeS, k()),
+            (masked("new_fraction"), CmpOp::LtS, k()),
+            (raw("new_fraction"), CmpOp::GeU, k()),
+            (k(), CmpOp::GtU, raw("new_fraction")),
+            (masked("amount"), CmpOp::GeU, k()),
+            (
+                masked("new_fraction"),
+                CmpOp::GeU,
+                StackVal::I64((10001 << 32) | 4),
+            ),
+        ] {
+            assert_eq!(
+                decode_val_order_compare(&a, op, &b, &params),
+                None,
+                "{a:?} {op:?} {b:?}"
+            );
+        }
+    }
+
+    /// The raw-`Val` mark comes from the bytecode, not from the operand's
+    /// value: a compare whose operands are pushed right before it by
+    /// `local.get <u32 param>; i64.const K` (or the reverse for `<=u` / `>u`)
+    /// marks the parameter, at the function's own level only, and only for a
+    /// parameter local the function never writes.
+    #[test]
+    fn raw_param_compare_mark_needs_an_unwritten_param_local_read() {
+        use super::super::structurize::StructuredBlock as SB;
+        use crate::wasm::ir::{WasmFunction, WasmInstr as WI};
+        let params = vec![
+            FnParam {
+                name: "env".to_string(),
+                type_def: ScSpecTypeDef::Val,
+            },
+            FnParam {
+                name: "fee".to_string(),
+                type_def: ScSpecTypeDef::U32,
+            },
+            FnParam {
+                name: "cap".to_string(),
+                type_def: ScSpecTypeDef::U32,
+            },
+            FnParam {
+                name: "amount".to_string(),
+                type_def: ScSpecTypeDef::I128,
+            },
+        ];
+        // Local 2 (`cap`) is overwritten, e.g. with its decoded payload.
+        let func = WasmFunction {
+            index: 0,
+            type_index: 0,
+            locals: Vec::new(),
+            body: vec![
+                WI::LocalGet(2),
+                WI::I64Const(32),
+                WI::I64ShrU,
+                WI::LocalSet(2),
+            ],
+        };
+        let unwritten = unwritten_u32_param_locals(&func, &params, 4);
+        assert_eq!(unwritten, vec![1]);
+
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let locals = params
+            .iter()
+            .map(|p| StackVal::Param(p.name.clone()))
+            .collect();
+        let mut ctx = LiftContext::new(&wasm, &reg, &params, &rt, locals, 4);
+        ctx.raw_u32_param_locals = Rc::new(unwritten);
+        let k = 10001_i64 << 32;
+        let seq = |a: WI, b: WI, op: WI| {
+            vec![SB::Instruction(a), SB::Instruction(b), SB::Instruction(op)]
+        };
+
+        let left = seq(WI::LocalGet(1), WI::I64Const(k), WI::I64GeU);
+        assert_eq!(
+            ctx.raw_param_operand(&left, 2, &WI::I64GeU),
+            Some(RawSide::Left)
+        );
+        let right = seq(WI::I64Const(k), WI::LocalGet(1), WI::I64GtU);
+        assert_eq!(
+            ctx.raw_param_operand(&right, 2, &WI::I64GtU),
+            Some(RawSide::Right)
+        );
+        // `>u` with the parameter on the left is decided by the tag bits.
+        let gt = seq(WI::LocalGet(1), WI::I64Const(k), WI::I64GtU);
+        assert_eq!(ctx.raw_param_operand(&gt, 2, &WI::I64GtU), None);
+        // A written parameter local, or a non-parameter local.
+        let written = seq(WI::LocalGet(2), WI::I64Const(k), WI::I64GeU);
+        assert_eq!(ctx.raw_param_operand(&written, 2, &WI::I64GeU), None);
+        let other = seq(WI::LocalGet(5), WI::I64Const(k), WI::I64GeU);
+        assert_eq!(ctx.raw_param_operand(&other, 2, &WI::I64GeU), None);
+        // The operand is not the read itself (`p >> 32` reaches the compare).
+        let shifted = vec![
+            SB::Instruction(WI::LocalGet(1)),
+            SB::Instruction(WI::I64Const(32)),
+            SB::Instruction(WI::I64ShrU),
+            SB::Instruction(WI::I64Const(k)),
+            SB::Instruction(WI::I64GeU),
+        ];
+        assert_eq!(ctx.raw_param_operand(&shifted, 4, &WI::I64GeU), None);
+        // An inlined callee's locals hold the caller's arguments.
+        ctx.inline_depth = 1;
+        assert_eq!(ctx.raw_param_operand(&left, 2, &WI::I64GeU), None);
+        ctx.inline_depth = 0;
+
+        // The mark reaches the stack as the payload mask, and only on the
+        // proven side.
+        ctx.stack = vec![StackVal::Param("fee".to_string()), StackVal::I64(k)];
+        ctx.raw_param_compare = Some(RawSide::Left);
+        let (a, b) = ctx.pop_order_operands();
+        assert_eq!(
+            a,
+            StackVal::BinOp(
+                Box::new(StackVal::Param("fee".to_string())),
+                BinOper::And,
+                Box::new(StackVal::I64(LEN_VAL_MASK as i64)),
+            )
+        );
+        assert_eq!(b, StackVal::I64(k));
+        assert_eq!(ctx.raw_param_compare, None);
+        ctx.stack = vec![StackVal::Param("fee".to_string()), StackVal::I64(k)];
+        let (a, _) = ctx.pop_order_operands();
+        assert_eq!(a, StackVal::Param("fee".to_string()));
     }
 
     /// The mask mark must stay transparent to the `U32Val` decode. A `u32`
