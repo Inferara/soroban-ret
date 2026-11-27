@@ -628,6 +628,7 @@ fn walk_expr(e: &SorobanExpr, s: &mut NodeStats) {
         | SorobanExpr::StringLiteral(_)
         | SorobanExpr::BytesLiteral(_)
         | SorobanExpr::Void
+        | SorobanExpr::Deferred
         | SorobanExpr::None
         | SorobanExpr::Local(_)
         | SorobanExpr::Env

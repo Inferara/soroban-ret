@@ -812,6 +812,9 @@ struct LiftContext<'a> {
     /// Set by `lift_structured` for the one compare instruction it is about to
     /// lift: which operand is proven to be such a raw parameter `Val`.
     raw_param_compare: Option<RawSide>,
+    /// Locals holding a decoded `bool` parameter, with the parameter's name
+    /// (see [`decoded_bool_param_locals`]). Top-level function only.
+    bool_param_locals: Rc<Vec<(u32, String)>>,
 }
 
 /// The operand of an unsigned order compare proven to be a raw `u32`
@@ -876,6 +879,7 @@ impl<'a> LiftContext<'a> {
             exact_function: false,
             raw_u32_param_locals: Rc::new(Vec::new()),
             raw_param_compare: None,
+            bool_param_locals: Rc::new(Vec::new()),
         }
     }
 
@@ -921,6 +925,7 @@ impl<'a> LiftContext<'a> {
             exact_function: self.exact_function,
             raw_u32_param_locals: Rc::clone(&self.raw_u32_param_locals),
             raw_param_compare: None,
+            bool_param_locals: Rc::clone(&self.bool_param_locals),
         }
     }
 
@@ -4184,6 +4189,31 @@ impl<'a> LiftContext<'a> {
                                     self.stack.push((**hv).clone());
                                     return;
                                 }
+                                // An open-coded add/sub of limbs (`q + 1`'s
+                                // `(q_lo + 1, q_hi + (lo == 0))`) is the
+                                // whole value it computes.
+                                if let [hi, lo] = raw_args.as_slice() {
+                                    if let Some((v, true)) = reconstruct_i128_operand(lo, hi) {
+                                        cov_mark::hit!(i128_pieces_reconstructed);
+                                        self.stack.push(v);
+                                        return;
+                                    }
+                                    // The generic lowering renders the HIGH
+                                    // half as the value. Its arithmetic
+                                    // mirrors the whole computation except a
+                                    // constant only the low half adds (it
+                                    // dropped `swap`'s `+ 1`): that sum is
+                                    // not known instead.
+                                    if matches!(
+                                        lo,
+                                        StackVal::BinOp(_, BinOper::Add | BinOper::Sub, k)
+                                            if matches!(**k, StackVal::I64(c) if c != 0)
+                                    ) {
+                                        cov_mark::hit!(i128_pieces_limb_arith_unknown);
+                                        self.stack.push(StackVal::Unknown);
+                                        return;
+                                    }
+                                }
                                 // else fall through to the generic ValConvert lowering.
                             }
                             _ => {}
@@ -7036,6 +7066,29 @@ impl<'a> LiftContext<'a> {
         }
     }
 
+    /// The parameter a `local.get L; i32.const 1; i32.and` at `blocks[i]`
+    /// reads, when `L` holds a decoded `bool` parameter (see
+    /// [`decoded_bool_param_locals`]: past the SDK's decode, `L` is `0` or
+    /// `1`, the argument). Top-level function only.
+    fn bool_param_read(
+        &self,
+        blocks: &[super::structurize::StructuredBlock],
+        i: usize,
+    ) -> Option<String> {
+        use super::structurize::StructuredBlock::Instruction as I;
+        use crate::wasm::ir::WasmInstr as WI;
+        if self.inline_depth != 0 || self.bool_param_locals.is_empty() {
+            return None;
+        }
+        let [I(WI::LocalGet(l)), I(WI::I32Const(1)), I(WI::I32And), ..] = blocks.get(i..)? else {
+            return None;
+        };
+        self.bool_param_locals
+            .iter()
+            .find(|(x, _)| x == l)
+            .map(|(_, name)| name.clone())
+    }
+
     /// Which operand of the unsigned order compare `instr` (at `blocks[i]`) is
     /// the raw `Val` of a `u32` parameter, if one provably is (issue #80 C4).
     ///
@@ -7164,6 +7217,14 @@ impl<'a> LiftContext<'a> {
                     // remove_dead_code.
                 }
                 StructuredBlock::Instruction(instr) => {
+                    // `local.get L; i32.const 1; i32.and` on a local holding a
+                    // decoded `bool` parameter is the parameter (issue #74).
+                    if let Some(name) = self.bool_param_read(blocks, i) {
+                        cov_mark::hit!(decoded_bool_param_read);
+                        self.stack.push(StackVal::Param(name));
+                        i += 3;
+                        continue;
+                    }
                     self.raw_param_compare = self.raw_param_operand(blocks, i, instr);
                     self.lift_instruction(instr);
                     self.raw_param_compare = None;
@@ -8245,6 +8306,22 @@ impl<'a> LiftContext<'a> {
                     } else {
                         else_stmts.iter().any(is_terminator_stmt)
                     };
+                    // An exact arm that falls through reaches the code after
+                    // the `if`. A standalone panic at its top level is then an
+                    // inlined helper's trap path whose condition the lift lost
+                    // (the token client's `transfer` result check): the same
+                    // stray the optimizer drops before live code at the top
+                    // level of a function.
+                    if exact_if {
+                        for (terminates, stmts) in [
+                            (then_terminates, &mut then_stmts),
+                            (else_terminates, &mut else_stmts),
+                        ] {
+                            if !terminates {
+                                drop_exact_arm_stray_panics(stmts);
+                            }
+                        }
+                    }
                     if !(then_terminates && else_terminates) {
                         reconcile_branch_locals(
                             &mut self.locals,
@@ -10757,6 +10834,8 @@ fn lift_function_body(
 
     let raw_u32_param_locals = Rc::new(unwritten_u32_param_locals(func, params, num_wasm_params));
     ctx.raw_u32_param_locals = Rc::clone(&raw_u32_param_locals);
+    let bool_param_locals = Rc::new(decoded_bool_param_locals(func, params, num_wasm_params));
+    ctx.bool_param_locals = Rc::clone(&bool_param_locals);
 
     // Structurize flat WASM instructions into a tree, then lift. Reclassify
     // compiler-emitted safety-net `unreachable` traps before lifting so the
@@ -10781,9 +10860,14 @@ fn lift_function_body(
         // is an SDK idiom (a `Val` encode/decode split, a bounds or
         // overflow check, the `Option` front-of-vec) that dedicated
         // recognizers read off its original shape.
-        let o = super::restructure::restructure_regions(&mut structured, &|f| {
-            detect_i128_intrinsic(wasm_module, f).is_some()
-        });
+        // Also regions that branch on a decoded `bool` parameter: the
+        // contract's own `if` on it (`swap`'s `buy_a`).
+        let bool_locals: Vec<u32> = bool_param_locals.iter().map(|(l, _)| *l).collect();
+        let o = super::restructure::restructure_regions(
+            &mut structured,
+            &|f| detect_i128_intrinsic(wasm_module, f).is_some(),
+            &bool_locals,
+        );
         restructured = o.regions > 0;
         if std::env::var("DBG_RESTRUCT").is_ok() && (o.regions > 0 || !o.refused.is_empty()) {
             eprintln!("[RESTRUCT] func {func_index} {o:?}");
@@ -10813,6 +10897,7 @@ fn lift_function_body(
             num_wasm_params,
         );
         plain.raw_u32_param_locals = Rc::clone(&raw_u32_param_locals);
+        plain.bool_param_locals = Rc::clone(&bool_param_locals);
         plain.lift_structured(&unrewritten);
         let (kept, lost) = (effect_census(&ctx.stmts), effect_census(&plain.stmts));
         // A terminator with statements after it is cut there by dead-code
@@ -11151,6 +11236,7 @@ fn expr_contains_unknown(expr: &SorobanExpr) -> bool {
         | SorobanExpr::RawHostCall { .. } => true,
         // Leaves with no expression children.
         SorobanExpr::U32Literal(_)
+        | SorobanExpr::Deferred
         | SorobanExpr::I32Literal(_)
         | SorobanExpr::U64Literal(_)
         | SorobanExpr::I64Literal(_)
@@ -12285,6 +12371,80 @@ fn unwritten_u32_param_locals(
                 .any(|ins| matches!(ins, WI::LocalSet(x) | WI::LocalTee(x) if *x == l))
         })
         .collect()
+}
+
+/// The locals that hold a decoded `bool` parameter (issue #74).
+///
+/// The SDK decodes a `bool` argument `p` with one fixed window:
+///
+/// ```text
+/// i32.const 1  i32.const 2  i32.const 0
+/// local.get p  i32.wrap_i64  i32.const 255  i32.and  local.tee L
+/// select  local.get L  i32.const 1  i32.eq  select  local.tee L
+/// i32.const 2  i32.eq  br_if
+/// ```
+///
+/// `L` ends up `1` for `true` (tag 1), `0` for `false` (tag 0) and `2` for
+/// anything else, which the `br_if` sends to the argument-error trap. So
+/// past the window `L` is `0` or `1`, the parameter's value. `L` must be
+/// written exactly twice (both in the window), and `p` must be a `bool`
+/// parameter whose local nothing writes before the window, outside any
+/// loop, so the window reads the argument itself. (The SDK reuses the
+/// parameter's local afterwards.)
+fn decoded_bool_param_locals(
+    func: &crate::wasm::ir::WasmFunction,
+    params: &[FnParam],
+    num_wasm_params: u32,
+) -> Vec<(u32, String)> {
+    use crate::wasm::ir::WasmInstr as WI;
+    let writes = |l: u32| {
+        func.body
+            .iter()
+            .filter(|ins| matches!(ins, WI::LocalSet(x) | WI::LocalTee(x) if *x == l))
+            .count()
+    };
+    let mut out = Vec::new();
+    for (at, w) in func.body.windows(17).enumerate() {
+        let [
+            WI::I32Const(1),
+            WI::I32Const(2),
+            WI::I32Const(0),
+            WI::LocalGet(p),
+            WI::I32WrapI64,
+            WI::I32Const(255),
+            WI::I32And,
+            WI::LocalTee(l1),
+            WI::Select,
+            WI::LocalGet(l2),
+            WI::I32Const(1),
+            WI::I32Eq,
+            WI::Select,
+            WI::LocalTee(l3),
+            WI::I32Const(2),
+            WI::I32Eq,
+            WI::BrIf(_),
+        ] = w
+        else {
+            continue;
+        };
+        let l = *l1;
+        if *l2 != l || *l3 != l || *p >= num_wasm_params.min(params.len() as u32) {
+            continue;
+        }
+        let before = &func.body[..at];
+        let clean_read = !before.iter().any(|ins| {
+            matches!(ins, WI::Loop { .. })
+                || matches!(ins, WI::LocalSet(x) | WI::LocalTee(x) if x == p)
+        });
+        if matches!(params[*p as usize].type_def, ScSpecTypeDef::Bool)
+            && clean_read
+            && writes(l) == 2
+            && !out.iter().any(|(x, _)| *x == l)
+        {
+            out.push((l, params[*p as usize].name.clone()));
+        }
+    }
+    out
 }
 
 /// An UNSIGNED order compare of a raw `u32` `Val` against `N << 32`, decoded
@@ -21397,6 +21557,30 @@ fn reconcile_branch_locals(
     }
 }
 
+/// Drop the standalone top-level panics of an exact `if` arm that falls
+/// through (see the `IfElse` arm of `lift_structured`). Nested panics are
+/// conditional exits and stay.
+fn drop_exact_arm_stray_panics(stmts: &mut Vec<SorobanStmt>) {
+    let before = stmts.len();
+    stmts.retain(|s| {
+        !matches!(
+            s,
+            SorobanStmt::Expr(SorobanExpr::Panic | SorobanExpr::PanicWithError(_))
+        )
+    });
+    if stmts.len() != before {
+        cov_mark::hit!(exact_arm_stray_panic_dropped);
+    }
+}
+
+/// One arm's low half of an `i128` limb pair in [`reconcile_exact_branch_locals`].
+enum Side {
+    /// The low limb of this value.
+    Limb(StackVal),
+    /// A constant low half.
+    Const(i64),
+}
+
 /// The join of an `IfElse` whose arms are exact paths (issue #74; the body was
 /// rewritten by `restructure::restructure_regions`). Unlike the generic merge
 /// it guesses nothing:
@@ -21408,7 +21592,9 @@ fn reconcile_branch_locals(
 ///   (the SDK's small/object `i128` decode is two arms that both yield the
 ///   parameter);
 /// - an `i128` held as a `(lo, hi)` limb pair in two locals is merged as ONE
-///   value, so it is still a whole `i128` after the join;
+///   value, so it is still a whole `i128` after the join — also where the
+///   other arm leaves two constants in those locals (`(out, 0)` against
+///   `(0, out)`), which are then that `i128`'s two halves;
 /// - any other divergence becomes a `let mut` assigned in each arm, whatever
 ///   the values are — constants included;
 /// - an arm value that is not known makes the merged value not known.
@@ -21499,22 +21685,56 @@ fn reconcile_exact_branch_locals(
     };
     let mut done = vec![false; n];
 
-    // `i128` limb pairs.
+    // `i128` limb pairs. One arm may hold a constant pair instead (`(out, 0)`
+    // against `(0, out)`): the other arm's limbs prove the two locals carry
+    // one `i128`, so the constants are its two halves.
+    let low_side = |v: &StackVal| -> Option<Side> {
+        match v {
+            StackVal::I64(c) => Some(Side::Const(*c)),
+            _ => limb_of(v, false).map(Side::Limb),
+        }
+    };
+    let high_of = |side: &Side, v: &StackVal| -> bool {
+        match side {
+            Side::Limb(x) => limb_of(v, true).as_ref() == Some(x),
+            Side::Const(_) => matches!(v, StackVal::I64(_)),
+        }
+    };
     for lo in 0..n {
         if done[lo] {
             continue;
         }
-        let (Some(xa), Some(xb)) = (limb_of(&a[lo], false), limb_of(&b[lo], false)) else {
+        let (Some(sa), Some(sb)) = (low_side(&a[lo]), low_side(&b[lo])) else {
             continue;
         };
-        let Some(hi) = (0..n).find(|&h| {
-            h != lo
-                && !done[h]
-                && limb_of(&a[h], true).as_ref() == Some(&xa)
-                && limb_of(&b[h], true).as_ref() == Some(&xb)
-        }) else {
+        let has_const = matches!(sa, Side::Const(_)) || matches!(sb, Side::Const(_));
+        if matches!((&sa, &sb), (Side::Const(_), Side::Const(_))) {
             continue;
+        }
+        let his: Vec<usize> = (0..n)
+            .filter(|&h| h != lo && !done[h] && high_of(&sa, &a[h]) && high_of(&sb, &b[h]))
+            .collect();
+        // With a constant arm the limb arm alone names the high half: it
+        // must name exactly one.
+        let hi = match his.as_slice() {
+            [h] => *h,
+            [h, ..] if !has_const => *h,
+            _ => continue,
         };
+        let whole = |side: Side, v_hi: &StackVal| -> StackVal {
+            match (side, v_hi) {
+                (Side::Limb(x), _) => x,
+                (Side::Const(l), StackVal::I64(h)) => {
+                    cov_mark::hit!(exact_join_i128_const_pair);
+                    StackVal::HostCallResult(Box::new(SorobanExpr::I128Literal(
+                        ((*h as i128) << 64) | (l as u64 as i128),
+                    )))
+                }
+                (Side::Const(_), _) => unreachable!("high_of matched an I64"),
+            }
+        };
+        let xa = whole(sa, &a[hi]);
+        let xb = whole(sb, &b[hi]);
         done[lo] = true;
         done[hi] = true;
         if agree(&xa, &xb) && in_scope(&xa, &a_ids) {
@@ -21529,15 +21749,12 @@ fn reconcile_exact_branch_locals(
         }
         let id = fresh_join_binding();
         let name = format!("var_{id}");
-        let init = match (limb_of(&pre[lo], false), limb_of(&pre[hi], true)) {
-            (Some(p), Some(q)) if p == q => expr(&p),
-            _ => SorobanExpr::UnknownVal,
-        };
         cov_mark::hit!(exact_join_i128_pair_merged);
+        // Both arms assign it: `let mut x;`, no initial value to run.
         parent_stmts.push(SorobanStmt::Let {
             name: name.clone(),
             mutable: true,
-            value: init,
+            value: SorobanExpr::Deferred,
         });
         let assign = |x: &StackVal| SorobanStmt::Assign {
             target: name.clone(),
@@ -21597,7 +21814,11 @@ fn reconcile_exact_branch_locals(
         parent_stmts.push(SorobanStmt::Let {
             name: name.clone(),
             mutable: true,
-            value: if stack_val_contains_unknown(p) {
+            // An arm that keeps the local reads the value before the `if`;
+            // where both arms assign it there is none to run.
+            value: if a_changed && b_changed {
+                SorobanExpr::Deferred
+            } else if stack_val_contains_unknown(p) {
                 SorobanExpr::UnknownVal
             } else {
                 expr(p)
@@ -30109,6 +30330,100 @@ mod tests {
         ctx.stack = vec![StackVal::Param("fee".to_string()), StackVal::I64(k)];
         let (a, _) = ctx.pop_order_operands();
         assert_eq!(a, StackVal::Param("fee".to_string()));
+    }
+
+    /// The SDK's `bool` decode window proves its local holds the argument;
+    /// `local.get L; i32.const 1; i32.and` past it reads the parameter.
+    #[test]
+    fn decoded_bool_param_local_reads_the_parameter() {
+        use super::super::structurize::StructuredBlock as SB;
+        use crate::wasm::ir::{WasmFunction, WasmInstr as WI};
+        let params = vec![
+            FnParam {
+                name: "to".to_string(),
+                type_def: ScSpecTypeDef::Address,
+            },
+            FnParam {
+                name: "buy_a".to_string(),
+                type_def: ScSpecTypeDef::Bool,
+            },
+            FnParam {
+                name: "n".to_string(),
+                type_def: ScSpecTypeDef::U32,
+            },
+        ];
+        let window = |p: u32, l: u32| {
+            vec![
+                WI::I32Const(1),
+                WI::I32Const(2),
+                WI::I32Const(0),
+                WI::LocalGet(p),
+                WI::I32WrapI64,
+                WI::I32Const(255),
+                WI::I32And,
+                WI::LocalTee(l),
+                WI::Select,
+                WI::LocalGet(l),
+                WI::I32Const(1),
+                WI::I32Eq,
+                WI::Select,
+                WI::LocalTee(l),
+                WI::I32Const(2),
+                WI::I32Eq,
+                WI::BrIf(0),
+            ]
+        };
+        let func = |body: Vec<WI>| WasmFunction {
+            index: 0,
+            type_index: 0,
+            locals: Vec::new(),
+            body,
+        };
+        // The parameter's local reused afterwards is fine.
+        let mut body = window(1, 5);
+        body.extend([WI::I64Const(0), WI::LocalSet(1)]);
+        assert_eq!(
+            decoded_bool_param_locals(&func(body), &params, 3),
+            vec![(5, "buy_a".to_string())]
+        );
+        // Not a `bool` parameter.
+        assert!(decoded_bool_param_locals(&func(window(2, 5)), &params, 3).is_empty());
+        // The parameter's local written before the window.
+        let mut body = vec![WI::I64Const(0), WI::LocalSet(1)];
+        body.extend(window(1, 5));
+        assert!(decoded_bool_param_locals(&func(body), &params, 3).is_empty());
+        // The window inside a loop.
+        let mut body = vec![WI::Loop {
+            block_type: crate::wasm::ir::BlockType::Empty,
+        }];
+        body.extend(window(1, 5));
+        assert!(decoded_bool_param_locals(&func(body), &params, 3).is_empty());
+        // `L` written again elsewhere.
+        let mut body = window(1, 5);
+        body.extend([WI::I32Const(7), WI::LocalSet(5)]);
+        assert!(decoded_bool_param_locals(&func(body), &params, 3).is_empty());
+
+        let wasm = empty_lift_module();
+        let reg = empty_registry();
+        let rt = None;
+        let locals = params
+            .iter()
+            .map(|p| StackVal::Param(p.name.clone()))
+            .collect();
+        let mut ctx = LiftContext::new(&wasm, &reg, &params, &rt, locals, 3);
+        ctx.bool_param_locals = Rc::new(vec![(5, "buy_a".to_string())]);
+        let read = |l: u32, k: i32| {
+            vec![
+                SB::Instruction(WI::LocalGet(l)),
+                SB::Instruction(WI::I32Const(k)),
+                SB::Instruction(WI::I32And),
+            ]
+        };
+        assert_eq!(ctx.bool_param_read(&read(5, 1), 0), Some("buy_a".into()));
+        assert_eq!(ctx.bool_param_read(&read(5, 3), 0), None);
+        assert_eq!(ctx.bool_param_read(&read(6, 1), 0), None);
+        ctx.inline_depth = 1;
+        assert_eq!(ctx.bool_param_read(&read(5, 1), 0), None);
     }
 
     /// The mask mark must stay transparent to the `U32Val` decode. A `u32`

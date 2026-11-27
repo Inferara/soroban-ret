@@ -1454,6 +1454,7 @@ fn repair_unknown_invoke_functions_in_expr(expr: &mut SorobanExpr, replacement: 
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::ValTagName(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. } => {}
     }
 }
@@ -1704,6 +1705,7 @@ fn repair_unknown_event_values_in_expr(expr: &mut SorobanExpr, hint: &EventRepai
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::ValTagName(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. } => {}
     }
 }
@@ -1970,6 +1972,7 @@ fn repair_weak_auth_in_expr(expr: &mut SorobanExpr, hint: &AuthRepairHint) {
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::ValTagName(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. } => {}
     }
 }
@@ -2220,6 +2223,7 @@ fn repair_unknown_storage_keys_in_expr(expr: &mut SorobanExpr, replacement: &Sor
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::ValTagName(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. } => {}
     }
 }
@@ -5209,6 +5213,7 @@ fn score_param_local_base_in_expr(
         SorobanExpr::ContractError { .. }
         | SorobanExpr::Panic
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. }
         | SorobanExpr::Void
         | SorobanExpr::None
@@ -5539,6 +5544,7 @@ fn expr_uses_env(expr: &SorobanExpr) -> bool {
         | SorobanExpr::Panic
         | SorobanExpr::ValTagName(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. } => false,
     }
 }

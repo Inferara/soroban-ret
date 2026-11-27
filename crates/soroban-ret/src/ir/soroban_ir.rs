@@ -222,6 +222,12 @@ pub enum SorobanExpr {
     // Placeholder for unknown/untracked stack values
     UnknownVal,
 
+    /// The initializer of a `let mut x;` that every path assigns before it
+    /// is read (an exact join both of whose arms set `x`, issue #74). Valid
+    /// only as the whole `value` of a `SorobanStmt::Let`; renders as
+    /// `let mut x;`.
+    Deferred,
+
     // A frame slot whose stored value transitively references itself — a genuine
     // data cycle the lifter cannot resolve to a value. Reported precisely (with
     // the slot identity) instead of collapsing to an anonymous `UnknownVal`.

@@ -915,6 +915,11 @@ fn generate_expr_base(expr: &SorobanExpr) -> TokenStream {
         SorobanExpr::UnknownVal => {
             quote! { todo!("unknown value") }
         }
+        // Only meaningful as a `let`'s whole initializer (rendered there as
+        // `let mut x;`). Anywhere else it is not a value the output knows.
+        SorobanExpr::Deferred => {
+            quote! { todo!("unknown value") }
+        }
 
         SorobanExpr::CyclicSlot { frame_id, offset } => {
             let msg = format!("cyclic frame slot ({frame_id}, {offset})");
@@ -1177,6 +1182,13 @@ pub fn generate_stmt(stmt: &SorobanStmt) -> TokenStream {
             value,
         } => {
             let ident = safe_ident(name);
+            if matches!(value, SorobanExpr::Deferred) {
+                return if *mutable {
+                    quote! { let mut #ident; }
+                } else {
+                    quote! { let #ident; }
+                };
+            }
             let value = generate_expr(value);
             if *mutable {
                 quote! { let mut #ident = #value; }
@@ -3329,6 +3341,21 @@ mod generate_stmt_tests {
             value: SorobanExpr::U32Literal(2),
         };
         assert_eq!(collapse(&s(generate_stmt(&mu))), "let mut y = 2 ;");
+    }
+
+    #[test]
+    fn deferred_let_has_no_initializer() {
+        let d = SorobanStmt::Let {
+            name: "z".into(),
+            mutable: true,
+            value: SorobanExpr::Deferred,
+        };
+        assert_eq!(collapse(&s(generate_stmt(&d))), "let mut z ;");
+        // Anywhere but a whole `let` initializer it is not a known value.
+        assert_eq!(
+            collapse(&s(generate_expr(&SorobanExpr::Deferred))),
+            "todo ! (\"unknown value\")"
+        );
     }
 
     #[test]
