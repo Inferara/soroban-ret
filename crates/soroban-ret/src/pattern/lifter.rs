@@ -5573,7 +5573,7 @@ impl<'a> LiftContext<'a> {
                             // captured before `args` moves into the inline
                             // (issue #34 t2, `seed_decode_helper_result`).
                             let decode_operand = args.get(1).cloned();
-                            let mut inline_result = lift_inline_call(
+                            let mut inline_result = lift_inline_call_in(
                                 self.wasm_module,
                                 self.registry,
                                 *target_idx,
@@ -5582,6 +5582,7 @@ impl<'a> LiftContext<'a> {
                                 Rc::clone(&self.frame_slots),
                                 Rc::clone(&self.next_frame_id),
                                 Rc::clone(&self.slot_write_log),
+                                self.exact_function,
                             );
                             // Always propagate memory stores from inlined calls — helper
                             // functions may store Val-encoded values to memory without
@@ -5984,6 +5985,12 @@ impl<'a> LiftContext<'a> {
             WasmInstr::I32LtS | WasmInstr::I64LtS => {
                 let b = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                if matches!(instr, WasmInstr::I64LtS)
+                    && let Some(v) = self.read_i128_overflow_test(&a, &b, true)
+                {
+                    self.stack.push(v);
+                    return;
+                }
                 self.stack
                     .push(StackVal::Compare(Box::new(a), CmpOp::LtS, Box::new(b)));
             }
@@ -6025,6 +6032,12 @@ impl<'a> LiftContext<'a> {
             WasmInstr::I32GeS | WasmInstr::I64GeS => {
                 let b = self.stack.pop().unwrap_or(StackVal::Unknown);
                 let a = self.stack.pop().unwrap_or(StackVal::Unknown);
+                if matches!(instr, WasmInstr::I64GeS)
+                    && let Some(v) = self.read_i128_overflow_test(&a, &b, false)
+                {
+                    self.stack.push(v);
+                    return;
+                }
                 self.stack
                     .push(StackVal::Compare(Box::new(a), CmpOp::GeS, Box::new(b)));
             }
@@ -6116,6 +6129,15 @@ impl<'a> LiftContext<'a> {
                     _ if self.exact_function && limb_pair_value(&a, &b).is_some() => self
                         .stack
                         .push(StackVal::BinOp(Box::new(a), BinOper::And, Box::new(b))),
+                    // `(x ^ y) & (x ^ r)`: the compiler's overflow test
+                    // (`i128_overflow_test`); unknown anywhere else.
+                    _ if self.exact_function
+                        && matches!(a, StackVal::BinOp(_, BinOper::Xor, _))
+                        && matches!(b, StackVal::BinOp(_, BinOper::Xor, _)) =>
+                    {
+                        self.stack
+                            .push(StackVal::BinOp(Box::new(a), BinOper::And, Box::new(b)))
+                    }
                     // `<x>.len() & 0xFFFF_FFFF_0000_0000`, or the same mask on
                     // a declared `u32` parameter: the tag-clearing mask on a raw
                     // `U32Val`. KEEP it (as a marked value that still renders as
@@ -6344,6 +6366,16 @@ impl<'a> LiftContext<'a> {
                     (StackVal::I128Limb { .. }, StackVal::I64(_))
                     | (StackVal::I64(_), StackVal::I128Limb { .. })
                         if self.exact_function =>
+                    {
+                        self.stack
+                            .push(StackVal::BinOp(Box::new(a), BinOper::Xor, Box::new(b)));
+                    }
+                    // Any other `x ^ y`, for the compiler's overflow test
+                    // (`i128_overflow_test`). It still reads as unknown
+                    // everywhere else.
+                    _ if self.exact_function
+                        && !matches!(a, StackVal::Unknown)
+                        && !matches!(b, StackVal::Unknown) =>
                     {
                         self.stack
                             .push(StackVal::BinOp(Box::new(a), BinOper::Xor, Box::new(b)));
@@ -6893,6 +6925,56 @@ impl<'a> LiftContext<'a> {
     /// `dividend == i128::MIN`. Only the constants every 128-bit type reads
     /// the same way are folded: `0`, and `1 << 127` (`i128::MIN` as an
     /// `i128`, `2^127` as a `u128` — the limbs do not say which).
+    /// `t < 0` (`overflows`) or `t >= 0` over the compiler's overflow test
+    /// `t` of an `i128` add or sub (see [`i128_overflow_test`]), as
+    /// `x.checked_sub(y).is_none()` (`.is_some()`). Only in an exactly
+    /// rewritten function, the only place the test's `^`/`&` are kept.
+    fn read_i128_overflow_test(
+        &self,
+        t: &StackVal,
+        zero: &StackVal,
+        overflows: bool,
+    ) -> Option<StackVal> {
+        if !self.exact_function || !matches!(zero, StackVal::I64(0)) {
+            return None;
+        }
+        let (x, add, y) = i128_overflow_test(t)?;
+        let slots = self.frame_slots.borrow();
+        let expr = |v: &StackVal| {
+            force_i128_type(stack_val_to_expr(
+                v,
+                self.params,
+                self.registry,
+                Some(&slots),
+            ))
+        };
+        let (mut x, mut y) = (expr(&x), expr(&y));
+        // A literal receiver has no type of its own (`1.checked_add(x)` does
+        // not compile); an addition can take the other operand there.
+        let is_lit = |e: &SorobanExpr| matches!(e, SorobanExpr::I128Literal(_));
+        if is_lit(&x) {
+            if !add || is_lit(&y) {
+                return None;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        if expr_contains_unknown(&x) || expr_contains_unknown(&y) {
+            return None;
+        }
+        cov_mark::hit!(i128_overflow_test_read);
+        Some(StackVal::HostCallResult(Box::new(
+            SorobanExpr::MethodCall {
+                object: Box::new(SorobanExpr::MethodCall {
+                    object: Box::new(x),
+                    method: if add { "checked_add" } else { "checked_sub" }.to_string(),
+                    args: vec![y],
+                }),
+                method: if overflows { "is_none" } else { "is_some" }.to_string(),
+                args: Vec::new(),
+            },
+        )))
+    }
+
     fn fold_limb_zero_test(&self, a: &StackVal) -> Option<StackVal> {
         let mut leaves = Vec::new();
         fn collect<'v>(v: &'v StackVal, out: &mut Vec<&'v StackVal>) {
@@ -8065,6 +8147,20 @@ impl<'a> LiftContext<'a> {
                 } => {
                     // Pop condition from stack
                     let cond_val = self.stack.pop().unwrap_or(StackVal::Unknown);
+
+                    // A standalone guard (issue #74, see `EXACT_GUARD`) whose
+                    // condition the lift cannot read is left out, as it was
+                    // before the rewrite: these are the compiler's own
+                    // overflow checks on add/sub, which the recompiled
+                    // arithmetic makes again, and `if todo!() { panic!() }`
+                    // would make every call trap.
+                    if super::restructure::is_exact_guard(block_type)
+                        && stack_val_contains_unknown(&cond_val)
+                    {
+                        cov_mark::hit!(exact_guard_unread_condition_left_out);
+                        i += 1;
+                        continue;
+                    }
 
                     // Issue #35: a fallible storage-decode discriminant guarded
                     // by a bare trap is the `.unwrap()`'s None-arm re-encoded —
@@ -11434,6 +11530,7 @@ struct InlineResult {
 /// functions may store Val-encoded values without making host calls, and these
 /// stores are consumed by subsequent `map_new_from_linear_memory` struct construction.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn lift_inline_call(
     wasm_module: &WasmModule,
     registry: &TypeRegistry,
@@ -11443,6 +11540,34 @@ fn lift_inline_call(
     frame_slots: Rc<RefCell<HashMap<(u32, i32), StackVal>>>,
     next_frame_id: Rc<RefCell<u32>>,
     slot_write_log: Rc<RefCell<SlotWriteLog>>,
+) -> InlineResult {
+    lift_inline_call_in(
+        wasm_module,
+        registry,
+        target_idx,
+        arg_vals,
+        inline_depth,
+        frame_slots,
+        next_frame_id,
+        slot_write_log,
+        false,
+    )
+}
+
+/// [`lift_inline_call`] from a caller that was lifted exactly (`exact`, see
+/// `lift_function_body`): only there are the callee's own joins rewritten
+/// too (issue #74).
+#[allow(clippy::too_many_arguments)]
+fn lift_inline_call_in(
+    wasm_module: &WasmModule,
+    registry: &TypeRegistry,
+    target_idx: u32,
+    arg_vals: Vec<StackVal>,
+    inline_depth: u32,
+    frame_slots: Rc<RefCell<HashMap<(u32, i32), StackVal>>>,
+    next_frame_id: Rc<RefCell<u32>>,
+    slot_write_log: Rc<RefCell<SlotWriteLog>>,
+    exact: bool,
 ) -> InlineResult {
     let func = match wasm_module.get_function(target_idx) {
         Some(f) => f,
@@ -11519,6 +11644,23 @@ fn lift_inline_call(
     // reach any more, so they do not render as an unconditional panic after
     // the recovered body (issue #80).
     drop_unreachable_fail_tails(&mut structured, wasm_module);
+    // A join inside a helper doing `i128` arithmetic, called from a function
+    // lifted exactly (issue #74: the liquidity pool's invariant closure): the
+    // walk would run both paths one after the other, so lift it exactly too.
+    // Only there: the SDK's own helpers (`i128` to `Val` conversion) have
+    // joins of this kind that the walk's recognizers read off their
+    // original shape, and the caller's acceptance checks cover the callee.
+    if exact && std::env::var("DBG_NORESTRUCT").is_err() {
+        let o = super::restructure::restructure_regions(
+            &mut structured,
+            &|f| detect_i128_intrinsic(wasm_module, f).is_some(),
+            &[],
+        );
+        if std::env::var("DBG_RESTRUCT").is_ok() && (o.regions > 0 || !o.refused.is_empty()) {
+            eprintln!("[RESTRUCT] inlined func {target_idx} {o:?}");
+        }
+        ctx.exact_function = o.regions > 0;
+    }
     // Debug affordance: dump the structured body of an *inlined* (non-exported)
     // function by index. `DBG_STRUCT` only reaches lifted entrypoints; the big
     // contracts degrade values inside 3-4 levels of inlined helpers, so tracing
@@ -15761,6 +15903,143 @@ fn reconstruct_i128_addsub_with(
 /// is accepted only as the whole pair: as an add/sub operand it is as
 /// likely a slot's stale contents (and a "limb" of a constant is a
 /// degraded track), so those answer nothing.
+/// The compiler's signed-overflow test of an `i128` subtraction or addition,
+/// read off the high limbs (issue #74): `x - y` overflows exactly when
+/// `(xh ^ yh) & (xh ^ rh) < 0`, and `x + y` when `(xh ^ yh ^ -1) & (xh ^ rh)
+/// < 0`, where `rh` is the result's high limb, `xh - yh - (xl <u yl)` or `xh
+/// + yh + carry`. Returns `(x, is_add, y)`, with both operands read strictly
+/// ([`exact_i128_pair`]) from the limbs the test and its borrow or carry use.
+fn i128_overflow_test(t: &StackVal) -> Option<(StackVal, bool, StackVal)> {
+    fn xor(v: &StackVal) -> Option<(&StackVal, &StackVal)> {
+        match v {
+            StackVal::BinOp(a, BinOper::Xor, b) => Some((a, b)),
+            _ => None,
+        }
+    }
+    fn ult(v: &StackVal) -> Option<(&StackVal, &StackVal)> {
+        match v {
+            StackVal::Compare(l, CmpOp::LtU, r) => Some((l, r)),
+            StackVal::Compare(l, CmpOp::GtU, r) => Some((r, l)),
+            _ => None,
+        }
+    }
+    let StackVal::BinOp(p, BinOper::And, q) = t else {
+        return None;
+    };
+    for (signs, result) in [(p, q), (q, p)] {
+        let Some((s1, s2)) = xor(signs) else { continue };
+        let Some((r1, r2)) = xor(result) else {
+            continue;
+        };
+        let (add, s1, s2) = match (s1, s2) {
+            (inner, StackVal::I64(-1)) | (StackVal::I64(-1), inner) => match xor(inner) {
+                Some((a, b)) => (true, a, b),
+                // `x + c` with a constant `0 <= c < 2^63`: `yh` is 0, so the
+                // test is `(xh ^ -1) & (xh ^ rh)`, `rh = xh + carry`.
+                None => {
+                    if let Some(v) = const_add_overflow(inner, r1, r2) {
+                        return Some(v);
+                    }
+                    continue;
+                }
+            },
+            _ => (false, s1, s2),
+        };
+        for (xh, yh) in [(s1, s2), (s2, s1)] {
+            for (rx, rh) in [(r1, r2), (r2, r1)] {
+                if rx != xh {
+                    continue;
+                }
+                let found = if add {
+                    let StackVal::BinOp(sum, BinOper::Add, carry) = rh else {
+                        continue;
+                    };
+                    if !matches!(sum.as_ref(), StackVal::BinOp(a, BinOper::Add, b)
+                        if (**a == *xh && **b == *yh) || (**a == *yh && **b == *xh))
+                    {
+                        continue;
+                    }
+                    let Some((lo_sum, addend)) = ult(carry) else {
+                        continue;
+                    };
+                    let StackVal::BinOp(l1, BinOper::Add, l2) = lo_sum else {
+                        continue;
+                    };
+                    if addend != l1.as_ref() && addend != l2.as_ref() {
+                        continue;
+                    }
+                    [(l1, l2), (l2, l1)].into_iter().find_map(|(xl, yl)| {
+                        Some((exact_i128_pair(xl, xh)?, exact_i128_pair(yl, yh)?))
+                    })
+                } else {
+                    let StackVal::BinOp(diff, BinOper::Sub, borrow) = rh else {
+                        continue;
+                    };
+                    if !matches!(diff.as_ref(), StackVal::BinOp(a, BinOper::Sub, b)
+                        if **a == *xh && **b == *yh)
+                    {
+                        continue;
+                    }
+                    let Some((xl, yl)) = ult(borrow) else {
+                        continue;
+                    };
+                    exact_i128_pair(xl, xh).zip(exact_i128_pair(yl, yh))
+                };
+                if let Some((x, y)) = found {
+                    return Some((x, add, y));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// [`i128_overflow_test`] of `x + c` for a constant `0 <= c < 2^63`: `xh ^
+/// rh` with `rh = xh + carry`, the carry `(xl + c) <u c` (`(xl + 1) == 0`
+/// for `c = 1`).
+fn const_add_overflow(
+    xh: &StackVal,
+    r1: &StackVal,
+    r2: &StackVal,
+) -> Option<(StackVal, bool, StackVal)> {
+    for (rx, rh) in [(r1, r2), (r2, r1)] {
+        if rx != xh {
+            continue;
+        }
+        let StackVal::BinOp(h, BinOper::Add, carry) = rh else {
+            continue;
+        };
+        if h.as_ref() != xh {
+            continue;
+        }
+        let (xl, c) = match carry.as_ref() {
+            StackVal::Eqz(sum) => match sum.as_ref() {
+                StackVal::BinOp(xl, BinOper::Add, k) if matches!(**k, StackVal::I64(1)) => {
+                    (xl.as_ref(), 1)
+                }
+                _ => continue,
+            },
+            StackVal::Compare(sum, CmpOp::LtU, k) => match (sum.as_ref(), k.as_ref()) {
+                (StackVal::BinOp(xl, BinOper::Add, k2), StackVal::I64(c))
+                    if **k2 == StackVal::I64(*c) && *c >= 0 =>
+                {
+                    (xl.as_ref(), *c)
+                }
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if let Some(x) = exact_i128_operand(xl, xh) {
+            return Some((
+                x,
+                true,
+                StackVal::HostCallResult(Box::new(SorobanExpr::I128Literal(c as i128))),
+            ));
+        }
+    }
+    None
+}
+
 fn exact_i128_pair(lo: &StackVal, hi: &StackVal) -> Option<StackVal> {
     if let (StackVal::I64(l), StackVal::I64(h)) = (lo, hi) {
         return Some(StackVal::HostCallResult(Box::new(
@@ -28038,6 +28317,86 @@ mod tests {
     /// `exact_i128_pair` accounts for both halves or answers nothing: a
     /// tracked low limb with an unrelated (here zero) high half is not the
     /// whole value — `(0, low64(x))` is not `x`.
+    /// The compiler's `i128` overflow tests read back the operation they
+    /// guard, only when every limb belongs to it.
+    #[test]
+    fn i128_overflow_test_reads_its_operation() {
+        let limb = |v: &str, hi| StackVal::I128Limb {
+            value: Box::new(StackVal::Param(v.to_string())),
+            hi,
+        };
+        let b = |x: StackVal| Box::new(x);
+        let bin = |x, op, y| StackVal::BinOp(b(x), op, b(y));
+        let xor = |x, y| bin(x, BinOper::Xor, y);
+        let and = |x, y| bin(x, BinOper::And, y);
+        let ult = |x, y| StackVal::Compare(b(x), CmpOp::LtU, b(y));
+        let (xl, xh, yl, yh) = (
+            limb("x", false),
+            limb("x", true),
+            limb("y", false),
+            limb("y", true),
+        );
+        let x = StackVal::Param("x".to_string());
+        let y = StackVal::Param("y".to_string());
+        // `x - y`: (xh ^ yh) & (xh ^ (xh - yh - (xl <u yl))).
+        let sub_hi = |l: StackVal| {
+            bin(
+                bin(xh.clone(), BinOper::Sub, yh.clone()),
+                BinOper::Sub,
+                ult(l, yl.clone()),
+            )
+        };
+        let sub = and(
+            xor(xh.clone(), yh.clone()),
+            xor(xh.clone(), sub_hi(xl.clone())),
+        );
+        assert_eq!(
+            i128_overflow_test(&sub),
+            Some((x.clone(), false, y.clone()))
+        );
+        // The borrow from another value's low limb is not `x - y`'s.
+        let other = and(
+            xor(xh.clone(), yh.clone()),
+            xor(xh.clone(), sub_hi(limb("z", false))),
+        );
+        assert_eq!(i128_overflow_test(&other), None);
+        // `x + y`: (xh ^ yh ^ -1) & (xh ^ (xh + yh + ((xl + yl) <u xl))).
+        let lo_sum = bin(xl.clone(), BinOper::Add, yl.clone());
+        let add_hi = bin(
+            bin(xh.clone(), BinOper::Add, yh.clone()),
+            BinOper::Add,
+            ult(lo_sum, xl.clone()),
+        );
+        let add = and(
+            xor(xor(xh.clone(), yh.clone()), StackVal::I64(-1)),
+            xor(xh.clone(), add_hi.clone()),
+        );
+        assert_eq!(i128_overflow_test(&add), Some((x.clone(), true, y.clone())));
+        // Without the `^ -1` it is a subtraction's test, which `add_hi` is not.
+        let mixed = and(xor(xh.clone(), yh.clone()), xor(xh.clone(), add_hi));
+        assert_eq!(i128_overflow_test(&mixed), None);
+        // `x + 1`: (xh ^ -1) & (xh ^ (xh + ((xl + 1) == 0))).
+        let inc = and(
+            xor(xh.clone(), StackVal::I64(-1)),
+            xor(
+                xh.clone(),
+                bin(
+                    xh.clone(),
+                    BinOper::Add,
+                    StackVal::Eqz(b(bin(xl.clone(), BinOper::Add, StackVal::I64(1)))),
+                ),
+            ),
+        );
+        assert_eq!(
+            i128_overflow_test(&inc),
+            Some((
+                x,
+                true,
+                StackVal::HostCallResult(Box::new(SorobanExpr::I128Literal(1)))
+            ))
+        );
+    }
+
     #[test]
     fn exact_i128_pair_needs_both_halves() {
         let x = StackVal::Param("x".to_string());
