@@ -805,7 +805,7 @@ pub fn run_to_ir(wasm: &[u8], options: &DecompileOptions) -> Result<DecompileIR,
         // keys read as i128; pass 2 types every get of those keys across all
         // functions (so a tuple-returning `get_rsrvs` or a dead `let reserve_a` whose
         // slot is i128 elsewhere is typed too).
-        let mut i128_keys: Vec<SorobanExpr> = Vec::new();
+        let mut i128_keys: Vec<I128Key> = Vec::new();
         for func in &mut contract_module.functions {
             let used = coerce_i128_invoke_types(&mut func.body, &func.params);
             for key in used.keys {
@@ -7791,11 +7791,15 @@ fn collect_i128_bound_get_keys(stmts: &[SorobanStmt], used: &mut I128Use) {
         match stmt {
             SorobanStmt::Let {
                 name,
-                value: SorobanExpr::StorageGet { key, .. },
+                value:
+                    SorobanExpr::StorageGet {
+                        storage_type, key, ..
+                    },
                 ..
             } if used.locals.contains(name) => {
-                if !used.keys.contains(key) {
-                    used.keys.push((**key).clone());
+                let k = (*storage_type, (**key).clone());
+                if !used.keys.contains(&k) {
+                    used.keys.push(k);
                 }
             }
             SorobanStmt::If {
@@ -7869,8 +7873,10 @@ fn collect_i128_invoke_bindings(
 struct I128Use {
     /// Names of locals referenced as i128 operands.
     locals: std::collections::HashSet<String>,
-    /// Storage keys read as i128 (e.g. `DataKey::ReserveA`).
-    keys: Vec<SorobanExpr>,
+    /// Storage keys read as i128 (e.g. `DataKey::ReserveA`), with the storage
+    /// they are read from: the same key in another storage is another entry,
+    /// which may hold another type.
+    keys: Vec<I128Key>,
     /// Bindings of a 128-bit `invoke_contract` ([`collect_i128_invoke_bindings`]).
     bound: std::collections::HashSet<String>,
 }
@@ -7911,7 +7917,10 @@ fn coerce_i128_collect(stmts: &mut [SorobanStmt], params: &[FnParam], used: &mut
 /// codegen emits a `get::<_, i128>` turbofish. A get's generic value type is not
 /// inferred from a tuple return or a `let` binding alone, so this types the reads
 /// that arithmetic didn't already reach (`get_rsrvs`, dead `let reserve_a`, …).
-fn type_i128_key_gets(stmts: &mut [SorobanStmt], keys: &[SorobanExpr]) {
+/// A storage entry read as i128: the storage it lives in and its key.
+type I128Key = (StorageType, SorobanExpr);
+
+fn type_i128_key_gets(stmts: &mut [SorobanStmt], keys: &[I128Key]) {
     for stmt in stmts.iter_mut() {
         match stmt {
             SorobanStmt::Expr(e) | SorobanStmt::Return(Some(e)) => {
@@ -7943,10 +7952,12 @@ fn type_i128_key_gets(stmts: &mut [SorobanStmt], keys: &[SorobanExpr]) {
     }
 }
 
-fn type_i128_key_gets_in_expr(e: &mut SorobanExpr, keys: &[SorobanExpr]) {
+fn type_i128_key_gets_in_expr(e: &mut SorobanExpr, keys: &[I128Key]) {
     // A bare get of an i128 key → wrap it (don't recurse into the new wrapper).
-    if let SorobanExpr::StorageGet { key, .. } = e
-        && keys.contains(&**key)
+    if let SorobanExpr::StorageGet {
+        storage_type, key, ..
+    } = e
+        && keys.iter().any(|(t, k)| t == storage_type && k == &**key)
     {
         let inner = std::mem::replace(e, SorobanExpr::Void);
         *e = SorobanExpr::CastAs {
@@ -8061,8 +8072,10 @@ fn force_i128_deep(e: &mut SorobanExpr, used: &mut I128Use) {
         {
             *return_type = Some("i128".to_string());
         }
-        SorobanExpr::StorageGet { key, .. } => {
-            used.keys.push((**key).clone());
+        SorobanExpr::StorageGet {
+            storage_type, key, ..
+        } => {
+            used.keys.push((*storage_type, (**key).clone()));
             let inner = std::mem::replace(e, SorobanExpr::Void);
             *e = SorobanExpr::CastAs {
                 value: Box::new(inner),
@@ -9673,7 +9686,32 @@ mod tests {
         let used = coerce_i128_invoke_types(&mut body, &params);
         assert_eq!(
             used.keys,
-            vec![SorobanExpr::SymbolLiteral("TotalShares".to_string())]
+            vec![(
+                StorageType::Instance,
+                SorobanExpr::SymbolLiteral("TotalShares".to_string())
+            )]
+        );
+        // The same key in persistent storage is another entry: typing the
+        // instance reads leaves it alone.
+        let mut other = vec![
+            SorobanStmt::Expr(get("TotalShares")),
+            SorobanStmt::Expr(SorobanExpr::StorageGet {
+                storage_type: StorageType::Persistent,
+                key: Box::new(SorobanExpr::SymbolLiteral("TotalShares".to_string())),
+                unwrap: true,
+                on_missing: None,
+            }),
+        ];
+        type_i128_key_gets(&mut other, &used.keys);
+        assert!(
+            matches!(&other[0], SorobanStmt::Expr(SorobanExpr::CastAs { .. })),
+            "{:?}",
+            other[0]
+        );
+        assert!(
+            matches!(&other[1], SorobanStmt::Expr(SorobanExpr::StorageGet { .. })),
+            "{:?}",
+            other[1]
         );
     }
 
