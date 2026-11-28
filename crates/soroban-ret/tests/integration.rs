@@ -937,6 +937,46 @@ fn liquidity_pool_deposit_paths_and_reserves() {
         withdraw.contains(".set(&DataKey::Shares(to.clone()),&(env.storage().persistent().get::<_,i128>(&DataKey::Shares(to.clone())).unwrap_or(0)-share_amount)"),
         "{withdraw}"
     );
+    // `swap` branches on `buy_a` (it used to run both arms on one path and
+    // send `out` of both tokens).
+    let swap = body_of("swap");
+    let sell = swap
+        .split("ifbuy_a{")
+        .nth(1)
+        .expect("swap branches on buy_a");
+    assert!(
+        sell.starts_with(
+            "lettoken_b=env.storage().instance().get::<_,Address>(&DataKey::TokenB).unwrap();"
+        ),
+        "buying A sells token B:\n{swap}"
+    );
+    // The amount sold in: `reserve_sell * out * 1000 / ((reserve_buy - out)
+    // * 997) + 1`, the `+ 1` included.
+    assert!(
+        swap.contains("((ifbuy_a{env.storage().instance().get::<_,i128>(&DataKey::ReserveB).unwrap()}else{env.storage().instance().get::<_,i128>(&DataKey::ReserveA).unwrap()})*out*1000/(((ifbuy_a{env.storage().instance().get::<_,i128>(&DataKey::ReserveA).unwrap()}else{env.storage().instance().get::<_,i128>(&DataKey::ReserveB).unwrap()})-out)*997)+1).into_val(&env)"),
+        "sell amount:\n{swap}"
+    );
+    // `(out_a, out_b)` merge as whole `i128`s, declared without a value to
+    // run (both arms assign them).
+    assert!(
+        swap.contains("letmutvar_2097153;letmutvar_2097154;"),
+        "{swap}"
+    );
+    assert!(swap.contains("var_2097153=0;var_2097154=out;"), "{swap}");
+    assert!(swap.contains("var_2097153=out;var_2097154=0;"), "{swap}");
+    assert!(!swap.contains("todo!"), "{swap}");
+    // One token goes out, in its own arm; the arm does not end in the
+    // inlined transfer's result-check trap.
+    assert_eq!(swap.matches("ifbuy_a{").count(), 4, "{swap}");
+    assert!(
+        swap.contains("to.into_val(&env),out.into_val(&env),],);}else{lettoken_b_2="),
+        "{swap}"
+    );
+    assert!(
+        swap.contains("to.into_val(&env),out.into_val(&env),],);}env.storage().instance().set(&DataKey::ReserveA,"),
+        "{swap}"
+    );
+    assert!(swap.ends_with("-var_2097153),);}"), "{swap}");
     let balance = body_of("balance_shares");
     assert!(
         balance.ends_with(".get::<_,i128>(&DataKey::Shares(user.clone())).unwrap_or(0)}"),
@@ -1494,8 +1534,9 @@ fn test_all_fixtures_decompile() {
 // `test_liquidity_pool` (issue #74): `deposit`'s branches, guards (the
 // division overflow guards included), amounts and share balances are
 // recovered, but its integer square root (a self-recursive helper, for the
-// first deposit's shares) is a hole, and `swap` still loses values in branches
-// no `i128` join region covers.
+// first deposit's shares) is a hole. `swap`'s values are recovered; its user
+// guards (`reserve_buy < out`, `sell_amount > in_max`, the constant-product
+// check) branch straight to the trap tail and are not rendered yet.
 //
 // `import_contract`: `safe_add_with` / `safe_add_with_two` map a `try_call`
 // result by hand (callee error 1 → `Err(Overflow)`, anything else →

@@ -512,16 +512,52 @@ fn calls_user_code(seq: &[StructuredBlock], user_call: &dyn Fn(u32) -> bool) -> 
     })
 }
 
+/// True when `seq` branches on one of `bool_locals` (`local.get L;
+/// i32.const 1; i32.and; br_if`): a `bool` parameter the SDK decoded into
+/// `L`, so the branch is the contract's own `if` on it.
+fn branches_on_user_bool(seq: &[StructuredBlock], bool_locals: &[u32]) -> bool {
+    if bool_locals.is_empty() {
+        return false;
+    }
+    let here = seq.windows(4).any(|w| {
+        matches!(
+            w,
+            [
+                StructuredBlock::Instruction(WasmInstr::LocalGet(l)),
+                StructuredBlock::Instruction(WasmInstr::I32Const(1)),
+                StructuredBlock::Instruction(WasmInstr::I32And),
+                StructuredBlock::Instruction(WasmInstr::BrIf(_)),
+            ] if bool_locals.contains(l)
+        )
+    });
+    here || seq.iter().any(|b| match b {
+        StructuredBlock::Block { body, .. } | StructuredBlock::Loop { body, .. } => {
+            branches_on_user_bool(body, bool_locals)
+        }
+        StructuredBlock::IfElse {
+            then_body,
+            else_body,
+            ..
+        } => {
+            branches_on_user_bool(then_body, bool_locals)
+                || branches_on_user_bool(else_body, bool_locals)
+        }
+        _ => false,
+    })
+}
+
 /// Rewrite the multi-level branches of a function body (see the module docs).
 ///
-/// Only join regions that call a function `user_call` accepts are rewritten
-/// (the caller passes "a local function that is not a bare trap helper"):
-/// that is user code. The SDK's own inline joins — the small/object split
+/// Only join regions that call a function `user_call` accepts, or that
+/// branch on a decoded `bool` parameter held in one of `bool_locals`, are
+/// rewritten (the caller passes "a local function that is not a bare trap
+/// helper"): that is user code. The SDK's own inline joins — the small/object split
 /// of a `Val` encode or decode, an integer overflow check — call host
 /// functions or nothing, and the lifter has dedicated handling for them.
 pub fn restructure_regions(
     body: &mut Vec<StructuredBlock>,
     user_call: &dyn Fn(u32) -> bool,
+    bool_locals: &[u32],
 ) -> Outcome {
     let mut out = Outcome::default();
 
@@ -605,7 +641,7 @@ pub fn restructure_regions(
                 out.refused.push(Refusal::ValueBlock);
                 continue;
             }
-            if !calls_user_code(rbody, user_call) {
+            if !calls_user_code(rbody, user_call) && !branches_on_user_bool(rbody, bool_locals) {
                 continue;
             }
             match rewrite_region(rbody, &outer_of(&info.labels)) {
@@ -782,7 +818,7 @@ mod tests {
             LocalGet(1),
             Drop,
         ]);
-        let o = restructure_regions(&mut body, &|_| true);
+        let o = restructure_regions(&mut body, &|_| true, &[]);
         assert_eq!(o.regions, 1, "{o:?}");
         assert!(!has_forward_branch(&body), "{body:#?}");
         assert!(
@@ -808,6 +844,41 @@ mod tests {
         assert!(matches!(body[2], StructuredBlock::Instruction(LocalGet(1))));
     }
 
+    /// A join region that calls nothing the caller accepts is rewritten when
+    /// it branches on a decoded `bool` parameter's local, and only then.
+    #[test]
+    fn region_branching_on_a_user_bool_is_rewritten() {
+        let diamond = || {
+            structurize(&[
+                blk(),
+                blk(),
+                LocalGet(5),
+                I32Const(1),
+                I32And,
+                BrIf(0),
+                Call(1),
+                LocalSet(6),
+                Br(1),
+                End,
+                Call(2),
+                LocalSet(6),
+                End,
+                LocalGet(6),
+                Drop,
+            ])
+        };
+        let mut body = diamond();
+        let o = restructure_regions(&mut body, &|_| false, &[5]);
+        assert_eq!(o.regions, 1, "{o:?}");
+        assert!(!has_forward_branch(&body), "{body:#?}");
+        let mut body = diamond();
+        let o = restructure_regions(&mut body, &|_| false, &[7]);
+        assert_eq!(o.regions, 0, "{o:?}");
+        let mut body = diamond();
+        let o = restructure_regions(&mut body, &|_| false, &[]);
+        assert_eq!(o.regions, 0, "{o:?}");
+    }
+
     /// A nested guard to a trapping continuation outside any join region is
     /// left to the lifter.
     #[test]
@@ -826,7 +897,7 @@ mod tests {
             Call(9),
             Unreachable,
         ]);
-        let o = restructure_regions(&mut body, &|_| true);
+        let o = restructure_regions(&mut body, &|_| true, &[]);
         assert_eq!(o.regions, 0, "{o:?}");
         assert!(has_forward_branch(&body));
     }
@@ -854,7 +925,7 @@ mod tests {
             Call(9),
             Unreachable,
         ]);
-        let o = restructure_regions(&mut body, &|_| true);
+        let o = restructure_regions(&mut body, &|_| true, &[]);
         assert_eq!(o.regions, 1, "{o:?}");
         let StructuredBlock::Block { body: outer, .. } = &body[0] else {
             panic!("{body:#?}")
@@ -889,7 +960,7 @@ mod tests {
             Call(4),
             End,
         ]);
-        let o = restructure_regions(&mut body, &|f| f >= 10);
+        let o = restructure_regions(&mut body, &|f| f >= 10, &[]);
         assert_eq!(o.regions, 0, "{o:?}");
     }
 
@@ -897,7 +968,7 @@ mod tests {
     #[test]
     fn top_level_br_if_is_left_alone() {
         let mut body = structurize(&[blk(), LocalGet(0), BrIf(0), I32Const(1), Drop, End]);
-        let o = restructure_regions(&mut body, &|_| true);
+        let o = restructure_regions(&mut body, &|_| true, &[]);
         assert_eq!(o.regions, 0);
         assert!(has_forward_branch(&body));
     }
@@ -922,7 +993,7 @@ mod tests {
             Drop,
         ]);
         let before = format!("{body:?}");
-        let o = restructure_regions(&mut body, &|_| true);
+        let o = restructure_regions(&mut body, &|_| true, &[]);
         assert_eq!(
             (o.regions, o.refused.clone()),
             (0, vec![Refusal::ValueBlock]),
@@ -949,7 +1020,7 @@ mod tests {
             LocalGet(1),
             Drop,
         ]);
-        let o = restructure_regions(&mut body, &|_| true);
+        let o = restructure_regions(&mut body, &|_| true, &[]);
         assert_eq!(o.refused, vec![Refusal::BrTable]);
     }
 }

@@ -2148,6 +2148,7 @@ fn expr_contains(haystack: &SorobanExpr, needle: &SorobanExpr) -> bool {
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. }
         | SorobanExpr::ValTagName(_)
         | SorobanExpr::ContractError { .. } => false,
@@ -5263,6 +5264,7 @@ fn invalidate_seen_gets_for_expr(
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. }
         | SorobanExpr::ValTagName(_)
         | SorobanExpr::ContractError { .. } => {}
@@ -6903,6 +6905,7 @@ fn expr_mentions_other_params(expr: &SorobanExpr, excluded: &str) -> bool {
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. }
         | SorobanExpr::ValTagName(_)
         | SorobanExpr::ContractError { .. } => false,
@@ -8242,6 +8245,7 @@ fn rename_in_expr(
         | SorobanExpr::MaxLiveUntilLedger
         | SorobanExpr::CollectionNew(_)
         | SorobanExpr::UnknownVal
+        | SorobanExpr::Deferred
         | SorobanExpr::CyclicSlot { .. }
         | SorobanExpr::ValTagName(_) => expr,
     }
