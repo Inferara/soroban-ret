@@ -941,7 +941,7 @@ fn liquidity_pool_deposit_paths_and_reserves() {
     // send `out` of both tokens).
     let swap = body_of("swap");
     let sell = swap
-        .split("ifbuy_a{")
+        .split("letmutvar_2097155;ifbuy_a{")
         .nth(1)
         .expect("swap branches on buy_a");
     assert!(
@@ -967,16 +967,57 @@ fn liquidity_pool_deposit_paths_and_reserves() {
     assert!(!swap.contains("todo!"), "{swap}");
     // One token goes out, in its own arm; the arm does not end in the
     // inlined transfer's result-check trap.
-    assert_eq!(swap.matches("ifbuy_a{").count(), 4, "{swap}");
     assert!(
         swap.contains("to.into_val(&env),out.into_val(&env),],);}else{lettoken_b_2="),
         "{swap}"
     );
     assert!(
-        swap.contains("to.into_val(&env),out.into_val(&env),],);}env.storage().instance().set(&DataKey::ReserveA,"),
+        swap.contains(
+            "to.into_val(&env),out.into_val(&env),],);}ifenv.invoke_contract::<i128>(&token_a,"
+        ),
         "{swap}"
     );
     assert!(swap.ends_with("-var_2097153),);}"), "{swap}");
+    // The contract's own guards, which branch straight to the panic (they
+    // used to vanish): not enough to buy, the sell amount over `in_max`,
+    // the constant-product invariant, and strictly positive new reserves.
+    let reserve =
+        |k: &str| format!("env.storage().instance().get::<_,i128>(&DataKey::Reserve{k}).unwrap()");
+    let (ra, rb) = (reserve("A"), reserve("B"));
+    assert!(
+        swap.contains(&format!("ififbuy_a{{{ra}}}else{{{rb}}}<out{{panic!();}}")),
+        "reserve_buy < out:\n{swap}"
+    );
+    assert!(swap.contains("*997)+1>in_max{panic!();}"), "{swap}");
+    assert!(
+        swap.contains(&format!(
+            "if(1000*{ra}+var_2097156)*(1000*{rb}+var_2097157)<{ra}*1000*({rb}*1000){{panic!();}}"
+        )),
+        "invariant:\n{swap}"
+    );
+    assert_eq!(swap.matches("<=0{panic!();}").count(), 2, "{swap}");
+    // `new_invariant_factor`'s `if delta > 0 { 997 * delta } else { 1000 *
+    // delta }` (an inlined closure) keeps both arms.
+    for v in ["var_2097156", "var_2097157"] {
+        let arms = swap
+            .split(&format!("letmut{v};if"))
+            .nth(1)
+            .expect("adj_delta");
+        let (then, rest) = arms.split_once(&format!("{v}=997*(")).expect("997 arm");
+        assert!(then.contains(">0{"), "{swap}");
+        assert!(rest.contains("}else{"), "{swap}");
+        assert!(rest.contains(&format!("{v}=1000*(")), "{swap}");
+    }
+    // The compiler's own overflow checks read as `checked_*`, not
+    // `if todo!() { panic!() }` (which would make every call trap).
+    assert!(
+        swap.contains(".checked_add(1).is_none(){panic!();}"),
+        "{swap}"
+    );
+    assert!(
+        swap.contains(".checked_sub(out).is_none(){panic!();}"),
+        "{swap}"
+    );
     let balance = body_of("balance_shares");
     assert!(
         balance.ends_with(".get::<_,i128>(&DataKey::Shares(user.clone())).unwrap_or(0)}"),

@@ -4303,6 +4303,23 @@ fn fold_expr(expr: SorobanExpr) -> SorobanExpr {
             SorobanExpr::Le(a, b) => fold_expr(SorobanExpr::Gt(a, b)),
             SorobanExpr::Eq(a, b) => fold_expr(SorobanExpr::Ne(a, b)),
             SorobanExpr::Ne(a, b) => fold_expr(SorobanExpr::Eq(a, b)),
+            // !o.is_some() → o.is_none(), and back.
+            SorobanExpr::MethodCall {
+                object,
+                method,
+                args,
+            } if args.is_empty() && (method == "is_some" || method == "is_none") => {
+                SorobanExpr::MethodCall {
+                    object,
+                    method: if method == "is_some" {
+                        "is_none"
+                    } else {
+                        "is_some"
+                    }
+                    .to_string(),
+                    args,
+                }
+            }
             other => SorobanExpr::Not(Box::new(other)),
         },
 
@@ -8509,6 +8526,24 @@ fn stmt_refs_local(stmt: &SorobanStmt, idx: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negated_option_test_flips() {
+        let opt = || Box::new(SorobanExpr::Param("o".to_string()));
+        let call = |m: &str| SorobanExpr::MethodCall {
+            object: opt(),
+            method: m.to_string(),
+            args: Vec::new(),
+        };
+        assert_eq!(
+            fold_expr(SorobanExpr::Not(Box::new(call("is_some")))),
+            call("is_none")
+        );
+        assert_eq!(
+            fold_expr(SorobanExpr::Not(Box::new(call("is_none")))),
+            call("is_some")
+        );
+    }
     use crate::ir::soroban_ir::StorageType;
 
     #[test]

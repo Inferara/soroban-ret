@@ -52,9 +52,22 @@ use crate::wasm::ir::{BlockType, WasmInstr};
 /// check that looks for `Value(_)`.
 pub const EXACT_IF: BlockType = BlockType::FuncType(u32::MAX);
 
-/// True when `bt` is [`EXACT_IF`].
+/// True when `bt` is [`EXACT_IF`] or [`EXACT_GUARD`].
 pub fn is_exact_if(bt: &BlockType) -> bool {
-    matches!(bt, BlockType::FuncType(u32::MAX))
+    matches!(bt, BlockType::FuncType(u32::MAX | GUARD_TYPE))
+}
+
+const GUARD_TYPE: u32 = u32::MAX - 1;
+
+/// The block type of a standalone guard outside a rewritten region: a
+/// multi-level `br_if` to a label that only traps, rewritten to `if c {
+/// <trap tail> }`. The lifter renders it only when it can read the condition
+/// as the contract's own check (see `exact_guard_condition`).
+pub const EXACT_GUARD: BlockType = BlockType::FuncType(GUARD_TYPE);
+
+/// True when `bt` is [`EXACT_GUARD`].
+pub fn is_exact_guard(bt: &BlockType) -> bool {
+    matches!(bt, BlockType::FuncType(GUARD_TYPE))
 }
 
 /// True when an arm this pass emitted cannot fall through: it ends in a
@@ -494,6 +507,8 @@ pub struct Outcome {
     pub regions: usize,
     /// Join regions left alone, and why.
     pub refused: Vec<Refusal>,
+    /// Standalone guards outside the regions rewritten to `if c { trap }`.
+    pub guards: usize,
 }
 
 /// True when `seq` calls a function `user_call` accepts.
@@ -655,13 +670,75 @@ pub fn restructure_regions(
         rewritten
     };
 
-    // A guard outside a rewritten region is left to the lifter: the SDK's
-    // own checks (parameter tags, integer overflow) reach a trap the same
-    // way, and rendering them needs their conditions classified first.
     if !rewritten.is_empty() {
+        out.guards = rewrite_guards(body, &mut vec![labels[0]], &a, &mt, &rewritten);
         apply(body, &rewritten);
     }
     out
+}
+
+/// Rewrite each multi-level `br_if` outside the rewritten regions whose label
+/// only runs a straight trap tail into `if c { <tail> }` (an exact guard).
+fn rewrite_guards(
+    seq: &mut [StructuredBlock],
+    labels: &mut Vec<Label>,
+    a: &Builder,
+    mt: &[bool],
+    regions: &HashMap<*const StructuredBlock, Vec<StructuredBlock>>,
+) -> usize {
+    let mut n = 0;
+    for item in seq.iter_mut() {
+        let p: *const StructuredBlock = item;
+        if regions.contains_key(&p) {
+            continue;
+        }
+        match item {
+            StructuredBlock::Block { body, .. } => {
+                let node = a
+                    .far
+                    .iter()
+                    .find(|f| f.target.block == Some(p))
+                    .map_or(usize::MAX, |f| f.target.node);
+                labels.push(Label {
+                    node,
+                    block: Some(p),
+                });
+                n += rewrite_guards(body, labels, a, mt, regions);
+                labels.pop();
+            }
+            StructuredBlock::IfElse {
+                then_body,
+                else_body,
+                ..
+            } => {
+                labels.push(Label {
+                    node: usize::MAX,
+                    block: None,
+                });
+                n += rewrite_guards(then_body, labels, a, mt, regions);
+                n += rewrite_guards(else_body, labels, a, mt, regions);
+                labels.pop();
+            }
+            StructuredBlock::Instruction(WasmInstr::BrIf(k)) if *k >= 1 => {
+                let Some(l) = labels.len().checked_sub(1 + *k as usize).map(|i| labels[i]) else {
+                    continue;
+                };
+                if l.node != usize::MAX
+                    && mt[l.node]
+                    && let Some(tail) = trap_tail(&a.nodes, l.node)
+                {
+                    *item = StructuredBlock::IfElse {
+                        block_type: EXACT_GUARD,
+                        then_body: tail,
+                        else_body: Vec::new(),
+                    };
+                    n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    n
 }
 
 /// What [`restructure_regions`] knows about one `block`.
@@ -900,6 +977,74 @@ mod tests {
         let o = restructure_regions(&mut body, &|_| true, &[]);
         assert_eq!(o.regions, 0, "{o:?}");
         assert!(has_forward_branch(&body));
+    }
+
+    /// In a function with a rewritten region, a guard outside it becomes an
+    /// exact guard running the trap tail; a branch to a label that does not
+    /// trap stays.
+    #[test]
+    fn guard_outside_a_rewritten_region_runs_the_trap_tail() {
+        let mut body = structurize(&[
+            blk(),
+            blk(),
+            blk(),
+            LocalGet(0),
+            BrIf(0),
+            Call(5),
+            Br(1),
+            End,
+            Call(6),
+            End,
+            blk(),
+            blk(),
+            LocalGet(1),
+            BrIf(2),
+            LocalGet(3),
+            BrIf(1),
+            End,
+            Call(7),
+            End,
+            LocalGet(2),
+            Return,
+            End,
+            Call(9),
+            Unreachable,
+        ]);
+        // The second join (`br_if 1`) calls no user code and is left alone.
+        let o = restructure_regions(&mut body, &|f| f == 5, &[]);
+        assert_eq!((o.regions, o.guards), (1, 1), "{o:?}");
+        let StructuredBlock::Block { body: outer, .. } = &body[0] else {
+            panic!("{body:#?}")
+        };
+        let Some(StructuredBlock::Block { body: d, .. }) = outer
+            .iter()
+            .find(|b| matches!(b, StructuredBlock::Block { .. }))
+        else {
+            panic!("{body:#?}")
+        };
+        let StructuredBlock::Block { body: inner, .. } = &d[0] else {
+            panic!("{body:#?}")
+        };
+        assert!(
+            matches!(
+                &inner[1],
+                StructuredBlock::IfElse { block_type, then_body, else_body }
+                    if is_exact_guard(block_type)
+                        && else_body.is_empty()
+                        && matches!(
+                            then_body[..],
+                            [
+                                StructuredBlock::Instruction(Call(9)),
+                                StructuredBlock::Instruction(Unreachable)
+                            ]
+                        )
+            ),
+            "{body:#?}"
+        );
+        assert!(
+            matches!(inner[3], StructuredBlock::Instruction(BrIf(1))),
+            "{body:#?}"
+        );
     }
 
     /// Inside a join region, a branch to a trapping outer label runs the
