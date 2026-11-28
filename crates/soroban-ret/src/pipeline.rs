@@ -7778,7 +7778,45 @@ fn coerce_i128_invoke_types(stmts: &mut [SorobanStmt], params: &[FnParam]) -> I1
     let mut used = I128Use::default();
     collect_i128_invoke_bindings(stmts, &mut used.bound);
     coerce_i128_collect(stmts, params, &mut used);
+    collect_i128_bound_get_keys(stmts, &mut used);
     used
+}
+
+/// Record the key of every `let name = <storage get>` whose `name` the i128
+/// arithmetic reads (`used.locals`), so [`type_i128_key_gets`] types that read
+/// too. A getter's result is bound where the read happens (issue #74), and the
+/// arithmetic then reads the binding, not the get.
+fn collect_i128_bound_get_keys(stmts: &[SorobanStmt], used: &mut I128Use) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Let {
+                name,
+                value: SorobanExpr::StorageGet { key, .. },
+                ..
+            } if used.locals.contains(name) => {
+                if !used.keys.contains(key) {
+                    used.keys.push((**key).clone());
+                }
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_i128_bound_get_keys(then_body, used);
+                collect_i128_bound_get_keys(else_body, used);
+            }
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms {
+                    collect_i128_bound_get_keys(&arm.body, used);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => collect_i128_bound_get_keys(body, used),
+            _ => {}
+        }
+    }
 }
 
 /// Names of the `let` bindings whose value is an `invoke_contract` typed `i128`
@@ -7830,7 +7868,6 @@ fn collect_i128_invoke_bindings(
 #[derive(Default)]
 struct I128Use {
     /// Names of locals referenced as i128 operands.
-    #[allow(dead_code)]
     locals: std::collections::HashSet<String>,
     /// Storage keys read as i128 (e.g. `DataKey::ReserveA`).
     keys: Vec<SorobanExpr>,
@@ -8032,8 +8069,8 @@ fn force_i128_deep(e: &mut SorobanExpr, used: &mut I128Use) {
                 target_type: "i128".to_string(),
             };
         }
-        // Record locals used in i128 arithmetic so `type_i128_let_bindings` can type
-        // their `let name = <storage get>` declarations.
+        // Record locals used in i128 arithmetic so `collect_i128_bound_get_keys`
+        // can type their `let name = <storage get>` declarations.
         SorobanExpr::NamedLocal(name) => {
             used.locals.insert(name.clone());
         }
@@ -9600,6 +9637,44 @@ mod tests {
             ),
             other => panic!("unexpected body: {other:?}"),
         }
+    }
+
+    #[test]
+    fn coerce_i128_invoke_types_types_a_bound_read_in_i128_arithmetic() {
+        // `let total = get(TotalShares); amount * total` with `amount: i128`:
+        // the bound read is i128, so its key is typed everywhere; a binding
+        // the arithmetic never reads is not.
+        let params = vec![FnParam {
+            name: "amount".to_string(),
+            type_def: ScSpecTypeDef::I128,
+        }];
+        let get = |k: &str| SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral(k.to_string())),
+            unwrap: true,
+            on_missing: None,
+        };
+        let mut body = vec![
+            SorobanStmt::Let {
+                name: "total".to_string(),
+                mutable: false,
+                value: get("TotalShares"),
+            },
+            SorobanStmt::Let {
+                name: "admin".to_string(),
+                mutable: false,
+                value: get("Admin"),
+            },
+            SorobanStmt::Expr(SorobanExpr::Mul(
+                Box::new(SorobanExpr::Param("amount".to_string())),
+                Box::new(SorobanExpr::NamedLocal("total".to_string())),
+            )),
+        ];
+        let used = coerce_i128_invoke_types(&mut body, &params);
+        assert_eq!(
+            used.keys,
+            vec![SorobanExpr::SymbolLiteral("TotalShares".to_string())]
+        );
     }
 
     #[test]

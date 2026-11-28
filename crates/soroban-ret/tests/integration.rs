@@ -884,10 +884,16 @@ fn liquidity_pool_deposit_paths_and_reserves() {
     );
 
     let deposit = body_of("deposit");
+    // Each reserve is read once, where `get_reserve_*` runs.
+    assert!(
+        deposit.starts_with("pubfndeposit(env:Env,to:Address,desired_a:i128,min_a:i128,desired_b:i128,min_b:i128,){to.require_auth();letreserve_a=env.storage().instance().get::<_,i128>(&DataKey::ReserveA).unwrap();letreserve_b=env.storage().instance().get::<_,i128>(&DataKey::ReserveB).unwrap();"),
+        "{deposit}"
+    );
+    assert_eq!(deposit.matches("DataKey::ReserveA").count(), 2, "{deposit}");
     // Both reserves zero: the desired amounts. Otherwise one of two computed
     // pairs. The choice is a branch, not the first path's value.
     assert!(
-        deposit.contains("if!(env.storage().instance().get::<_,i128>(&DataKey::ReserveA).unwrap()==0&&env.storage().instance().get::<_,i128>(&DataKey::ReserveB).unwrap()==0)"),
+        deposit.contains("if!(reserve_a==0&&reserve_b==0)"),
         "deposit branches on both reserves being zero:\n{deposit}"
     );
     // `amount_b < min_b` / `amount_a > desired_a` / `amount_a < min_a`: the
@@ -909,7 +915,7 @@ fn liquidity_pool_deposit_paths_and_reserves() {
         "dividend == MIN guard:\n{deposit}"
     );
     assert!(
-        deposit.contains("!=1<<127{}else{ifenv.storage().instance().get::<_,i128>(&DataKey::ReserveB).unwrap()==-1{panic!();}}"),
+        deposit.contains("!=1<<127{}else{ifreserve_b==-1{panic!();}}"),
         "dividend != MIN, else divisor == -1:\n{deposit}"
     );
     assert_eq!(deposit.matches("1<<127").count(), 2, "{deposit}");
@@ -933,6 +939,22 @@ fn liquidity_pool_deposit_paths_and_reserves() {
         "{deposit}"
     );
     let withdraw = body_of("withdraw");
+    // The share total is read once, before the burn lowers it, and the
+    // amounts paid out divide by that read (they used to read the total again
+    // after the burn).
+    let (before, after) = withdraw
+        .split_once(".set(&DataKey::TotalShares,&(total_shares-share_amount));")
+        .expect("burn");
+    assert!(
+        before.contains("lettotal_shares=env.storage().instance().get::<_,i128>(&DataKey::TotalShares).unwrap();"),
+        "{withdraw}"
+    );
+    assert!(!after.contains("DataKey::TotalShares"), "{withdraw}");
+    assert_eq!(
+        after.matches("*share_amount/total_shares").count(),
+        6,
+        "{withdraw}"
+    );
     assert!(
         withdraw.contains(".set(&DataKey::Shares(to.clone()),&(env.storage().persistent().get::<_,i128>(&DataKey::Shares(to.clone())).unwrap_or(0)-share_amount)"),
         "{withdraw}"
@@ -953,7 +975,7 @@ fn liquidity_pool_deposit_paths_and_reserves() {
     // The amount sold in: `reserve_sell * out * 1000 / ((reserve_buy - out)
     // * 997) + 1`, the `+ 1` included.
     assert!(
-        swap.contains("((ifbuy_a{env.storage().instance().get::<_,i128>(&DataKey::ReserveB).unwrap()}else{env.storage().instance().get::<_,i128>(&DataKey::ReserveA).unwrap()})*out*1000/(((ifbuy_a{env.storage().instance().get::<_,i128>(&DataKey::ReserveA).unwrap()}else{env.storage().instance().get::<_,i128>(&DataKey::ReserveB).unwrap()})-out)*997)+1).into_val(&env)"),
+        swap.contains("((ifbuy_a{reserve_b}else{reserve_a})*out*1000/(((ifbuy_a{reserve_a}else{reserve_b})-out)*997)+1).into_val(&env)"),
         "sell amount:\n{swap}"
     );
     // `(out_a, out_b)` merge as whole `i128`s, declared without a value to
@@ -987,9 +1009,7 @@ fn liquidity_pool_deposit_paths_and_reserves() {
     // The contract's own guards, which branch straight to the panic (they
     // used to vanish): not enough to buy, the sell amount over `in_max`,
     // the constant-product invariant, and strictly positive new reserves.
-    let reserve =
-        |k: &str| format!("env.storage().instance().get::<_,i128>(&DataKey::Reserve{k}).unwrap()");
-    let (ra, rb) = (reserve("A"), reserve("B"));
+    let (ra, rb) = ("reserve_a", "reserve_b");
     assert!(
         swap.contains(&format!("ififbuy_a{{{ra}}}else{{{rb}}}<out{{panic!();}}")),
         "reserve_buy < out:\n{swap}"
