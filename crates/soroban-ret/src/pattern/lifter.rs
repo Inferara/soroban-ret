@@ -815,6 +815,9 @@ struct LiftContext<'a> {
     /// Locals holding a decoded `bool` parameter, with the parameter's name
     /// (see [`decoded_bool_param_locals`]). Top-level function only.
     bool_param_locals: Rc<Vec<(u32, String)>>,
+    /// The WASM function whose body this context lifts (the callee, in an
+    /// inlined call), when known. Child contexts lift the same body.
+    func_index: Option<u32>,
 }
 
 /// The operand of an unsigned order compare proven to be a raw `u32`
@@ -880,6 +883,7 @@ impl<'a> LiftContext<'a> {
             raw_u32_param_locals: Rc::new(Vec::new()),
             raw_param_compare: None,
             bool_param_locals: Rc::new(Vec::new()),
+            func_index: None,
         }
     }
 
@@ -926,6 +930,7 @@ impl<'a> LiftContext<'a> {
             raw_u32_param_locals: Rc::clone(&self.raw_u32_param_locals),
             raw_param_compare: None,
             bool_param_locals: Rc::clone(&self.bool_param_locals),
+            func_index: self.func_index,
         }
     }
 
@@ -3388,17 +3393,21 @@ impl<'a> LiftContext<'a> {
     /// read the binding too.
     ///
     /// The call is an untyped `invoke_contract` whose `Val` the proven decode
-    /// helper `class` converts, so the binding is the SDK's typed form
-    /// `invoke_contract::<T>` — exactly the invoke followed by
-    /// `T::try_from_val(..)` and a trap on failure that the SDK inlines. A
+    /// helper `decode` (of class `class`) converts, and this function traps
+    /// on every failed decode ([`decode_failure_traps`]). So the binding is
+    /// the SDK's typed form `invoke_contract::<T>` — exactly the invoke
+    /// followed by `T::try_from_val(..)` and a trap on failure. A caller that
+    /// handles the failure (`try_from_val(..).unwrap_or(0)`) is not proved and
+    /// is left alone: typing its call would turn the fallback into a panic. A
     /// `try_invoke_contract` result is a `Result`, not the decoded value, and
-    /// is left alone.
+    /// is left alone too.
     ///
     /// Returns `None`, changing nothing, unless `operand` is such a call result
     /// whose exact expression is the last statement.
     fn bind_speculative_call(
         &mut self,
         operand: &StackVal,
+        decode: u32,
         class: DecodeHelperClass,
     ) -> Option<StackVal> {
         let StackVal::HostCallResult(call) = operand else {
@@ -3413,7 +3422,11 @@ impl<'a> LiftContext<'a> {
         else {
             return None;
         };
-        if !matches!(self.stmts.last(), Some(SorobanStmt::Expr(e)) if e == &**call) {
+        if !matches!(self.stmts.last(), Some(SorobanStmt::Expr(e)) if e == &**call)
+            || !self
+                .func_index
+                .is_some_and(|f| decode_failure_traps(self.wasm_module, f, decode))
+        {
             return None;
         }
         let var_idx = {
@@ -5747,7 +5760,7 @@ impl<'a> LiftContext<'a> {
                                     && let Some(operand) = decode_operand.as_ref()
                                 {
                                     let operand = self
-                                        .bind_speculative_call(operand, class)
+                                        .bind_speculative_call(operand, *target_idx, class)
                                         .unwrap_or_else(|| operand.clone());
                                     self.seed_decode_helper_result(id, base, class, &operand);
                                 }
@@ -10997,6 +11010,7 @@ fn lift_function_body(
         locals,
         num_wasm_params,
     );
+    ctx.func_index = Some(func_index);
 
     let raw_u32_param_locals = Rc::new(unwritten_u32_param_locals(func, params, num_wasm_params));
     ctx.raw_u32_param_locals = Rc::clone(&raw_u32_param_locals);
@@ -11064,6 +11078,7 @@ fn lift_function_body(
         );
         plain.raw_u32_param_locals = Rc::clone(&raw_u32_param_locals);
         plain.bool_param_locals = Rc::clone(&bool_param_locals);
+        plain.func_index = Some(func_index);
         plain.lift_structured(&unrewritten);
         let (kept, lost) = (effect_census(&ctx.stmts), effect_census(&plain.stmts));
         // A terminator with statements after it is cut there by dead-code
@@ -11688,6 +11703,7 @@ fn lift_inline_call_in(
         };
     }
     ctx.inline_depth = inline_depth + 1;
+    ctx.func_index = Some(target_idx);
     ctx.frame_slots = frame_slots;
     ctx.next_frame_id = next_frame_id;
     // Shared like `frame_slots`: the log records GLOBAL simulation order, so
@@ -23584,6 +23600,85 @@ fn instr_stack_effect(
     })
 }
 
+/// True when `func` calls the decode helper `decode` at least once and every
+/// call is followed straight away by a trap on its `Err` discriminant:
+///
+/// ```text
+/// call decode            ;; (out_ptr = local.get p, val)
+/// block
+///   local.get p
+///   i32.load             ;; discriminant at +0, 1 = Err
+///   i32.const 1
+///   i32.ne
+///   br_if 0
+///   [call _]             ;; a panic helper, if any
+///   unreachable
+/// end
+/// ```
+///
+/// This is the SDK's `T::try_from_val(..).unwrap_optimized()` inside
+/// `invoke_contract::<T>`. A failed decode that the caller handles some other
+/// way does not match.
+fn decode_failure_traps(module: &WasmModule, func: u32, decode: u32) -> bool {
+    use crate::wasm::ir::WasmInstr as W;
+    let Some(f) = module.get_function(func) else {
+        return false;
+    };
+    let Some(nparams) = module.get_func_type(decode).map(|ft| ft.params.len()) else {
+        return false;
+    };
+    let body = &f.body;
+    let mut seen = false;
+    for (pos, ins) in body.iter().enumerate() {
+        if !matches!(ins, W::Call(d) if *d == decode) {
+            continue;
+        }
+        // The out pointer is the call's first (deepest) argument.
+        let Some(depth) = nparams.checked_sub(1) else {
+            return false;
+        };
+        let mut depth = depth;
+        let mut j = pos;
+        let mut ptr = None;
+        while j > 0 {
+            j -= 1;
+            let Some((pops, pushes)) = instr_stack_effect(module, &body[j]) else {
+                break;
+            };
+            if depth < pushes {
+                if let W::LocalGet(p) = body[j] {
+                    ptr = Some(p);
+                }
+                break;
+            }
+            depth = depth - pushes + pops;
+        }
+        let Some(p) = ptr else {
+            return false;
+        };
+        let traps = match &body[pos + 1..] {
+            [
+                W::Block { .. },
+                W::LocalGet(l),
+                W::I32Load(0),
+                W::I32Const(1),
+                W::I32Ne,
+                W::BrIf(0),
+                tail @ ..,
+            ] if *l == p => matches!(
+                tail,
+                [W::Unreachable, W::End, ..] | [W::Call(_), W::Unreachable, W::End, ..]
+            ),
+            _ => false,
+        };
+        if !traps {
+            return false;
+        }
+        seen = true;
+    }
+    seen
+}
+
 /// `(param, offset)` of every store a helper makes through one of its own
 /// parameters: the store's address operand is `local.get p` (found by
 /// walking back over the straight-line stack effects before the store), so
@@ -26854,6 +26949,55 @@ mod tests {
             None,
             "halves swapped"
         );
+    }
+
+    #[test]
+    fn decode_failure_traps_needs_the_err_trap_after_every_decode() {
+        // 1 = the decode helper; 2 = invoke-and-unwrap (traps on `Err`, via a
+        // panic helper); 3 = the same with a bare `unreachable`; 4 = decode,
+        // then a fallback on `Err` (`unwrap_or`); 5 = one unwrap and one
+        // unchecked decode; 6 = never decodes.
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "x" "0" (func (param i64) (result i64)))
+                (func (param i32 i64)                               ;; 1
+                    local.get 0 i64.const 0 i64.store)
+                (func (param i32 i64) (local i32)                   ;; 2
+                    local.get 2 local.get 1 call 0 call 1
+                    block
+                        local.get 2 i32.load i32.const 1 i32.ne br_if 0
+                        call 6 unreachable
+                    end)
+                (func (param i32 i64) (local i32)                   ;; 3
+                    local.get 2 local.get 1 call 1
+                    block
+                        local.get 2 i32.load i32.const 1 i32.ne br_if 0
+                        unreachable
+                    end)
+                (func (param i32 i64) (local i32)                   ;; 4
+                    local.get 2 local.get 1 call 1
+                    block
+                        local.get 2 i32.load i32.const 1 i32.ne br_if 0
+                        local.get 0 i64.const 0 i64.store
+                    end)
+                (func (param i32 i64) (local i32)                   ;; 5
+                    local.get 2 local.get 1 call 1
+                    block
+                        local.get 2 i32.load i32.const 1 i32.ne br_if 0
+                        unreachable
+                    end
+                    local.get 2 local.get 1 call 1)
+                (func                                               ;; 6
+                    unreachable)
+            )"#,
+        )
+        .expect("wat parses");
+        let m = WasmModule::parse(&wasm).expect("module parses");
+        assert!(decode_failure_traps(&m, 2, 1));
+        assert!(decode_failure_traps(&m, 3, 1));
+        assert!(!decode_failure_traps(&m, 4, 1), "a handled failure");
+        assert!(!decode_failure_traps(&m, 5, 1), "an unchecked decode");
+        assert!(!decode_failure_traps(&m, 6, 1), "no decode at all");
     }
 
     fn tranche2_module() -> WasmModule {
