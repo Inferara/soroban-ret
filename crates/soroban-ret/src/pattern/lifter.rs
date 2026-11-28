@@ -3375,6 +3375,73 @@ impl<'a> LiftContext<'a> {
         true
     }
 
+    /// Bind the value of the call this context just made, when `operand` is
+    /// that call's result and the call is still the trailing statement it was
+    /// emitted as (issue #74: the liquidity pool's `balance` invoke).
+    ///
+    /// A host call is emitted as a statement the moment it runs, and its value
+    /// stays on the abstract stack as the call expression. Every consumer then
+    /// renders the whole call again — a value read in three places makes three
+    /// cross-contract calls. Turning the statement into `let var_N = <call>;`
+    /// and handing back `var_N` keeps the one call where it ran and makes every
+    /// consumer read its value. Locals and stack entries still holding the call
+    /// read the binding too.
+    ///
+    /// The call is an untyped `invoke_contract` whose `Val` the proven decode
+    /// helper `class` converts, so the binding is the SDK's typed form
+    /// `invoke_contract::<T>` — exactly the invoke followed by
+    /// `T::try_from_val(..)` and a trap on failure that the SDK inlines. A
+    /// `try_invoke_contract` result is a `Result`, not the decoded value, and
+    /// is left alone.
+    ///
+    /// Returns `None`, changing nothing, unless `operand` is such a call result
+    /// whose exact expression is the last statement.
+    fn bind_speculative_call(
+        &mut self,
+        operand: &StackVal,
+        class: DecodeHelperClass,
+    ) -> Option<StackVal> {
+        let StackVal::HostCallResult(call) = operand else {
+            return None;
+        };
+        let SorobanExpr::InvokeContract {
+            address,
+            function,
+            args,
+            return_type: None,
+        } = &**call
+        else {
+            return None;
+        };
+        if !matches!(self.stmts.last(), Some(SorobanStmt::Expr(e)) if e == &**call) {
+            return None;
+        }
+        let var_idx = {
+            let mut ctr = self.next_frame_id.borrow_mut();
+            *ctr += 1;
+            PROTO_BINDING_BASE + *ctr
+        };
+        let typed = SorobanExpr::InvokeContract {
+            address: address.clone(),
+            function: function.clone(),
+            args: args.clone(),
+            return_type: Some(class.target().to_string()),
+        };
+        *self.stmts.last_mut()? = SorobanStmt::Let {
+            name: format!("var_{var_idx}"),
+            mutable: false,
+            value: typed,
+        };
+        let bound = StackVal::LetBinding(var_idx);
+        for v in self.locals.iter_mut().chain(self.stack.iter_mut()) {
+            if v == operand {
+                *v = bound.clone();
+            }
+        }
+        cov_mark::hit!(speculative_call_bound);
+        Some(bound)
+    }
+
     /// Seed the payload slots of a proven `TryFromVal` decode helper (issue
     /// #34 tranche 2) with the conversion of its operand. The helper's
     /// small/object tag split collapsed the payload stores at the lifter's
@@ -3394,11 +3461,7 @@ impl<'a> LiftContext<'a> {
         if !stack_val_is_pure(operand) {
             return;
         }
-        let target = match class {
-            DecodeHelperClass::U64 => "u64",
-            DecodeHelperClass::U128 => "u128",
-            DecodeHelperClass::I128 => "i128",
-        };
+        let target = class.target();
         let conv = StackVal::HostCallResult(Box::new(SorobanExpr::ValConvert {
             value: Box::new(stack_val_to_expr(
                 operand,
@@ -5683,7 +5746,10 @@ impl<'a> LiftContext<'a> {
                                     )
                                     && let Some(operand) = decode_operand.as_ref()
                                 {
-                                    self.seed_decode_helper_result(id, base, class, operand);
+                                    let operand = self
+                                        .bind_speculative_call(operand, class)
+                                        .unwrap_or_else(|| operand.clone());
+                                    self.seed_decode_helper_result(id, base, class, &operand);
                                 }
                                 // …then the storage-decode Option seed (issue #35),
                                 // for the fallible has+get wrapper class (again only
@@ -18587,6 +18653,17 @@ enum DecodeHelperClass {
     U64,
     U128,
     I128,
+}
+
+impl DecodeHelperClass {
+    /// The Rust type the helper decodes to.
+    fn target(self) -> &'static str {
+        match self {
+            DecodeHelperClass::U64 => "u64",
+            DecodeHelperClass::U128 => "u128",
+            DecodeHelperClass::I128 => "i128",
+        }
+    }
 }
 
 /// The set of distinct `i64.store` offsets in a function body, or `None` if

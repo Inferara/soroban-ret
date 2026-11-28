@@ -973,11 +973,17 @@ fn liquidity_pool_deposit_paths_and_reserves() {
     );
     assert!(
         swap.contains(
-            "to.into_val(&env),out.into_val(&env),],);}ifenv.invoke_contract::<i128>(&token_a,"
+            "to.into_val(&env),out.into_val(&env),],);}ifbalance.checked_sub(var_2097154)"
         ),
         "{swap}"
     );
-    assert!(swap.ends_with("-var_2097153),);}"), "{swap}");
+    // The new reserves are the balances read before the transfer out, less
+    // what went out (no second `balance` call).
+    assert!(
+        swap.contains(".set(&DataKey::ReserveA,&(balance-var_2097154));"),
+        "{swap}"
+    );
+    assert!(swap.ends_with("-var_2097153));}"), "{swap}");
     // The contract's own guards, which branch straight to the panic (they
     // used to vanish): not enough to buy, the sell amount over `in_max`,
     // the constant-product invariant, and strictly positive new reserves.
@@ -1018,6 +1024,30 @@ fn liquidity_pool_deposit_paths_and_reserves() {
         swap.contains(".checked_sub(out).is_none(){panic!();}"),
         "{swap}"
     );
+    // Each token's `balance` is asked once and read through its binding,
+    // typed by the `i128` decode the call goes through (every use used to
+    // render the whole call again, typed `Val` where nothing forced `i128`).
+    for (name, body) in [
+        ("deposit", &deposit),
+        ("swap", &swap),
+        ("withdraw", &withdraw),
+    ] {
+        assert_eq!(
+            body.matches("&symbol_short!(\"balance\")").count(),
+            2,
+            "{name} asks each token once:\n{body}"
+        );
+        assert!(
+            body.contains("letbalance=env.invoke_contract::<i128>(&token_a"),
+            "{name}:\n{body}"
+        );
+        assert!(
+            !body.contains(
+                "invoke_contract::<soroban_sdk::Val>(&token_a,&symbol_short!(\"balance\")"
+            ),
+            "{name}:\n{body}"
+        );
+    }
     let balance = body_of("balance_shares");
     assert!(
         balance.ends_with(".get::<_,i128>(&DataKey::Shares(user.clone())).unwrap_or(0)}"),
