@@ -5218,17 +5218,31 @@ impl<'a> LiftContext<'a> {
                                     };
 
                                     // Push result to stack (for return value) or emit as Let
+                                    let mut result_val =
+                                        StackVal::HostCallResult(Box::new(get_expr.clone()));
                                     if num_results > 0 {
-                                        self.stack.push(StackVal::HostCallResult(Box::new(
-                                            get_expr.clone(),
-                                        )));
+                                        self.stack.push(result_val.clone());
                                     } else {
-                                        // Output-pointer pattern: emit as Let binding
+                                        // Output-pointer pattern: the read happens HERE, so
+                                        // bind it here and let the result slots hold the
+                                        // binding. Seeding them with the read itself would
+                                        // re-render it at every consumer — after any write
+                                        // in between (issue #74: the liquidity pool's
+                                        // `withdraw` divided by the share total read after
+                                        // the burn lowered it). The id is function-wide: a
+                                        // per-context one could be shadowed by the caller's
+                                        // own later binding.
+                                        let var_idx = {
+                                            let mut ctr = self.next_frame_id.borrow_mut();
+                                            *ctr += 1;
+                                            PROTO_BINDING_BASE + *ctr
+                                        };
                                         self.stmts.push(SorobanStmt::Let {
-                                            name: format!("var_{}", variant_idx),
+                                            name: format!("var_{var_idx}"),
                                             mutable: false,
-                                            value: get_expr.clone(),
+                                            value: get_expr,
                                         });
+                                        result_val = StackVal::LetBinding(var_idx);
                                     }
 
                                     // Write result to frame_slots at the output pointer
@@ -5236,8 +5250,6 @@ impl<'a> LiftContext<'a> {
                                     // StorageGet value instead of Unknown.
                                     if let Some(StackVal::FrameSlot(frame_id, base)) = args.first()
                                     {
-                                        let result_val =
-                                            StackVal::HostCallResult(Box::new(get_expr));
                                         let mut fs = self.frame_slots.borrow_mut();
                                         // Status = 1 (success) at offset 0
                                         fs.insert((*frame_id, base.base), StackVal::I64(1));
@@ -5812,8 +5824,21 @@ impl<'a> LiftContext<'a> {
                                 let result_layout = output_frame_slot
                                     .filter(|_| num_results == 0)
                                     .and_then(|(id, base)| self.clean_i128_result_layout(id, base));
+                                // The variables the result slots read that the helper's
+                                // statements define: a top-level `let` is the value
+                                // itself and is kept; one assigned anywhere else (an
+                                // `if` arm's merge variable) means the statements
+                                // compute the result, so nothing is dropped.
+                                let result_defs = output_frame_slot.map(|(id, base)| {
+                                    let slots = self.frame_slots.borrow();
+                                    let read: Vec<StackVal> = (0..=4)
+                                        .filter_map(|k| slots.get(&(id, base + 8 * k)).cloned())
+                                        .collect();
+                                    result_bindings_defined_in(&inlined_stmts, &read)
+                                });
                                 let dropped_husks = !defaulting_getter_seeded
                                     && result_layout.is_some()
+                                    && !result_defs.as_ref().is_some_and(|(_, nested)| *nested)
                                     && stmts_are_pure_arith_husks(&inlined_stmts);
                                 if dropped_husks {
                                     // For the checked `Result<i128,E>` layout, seed the
@@ -5828,6 +5853,23 @@ impl<'a> LiftContext<'a> {
                                         self.frame_slots
                                             .borrow_mut()
                                             .insert((id, base), StackVal::I64(0));
+                                    }
+                                    // A binding the result slots read is the value
+                                    // itself, not a husk: the read it names happened
+                                    // inside the helper, and dropping it would leave
+                                    // the slots naming nothing (issue #74, a keyed
+                                    // storage getter's result binding).
+                                    if let Some((keep, _)) = result_defs {
+                                        if !keep.is_empty() {
+                                            cov_mark::hit!(husk_drop_keeps_result_binding);
+                                        }
+                                        self.stmts.extend(
+                                            inlined_stmts
+                                                .into_iter()
+                                                .enumerate()
+                                                .filter(|(i, _)| keep.contains(i))
+                                                .map(|(_, st)| st),
+                                        );
                                     }
                                 } else {
                                     self.stmts.extend(inlined_stmts);
@@ -23932,6 +23974,42 @@ fn expr_is_clean_arith(expr: &SorobanExpr) -> bool {
 /// Result-discriminant guards a checked-arith composite collapses to once its
 /// happy-path value is recovered into the frame slot. Conservative — an
 /// unrecognized effect keeps the statements (no drop).
+/// The statements among `stmts` that define a variable one of `read` reads:
+/// the indices of the top-level `let`s, and whether any such variable is also
+/// (or only) written elsewhere — assigned, or declared in a nested block.
+fn result_bindings_defined_in(stmts: &[SorobanStmt], read: &[StackVal]) -> (Vec<usize>, bool) {
+    let is_read = |name: &str| {
+        name.strip_prefix("var_")
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_some_and(|n| read.iter().any(|v| stack_val_mentions_binding(v, n)))
+    };
+    fn nested_def(stmts: &[SorobanStmt], is_read: &dyn Fn(&str) -> bool, top: bool) -> bool {
+        stmts.iter().any(|st| match st {
+            SorobanStmt::Let { name, .. } => !top && is_read(name),
+            SorobanStmt::Assign { target, .. } => is_read(target),
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => nested_def(then_body, is_read, false) || nested_def(else_body, is_read, false),
+            SorobanStmt::Match { arms, .. } => {
+                arms.iter().any(|a| nested_def(&a.body, is_read, false))
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => nested_def(body, is_read, false),
+            _ => false,
+        })
+    }
+    let keep = stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, st)| matches!(st, SorobanStmt::Let { name, .. } if is_read(name)))
+        .map(|(i, _)| i)
+        .collect();
+    (keep, nested_def(stmts, &is_read, true))
+}
+
 fn stmts_are_pure_arith_husks(stmts: &[SorobanStmt]) -> bool {
     stmts.iter().all(stmt_is_pure_arith_husk)
 }
@@ -26948,6 +27026,52 @@ mod tests {
             detect_defaulting_int128_getter(&m, 6),
             None,
             "halves swapped"
+        );
+    }
+
+    #[test]
+    fn husk_drop_keeps_only_a_top_level_result_binding() {
+        let get = |k: &str| SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral(k.into())),
+            unwrap: true,
+            on_missing: None,
+        };
+        let limb = |n, hi| StackVal::I128Limb {
+            value: Box::new(StackVal::LetBinding(n)),
+            hi,
+        };
+        let read = [limb(7, false), limb(7, true)];
+        // `let var_7 = get(Total); let var_8 = get(Other);` — the slots read
+        // var_7, so it is kept; var_8 is a husk.
+        let stmts = vec![
+            SorobanStmt::Let {
+                name: "var_7".into(),
+                mutable: false,
+                value: get("Total"),
+            },
+            SorobanStmt::Let {
+                name: "var_8".into(),
+                mutable: false,
+                value: get("Other"),
+            },
+        ];
+        assert_eq!(result_bindings_defined_in(&stmts, &read), (vec![0], false));
+        // A merge variable assigned in an `if` arm: the statements compute the
+        // result, so it is nested (nothing may be dropped).
+        let stmts = vec![SorobanStmt::If {
+            condition: SorobanExpr::BoolLiteral(true),
+            then_body: vec![SorobanStmt::Assign {
+                target: "var_7".into(),
+                value: SorobanExpr::I64Literal(1),
+            }],
+            else_body: vec![],
+        }];
+        assert_eq!(result_bindings_defined_in(&stmts, &read), (vec![], true));
+        // Nothing the slots read: nothing kept, nothing nested.
+        assert_eq!(
+            result_bindings_defined_in(&stmts, &[StackVal::I64(0)]),
+            (vec![], false)
         );
     }
 
