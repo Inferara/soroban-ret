@@ -7776,8 +7776,45 @@ fn coerce_i128_invoke_types(stmts: &mut [SorobanStmt], params: &[FnParam]) -> I1
     // Retype invokes and inline-arithmetic gets, collecting the storage keys read as
     // i128 (the caller types every get of those keys, including in other functions).
     let mut used = I128Use::default();
+    collect_i128_invoke_bindings(stmts, &mut used.bound);
     coerce_i128_collect(stmts, params, &mut used);
     used
+}
+
+/// Names of the `let` bindings whose value is an `invoke_contract` already typed
+/// 128-bit (the lifter binds a decoded cross-contract result once and types it
+/// from the decode it proved — issue #74). Arithmetic reading such a binding is
+/// i128 arithmetic just as it is when the call is written inline.
+fn collect_i128_invoke_bindings(
+    stmts: &[SorobanStmt],
+    bound: &mut std::collections::HashSet<String>,
+) {
+    for stmt in stmts {
+        match stmt {
+            SorobanStmt::Let { name, value, .. } if expr_is_i128(value, &[], bound) => {
+                if matches!(value, SorobanExpr::InvokeContract { .. }) {
+                    bound.insert(name.clone());
+                }
+            }
+            SorobanStmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_i128_invoke_bindings(then_body, bound);
+                collect_i128_invoke_bindings(else_body, bound);
+            }
+            SorobanStmt::Match { arms, .. } => {
+                for arm in arms {
+                    collect_i128_invoke_bindings(&arm.body, bound);
+                }
+            }
+            SorobanStmt::Loop { body }
+            | SorobanStmt::Block(body)
+            | SorobanStmt::For { body, .. } => collect_i128_invoke_bindings(body, bound),
+            _ => {}
+        }
+    }
 }
 
 /// What a function's i128 arithmetic depends on, gathered to type the storage gets
@@ -7789,6 +7826,8 @@ struct I128Use {
     locals: std::collections::HashSet<String>,
     /// Storage keys read as i128 (e.g. `DataKey::ReserveA`).
     keys: Vec<SorobanExpr>,
+    /// Bindings of a 128-bit `invoke_contract` ([`collect_i128_invoke_bindings`]).
+    bound: std::collections::HashSet<String>,
 }
 
 fn coerce_i128_collect(stmts: &mut [SorobanStmt], params: &[FnParam], used: &mut I128Use) {
@@ -7920,17 +7959,25 @@ fn coerce_i128_invoke_in_expr(e: &mut SorobanExpr, params: &[FnParam], used: &mu
             | SorobanExpr::Shl(..)
             | SorobanExpr::Div(..)
             | SorobanExpr::Rem(..)
-    ) && expr_is_i128(e, params)
+    ) && expr_is_i128(e, params, &used.bound)
     {
         force_i128_deep(e, used);
     }
 }
 
 /// True when `e` is statically known to be 128-bit: a 128-bit literal, a 128-bit
-/// parameter, an `invoke_contract` already typed 128-bit, or arithmetic with such
-/// an operand.
-fn expr_is_i128(e: &SorobanExpr, params: &[FnParam]) -> bool {
+/// parameter, an `invoke_contract` already typed 128-bit or a binding of one
+/// (`bound`), or arithmetic with such an operand.
+fn expr_is_i128(
+    e: &SorobanExpr,
+    params: &[FnParam],
+    bound: &std::collections::HashSet<String>,
+) -> bool {
     match e {
+        SorobanExpr::NamedLocal(name) => bound.contains(name),
+        SorobanExpr::Local(idx) => bound.contains(&format!("var_{idx}")),
+        // The lifter's decode of an already-128-bit value renders bare.
+        SorobanExpr::ValConvert { value, .. } => expr_is_i128(value, params, bound),
         SorobanExpr::I128Literal(_) | SorobanExpr::U128Literal(_) => true,
         SorobanExpr::Param(n) => params.iter().any(|p| {
             p.name == *n && matches!(p.type_def, ScSpecTypeDef::I128 | ScSpecTypeDef::U128)
@@ -7948,7 +7995,9 @@ fn expr_is_i128(e: &SorobanExpr, params: &[FnParam]) -> bool {
         | SorobanExpr::Mul(a, b)
         | SorobanExpr::Shl(a, b)
         | SorobanExpr::Div(a, b)
-        | SorobanExpr::Rem(a, b) => expr_is_i128(a, params) || expr_is_i128(b, params),
+        | SorobanExpr::Rem(a, b) => {
+            expr_is_i128(a, params, bound) || expr_is_i128(b, params, bound)
+        }
         _ => false,
     }
 }
@@ -9543,6 +9592,59 @@ mod tests {
             ),
             other => panic!("unexpected body: {other:?}"),
         }
+    }
+
+    #[test]
+    fn coerce_i128_invoke_types_reads_a_bound_call_as_i128() {
+        // `let balance = invoke::<i128>(..); balance * get(TotalShares)`: the
+        // binding is i128, so the get it multiplies is typed `i128` as it would
+        // be next to the call itself — including through the lifter's bare
+        // decode of the binding.
+        let invoke = SorobanExpr::InvokeContract {
+            address: Box::new(SorobanExpr::Param("token".to_string())),
+            function: Box::new(SorobanExpr::SymbolLiteral("balance".to_string())),
+            args: vec![],
+            return_type: Some("i128".to_string()),
+        };
+        let get = SorobanExpr::StorageGet {
+            storage_type: StorageType::Instance,
+            key: Box::new(SorobanExpr::SymbolLiteral("TotalShares".to_string())),
+            unwrap: true,
+            on_missing: None,
+        };
+        let mut body = vec![
+            SorobanStmt::Let {
+                name: "balance".to_string(),
+                mutable: false,
+                value: invoke,
+            },
+            SorobanStmt::Expr(SorobanExpr::Mul(
+                Box::new(SorobanExpr::ValConvert {
+                    value: Box::new(SorobanExpr::NamedLocal("balance".to_string())),
+                    target_type: "i128".to_string(),
+                }),
+                Box::new(get.clone()),
+            )),
+            SorobanStmt::Expr(SorobanExpr::Mul(
+                Box::new(SorobanExpr::NamedLocal("other".to_string())),
+                Box::new(get),
+            )),
+        ];
+        let used = coerce_i128_invoke_types(&mut body, &[]);
+        assert!(
+            matches!(&body[1], SorobanStmt::Expr(SorobanExpr::Mul(_, b))
+                if matches!(b.as_ref(), SorobanExpr::CastAs { target_type, .. } if target_type == "i128")),
+            "{:?}",
+            body[1]
+        );
+        assert_eq!(used.keys.len(), 1);
+        // An unbound name says nothing about its type.
+        assert!(
+            matches!(&body[2], SorobanStmt::Expr(SorobanExpr::Mul(_, b))
+                if matches!(b.as_ref(), SorobanExpr::StorageGet { .. })),
+            "{:?}",
+            body[2]
+        );
     }
 
     fn storage_hints(function_name: &str, keys: Vec<HintValue>) -> DecompileHints {
